@@ -187,8 +187,14 @@ def test_discover_sources_includes_github_candidates(workspace, tmp_path, monkey
     repository = SQLiteRepository(paths.db_path)
     sources = repository.list_sources()
     report = result.report_path.read_text(encoding="utf-8")
+    repo_source = next(source for source in sources if source.type == SourceType.GITHUB_REPOSITORY)
+    with repository.connect() as conn:
+        activity = conn.execute(
+            "SELECT source_id FROM github_activities WHERE repo = ?",
+            ("octo/demo",),
+        ).fetchone()
 
     assert result.discovered_count == 2
-    assert any(source.type == SourceType.GITHUB_REPOSITORY for source in sources)
+    assert activity["source_id"] == repo_source.id
     assert "octo/demo" in report
     assert "Add RAG ingestion" in report

@@ -36,8 +36,9 @@ def discover_sources(request: DiscoverSourcesRequest) -> DiscoverSourcesResult:
     github_activities: list[GitHubActivityCandidate] = []
     if request.include_github:
         github_repos, github_activities = discover_github_candidates()
+        repo_source_ids: dict[str, int] = {}
         for repo in github_repos:
-            repository.upsert_source(
+            repo_source_ids[repo.name_with_owner] = repository.upsert_source(
                 Source(
                     id=None,
                     type=SourceType.GITHUB_REPOSITORY,
@@ -51,7 +52,7 @@ def discover_sources(request: DiscoverSourcesRequest) -> DiscoverSourcesResult:
             repository.insert_github_activity(
                 GitHubActivity(
                     id=None,
-                    source_id=None,
+                    source_id=repo_source_ids.get(activity.repo),
                     repo=activity.repo,
                     activity_type=activity.activity_type,
                     url=activity.url,
