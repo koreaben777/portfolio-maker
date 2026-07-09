@@ -1,4 +1,7 @@
 import json
+import sqlite3
+
+import pytest
 
 from portfolio_maker.domain.models import Source, SourceStatus, SourceType
 from portfolio_maker.infrastructure.audit import AuditEvent, AuditLog
@@ -7,7 +10,7 @@ from portfolio_maker.workspace import WorkspacePaths
 
 
 def column_names(repository, table_name):
-    with repository.connect() as conn:
+    with repository._connection() as conn:
         rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
     return {row["name"] for row in rows}
 
@@ -66,8 +69,32 @@ def test_sqlite_repository_initialize_creates_schema_tables(workspace):
         "source_snapshots",
         "evidence_items",
         "github_activities",
+        "projects",
         "career_claims",
+        "claim_evidence",
+        "artifacts",
     } <= repository.table_names()
+
+
+def test_sqlite_repository_enforces_foreign_keys(workspace):
+    paths = WorkspacePaths.from_root(workspace)
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+
+    with repository._connection() as conn:
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                """
+                INSERT INTO source_snapshots (
+                    source_id,
+                    snapshot_path,
+                    content_hash,
+                    extractor
+                )
+                VALUES (?, ?, ?, ?)
+                """,
+                (999, "/missing", "hash", "test"),
+            )
 
 
 def test_sqlite_repository_initialize_creates_required_schema_columns(workspace):
