@@ -12,6 +12,10 @@ Portfolio Maker is a Codex app guided local workflow for building an evidence-ba
 - Master profile JSON/Markdown
 - Portfolio draft Markdown
 
+## Requirements
+
+- Python 3.11 or newer
+
 ## Safety Rules
 
 - The tool must not ingest source bodies until `.portfolio-maker/reviews/source-approval.json` approves them.
@@ -21,14 +25,16 @@ Portfolio Maker is a Codex app guided local workflow for building an evidence-ba
 ## Local Setup
 
 ```bash
-python3 -m venv .venv
+python3.11 -m venv .venv
 . .venv/bin/activate
 python -m pip install --upgrade pip
 pip install -e ".[dev]"
 pytest
 ```
 
-## Basic Commands
+## Planned Commands
+
+The following MVP commands are planned for later tasks and are not implemented yet:
 
 ```bash
 portfolio-maker discover --workspace .
@@ -36,4 +42,10 @@ portfolio-maker approve --workspace . --write-sample
 portfolio-maker ingest --workspace .
 portfolio-maker build-profile --workspace .
 portfolio-maker draft-portfolio --workspace .
+```
+
+The currently working smoke command is:
+
+```bash
+portfolio-maker
 ```
