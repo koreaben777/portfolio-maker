@@ -12,6 +12,10 @@ class ApprovalMissingError(RuntimeError):
     pass
 
 
+class ApprovalFormatError(ValueError):
+    pass
+
+
 @dataclass(frozen=True)
 class SourceApproval:
     approved_source_uris: tuple[str, ...]
@@ -44,9 +48,20 @@ def load_approval(paths: WorkspacePaths) -> SourceApproval:
         raise ApprovalMissingError(f"Approval file missing: {paths.approval_path}")
 
     payload = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    private_sources_allowed = payload.get("private_sources_allowed", False)
+    if not isinstance(private_sources_allowed, bool):
+        raise ApprovalFormatError("private_sources_allowed must be a bool")
+
     return SourceApproval(
-        approved_source_uris=tuple(payload.get("approved_source_uris", ())),
-        forbidden_paths=tuple(payload.get("forbidden_paths", ())),
-        excluded_repositories=tuple(payload.get("excluded_repositories", ())),
-        private_sources_allowed=bool(payload.get("private_sources_allowed", False)),
+        approved_source_uris=_string_list(payload, "approved_source_uris"),
+        forbidden_paths=_string_list(payload, "forbidden_paths"),
+        excluded_repositories=_string_list(payload, "excluded_repositories"),
+        private_sources_allowed=private_sources_allowed,
     )
+
+
+def _string_list(payload: dict[str, Any], key: str) -> tuple[str, ...]:
+    value = payload.get(key, [])
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ApprovalFormatError(f"{key} must be a list of strings")
+    return tuple(value)
