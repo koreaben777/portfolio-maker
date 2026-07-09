@@ -14,39 +14,89 @@ Portfolio Maker is a Codex app guided local workflow for building an evidence-ba
 
 ## Requirements
 
-- Python 3.11 or newer
+- macOS
+- Codex app
+- Python 3.11+
+- Git
+- GitHub CLI `gh` for GitHub discovery
 
-## Safety Rules
-
-- The tool must not ingest source bodies until `.portfolio-maker/reviews/source-approval.json` approves them.
-- The tool must not copy original files into `.portfolio-maker/`.
-- Public artifacts must not expose secrets, tokens, or private raw paths.
-
-## Local Setup
+## Setup
 
 ```bash
-PYTHON_BIN=python3.11  # replace with your Python 3.11+ executable if needed
-$PYTHON_BIN -m venv .venv
+python3 -m venv .venv
 . .venv/bin/activate
-python -m pip install --upgrade pip
 pip install -e ".[dev]"
 pytest
 ```
 
-## Planned Commands
+## Safety Rules
 
-The following MVP commands are planned for later tasks and are not implemented yet:
+- Discovery may list candidates, but ingestion is blocked until `.portfolio-maker/reviews/source-approval.json` exists.
+- Original files are not copied into `.portfolio-maker/`.
+- Extracted snapshots are masked for common secret patterns.
+- Public portfolio drafts must not include secrets, tokens, or private raw paths.
+- Keep `.portfolio-maker/` out of Git.
+
+## Codex App Workflow
+
+In Codex app, invoke the repo skill:
+
+```text
+$portfolio-maker
+```
+
+Then follow the approval flow:
 
 ```bash
 portfolio-maker discover --workspace .
 portfolio-maker approve --workspace . --write-sample
+```
+
+Review:
+
+```text
+.portfolio-maker/reviews/discovery-report.md
+.portfolio-maker/reviews/source-approval.json
+```
+
+After approval:
+
+```bash
 portfolio-maker ingest --workspace .
 portfolio-maker build-profile --workspace .
 portfolio-maker draft-portfolio --workspace .
 ```
 
-The currently working smoke command is:
+Generated artifacts:
+
+```text
+.portfolio-maker/artifacts/master-profile.json
+.portfolio-maker/artifacts/master-profile.md
+.portfolio-maker/artifacts/portfolio-draft.md
+```
+
+## Troubleshooting
+
+### GitHub authentication
+
+Run:
 
 ```bash
-portfolio-maker
+gh auth status
 ```
+
+If authentication is missing, run:
+
+```bash
+gh auth login
+```
+
+Use the narrowest read-only access that supports repository and activity reads.
+
+### Permission errors
+
+Permission-denied paths are skipped and recorded. Add sensitive folders to `forbidden_paths` in `.portfolio-maker/reviews/source-approval.json`.
+
+### Rate limits
+
+GitHub rate limits are recorded as paused states. Re-run the same command after the limit resets.
