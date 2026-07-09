@@ -13,7 +13,9 @@ CREATE TABLE IF NOT EXISTS sources (
     uri TEXT NOT NULL UNIQUE,
     display_name TEXT NOT NULL,
     owner TEXT,
-    status TEXT NOT NULL
+    status TEXT NOT NULL,
+    discovered_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    approved_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS source_snapshots (
@@ -21,7 +23,8 @@ CREATE TABLE IF NOT EXISTS source_snapshots (
     source_id INTEGER NOT NULL REFERENCES sources(id),
     snapshot_path TEXT NOT NULL,
     content_hash TEXT NOT NULL,
-    extractor TEXT NOT NULL
+    extractor TEXT NOT NULL,
+    extracted_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS evidence_items (
@@ -62,12 +65,14 @@ CREATE TABLE IF NOT EXISTS career_claims (
     claim_type TEXT NOT NULL,
     text TEXT NOT NULL,
     confidence TEXT NOT NULL,
-    public_safe INTEGER NOT NULL
+    public_safe INTEGER NOT NULL,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS claim_evidence (
     claim_id INTEGER NOT NULL REFERENCES career_claims(id),
     evidence_id INTEGER NOT NULL REFERENCES evidence_items(id),
+    support_level TEXT NOT NULL,
     PRIMARY KEY (claim_id, evidence_id)
 );
 
@@ -75,7 +80,8 @@ CREATE TABLE IF NOT EXISTS artifacts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     type TEXT NOT NULL,
     path TEXT NOT NULL,
-    source_profile_version TEXT NOT NULL
+    source_profile_version TEXT NOT NULL,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 """
 

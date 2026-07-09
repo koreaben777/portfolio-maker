@@ -6,6 +6,12 @@ from portfolio_maker.infrastructure.sqlite_repository import SQLiteRepository
 from portfolio_maker.workspace import WorkspacePaths
 
 
+def column_names(repository, table_name):
+    with repository.connect() as conn:
+        rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    return {row["name"] for row in rows}
+
+
 def test_workspace_paths_create_expected_directories(workspace):
     paths = WorkspacePaths.from_root(workspace)
     paths.ensure()
@@ -62,6 +68,18 @@ def test_sqlite_repository_initialize_creates_schema_tables(workspace):
         "github_activities",
         "career_claims",
     } <= repository.table_names()
+
+
+def test_sqlite_repository_initialize_creates_required_schema_columns(workspace):
+    paths = WorkspacePaths.from_root(workspace)
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+
+    assert {"discovered_at", "approved_at"} <= column_names(repository, "sources")
+    assert {"extracted_at"} <= column_names(repository, "source_snapshots")
+    assert {"created_at"} <= column_names(repository, "career_claims")
+    assert {"created_at"} <= column_names(repository, "artifacts")
+    assert {"support_level"} <= column_names(repository, "claim_evidence")
 
 
 def test_sqlite_repository_upsert_source_lists_inserted_source(workspace):
