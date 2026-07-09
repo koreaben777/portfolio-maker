@@ -5,6 +5,10 @@ from pathlib import Path
 from portfolio_maker.application.discovery import discover_sources
 from portfolio_maker.application.models import DiscoverSourcesRequest
 from portfolio_maker.domain.models import SourceStatus, SourceType
+from portfolio_maker.infrastructure.github_connector import (
+    GitHubActivityCandidate,
+    GitHubRepositoryCandidate,
+)
 from portfolio_maker.infrastructure.local_discovery import discover_local_candidates
 from portfolio_maker.infrastructure.sqlite_repository import SQLiteRepository
 from portfolio_maker.workspace import WorkspacePaths
@@ -137,3 +141,54 @@ def test_discover_sources_redacts_policy_skipped_paths_in_report(tmp_path):
     report = result.report_path.read_text(encoding="utf-8")
     assert "skipped_policy" in report
     assert ".env" not in report
+
+
+def test_discover_sources_includes_github_candidates(workspace, tmp_path, monkeypatch):
+    def fake_discover_github_candidates():
+        return (
+            [
+                GitHubRepositoryCandidate(
+                    name_with_owner="octo/demo",
+                    url="https://github.com/octo/demo",
+                    is_private=False,
+                    description="Demo portfolio project",
+                    primary_language="Python",
+                )
+            ],
+            [
+                GitHubActivityCandidate(
+                    repo="octo/demo",
+                    activity_type="pull_request",
+                    url="https://github.com/octo/demo/pull/1",
+                    title="Add RAG ingestion",
+                    state="MERGED",
+                    author="octo",
+                    created_at="2026-01-01T00:00:00Z",
+                    merged_at="2026-01-02T00:00:00Z",
+                )
+            ],
+        )
+
+    monkeypatch.setattr(
+        "portfolio_maker.application.discovery.discover_github_candidates",
+        fake_discover_github_candidates,
+    )
+
+    result = discover_sources(
+        DiscoverSourcesRequest(
+            workspace=workspace,
+            home=tmp_path,
+            include_github=True,
+            forbidden_paths=(),
+        )
+    )
+
+    paths = WorkspacePaths.from_root(workspace)
+    repository = SQLiteRepository(paths.db_path)
+    sources = repository.list_sources()
+    report = result.report_path.read_text(encoding="utf-8")
+
+    assert result.discovered_count == 2
+    assert any(source.type == SourceType.GITHUB_REPOSITORY for source in sources)
+    assert "octo/demo" in report
+    assert "Add RAG ingestion" in report

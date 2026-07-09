@@ -143,3 +143,77 @@ def run_gh_json(args: list[str]) -> Any:
         text=True,
     )
     return json.loads(completed.stdout)
+
+
+def discover_github_candidates() -> tuple[list[GitHubRepositoryCandidate], list[GitHubActivityCandidate]]:
+    repos = parse_repo_list(
+        run_gh_json(
+            [
+                "repo",
+                "list",
+                "--json",
+                "nameWithOwner,url,isPrivate,description,primaryLanguage",
+                "--limit",
+                "100",
+            ]
+        )
+    )
+    activities: list[GitHubActivityCandidate] = []
+    for repo in repos:
+        activities.extend(
+            parse_pr_list(
+                repo.name_with_owner,
+                run_gh_json(
+                    [
+                        "pr",
+                        "list",
+                        "--repo",
+                        repo.name_with_owner,
+                        "--state",
+                        "all",
+                        "--json",
+                        "title,url,state,createdAt,mergedAt,author",
+                        "--limit",
+                        "100",
+                    ]
+                ),
+            )
+        )
+        activities.extend(
+            parse_commit_list(
+                repo.name_with_owner,
+                run_gh_json(["api", f"repos/{repo.name_with_owner}/commits", "--paginate"]),
+            )
+        )
+        activities.extend(
+            parse_issue_list(
+                repo.name_with_owner,
+                run_gh_json(
+                    [
+                        "issue",
+                        "list",
+                        "--repo",
+                        repo.name_with_owner,
+                        "--state",
+                        "all",
+                        "--json",
+                        "title,url,state,createdAt,author",
+                        "--limit",
+                        "100",
+                    ]
+                ),
+            )
+        )
+        activities.extend(
+            parse_review_list(
+                repo.name_with_owner,
+                run_gh_json(["api", f"repos/{repo.name_with_owner}/pulls/comments", "--paginate"]),
+            )
+        )
+        activities.extend(
+            parse_workflow_run_list(
+                repo.name_with_owner,
+                run_gh_json(["api", f"repos/{repo.name_with_owner}/actions/runs"]),
+            )
+        )
+    return repos, activities

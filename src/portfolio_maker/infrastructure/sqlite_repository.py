@@ -5,7 +5,7 @@ from contextlib import contextmanager
 import sqlite3
 from pathlib import Path
 
-from portfolio_maker.domain.models import Source, SourceStatus, SourceType
+from portfolio_maker.domain.models import GitHubActivity, Source, SourceStatus, SourceType
 
 
 SCHEMA = """
@@ -144,6 +144,28 @@ class SQLiteRepository:
                 (source.uri,),
             ).fetchone()
         return int(row["id"])
+
+    def insert_github_activity(self, activity: GitHubActivity) -> int:
+        with self._connection() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO github_activities
+                    (source_id, repo, activity_type, url, title, state, author, created_at, merged_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    activity.source_id,
+                    activity.repo,
+                    activity.activity_type,
+                    activity.url,
+                    activity.title,
+                    activity.state,
+                    activity.author,
+                    activity.created_at,
+                    activity.merged_at,
+                ),
+            )
+        return int(cursor.lastrowid)
 
     def list_sources(self, status: SourceStatus | None = None) -> list[Source]:
         sql = "SELECT id, type, uri, display_name, owner, status FROM sources"
