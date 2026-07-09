@@ -182,7 +182,7 @@ def discover_github_candidates() -> tuple[list[GitHubRepositoryCandidate], list[
         activities.extend(
             parse_commit_list(
                 repo.name_with_owner,
-                run_gh_json(["api", f"repos/{repo.name_with_owner}/commits", "--paginate"]),
+                run_gh_json(["api", f"repos/{repo.name_with_owner}/commits"]),
             )
         )
         activities.extend(
@@ -207,7 +207,7 @@ def discover_github_candidates() -> tuple[list[GitHubRepositoryCandidate], list[
         activities.extend(
             parse_review_list(
                 repo.name_with_owner,
-                run_gh_json(["api", f"repos/{repo.name_with_owner}/pulls/comments", "--paginate"]),
+                run_gh_json(["api", f"repos/{repo.name_with_owner}/pulls/comments"]),
             )
         )
         activities.extend(

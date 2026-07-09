@@ -4,6 +4,7 @@ from pathlib import Path
 from portfolio_maker.infrastructure.github_connector import (
     GitHubActivityCandidate,
     GitHubRepositoryCandidate,
+    discover_github_candidates,
     parse_commit_list,
     parse_issue_list,
     parse_pr_list,
@@ -84,3 +85,34 @@ def test_parse_commit_review_and_workflow_run_lists():
         created_at="2026-01-05T00:00:00Z",
         merged_at=None,
     )
+
+
+def test_discover_github_candidates_does_not_paginate_api_json(monkeypatch):
+    calls = []
+
+    def fake_run_gh_json(args):
+        calls.append(args)
+        if args[:2] == ["repo", "list"]:
+            return load_fixture("gh_repo_list.json")
+        if args[:2] == ["pr", "list"]:
+            return load_fixture("gh_pr_list.json")
+        if args[:2] == ["issue", "list"]:
+            return load_fixture("gh_issue_list.json")
+        if args == ["api", "repos/octo/demo/commits"]:
+            return load_fixture("gh_commit_list.json")
+        if args == ["api", "repos/octo/demo/pulls/comments"]:
+            return load_fixture("gh_review_list.json")
+        if args == ["api", "repos/octo/demo/actions/runs"]:
+            return load_fixture("gh_workflow_run_list.json")
+        raise AssertionError(args)
+
+    monkeypatch.setattr(
+        "portfolio_maker.infrastructure.github_connector.run_gh_json",
+        fake_run_gh_json,
+    )
+
+    repos, activities = discover_github_candidates()
+
+    assert len(repos) == 1
+    assert len(activities) == 5
+    assert all("--paginate" not in call for call in calls)
