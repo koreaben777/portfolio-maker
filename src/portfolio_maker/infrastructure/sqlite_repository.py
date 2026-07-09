@@ -167,6 +167,24 @@ class SQLiteRepository:
             )
         return int(cursor.lastrowid)
 
+    def insert_source_snapshot(
+        self,
+        source_id: int,
+        snapshot_path: Path,
+        content_hash: str,
+        extractor: str,
+    ) -> int:
+        with self._connection() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO source_snapshots
+                    (source_id, snapshot_path, content_hash, extractor)
+                VALUES (?, ?, ?, ?)
+                """,
+                (source_id, str(snapshot_path), content_hash, extractor),
+            )
+        return int(cursor.lastrowid)
+
     def list_sources(self, status: SourceStatus | None = None) -> list[Source]:
         sql = "SELECT id, type, uri, display_name, owner, status FROM sources"
         params: tuple[str, ...] = ()
