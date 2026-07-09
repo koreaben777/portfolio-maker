@@ -23,6 +23,7 @@ Portfolio Maker is a Codex app guided local workflow for building an evidence-ba
 ```bash
 python3 -m venv .venv
 . .venv/bin/activate
+python -m pip install --upgrade pip
 pip install -e ".[dev]"
 pytest
 ```
