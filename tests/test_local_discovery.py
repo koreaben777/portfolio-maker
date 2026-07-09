@@ -33,6 +33,32 @@ def test_discover_local_candidates_finds_readme_and_skips_forbidden_and_policy_p
     assert (node_modules.resolve(), "skipped_policy") in [(item.path, item.reason) for item in skipped]
 
 
+def test_discover_local_candidates_prunes_forbidden_children(tmp_path):
+    home = tmp_path / "home"
+    forbidden = home / "private"
+    forbidden.mkdir(parents=True)
+    secret = forbidden / "secret-child.md"
+    secret.write_text("# Secret\n", encoding="utf-8")
+
+    candidates, skipped = discover_local_candidates(home, forbidden_paths=(forbidden,))
+
+    assert candidates == []
+    assert (forbidden.resolve(), "forbidden") in [(item.path, item.reason) for item in skipped]
+    reported_paths = [str(item.path) for item in skipped] + [str(candidate.path) for candidate in candidates]
+    assert secret.name not in "\n".join(reported_paths)
+
+
+def test_discover_local_candidates_respects_zero_max_candidates(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "README.md").write_text("# Portfolio\n", encoding="utf-8")
+
+    candidates, skipped = discover_local_candidates(home, max_candidates=0)
+
+    assert candidates == []
+    assert skipped == []
+
+
 def test_discover_local_candidates_uses_contract_skip_reasons_for_oversize_and_oserror(tmp_path, monkeypatch):
     home = tmp_path / "home"
     home.mkdir()
