@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 from portfolio_maker.application.models import BuildProfileRequest, BuildProfileResult
 from portfolio_maker.domain.models import SourceStatus
 from portfolio_maker.infrastructure.artifacts import write_json, write_markdown
@@ -13,12 +16,15 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
     repository = SQLiteRepository(paths.db_path)
     repository.initialize()
     sources = repository.list_sources(status=SourceStatus.INGESTED)
+    snapshots = repository.latest_snapshots_by_source_id()
     claims = [
         {
-            "text": f"Worked on {source.display_name}.",
-            "confidence": "low",
+            "claim_type": "project_evidence",
+            "text": f"{source.display_name}: {_snapshot_evidence(source.display_name, snapshots.get(source.id or -1))}",
+            "confidence": "medium",
             "public_safe": False,
             "evidence_uri": source.uri,
+            "evidence_snapshot": str(snapshots[source.id]) if source.id in snapshots else None,
         }
         for source in sources
     ]
@@ -28,8 +34,10 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
             {
                 "id": source.id,
                 "type": source.type.value,
+                "uri": source.uri,
                 "display_name": source.display_name,
                 "owner": source.owner,
+                "status": source.status.value,
             }
             for source in sources
         ],
@@ -58,3 +66,18 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
         markdown_path=paths.master_profile_md_path,
         claim_count=len(claims),
     )
+
+
+def _snapshot_evidence(display_name: str, snapshot_path: Path | None) -> str:
+    if snapshot_path is None or not snapshot_path.exists():
+        return "Approved evidence captured."
+    payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    lines = [
+        line.strip().lstrip("#").strip()
+        for line in str(payload.get("text") or "").splitlines()
+        if line.strip()
+    ]
+    for line in lines:
+        if line != display_name:
+            return line
+    return lines[0] if lines else "Approved evidence captured."

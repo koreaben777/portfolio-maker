@@ -1,11 +1,8 @@
 [
   {
-    "pullRequest": {
-      "title": "Add RAG ingestion",
-      "url": "https://github.com/octo/demo/pull/1"
-    },
-    "state": "APPROVED",
-    "author": {"login": "octo"},
-    "submittedAt": "2026-01-06T00:00:00Z"
+    "html_url": "https://github.com/octo/demo/pull/1#discussion_r1",
+    "body": "Please tighten approval validation.",
+    "user": {"login": "octo"},
+    "created_at": "2026-01-06T00:00:00Z"
   }
 ]

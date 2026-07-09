@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from portfolio_maker.application.approval import load_approval
 from portfolio_maker.application.models import DiscoverSourcesRequest, DiscoverSourcesResult, ProgressEvent
 from portfolio_maker.domain.models import GitHubActivity, Source, SourceStatus, SourceType
 from portfolio_maker.infrastructure.github_connector import (
+    GitHubDiscoveryError,
     GitHubActivityCandidate,
     GitHubRepositoryCandidate,
     discover_github_candidates,
@@ -34,8 +36,30 @@ def discover_sources(request: DiscoverSourcesRequest) -> DiscoverSourcesResult:
 
     github_repos: list[GitHubRepositoryCandidate] = []
     github_activities: list[GitHubActivityCandidate] = []
+    github_error: str | None = None
     if request.include_github:
-        github_repos, github_activities = discover_github_candidates()
+        try:
+            github_repos, github_activities = discover_github_candidates()
+        except (GitHubDiscoveryError, FileNotFoundError) as error:
+            github_error = str(error) or "GitHub discovery failed"
+
+        excluded_repositories: set[str] = set()
+        private_sources_allowed = False
+        if paths.approval_path.exists():
+            approval = load_approval(paths)
+            excluded_repositories = set(approval.excluded_repositories)
+            private_sources_allowed = approval.private_sources_allowed
+
+        github_repos = [
+            repo
+            for repo in github_repos
+            if repo.name_with_owner not in excluded_repositories
+            and (private_sources_allowed or not repo.is_private)
+        ]
+        allowed_repos = {repo.name_with_owner for repo in github_repos}
+        github_activities = [
+            activity for activity in github_activities if activity.repo in allowed_repos
+        ]
         repo_source_ids: dict[str, int] = {}
         for repo in github_repos:
             repo_source_ids[repo.name_with_owner] = repository.upsert_source(
@@ -65,7 +89,7 @@ def discover_sources(request: DiscoverSourcesRequest) -> DiscoverSourcesResult:
             )
 
     paths.discovery_report_path.write_text(
-        _render_report(candidates, skipped, github_repos, github_activities),
+        _render_report(candidates, skipped, github_repos, github_activities, github_error),
         encoding="utf-8",
     )
     discovered_count = len(candidates) + len(github_repos) + len(github_activities)
@@ -89,6 +113,7 @@ def _render_report(
     skipped: list[SkippedPath],
     github_repos: list[GitHubRepositoryCandidate],
     github_activities: list[GitHubActivityCandidate],
+    github_error: str | None = None,
 ) -> str:
     lines = ["# Discovery Report", "", "## Local candidates"]
     for candidate in candidates:
@@ -100,6 +125,8 @@ def _render_report(
     lines.extend(["", "## GitHub Activities"])
     for activity in github_activities:
         lines.append(f"- `{activity.activity_type}` `{activity.repo}`: {activity.title} {activity.url}")
+    if github_error:
+        lines.extend(["", "## GitHub Status", f"- GitHub discovery failed: {github_error}"])
     lines.extend(["", "## Skipped"])
     for item in skipped:
         path = "[redacted]" if item.reason in {"forbidden", "skipped_policy"} else item.path

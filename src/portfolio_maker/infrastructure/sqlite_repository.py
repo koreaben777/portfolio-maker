@@ -50,7 +50,8 @@ CREATE TABLE IF NOT EXISTS github_activities (
     state TEXT NOT NULL,
     author TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    merged_at TEXT
+    merged_at TEXT,
+    UNIQUE(repo, activity_type, url)
 );
 
 CREATE TABLE IF NOT EXISTS projects (
@@ -152,11 +153,18 @@ class SQLiteRepository:
 
     def insert_github_activity(self, activity: GitHubActivity) -> int:
         with self._connection() as conn:
-            cursor = conn.execute(
+            conn.execute(
                 """
                 INSERT INTO github_activities
                     (source_id, repo, activity_type, url, title, state, author, created_at, merged_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(repo, activity_type, url) DO UPDATE SET
+                    source_id = excluded.source_id,
+                    title = excluded.title,
+                    state = excluded.state,
+                    author = excluded.author,
+                    created_at = excluded.created_at,
+                    merged_at = excluded.merged_at
                 """,
                 (
                     activity.source_id,
@@ -170,7 +178,14 @@ class SQLiteRepository:
                     activity.merged_at,
                 ),
             )
-        return int(cursor.lastrowid)
+            row = conn.execute(
+                """
+                SELECT id FROM github_activities
+                WHERE repo = ? AND activity_type = ? AND url = ?
+                """,
+                (activity.repo, activity.activity_type, activity.url),
+            ).fetchone()
+        return int(row["id"])
 
     def insert_source_snapshot(
         self,
@@ -189,6 +204,21 @@ class SQLiteRepository:
                 (source_id, str(snapshot_path), content_hash, extractor),
             )
         return int(cursor.lastrowid)
+
+    def latest_snapshots_by_source_id(self) -> dict[int, Path]:
+        with self._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT source_id, snapshot_path
+                FROM source_snapshots
+                WHERE id IN (
+                    SELECT MAX(id)
+                    FROM source_snapshots
+                    GROUP BY source_id
+                )
+                """
+            ).fetchall()
+        return {int(row["source_id"]): Path(row["snapshot_path"]) for row in rows}
 
     def list_sources(self, status: SourceStatus | None = None) -> list[Source]:
         sql = "SELECT id, type, uri, display_name, owner, status FROM sources"

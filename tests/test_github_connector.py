@@ -67,10 +67,10 @@ def test_parse_commit_review_and_workflow_run_lists():
     )
     assert reviews[0] == GitHubActivityCandidate(
         repo="octo/demo",
-        activity_type="review",
-        url="https://github.com/octo/demo/pull/1",
-        title="Review: Add RAG ingestion",
-        state="APPROVED",
+        activity_type="review_comment",
+        url="https://github.com/octo/demo/pull/1#discussion_r1",
+        title="Review comment: Please tighten approval validation.",
+        state="commented",
         author="octo",
         created_at="2026-01-06T00:00:00Z",
         merged_at=None,
@@ -87,7 +87,7 @@ def test_parse_commit_review_and_workflow_run_lists():
     )
 
 
-def test_discover_github_candidates_does_not_paginate_api_json(monkeypatch):
+def test_discover_github_candidates_collects_repo_activities(monkeypatch):
     calls = []
 
     def fake_run_gh_json(args):
@@ -115,4 +115,10 @@ def test_discover_github_candidates_does_not_paginate_api_json(monkeypatch):
 
     assert len(repos) == 1
     assert len(activities) == 5
-    assert all("--paginate" not in call for call in calls)
+    assert [activity.activity_type for activity in activities] == [
+        "pull_request",
+        "commit",
+        "issue",
+        "review_comment",
+        "workflow_run",
+    ]

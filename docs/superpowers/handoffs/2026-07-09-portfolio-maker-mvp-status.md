@@ -161,7 +161,7 @@ Verification:
 
 Latest reviewed result: `9 passed`.
 
-## Not Started
+## Completed After Resume
 
 - Task 6: Local Discovery
 - Task 7: Approval File and Gate
@@ -174,25 +174,13 @@ Latest reviewed result: `9 passed`.
 - Task 14: Codex Skill Workflow
 - Task 15: Documentation and End-to-End Verification
 
-## Resume Instructions
+Latest implementation review fixes were applied after HEAD `a15462f fix: enforce approval boundaries`.
 
-When resuming, continue Subagent-Driven Development from Task 6: Local Discovery.
+Current resume point:
 
-Recommended first worker prompt:
-
-```text
-Implement Task 6: Local Discovery from
-docs/superpowers/plans/2026-07-09-portfolio-maker-mvp.md.
-
-Create only:
-- src/portfolio_maker/infrastructure/local_discovery.py
-- src/portfolio_maker/application/discovery.py
-- tests/test_local_discovery.py
-
-Follow the plan's TDD flow: write tests, confirm failure if practical,
-implement local candidate discovery and discover_sources(), run
-./.venv/bin/python -m pytest tests/test_local_discovery.py -v, commit with
-message "feat: add local discovery".
+```bash
+git status --short --branch
+./.venv/bin/python -m pytest -q
 ```
 
-After Task 6 implementation, run spec compliance review and code quality review before Task 7.
+Continue from the latest `codex/portfolio-maker-mvp` HEAD; do not restart at Task 6.

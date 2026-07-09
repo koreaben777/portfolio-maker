@@ -34,8 +34,15 @@ pytest
 - Discovery may list candidates, but ingestion is blocked until `.portfolio-maker/reviews/source-approval.json` exists.
 - Original files are not copied into `.portfolio-maker/`.
 - Extracted snapshots are masked for common secret patterns.
+- Private GitHub repositories are skipped unless `private_sources_allowed` is set to `true` in the approval file.
+- Repositories listed in `excluded_repositories` are skipped during GitHub discovery.
 - Public portfolio drafts must not include secrets, tokens, or private raw paths.
 - Keep `.portfolio-maker/` out of Git.
+
+## MVP Contract
+
+- The evidence store uses `sources`, `source_snapshots`, and `github_activities` at runtime.
+- Normalized `evidence_items`, `career_claims`, and artifact rows remain reserved for the later company-specific generation phase.
 
 ## Codex App Workflow
 
@@ -99,4 +106,4 @@ Permission-denied paths are skipped and recorded. Add sensitive folders to `forb
 
 ### Rate limits
 
-GitHub rate limits are recorded as paused states. Re-run the same command after the limit resets.
+GitHub discovery failures are recorded in the discovery report while local discovery continues. Re-run after the limit resets, or use `--no-github`.

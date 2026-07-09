@@ -6,6 +6,10 @@ from dataclasses import dataclass
 from typing import Any
 
 
+class GitHubDiscoveryError(RuntimeError):
+    pass
+
+
 @dataclass(frozen=True)
 class GitHubRepositoryCandidate:
     name_with_owner: str
@@ -99,17 +103,17 @@ def parse_commit_list(repo: str, payload: list[dict]) -> list[GitHubActivityCand
 def parse_review_list(repo: str, payload: list[dict]) -> list[GitHubActivityCandidate]:
     activities: list[GitHubActivityCandidate] = []
     for item in payload:
-        pull_request = item.get("pullRequest") or {}
         user = item.get("user") or {}
+        body = str(item.get("body") or "pull request").splitlines()[0]
         activities.append(
             GitHubActivityCandidate(
                 repo=repo,
-                activity_type="review",
-                url=pull_request.get("url") or item.get("html_url") or "",
-                title=f"Review: {pull_request.get('title') or item.get('body') or 'pull request'}",
-                state=item.get("state") or "",
-                author=(item.get("author") or user).get("login", ""),
-                created_at=item.get("submittedAt") or item.get("created_at") or "",
+                activity_type="review_comment",
+                url=item.get("html_url") or "",
+                title=f"Review comment: {body}",
+                state="commented",
+                author=user.get("login", ""),
+                created_at=item.get("created_at") or "",
                 merged_at=None,
             )
         )
@@ -136,13 +140,16 @@ def parse_workflow_run_list(repo: str, payload: dict) -> list[GitHubActivityCand
 
 
 def run_gh_json(args: list[str]) -> Any:
-    completed = subprocess.run(
-        ["gh", *args],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    return json.loads(completed.stdout)
+    try:
+        completed = subprocess.run(
+            ["gh", *args],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return json.loads(completed.stdout)
+    except (FileNotFoundError, subprocess.CalledProcessError, json.JSONDecodeError) as error:
+        raise GitHubDiscoveryError("GitHub discovery failed; check gh auth or use --no-github.") from error
 
 
 def discover_github_candidates() -> tuple[list[GitHubRepositoryCandidate], list[GitHubActivityCandidate]]:

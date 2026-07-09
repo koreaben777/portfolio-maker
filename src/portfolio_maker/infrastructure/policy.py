@@ -66,7 +66,7 @@ class FilePolicy:
     def classify_path(self, path: Path) -> str:
         if self.is_forbidden(path):
             return "forbidden"
-        if path.name in SENSITIVE_FILE_NAMES:
+        if path.name.lower() in SENSITIVE_FILE_NAMES:
             return "skipped_policy"
         if any(part in DEFAULT_EXCLUDED_NAMES for part in path.parts):
             return "skipped_policy"

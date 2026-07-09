@@ -44,12 +44,25 @@ def ingest_sources(request: IngestSourcesRequest) -> IngestSourcesResult:
             skipped_count += 1
             continue
 
+        if source.status == SourceStatus.INGESTED:
+            skipped_count += 1
+            continue
+
         source_path = _path_from_file_uri(source.uri)
         if policy.is_forbidden(source_path):
             skipped_count += 1
             continue
 
-        extracted = extract_text(source_path)
+        try:
+            extracted = extract_text(source_path)
+        except FileNotFoundError:
+            repository.update_source_status(source.id, SourceStatus.STALE_SOURCE)
+            skipped_count += 1
+            continue
+        except OSError:
+            repository.update_source_status(source.id, SourceStatus.EXTRACT_FAILED)
+            skipped_count += 1
+            continue
         snapshot_path = snapshots.write_local_snapshot(source.id, source_path, extracted)
         repository.insert_source_snapshot(
             source.id,

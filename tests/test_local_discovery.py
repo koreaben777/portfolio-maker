@@ -198,3 +198,127 @@ def test_discover_sources_includes_github_candidates(workspace, tmp_path, monkey
     assert activity["source_id"] == repo_source.id
     assert "octo/demo" in report
     assert "Add RAG ingestion" in report
+
+
+def test_discover_sources_keeps_local_report_when_github_fails(workspace, tmp_path, monkeypatch):
+    readme = tmp_path / "README.md"
+    readme.write_text("# Demo\n", encoding="utf-8")
+
+    def fail_github():
+        raise FileNotFoundError("gh")
+
+    monkeypatch.setattr(
+        "portfolio_maker.application.discovery.discover_github_candidates",
+        fail_github,
+    )
+
+    result = discover_sources(
+        DiscoverSourcesRequest(
+            workspace=workspace,
+            home=tmp_path,
+            include_github=True,
+            forbidden_paths=(),
+        )
+    )
+
+    report = result.report_path.read_text(encoding="utf-8")
+    assert result.discovered_count == 1
+    assert "README.md" in report
+    assert "GitHub discovery failed" in report
+
+
+def test_discover_sources_filters_private_and_excluded_github_repos(workspace, tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    paths = WorkspacePaths.from_root(workspace)
+    paths.ensure()
+    paths.approval_path.write_text(
+        """
+{
+  "approved_source_uris": [],
+  "forbidden_paths": [],
+  "excluded_repositories": ["octo/excluded"],
+  "private_sources_allowed": false
+}
+""".strip(),
+        encoding="utf-8",
+    )
+
+    def fake_discover_github_candidates():
+        return (
+            [
+                GitHubRepositoryCandidate(
+                    name_with_owner="octo/public",
+                    url="https://github.com/octo/public",
+                    is_private=False,
+                    description="Public",
+                    primary_language="Python",
+                ),
+                GitHubRepositoryCandidate(
+                    name_with_owner="octo/private",
+                    url="https://github.com/octo/private",
+                    is_private=True,
+                    description="Private",
+                    primary_language="Python",
+                ),
+                GitHubRepositoryCandidate(
+                    name_with_owner="octo/excluded",
+                    url="https://github.com/octo/excluded",
+                    is_private=False,
+                    description="Excluded",
+                    primary_language="Python",
+                ),
+            ],
+            [
+                GitHubActivityCandidate(
+                    repo="octo/public",
+                    activity_type="issue",
+                    url="https://github.com/octo/public/issues/1",
+                    title="Keep",
+                    state="OPEN",
+                    author="octo",
+                    created_at="2026-01-01T00:00:00Z",
+                    merged_at=None,
+                ),
+                GitHubActivityCandidate(
+                    repo="octo/private",
+                    activity_type="issue",
+                    url="https://github.com/octo/private/issues/1",
+                    title="Drop private",
+                    state="OPEN",
+                    author="octo",
+                    created_at="2026-01-01T00:00:00Z",
+                    merged_at=None,
+                ),
+                GitHubActivityCandidate(
+                    repo="octo/excluded",
+                    activity_type="issue",
+                    url="https://github.com/octo/excluded/issues/1",
+                    title="Drop excluded",
+                    state="OPEN",
+                    author="octo",
+                    created_at="2026-01-01T00:00:00Z",
+                    merged_at=None,
+                ),
+            ],
+        )
+
+    monkeypatch.setattr(
+        "portfolio_maker.application.discovery.discover_github_candidates",
+        fake_discover_github_candidates,
+    )
+
+    result = discover_sources(
+            DiscoverSourcesRequest(
+                workspace=workspace,
+                home=home,
+                include_github=True,
+                forbidden_paths=(),
+            )
+    )
+
+    report = result.report_path.read_text(encoding="utf-8")
+    assert result.discovered_count == 2
+    assert "octo/public" in report
+    assert "octo/private" not in report
+    assert "octo/excluded" not in report

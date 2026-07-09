@@ -3,7 +3,7 @@ import sqlite3
 
 import pytest
 
-from portfolio_maker.domain.models import Source, SourceStatus, SourceType
+from portfolio_maker.domain.models import GitHubActivity, Source, SourceStatus, SourceType
 from portfolio_maker.infrastructure.audit import AuditEvent, AuditLog
 from portfolio_maker.infrastructure.sqlite_repository import SQLiteRepository
 from portfolio_maker.workspace import WorkspacePaths
@@ -226,3 +226,42 @@ def test_sqlite_repository_update_source_status_is_observable(workspace):
 
     sources = repository.list_sources(status=SourceStatus.APPROVED)
     assert [source.id for source in sources] == [source_id]
+
+
+def test_sqlite_repository_upserts_github_activity_by_repo_type_and_url(workspace):
+    paths = WorkspacePaths.from_root(workspace)
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    activity = GitHubActivity(
+        id=None,
+        source_id=None,
+        repo="octo/demo",
+        activity_type="issue",
+        url="https://github.com/octo/demo/issues/1",
+        title="First title",
+        state="OPEN",
+        author="octo",
+        created_at="2026-01-01T00:00:00Z",
+        merged_at=None,
+    )
+
+    first_id = repository.insert_github_activity(activity)
+    second_id = repository.insert_github_activity(
+        GitHubActivity(
+            id=None,
+            source_id=None,
+            repo=activity.repo,
+            activity_type=activity.activity_type,
+            url=activity.url,
+            title="Updated title",
+            state=activity.state,
+            author=activity.author,
+            created_at=activity.created_at,
+            merged_at=activity.merged_at,
+        )
+    )
+
+    with repository.connect() as conn:
+        rows = conn.execute("SELECT id, title FROM github_activities").fetchall()
+    assert second_id == first_id
+    assert [(row["id"], row["title"]) for row in rows] == [(first_id, "Updated title")]

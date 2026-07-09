@@ -166,6 +166,85 @@ def test_ingest_sources_skips_approved_file_under_forbidden_path(tmp_path):
         assert conn.execute("SELECT COUNT(*) FROM source_snapshots").fetchone()[0] == 0
 
 
+def test_ingest_sources_continues_after_missing_approved_file(tmp_path):
+    workspace = tmp_path / "workspace"
+    missing_path = tmp_path / "missing.txt"
+    valid_path = tmp_path / "valid.txt"
+    valid_path.write_text("valid evidence", encoding="utf-8")
+    paths = WorkspacePaths.from_root(workspace)
+    write_sample_approval(paths)
+    approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    approval["approved_source_uris"] = [
+        missing_path.resolve().as_uri(),
+        valid_path.resolve().as_uri(),
+    ]
+    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    missing_id = repository.upsert_source(
+        Source(
+            id=None,
+            type=SourceType.LOCAL_FILE,
+            uri=missing_path.resolve().as_uri(),
+            display_name="missing.txt",
+            owner=None,
+            status=SourceStatus.APPROVED,
+        )
+    )
+    valid_id = repository.upsert_source(
+        Source(
+            id=None,
+            type=SourceType.LOCAL_FILE,
+            uri=valid_path.resolve().as_uri(),
+            display_name="valid.txt",
+            owner=None,
+            status=SourceStatus.APPROVED,
+        )
+    )
+
+    result = ingest_sources(IngestSourcesRequest(workspace=workspace))
+
+    sources = {source.id: source.status for source in repository.list_sources()}
+    assert result.ingested_count == 1
+    assert result.skipped_count == 1
+    assert sources[missing_id] == SourceStatus.STALE_SOURCE
+    assert sources[valid_id] == SourceStatus.INGESTED
+    with repository.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM source_snapshots").fetchone()[0] == 1
+
+
+def test_ingest_sources_skips_already_ingested_source_without_duplicate_snapshot(tmp_path):
+    workspace = tmp_path / "workspace"
+    source_path = tmp_path / "note.txt"
+    source_path.write_text("hello", encoding="utf-8")
+    paths = WorkspacePaths.from_root(workspace)
+    write_sample_approval(paths)
+    approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    approval["approved_source_uris"] = [source_path.resolve().as_uri()]
+    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    repository.upsert_source(
+        Source(
+            id=None,
+            type=SourceType.LOCAL_FILE,
+            uri=source_path.resolve().as_uri(),
+            display_name="note.txt",
+            owner=None,
+            status=SourceStatus.APPROVED,
+        )
+    )
+
+    first = ingest_sources(IngestSourcesRequest(workspace=workspace))
+    second = ingest_sources(IngestSourcesRequest(workspace=workspace))
+
+    assert first.ingested_count == 1
+    assert second.ingested_count == 0
+    assert second.skipped_count == 1
+    with repository.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM source_snapshots").fetchone()[0] == 1
+
+
 def test_upsert_source_does_not_downgrade_ingested_to_discovered(tmp_path):
     paths = WorkspacePaths.from_root(tmp_path / "workspace")
     repository = SQLiteRepository(paths.db_path)

@@ -27,3 +27,25 @@ def test_cli_approve_write_sample(workspace):
 
     assert exit_code == 0
     assert (workspace / ".portfolio-maker" / "reviews" / "source-approval.json").exists()
+
+
+def test_cli_ingest_missing_approval_exits_without_traceback(workspace, capsys):
+    exit_code = main(["ingest", "--workspace", str(workspace)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "Approval file missing" in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_cli_ingest_malformed_approval_exits_without_traceback(workspace, capsys):
+    approval_path = workspace / ".portfolio-maker" / "reviews" / "source-approval.json"
+    approval_path.parent.mkdir(parents=True)
+    approval_path.write_text('{"approved_source_uris": "not-a-list"}', encoding="utf-8")
+
+    exit_code = main(["ingest", "--workspace", str(workspace)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "approved_source_uris must be a list" in captured.err
+    assert "Traceback" not in captured.err

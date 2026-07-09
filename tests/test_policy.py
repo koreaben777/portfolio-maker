@@ -27,6 +27,7 @@ def test_env_and_private_key_files_are_skipped(tmp_path):
     policy = FilePolicy()
 
     assert policy.classify_path(tmp_path / ".env") == "skipped_policy"
+    assert policy.classify_path(tmp_path / "credentials.JSON") == "skipped_policy"
     assert policy.classify_path(tmp_path / "id_rsa") == "skipped_policy"
     assert policy.classify_path(tmp_path / "node_modules" / "pkg.js") == "skipped_policy"
     assert policy.classify_path(tmp_path / "project.md") == "candidate"
