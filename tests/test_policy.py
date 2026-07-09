@@ -76,6 +76,20 @@ def test_secret_masking_redacts_json_and_equals_quoted_values():
     assert masked == '{"password": "[REDACTED]"}\napi_key = "[REDACTED]"'
 
 
+def test_secret_masking_redacts_bare_value_with_comma():
+    masked = mask_secrets("password: abc,def")
+
+    assert "abc,def" not in masked
+    assert masked == "password: [REDACTED]"
+
+
+def test_secret_masking_redacts_json_bare_value_with_comma():
+    masked = mask_secrets('{"token": abc,def}')
+
+    assert "abc,def" not in masked
+    assert masked == '{"token": [REDACTED]}'
+
+
 def test_relative_forbidden_path_blocks_descendants(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     policy = FilePolicy(forbidden_paths=(Path("private"),))
