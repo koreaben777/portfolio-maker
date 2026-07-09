@@ -48,6 +48,20 @@ def test_discover_local_candidates_prunes_forbidden_children(tmp_path):
     assert secret.name not in "\n".join(reported_paths)
 
 
+def test_discover_local_candidates_blocks_forbidden_root_without_listing_children(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    secret = home / "secret-child.md"
+    secret.write_text("# Secret\n", encoding="utf-8")
+
+    candidates, skipped = discover_local_candidates(home, forbidden_paths=(home,))
+
+    assert candidates == []
+    assert [(item.path, item.reason) for item in skipped] == [(home.resolve(), "forbidden")]
+    reported_paths = [str(item.path) for item in skipped] + [str(candidate.path) for candidate in candidates]
+    assert secret.name not in "\n".join(reported_paths)
+
+
 def test_discover_local_candidates_respects_zero_max_candidates(tmp_path):
     home = tmp_path / "home"
     home.mkdir()

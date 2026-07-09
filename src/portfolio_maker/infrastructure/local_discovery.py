@@ -35,12 +35,17 @@ def discover_local_candidates(
     if max_candidates <= 0:
         return candidates, skipped
 
+    home_resolved = home.resolve(strict=False)
+    home_classification = policy.classify_path(home_resolved)
+    if home_classification != "candidate":
+        return candidates, [SkippedPath(home_resolved, home_classification)]
+
     def record_permission_error(error: OSError) -> None:
         filename = error.filename
-        skipped_path = Path(filename).resolve(strict=False) if filename else home.resolve(strict=False)
+        skipped_path = Path(filename).resolve(strict=False) if filename else home_resolved
         skipped.append(SkippedPath(skipped_path, "skipped_permission_denied"))
 
-    for root, dirs, files in os.walk(home, topdown=True, onerror=record_permission_error):
+    for root, dirs, files in os.walk(home_resolved, topdown=True, onerror=record_permission_error):
         for dirname in dirs[:]:
             path = Path(root) / dirname
             try:
