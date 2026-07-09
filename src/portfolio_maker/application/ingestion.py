@@ -36,7 +36,10 @@ def ingest_sources(request: IngestSourcesRequest) -> IngestSourcesResult:
             skipped_count += 1
             continue
 
-        assert source.id is not None
+        if source.id is None:
+            skipped_count += 1
+            continue
+
         source_path = _path_from_file_uri(source.uri)
         extracted = extract_text(source_path)
         snapshot_path = snapshots.write_local_snapshot(source.id, source_path, extracted)

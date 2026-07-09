@@ -85,3 +85,46 @@ def test_ingest_sources_ingests_approved_local_file(tmp_path):
         row = conn.execute("SELECT source_id, snapshot_path FROM source_snapshots").fetchone()
     assert row["source_id"] == source_id
     assert row["snapshot_path"] == str(result.snapshot_paths[0])
+
+
+def test_ingest_sources_skips_unapproved_local_and_approved_github_sources(tmp_path):
+    workspace = tmp_path / "workspace"
+    source_path = tmp_path / "note.txt"
+    source_path.write_text("hello", encoding="utf-8")
+    github_uri = "https://github.com/example/project"
+    paths = WorkspacePaths.from_root(workspace)
+    write_sample_approval(paths)
+    approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    approval["approved_source_uris"] = [github_uri]
+    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    repository.upsert_source(
+        Source(
+            id=None,
+            type=SourceType.LOCAL_FILE,
+            uri=source_path.resolve().as_uri(),
+            display_name="note.txt",
+            owner=None,
+            status=SourceStatus.APPROVED,
+        )
+    )
+    repository.upsert_source(
+        Source(
+            id=None,
+            type=SourceType.GITHUB_REPOSITORY,
+            uri=github_uri,
+            display_name="example/project",
+            owner="example",
+            status=SourceStatus.APPROVED,
+        )
+    )
+
+    result = ingest_sources(IngestSourcesRequest(workspace=workspace))
+
+    assert result.ingested_count == 0
+    assert result.skipped_count == 2
+    assert result.snapshot_paths == ()
+    assert not any(paths.local_snapshots_dir.iterdir())
+    with repository.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM source_snapshots").fetchone()[0] == 0
