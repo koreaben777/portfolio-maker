@@ -37,11 +37,21 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
     }
 
     write_json(paths.master_profile_json_path, payload)
+    source_lines = [f"- {source.display_name} ({source.type.value})" for source in sources]
+    claim_lines = [
+        f"- {claim['text']} ({claim['confidence']})\n  Evidence: {claim['evidence_uri']}"
+        for claim in claims
+    ]
     write_markdown(
         paths.master_profile_md_path,
-        "# Master Profile\n\n"
-        + "\n".join(f"- {claim['text']} ({claim['confidence']})" for claim in claims)
-        + ("\n" if claims else ""),
+        "\n\n".join(
+            [
+                "# Master Profile",
+                "## Sources\n" + "\n".join(source_lines),
+                "## Claims\n" + "\n".join(claim_lines),
+            ]
+        )
+        + "\n",
     )
     return BuildProfileResult(
         json_path=paths.master_profile_json_path,

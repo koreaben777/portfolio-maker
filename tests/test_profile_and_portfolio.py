@@ -40,7 +40,11 @@ def test_build_profile_and_draft_portfolio_from_ingested_source(tmp_path):
             "evidence_uri": "/private/project/path",
         }
     ]
-    assert "Portfolio Maker" in paths.master_profile_md_path.read_text(encoding="utf-8")
+    profile_markdown = paths.master_profile_md_path.read_text(encoding="utf-8")
+    assert "## Sources" in profile_markdown
+    assert "## Claims" in profile_markdown
+    assert "Portfolio Maker" in profile_markdown
+    assert "Evidence: /private/project/path" in profile_markdown
 
     portfolio_result = draft_portfolio(DraftPortfolioRequest(workspace=workspace))
 
