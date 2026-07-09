@@ -1,0 +1,59 @@
+from __future__ import annotations
+
+from portfolio_maker.application.discovery import discover_sources
+from portfolio_maker.application.models import DiscoverSourcesRequest
+from portfolio_maker.domain.models import SourceStatus, SourceType
+from portfolio_maker.infrastructure.local_discovery import discover_local_candidates
+from portfolio_maker.infrastructure.sqlite_repository import SQLiteRepository
+from portfolio_maker.workspace import WorkspacePaths
+
+
+def test_discover_local_candidates_finds_readme_and_skips_forbidden_and_policy_paths(tmp_path):
+    home = tmp_path / "home"
+    project = home / "project"
+    forbidden = home / "private"
+    node_modules = home / "project" / "node_modules"
+    project.mkdir(parents=True)
+    forbidden.mkdir(parents=True)
+    node_modules.mkdir(parents=True)
+    readme = project / "README.md"
+    readme.write_text("# Portfolio\n", encoding="utf-8")
+    (forbidden / "README.md").write_text("# Secret\n", encoding="utf-8")
+    (node_modules / "package.json").write_text("{}", encoding="utf-8")
+
+    candidates, skipped = discover_local_candidates(home, forbidden_paths=(forbidden,))
+
+    assert [(candidate.path, candidate.display_name) for candidate in candidates] == [
+        (readme.resolve(), "README.md")
+    ]
+    assert candidates[0].uri == readme.resolve().as_uri()
+    assert (forbidden.resolve(), "forbidden") in [(item.path, item.reason) for item in skipped]
+    assert (node_modules.resolve(), "skipped_policy") in [(item.path, item.reason) for item in skipped]
+
+
+def test_discover_sources_writes_report_and_persists_local_files(tmp_path):
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    project = home / "project"
+    project.mkdir(parents=True)
+    readme = project / "README.md"
+    readme.write_text("# Portfolio\n", encoding="utf-8")
+
+    result = discover_sources(DiscoverSourcesRequest(workspace=workspace, home=home, include_github=False))
+
+    paths = WorkspacePaths.from_root(workspace)
+    repository = SQLiteRepository(paths.db_path)
+    sources = repository.list_sources()
+
+    assert result.report_path == paths.discovery_report_path
+    assert result.discovered_count == 1
+    assert result.skipped_count == 0
+    assert len(result.events) == 1
+    assert result.events[0].stage == "discover"
+    assert paths.discovery_report_path.exists()
+    report = paths.discovery_report_path.read_text(encoding="utf-8")
+    assert "README.md" in report
+    assert readme.resolve().as_uri() in report
+    assert sources[0].type == SourceType.LOCAL_FILE
+    assert sources[0].status == SourceStatus.DISCOVERED
+    assert sources[0].uri == readme.resolve().as_uri()
