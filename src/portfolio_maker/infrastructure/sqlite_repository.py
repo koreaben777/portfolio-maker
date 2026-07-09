@@ -1,0 +1,155 @@
+from __future__ import annotations
+
+import sqlite3
+from pathlib import Path
+
+from portfolio_maker.domain.models import Source, SourceStatus, SourceType
+
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS sources (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    type TEXT NOT NULL,
+    uri TEXT NOT NULL UNIQUE,
+    display_name TEXT NOT NULL,
+    owner TEXT,
+    status TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS source_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_id INTEGER NOT NULL REFERENCES sources(id),
+    snapshot_path TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    extractor TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS evidence_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_id INTEGER NOT NULL REFERENCES sources(id),
+    snapshot_id INTEGER REFERENCES source_snapshots(id),
+    kind TEXT NOT NULL,
+    locator TEXT NOT NULL,
+    quote_hash TEXT,
+    summary TEXT NOT NULL,
+    confidence TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS github_activities (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_id INTEGER REFERENCES sources(id),
+    repo TEXT NOT NULL,
+    activity_type TEXT NOT NULL,
+    url TEXT NOT NULL,
+    title TEXT NOT NULL,
+    state TEXT NOT NULL,
+    author TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    merged_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS projects (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    status TEXT NOT NULL,
+    visibility TEXT NOT NULL,
+    primary_source_id INTEGER REFERENCES sources(id)
+);
+
+CREATE TABLE IF NOT EXISTS career_claims (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    claim_type TEXT NOT NULL,
+    text TEXT NOT NULL,
+    confidence TEXT NOT NULL,
+    public_safe INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS claim_evidence (
+    claim_id INTEGER NOT NULL REFERENCES career_claims(id),
+    evidence_id INTEGER NOT NULL REFERENCES evidence_items(id),
+    PRIMARY KEY (claim_id, evidence_id)
+);
+
+CREATE TABLE IF NOT EXISTS artifacts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    type TEXT NOT NULL,
+    path TEXT NOT NULL,
+    source_profile_version TEXT NOT NULL
+);
+"""
+
+
+class SQLiteRepository:
+    def __init__(self, db_path: Path) -> None:
+        self.db_path = db_path
+
+    def connect(self) -> sqlite3.Connection:
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def initialize(self) -> None:
+        with self.connect() as conn:
+            conn.executescript(SCHEMA)
+
+    def table_names(self) -> set[str]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        return {row["name"] for row in rows}
+
+    def upsert_source(self, source: Source) -> int:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                INSERT INTO sources (type, uri, display_name, owner, status)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(uri) DO UPDATE SET
+                    type = excluded.type,
+                    display_name = excluded.display_name,
+                    owner = excluded.owner,
+                    status = excluded.status
+                RETURNING id
+                """,
+                (
+                    source.type.value,
+                    source.uri,
+                    source.display_name,
+                    source.owner,
+                    source.status.value,
+                ),
+            ).fetchone()
+        return int(row["id"])
+
+    def list_sources(self, status: SourceStatus | None = None) -> list[Source]:
+        sql = "SELECT id, type, uri, display_name, owner, status FROM sources"
+        params: tuple[str, ...] = ()
+        if status is not None:
+            sql += " WHERE status = ?"
+            params = (status.value,)
+        sql += " ORDER BY id"
+
+        with self.connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+
+        return [
+            Source(
+                id=row["id"],
+                type=SourceType(row["type"]),
+                uri=row["uri"],
+                display_name=row["display_name"],
+                owner=row["owner"],
+                status=SourceStatus(row["status"]),
+            )
+            for row in rows
+        ]
+
+    def update_source_status(self, source_id: int, status: SourceStatus) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE sources SET status = ? WHERE id = ?",
+                (status.value, source_id),
+            )
