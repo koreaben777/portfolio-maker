@@ -25,7 +25,8 @@ Portfolio Maker is a Codex app guided local workflow for building an evidence-ba
 ## Local Setup
 
 ```bash
-python3.11 -m venv .venv
+PYTHON_BIN=python3.11  # replace with your Python 3.11+ executable if needed
+$PYTHON_BIN -m venv .venv
 . .venv/bin/activate
 python -m pip install --upgrade pip
 pip install -e ".[dev]"
