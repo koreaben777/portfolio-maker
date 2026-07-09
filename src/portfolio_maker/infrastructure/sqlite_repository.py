@@ -129,7 +129,10 @@ class SQLiteRepository:
                     type = excluded.type,
                     display_name = excluded.display_name,
                     owner = excluded.owner,
-                    status = excluded.status
+                    status = CASE
+                        WHEN sources.status = ? AND excluded.status = ? THEN sources.status
+                        ELSE excluded.status
+                    END
                 """,
                 (
                     source.type.value,
@@ -137,6 +140,8 @@ class SQLiteRepository:
                     source.display_name,
                     source.owner,
                     source.status.value,
+                    SourceStatus.INGESTED.value,
+                    SourceStatus.DISCOVERED.value,
                 ),
             )
             row = conn.execute(

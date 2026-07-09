@@ -128,3 +128,69 @@ def test_ingest_sources_skips_unapproved_local_and_approved_github_sources(tmp_p
     assert not any(paths.local_snapshots_dir.iterdir())
     with repository.connect() as conn:
         assert conn.execute("SELECT COUNT(*) FROM source_snapshots").fetchone()[0] == 0
+
+
+def test_ingest_sources_skips_approved_file_under_forbidden_path(tmp_path):
+    workspace = tmp_path / "workspace"
+    forbidden = tmp_path / "private"
+    source_path = forbidden / "note.txt"
+    source_path.parent.mkdir()
+    source_path.write_text("hello", encoding="utf-8")
+    paths = WorkspacePaths.from_root(workspace)
+    write_sample_approval(paths)
+    approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    approval["approved_source_uris"] = [source_path.resolve().as_uri()]
+    approval["forbidden_paths"] = [str(forbidden)]
+    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    repository.upsert_source(
+        Source(
+            id=None,
+            type=SourceType.LOCAL_FILE,
+            uri=source_path.resolve().as_uri(),
+            display_name="note.txt",
+            owner=None,
+            status=SourceStatus.APPROVED,
+        )
+    )
+
+    result = ingest_sources(IngestSourcesRequest(workspace=workspace))
+
+    assert result.ingested_count == 0
+    assert result.skipped_count == 1
+    assert result.snapshot_paths == ()
+    assert not any(paths.local_snapshots_dir.iterdir())
+    assert repository.list_sources()[0].status == SourceStatus.APPROVED
+    with repository.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM source_snapshots").fetchone()[0] == 0
+
+
+def test_upsert_source_does_not_downgrade_ingested_to_discovered(tmp_path):
+    paths = WorkspacePaths.from_root(tmp_path / "workspace")
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    source_id = repository.upsert_source(
+        Source(
+            id=None,
+            type=SourceType.LOCAL_FILE,
+            uri="file:///tmp/note.txt",
+            display_name="note.txt",
+            owner=None,
+            status=SourceStatus.DISCOVERED,
+        )
+    )
+    repository.update_source_status(source_id, SourceStatus.INGESTED)
+
+    repository.upsert_source(
+        Source(
+            id=None,
+            type=SourceType.LOCAL_FILE,
+            uri="file:///tmp/note.txt",
+            display_name="note.txt",
+            owner=None,
+            status=SourceStatus.DISCOVERED,
+        )
+    )
+
+    assert repository.list_sources()[0].status == SourceStatus.INGESTED

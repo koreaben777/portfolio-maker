@@ -7,6 +7,7 @@ from portfolio_maker.application.approval import load_approval
 from portfolio_maker.application.models import IngestSourcesRequest, IngestSourcesResult
 from portfolio_maker.domain.models import SourceStatus, SourceType
 from portfolio_maker.infrastructure.extractors import extract_text
+from portfolio_maker.infrastructure.policy import FilePolicy
 from portfolio_maker.infrastructure.sqlite_repository import SQLiteRepository
 from portfolio_maker.infrastructure.snapshots import SnapshotStore
 from portfolio_maker.workspace import WorkspacePaths
@@ -24,6 +25,9 @@ def ingest_sources(request: IngestSourcesRequest) -> IngestSourcesResult:
     paths.ensure()
     approval = load_approval(paths)
     approved_uris = set(approval.approved_source_uris)
+    policy = FilePolicy(
+        forbidden_paths=tuple(Path(path) for path in approval.forbidden_paths)
+    )
     repository = SQLiteRepository(paths.db_path)
     repository.initialize()
     snapshots = SnapshotStore(paths)
@@ -41,6 +45,10 @@ def ingest_sources(request: IngestSourcesRequest) -> IngestSourcesResult:
             continue
 
         source_path = _path_from_file_uri(source.uri)
+        if policy.is_forbidden(source_path):
+            skipped_count += 1
+            continue
+
         extracted = extract_text(source_path)
         snapshot_path = snapshots.write_local_snapshot(source.id, source_path, extracted)
         repository.insert_source_snapshot(
