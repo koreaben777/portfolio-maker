@@ -35,8 +35,8 @@ def discover_sources(request: DiscoverSourcesRequest) -> DiscoverSourcesResult:
         skipped_count=len(skipped),
         events=(
             ProgressEvent(
-                stage="discover",
-                message="Local discovery complete",
+                stage="discovery",
+                message="local discovery complete",
                 count=len(candidates),
             ),
         ),

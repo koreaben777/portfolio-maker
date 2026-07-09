@@ -46,12 +46,16 @@ def discover_local_candidates(
                 skipped.append(SkippedPath(resolved, "unsupported_extension"))
                 continue
             if resolved.stat().st_size > policy.max_file_size_bytes:
-                skipped.append(SkippedPath(resolved, "oversized_file"))
+                skipped.append(SkippedPath(resolved, "skipped_policy"))
                 continue
             candidates.append(LocalCandidate(resolved, resolved.as_uri(), resolved.name))
             if len(candidates) >= max_candidates:
                 break
-        except PermissionError:
-            skipped.append(SkippedPath(path.resolve(strict=False), "permission_denied"))
+        except OSError:
+            try:
+                skipped_path = path.resolve(strict=False)
+            except OSError:
+                skipped_path = path.absolute()
+            skipped.append(SkippedPath(skipped_path, "skipped_permission_denied"))
 
     return candidates, skipped

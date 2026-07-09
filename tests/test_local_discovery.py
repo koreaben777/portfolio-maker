@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from portfolio_maker.application.discovery import discover_sources
 from portfolio_maker.application.models import DiscoverSourcesRequest
 from portfolio_maker.domain.models import SourceStatus, SourceType
@@ -31,6 +33,30 @@ def test_discover_local_candidates_finds_readme_and_skips_forbidden_and_policy_p
     assert (node_modules.resolve(), "skipped_policy") in [(item.path, item.reason) for item in skipped]
 
 
+def test_discover_local_candidates_uses_contract_skip_reasons_for_oversize_and_oserror(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    oversized = home / "oversized.md"
+    unreadable = home / "unreadable.md"
+    oversized.write_bytes(b"x" * 2_000_001)
+    unreadable.write_text("# blocked\n", encoding="utf-8")
+    unreadable_resolved = unreadable.resolve()
+    original_stat = Path.stat
+
+    def fail_unreadable_stat(path, *args, **kwargs):
+        if path == unreadable_resolved:
+            raise OSError("blocked")
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", fail_unreadable_stat)
+
+    candidates, skipped = discover_local_candidates(home)
+
+    assert candidates == []
+    assert (oversized.resolve(), "skipped_policy") in [(item.path, item.reason) for item in skipped]
+    assert (unreadable_resolved, "skipped_permission_denied") in [(item.path, item.reason) for item in skipped]
+
+
 def test_discover_sources_writes_report_and_persists_local_files(tmp_path):
     home = tmp_path / "home"
     workspace = tmp_path / "workspace"
@@ -49,7 +75,8 @@ def test_discover_sources_writes_report_and_persists_local_files(tmp_path):
     assert result.discovered_count == 1
     assert result.skipped_count == 0
     assert len(result.events) == 1
-    assert result.events[0].stage == "discover"
+    assert result.events[0].stage == "discovery"
+    assert result.events[0].message == "local discovery complete"
     assert paths.discovery_report_path.exists()
     report = paths.discovery_report_path.read_text(encoding="utf-8")
     assert "README.md" in report
