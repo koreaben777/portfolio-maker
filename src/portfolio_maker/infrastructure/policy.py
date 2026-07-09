@@ -26,10 +26,11 @@ SENSITIVE_FILE_NAMES = {
 }
 
 SECRET_PATTERNS = [
-    re.compile(r"gh[pousr]_[A-Za-z0-9_]{20,}"),
-    re.compile(r"(?i)(password\s*=\s*)([^\s]+)"),
-    re.compile(r"(?i)(api[_-]?key\s*=\s*)([^\s]+)"),
-    re.compile(r"(?i)(token\s*=\s*)([^\s]+)"),
+    (re.compile(r"gh[pousr]_[A-Za-z0-9_]{20,}"), "literal"),
+    (
+        re.compile(r'(?i)(["\']?(?:password|api[_-]?key|token)["\']?\s*[:=]\s*)(["\']?)([^\s,"\'}]+)(\2?)'),
+        "key_value",
+    ),
 ]
 
 
@@ -41,6 +42,9 @@ class FilePolicy:
     def is_forbidden(self, path: Path) -> bool:
         resolved = path.resolve(strict=False)
         for forbidden in self.forbidden_paths:
+            # Normalize both paths through resolve(strict=False) so relative roots,
+            # cwd-dependent paths, and differently normalized inputs compare
+            # against the same absolute path representation.
             forbidden_resolved = forbidden.resolve(strict=False)
             if resolved == forbidden_resolved or forbidden_resolved in resolved.parents:
                 return True
@@ -58,9 +62,9 @@ class FilePolicy:
 
 def mask_secrets(text: str) -> str:
     masked = text
-    for pattern in SECRET_PATTERNS:
-        if pattern.groups >= 2:
-            masked = pattern.sub(lambda match: f"{match.group(1)}[REDACTED]", masked)
+    for pattern, replacement_type in SECRET_PATTERNS:
+        if replacement_type == "key_value":
+            masked = pattern.sub(lambda match: f"{match.group(1)}{match.group(2)}[REDACTED]{match.group(4)}", masked)
         else:
             masked = pattern.sub("[REDACTED]", masked)
     return masked

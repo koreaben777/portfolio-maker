@@ -28,6 +28,7 @@ def test_env_and_private_key_files_are_skipped(tmp_path):
 
     assert policy.classify_path(tmp_path / ".env") == "skipped_policy"
     assert policy.classify_path(tmp_path / "id_rsa") == "skipped_policy"
+    assert policy.classify_path(tmp_path / "node_modules" / "pkg.js") == "skipped_policy"
     assert policy.classify_path(tmp_path / "project.md") == "candidate"
 
 
@@ -39,3 +40,28 @@ def test_secret_masking_removes_token_values():
     assert "ghp_" not in masked
     assert "supersecret" not in masked
     assert "[REDACTED]" in masked
+
+
+def test_secret_masking_redacts_colon_and_json_styles():
+    text = (
+        "password: secret-value\n"
+        "token: another-secret\n"
+        '{"password": "json-secret", "api_key": "json-key"}'
+    )
+
+    masked = mask_secrets(text)
+
+    assert "secret-value" not in masked
+    assert "another-secret" not in masked
+    assert "json-secret" not in masked
+    assert "json-key" not in masked
+    assert masked.count("[REDACTED]") >= 4
+
+
+def test_relative_forbidden_path_blocks_descendants(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    policy = FilePolicy(forbidden_paths=(Path("private"),))
+    target = Path("private") / "notes.md"
+
+    assert policy.is_forbidden(target)
+    assert policy.classify_path(target) == "forbidden"
