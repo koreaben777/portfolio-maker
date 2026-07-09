@@ -124,3 +124,16 @@ def test_discover_sources_writes_report_and_persists_local_files(tmp_path):
     assert sources[0].type == SourceType.LOCAL_FILE
     assert sources[0].status == SourceStatus.DISCOVERED
     assert sources[0].uri == readme.resolve().as_uri()
+
+
+def test_discover_sources_redacts_policy_skipped_paths_in_report(tmp_path):
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    home.mkdir()
+    (home / ".env").write_text("API_KEY=secret\n", encoding="utf-8")
+
+    result = discover_sources(DiscoverSourcesRequest(workspace=workspace, home=home, include_github=False))
+
+    report = result.report_path.read_text(encoding="utf-8")
+    assert "skipped_policy" in report
+    assert ".env" not in report

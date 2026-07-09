@@ -49,6 +49,7 @@ def _render_report(candidates: list[LocalCandidate], skipped: list[SkippedPath])
         lines.append(f"- {candidate.display_name}: {candidate.uri}")
     lines.extend(["", "## Skipped"])
     for item in skipped:
-        lines.append(f"- {item.reason}: {item.path}")
+        path = "[redacted]" if item.reason in {"forbidden", "skipped_policy"} else item.path
+        lines.append(f"- {item.reason}: {path}")
     lines.append("")
     return "\n".join(lines)
