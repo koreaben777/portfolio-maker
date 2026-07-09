@@ -37,7 +37,7 @@ SECRET_PATTERNS = [
         "quoted_key_value",
     ),
     (
-        re.compile(r'(?i)(["\'](?:password|api[_-]?key|token)["\']\s*:\s*)([^\s"\'}]+)'),
+        re.compile(r'(?i)(["\'](?:password|api[_-]?key|token)["\']\s*:\s*)([^"\'}\n]+?)(?=,\s*["\']|})'),
         "bare_key_value",
     ),
     (

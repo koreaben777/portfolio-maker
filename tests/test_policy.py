@@ -90,6 +90,13 @@ def test_secret_masking_redacts_json_bare_value_with_comma():
     assert masked == '{"token": [REDACTED]}'
 
 
+def test_secret_masking_preserves_json_delimiter_after_bare_comma_value():
+    masked = mask_secrets('{"token": abc,def, "next": 1}')
+
+    assert "abc,def" not in masked
+    assert masked == '{"token": [REDACTED], "next": 1}'
+
+
 def test_relative_forbidden_path_blocks_descendants(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     policy = FilePolicy(forbidden_paths=(Path("private"),))
