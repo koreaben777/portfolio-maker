@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 import sqlite3
 from pathlib import Path
 
@@ -96,20 +98,29 @@ class SQLiteRepository:
         conn.row_factory = sqlite3.Row
         return conn
 
+    @contextmanager
+    def _connection(self) -> Iterator[sqlite3.Connection]:
+        conn = self.connect()
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
+
     def initialize(self) -> None:
-        with self.connect() as conn:
+        with self._connection() as conn:
             conn.executescript(SCHEMA)
 
     def table_names(self) -> set[str]:
-        with self.connect() as conn:
+        with self._connection() as conn:
             rows = conn.execute(
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         return {row["name"] for row in rows}
 
     def upsert_source(self, source: Source) -> int:
-        with self.connect() as conn:
-            row = conn.execute(
+        with self._connection() as conn:
+            conn.execute(
                 """
                 INSERT INTO sources (type, uri, display_name, owner, status)
                 VALUES (?, ?, ?, ?, ?)
@@ -118,7 +129,6 @@ class SQLiteRepository:
                     display_name = excluded.display_name,
                     owner = excluded.owner,
                     status = excluded.status
-                RETURNING id
                 """,
                 (
                     source.type.value,
@@ -127,6 +137,10 @@ class SQLiteRepository:
                     source.owner,
                     source.status.value,
                 ),
+            )
+            row = conn.execute(
+                "SELECT id FROM sources WHERE uri = ?",
+                (source.uri,),
             ).fetchone()
         return int(row["id"])
 
@@ -138,7 +152,7 @@ class SQLiteRepository:
             params = (status.value,)
         sql += " ORDER BY id"
 
-        with self.connect() as conn:
+        with self._connection() as conn:
             rows = conn.execute(sql, params).fetchall()
 
         return [
@@ -154,7 +168,7 @@ class SQLiteRepository:
         ]
 
     def update_source_status(self, source_id: int, status: SourceStatus) -> None:
-        with self.connect() as conn:
+        with self._connection() as conn:
             conn.execute(
                 "UPDATE sources SET status = ? WHERE id = ?",
                 (status.value, source_id),

@@ -104,3 +104,98 @@ def test_sqlite_repository_upsert_source_lists_inserted_source(workspace):
     assert len(sources) == 1
     assert sources[0].id == 1
     assert sources[0].uri == "/workspace/project"
+
+
+def test_sqlite_repository_upsert_source_updates_existing_uri(workspace):
+    paths = WorkspacePaths.from_root(workspace)
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+
+    first_id = repository.upsert_source(
+        Source(
+            id=None,
+            type=SourceType.LOCAL_DIRECTORY,
+            uri="/workspace/project",
+            display_name="project",
+            owner=None,
+            status=SourceStatus.DISCOVERED,
+        )
+    )
+    second_id = repository.upsert_source(
+        Source(
+            id=None,
+            type=SourceType.GITHUB_REPOSITORY,
+            uri="/workspace/project",
+            display_name="updated project",
+            owner="june",
+            status=SourceStatus.APPROVED,
+        )
+    )
+
+    sources = repository.list_sources()
+
+    assert second_id == first_id
+    assert len(sources) == 1
+    assert sources[0] == Source(
+        id=first_id,
+        type=SourceType.GITHUB_REPOSITORY,
+        uri="/workspace/project",
+        display_name="updated project",
+        owner="june",
+        status=SourceStatus.APPROVED,
+    )
+
+
+def test_sqlite_repository_list_sources_filters_by_status(workspace):
+    paths = WorkspacePaths.from_root(workspace)
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+
+    repository.upsert_source(
+        Source(
+            id=None,
+            type=SourceType.LOCAL_DIRECTORY,
+            uri="/workspace/project",
+            display_name="project",
+            owner=None,
+            status=SourceStatus.DISCOVERED,
+        )
+    )
+    approved_id = repository.upsert_source(
+        Source(
+            id=None,
+            type=SourceType.GITHUB_REPOSITORY,
+            uri="https://github.com/example/project",
+            display_name="github project",
+            owner="example",
+            status=SourceStatus.APPROVED,
+        )
+    )
+
+    sources = repository.list_sources(status=SourceStatus.APPROVED)
+
+    assert len(sources) == 1
+    assert sources[0].id == approved_id
+    assert sources[0].status == SourceStatus.APPROVED
+
+
+def test_sqlite_repository_update_source_status_is_observable(workspace):
+    paths = WorkspacePaths.from_root(workspace)
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+
+    source_id = repository.upsert_source(
+        Source(
+            id=None,
+            type=SourceType.LOCAL_DIRECTORY,
+            uri="/workspace/project",
+            display_name="project",
+            owner=None,
+            status=SourceStatus.DISCOVERED,
+        )
+    )
+
+    repository.update_source_status(source_id, SourceStatus.APPROVED)
+
+    sources = repository.list_sources(status=SourceStatus.APPROVED)
+    assert [source.id for source in sources] == [source_id]
