@@ -33,29 +33,47 @@ def test_env_and_private_key_files_are_skipped(tmp_path):
 
 
 def test_secret_masking_removes_token_values():
-    text = "GITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz1234567890abcd\npassword = supersecret"
+    text = (
+        "GITHUB_TOKEN=github_pat_abcdefghijklmnopqrstuvwxyz1234567890abcd\n"
+        "password = supersecret"
+    )
 
     masked = mask_secrets(text)
 
-    assert "ghp_" not in masked
+    assert "github_pat_" not in masked
     assert "supersecret" not in masked
     assert "[REDACTED]" in masked
+    assert masked == "GITHUB_TOKEN=[REDACTED]\npassword = [REDACTED]"
 
 
 def test_secret_masking_redacts_colon_and_json_styles():
     text = (
-        "password: secret-value\n"
+        'password: "my secret value"\n'
         "token: another-secret\n"
         '{"password": "json-secret", "api_key": "json-key"}'
     )
 
     masked = mask_secrets(text)
 
-    assert "secret-value" not in masked
+    assert "my secret value" not in masked
     assert "another-secret" not in masked
     assert "json-secret" not in masked
     assert "json-key" not in masked
-    assert masked.count("[REDACTED]") >= 4
+    assert masked == (
+        'password: "[REDACTED]"\n'
+        "token: [REDACTED]\n"
+        '{"password": "[REDACTED]", "api_key": "[REDACTED]"}'
+    )
+
+
+def test_secret_masking_redacts_json_and_equals_quoted_values():
+    text = '{"password": "my secret value"}\napi_key = "abc def ghi"'
+
+    masked = mask_secrets(text)
+
+    assert "my secret value" not in masked
+    assert "abc def ghi" not in masked
+    assert masked == '{"password": "[REDACTED]"}\napi_key = "[REDACTED]"'
 
 
 def test_relative_forbidden_path_blocks_descendants(tmp_path, monkeypatch):

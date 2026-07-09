@@ -26,10 +26,19 @@ SENSITIVE_FILE_NAMES = {
 }
 
 SECRET_PATTERNS = [
+    (re.compile(r"github_pat_[A-Za-z0-9_]{20,}"), "literal"),
     (re.compile(r"gh[pousr]_[A-Za-z0-9_]{20,}"), "literal"),
     (
-        re.compile(r'(?i)(["\']?(?:password|api[_-]?key|token)["\']?\s*[:=]\s*)(["\']?)([^\s,"\'}]+)(\2?)'),
-        "key_value",
+        re.compile(r'(?i)(["\'](?:password|api[_-]?key|token)["\']\s*:\s*)(["\'])(.*?)\2'),
+        "quoted_key_value",
+    ),
+    (
+        re.compile(r"(?i)(\b(?:password|api[_-]?key|token)\b\s*[:=]\s*)(['\"])(.*?)\2"),
+        "quoted_key_value",
+    ),
+    (
+        re.compile(r"(?i)(\b(?:password|api[_-]?key|token)\b\s*[:=]\s*)([^\s\"',}]+)"),
+        "bare_key_value",
     ),
 ]
 
@@ -63,8 +72,10 @@ class FilePolicy:
 def mask_secrets(text: str) -> str:
     masked = text
     for pattern, replacement_type in SECRET_PATTERNS:
-        if replacement_type == "key_value":
-            masked = pattern.sub(lambda match: f"{match.group(1)}{match.group(2)}[REDACTED]{match.group(4)}", masked)
+        if replacement_type == "quoted_key_value":
+            masked = pattern.sub(lambda match: f"{match.group(1)}{match.group(2)}[REDACTED]{match.group(2)}", masked)
+        elif replacement_type == "bare_key_value":
+            masked = pattern.sub(lambda match: f"{match.group(1)}[REDACTED]", masked)
         else:
             masked = pattern.sub("[REDACTED]", masked)
     return masked
