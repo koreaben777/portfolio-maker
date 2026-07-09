@@ -26,11 +26,11 @@ def test_snapshot_store_writes_local_snapshot_json(tmp_path):
     extracted = extract_text(source)
     paths = WorkspacePaths.from_root(tmp_path / "workspace")
 
-    snapshot_path = SnapshotStore(paths).write_local_snapshot("abc123", source, extracted)
+    snapshot_path = SnapshotStore(paths).write_local_snapshot(7, source, extracted)
 
-    assert snapshot_path == paths.local_snapshots_dir / "source-abc123.json"
+    assert snapshot_path == paths.local_snapshots_dir / "source-7.json"
     payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
-    assert payload["source_id"] == "abc123"
+    assert payload["source_id"] == 7
     assert payload["source_uri"] == source.resolve().as_uri()
     assert payload["display_name"] == "note.txt"
     assert payload["content_hash"] == extracted.content_hash

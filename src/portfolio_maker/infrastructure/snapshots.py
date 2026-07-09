@@ -12,7 +12,7 @@ class SnapshotStore:
     def __init__(self, paths: WorkspacePaths) -> None:
         self.paths = paths
 
-    def write_local_snapshot(self, source_id: str, source_path: Path, extracted: ExtractedText) -> Path:
+    def write_local_snapshot(self, source_id: int, source_path: Path, extracted: ExtractedText) -> Path:
         self.paths.ensure()
         snapshot_path = self.paths.local_snapshots_dir / f"source-{source_id}.json"
         payload = {
