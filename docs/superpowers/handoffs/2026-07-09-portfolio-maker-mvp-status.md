@@ -7,19 +7,26 @@ Plan: `docs/superpowers/plans/2026-07-09-portfolio-maker-mvp.md`
 
 ## Stop Reason
 
-Work stopped because Codex usage is running low. Do not continue broad implementation until the user explicitly resumes.
+Work is intentionally paused to conserve Codex usage. Continue broad implementation only when the user explicitly resumes.
 
 ## Current Git State
 
-Last implementation commit:
+Last implementation commit before this handoff update:
 
 ```text
-3c08715 fix: cover quoted secret masking
+8eb2540 fix: enforce sqlite foreign keys
 ```
 
-Current branch history, newest first:
+Latest implementation history, newest first:
 
 ```text
+8eb2540 fix: enforce sqlite foreign keys
+ccd5c33 fix: harden sqlite repository behavior
+9001c8e fix: complete sqlite schema columns
+9f99c36 feat: add sqlite repository schema
+6fb27e7 fix: preserve masked json delimiters
+5de123a fix: mask punctuation secret values
+e4eb4d7 docs: save MVP implementation handoff
 3c08715 fix: cover quoted secret masking
 23a4429 fix: harden file policy masking
 f3aedf9 feat: add file policy and secret masking
@@ -34,7 +41,17 @@ c1f3b02 fix: add cli scaffold entrypoint
 d903b90 Add portfolio maker MVP implementation plan
 ```
 
-The worktree was clean before this handoff document was added.
+Fresh verification before this handoff:
+
+```bash
+./.venv/bin/python -m pytest -q
+```
+
+Result:
+
+```text
+19 passed in 0.04s
+```
 
 ## Completed Tasks
 
@@ -88,49 +105,64 @@ Review result:
 
 ### Task 4: Policy Filters and Secret Masking
 
-Status: implementation exists but code quality review is not yet passing.
+Status: completed and reviewed.
 
 Commits:
 
 - `f3aedf9 feat: add file policy and secret masking`
 - `23a4429 fix: harden file policy masking`
 - `3c08715 fix: cover quoted secret masking`
+- `5de123a fix: mask punctuation secret values`
+- `6fb27e7 fix: preserve masked json delimiters`
 
-Spec review:
+Review result:
 
-- Passed after the second masking fix.
+- Spec compliance: passed after the resumed fixes.
+- Code quality: passed after preserving JSON-like delimiters for comma-containing bare secret values.
 
-Latest code quality review:
-
-- Failed.
-- Remaining issue: `mask_secrets()` still leaks two common shapes:
-  - `password: abc,def` is partially redacted as `password: [REDACTED],def`.
-  - `{"token": abc,def}` is not redacted.
-
-Next action:
-
-1. Add regression tests in `tests/test_policy.py` for:
-   - punctuation-bearing unquoted value: `password: abc,def`
-   - JSON-like quoted key with unquoted punctuation value: `{"token": abc,def}`
-   - exact output or strong absence assertions so partial masking cannot pass.
-2. Fix `mask_secrets()` in `src/portfolio_maker/infrastructure/policy.py`.
-3. Run:
+Verification:
 
 ```bash
 ./.venv/bin/python -m pytest tests/test_policy.py -v
 ```
 
-4. Commit with a focused message, for example:
+Latest reviewed result: `10 passed`.
+
+### Task 5: SQLite Repository
+
+Status: completed and reviewed.
+
+Commits:
+
+- `9f99c36 feat: add sqlite repository schema`
+- `9001c8e fix: complete sqlite schema columns`
+- `ccd5c33 fix: harden sqlite repository behavior`
+- `8eb2540 fix: enforce sqlite foreign keys`
+
+Implemented:
+
+- `src/portfolio_maker/infrastructure/sqlite_repository.py`
+- Schema for `sources`, `source_snapshots`, `evidence_items`, `github_activities`, `projects`, `career_claims`, `claim_evidence`, and `artifacts`.
+- `SQLiteRepository.connect()`, `initialize()`, `table_names()`, `upsert_source()`, `list_sources()`, and `update_source_status()`.
+- Deterministic connection closing via private `_connection()`.
+- SQLite FK enforcement via `PRAGMA foreign_keys = ON`.
+- Portable `upsert_source()` without SQLite `RETURNING`.
+
+Review result:
+
+- Spec compliance: passed.
+- Code quality: passed after connection lifecycle, conflict/update tests, status tests, and FK enforcement were added.
+
+Verification:
 
 ```bash
-git commit -m "fix: mask punctuation secret values"
+./.venv/bin/python -m pytest tests/test_sqlite_repository.py -v
 ```
 
-5. Re-run Task 4 spec compliance review and code quality review before moving to Task 5.
+Latest reviewed result: `9 passed`.
 
 ## Not Started
 
-- Task 5: SQLite Repository
 - Task 6: Local Discovery
 - Task 7: Approval File and Gate
 - Task 8: Snapshot Store and Text Extraction
@@ -144,18 +176,23 @@ git commit -m "fix: mask punctuation secret values"
 
 ## Resume Instructions
 
-When resuming, continue Subagent-Driven Development from Task 4 fix, not Task 5.
+When resuming, continue Subagent-Driven Development from Task 6: Local Discovery.
 
-Recommended first prompt to the worker:
-
-```text
-Fix the remaining Task 4 code quality issue. Add tests for `password: abc,def`
-and `{"token": abc,def}`, then update `mask_secrets()` so the full values are
-redacted. Do not modify discovery, ingestion, CLI, or SQLite.
-```
-
-After Task 4 quality passes, continue with Task 5 from:
+Recommended first worker prompt:
 
 ```text
-docs/superpowers/plans/2026-07-09-portfolio-maker-mvp.md
+Implement Task 6: Local Discovery from
+docs/superpowers/plans/2026-07-09-portfolio-maker-mvp.md.
+
+Create only:
+- src/portfolio_maker/infrastructure/local_discovery.py
+- src/portfolio_maker/application/discovery.py
+- tests/test_local_discovery.py
+
+Follow the plan's TDD flow: write tests, confirm failure if practical,
+implement local candidate discovery and discover_sources(), run
+./.venv/bin/python -m pytest tests/test_local_discovery.py -v, commit with
+message "feat: add local discovery".
 ```
+
+After Task 6 implementation, run spec compliance review and code quality review before Task 7.
