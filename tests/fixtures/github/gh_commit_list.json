@@ -1,0 +1,13 @@
+[
+  {
+    "sha": "abc123",
+    "html_url": "https://github.com/octo/demo/commit/abc123",
+    "commit": {
+      "message": "Implement ingestion pipeline",
+      "author": {
+        "name": "octo",
+        "date": "2026-01-04T00:00:00Z"
+      }
+    }
+  }
+]

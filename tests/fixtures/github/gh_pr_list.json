@@ -1,0 +1,10 @@
+[
+  {
+    "title": "Add RAG ingestion",
+    "url": "https://github.com/octo/demo/pull/1",
+    "state": "MERGED",
+    "createdAt": "2026-01-01T00:00:00Z",
+    "mergedAt": "2026-01-02T00:00:00Z",
+    "author": {"login": "octo"}
+  }
+]
