@@ -43,7 +43,7 @@ SECRET_PATTERNS = [
         "bare_key_value",
     ),
     (
-        re.compile(r"(?i)(\b%s\b\s*[:=]\s*)([^\s\"'}]+)" % SENSITIVE_KEY),
+        re.compile(r"(?i)(?<![\"'])(\b%s\b\s*[:=](?![^\S\r\n]*[\"'])[^\S\r\n]*)([^\n]+)" % SENSITIVE_KEY),
         "bare_key_value",
     ),
 ]

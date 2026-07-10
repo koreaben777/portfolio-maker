@@ -66,6 +66,15 @@ def test_secret_masking_redacts_prefixed_environment_secret_keys():
     )
 
 
+def test_secret_masking_redacts_unquoted_multiword_secret_values():
+    masked = mask_secrets(
+        "password: my secret value\nOPENAI_API_KEY=my secret value"
+    )
+
+    assert "my secret value" not in masked
+    assert masked == "password: [REDACTED]\nOPENAI_API_KEY=[REDACTED]"
+
+
 def test_secret_masking_redacts_colon_and_json_styles():
     text = (
         'password: "my secret value"\n'

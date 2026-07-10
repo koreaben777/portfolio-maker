@@ -27,6 +27,18 @@ def test_extract_text_masks_secrets_and_hashes_raw_bytes(tmp_path):
     assert extracted.extractor == "text-v1"
 
 
+def test_extract_text_masks_unquoted_multiword_secret_values(tmp_path):
+    source = tmp_path / "note.txt"
+    source.write_text(
+        "password: my secret value\nOPENAI_API_KEY=my secret value",
+        encoding="utf-8",
+    )
+
+    extracted = extract_text(source)
+
+    assert extracted.text == "password: [REDACTED]\nOPENAI_API_KEY=[REDACTED]"
+
+
 def test_snapshot_store_writes_local_snapshot_json(tmp_path):
     source = tmp_path / "note.txt"
     source.write_text("password: hidden", encoding="utf-8")
@@ -275,6 +287,84 @@ def test_ingest_sources_skips_already_ingested_source_without_duplicate_snapshot
     assert second.skipped_count == 1
     with repository.connect() as conn:
         assert conn.execute("SELECT COUNT(*) FROM source_snapshots").fetchone()[0] == 1
+
+
+def test_ingest_sources_marks_deleted_ingested_source_stale(tmp_path):
+    workspace = tmp_path / "workspace"
+    source_path = tmp_path / "note.txt"
+    source_path.write_text("hello", encoding="utf-8")
+    paths = WorkspacePaths.from_root(workspace)
+    write_sample_approval(paths)
+    approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    approval["approved_source_uris"] = [source_path.resolve().as_uri()]
+    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    source_id = repository.upsert_source(
+        Source(
+            id=None,
+            type=SourceType.LOCAL_FILE,
+            uri=source_path.resolve().as_uri(),
+            display_name="note.txt",
+            owner=None,
+            status=SourceStatus.APPROVED,
+        )
+    )
+
+    ingest_sources(IngestSourcesRequest(workspace=workspace))
+    source_path.unlink()
+    result = ingest_sources(IngestSourcesRequest(workspace=workspace))
+
+    assert result.ingested_count == 0
+    assert result.skipped_count == 1
+    assert repository.list_sources()[0].status == SourceStatus.STALE_SOURCE
+    with repository.connect() as conn:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM source_snapshots WHERE source_id = ?",
+            (source_id,),
+        ).fetchone()[0]
+    assert count == 1
+
+
+def test_ingest_sources_reingests_changed_ingested_source(tmp_path):
+    workspace = tmp_path / "workspace"
+    source_path = tmp_path / "note.txt"
+    source_path.write_text("first evidence", encoding="utf-8")
+    paths = WorkspacePaths.from_root(workspace)
+    write_sample_approval(paths)
+    approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    approval["approved_source_uris"] = [source_path.resolve().as_uri()]
+    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    source_id = repository.upsert_source(
+        Source(
+            id=None,
+            type=SourceType.LOCAL_FILE,
+            uri=source_path.resolve().as_uri(),
+            display_name="note.txt",
+            owner=None,
+            status=SourceStatus.APPROVED,
+        )
+    )
+
+    ingest_sources(IngestSourcesRequest(workspace=workspace))
+    source_path.write_text("changed evidence", encoding="utf-8")
+    result = ingest_sources(IngestSourcesRequest(workspace=workspace))
+
+    assert result.ingested_count == 1
+    assert result.skipped_count == 0
+    assert repository.list_sources()[0].status == SourceStatus.INGESTED
+    with repository.connect() as conn:
+        hashes = [
+            row["content_hash"]
+            for row in conn.execute(
+                "SELECT content_hash FROM source_snapshots WHERE source_id = ? ORDER BY id",
+                (source_id,),
+            )
+        ]
+    assert len(hashes) == 2
+    assert hashes[0] != hashes[1]
 
 
 def test_upsert_source_does_not_downgrade_ingested_to_discovered(tmp_path):

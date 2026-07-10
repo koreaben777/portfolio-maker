@@ -24,7 +24,6 @@ def test_workspace_paths_create_expected_directories(workspace):
     assert paths.reviews_dir.is_dir()
     assert paths.artifacts_dir.is_dir()
     assert paths.local_snapshots_dir.is_dir()
-    assert paths.github_snapshots_dir.is_dir()
     assert paths.logs_dir.is_dir()
     assert not paths.db_path.exists()
     assert not paths.audit_log_path.exists()
@@ -67,13 +66,22 @@ def test_sqlite_repository_initialize_creates_schema_tables(workspace):
     assert {
         "sources",
         "source_snapshots",
-        "evidence_items",
         "github_activities",
+    } <= repository.table_names()
+
+
+def test_sqlite_repository_omits_future_generation_tables(workspace):
+    paths = WorkspacePaths.from_root(workspace)
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+
+    assert not repository.table_names() & {
+        "evidence_items",
         "projects",
         "career_claims",
         "claim_evidence",
         "artifacts",
-    } <= repository.table_names()
+    }
 
 
 def test_sqlite_repository_enforces_foreign_keys(workspace):
@@ -104,9 +112,7 @@ def test_sqlite_repository_initialize_creates_required_schema_columns(workspace)
 
     assert {"discovered_at", "approved_at"} <= column_names(repository, "sources")
     assert {"extracted_at"} <= column_names(repository, "source_snapshots")
-    assert {"created_at"} <= column_names(repository, "career_claims")
-    assert {"created_at"} <= column_names(repository, "artifacts")
-    assert {"support_level"} <= column_names(repository, "claim_evidence")
+    assert {"repo", "activity_type", "url"} <= column_names(repository, "github_activities")
 
 
 def test_sqlite_repository_upsert_source_lists_inserted_source(workspace):
@@ -117,7 +123,7 @@ def test_sqlite_repository_upsert_source_lists_inserted_source(workspace):
     source_id = repository.upsert_source(
         Source(
             id=None,
-            type=SourceType.LOCAL_DIRECTORY,
+            type=SourceType.LOCAL_FILE,
             uri="/workspace/project",
             display_name="project",
             owner=None,
@@ -141,7 +147,7 @@ def test_sqlite_repository_upsert_source_updates_existing_uri(workspace):
     first_id = repository.upsert_source(
         Source(
             id=None,
-            type=SourceType.LOCAL_DIRECTORY,
+            type=SourceType.LOCAL_FILE,
             uri="/workspace/project",
             display_name="project",
             owner=None,
@@ -181,7 +187,7 @@ def test_sqlite_repository_list_sources_filters_by_status(workspace):
     repository.upsert_source(
         Source(
             id=None,
-            type=SourceType.LOCAL_DIRECTORY,
+            type=SourceType.LOCAL_FILE,
             uri="/workspace/project",
             display_name="project",
             owner=None,
@@ -214,7 +220,7 @@ def test_sqlite_repository_update_source_status_is_observable(workspace):
     source_id = repository.upsert_source(
         Source(
             id=None,
-            type=SourceType.LOCAL_DIRECTORY,
+            type=SourceType.LOCAL_FILE,
             uri="/workspace/project",
             display_name="project",
             owner=None,

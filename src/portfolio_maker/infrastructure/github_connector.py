@@ -15,8 +15,6 @@ class GitHubRepositoryCandidate:
     name_with_owner: str
     url: str
     is_private: bool
-    description: str
-    primary_language: str | None
 
 
 @dataclass(frozen=True)
@@ -34,14 +32,11 @@ class GitHubActivityCandidate:
 def parse_repo_list(payload: list[dict]) -> list[GitHubRepositoryCandidate]:
     repos: list[GitHubRepositoryCandidate] = []
     for item in payload:
-        language = item.get("primaryLanguage") or {}
         repos.append(
             GitHubRepositoryCandidate(
                 name_with_owner=item["nameWithOwner"],
                 url=item["url"],
                 is_private=bool(item.get("isPrivate", False)),
-                description=item.get("description") or "",
-                primary_language=language.get("name"),
             )
         )
     return repos
@@ -162,7 +157,7 @@ def discover_github_candidates(
                 "repo",
                 "list",
                 "--json",
-                "nameWithOwner,url,isPrivate,description,primaryLanguage",
+                "nameWithOwner,url,isPrivate",
                 "--limit",
                 "100",
             ]

@@ -12,7 +12,6 @@ class WorkspacePaths:
     raw_dir: Path
     snapshots_dir: Path
     local_snapshots_dir: Path
-    github_snapshots_dir: Path
     artifacts_dir: Path
     reviews_dir: Path
     logs_dir: Path
@@ -39,7 +38,6 @@ class WorkspacePaths:
             raw_dir=raw_dir,
             snapshots_dir=snapshots_dir,
             local_snapshots_dir=snapshots_dir / "local",
-            github_snapshots_dir=snapshots_dir / "github",
             artifacts_dir=artifacts_dir,
             reviews_dir=reviews_dir,
             logs_dir=logs_dir,
@@ -57,7 +55,6 @@ class WorkspacePaths:
             self.raw_dir,
             self.snapshots_dir,
             self.local_snapshots_dir,
-            self.github_snapshots_dir,
             self.artifacts_dir,
             self.reviews_dir,
             self.logs_dir,

@@ -2,8 +2,6 @@
   {
     "nameWithOwner": "octo/demo",
     "url": "https://github.com/octo/demo",
-    "isPrivate": false,
-    "description": "Demo portfolio project",
-    "primaryLanguage": {"name": "Python"}
+    "isPrivate": false
   }
 ]

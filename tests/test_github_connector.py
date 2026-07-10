@@ -28,10 +28,16 @@ def test_parse_repo_list():
             name_with_owner="octo/demo",
             url="https://github.com/octo/demo",
             is_private=False,
-            description="Demo portfolio project",
-            primary_language="Python",
         )
     ]
+
+
+def test_github_repository_candidate_keeps_only_discovery_fields():
+    assert set(GitHubRepositoryCandidate.__dataclass_fields__) == {
+        "name_with_owner",
+        "url",
+        "is_private",
+    }
 
 
 def test_parse_pr_and_issue_lists():
@@ -137,22 +143,16 @@ def test_discover_github_candidates_filters_repos_before_activity_calls(monkeypa
                     "nameWithOwner": "octo/public",
                     "url": "https://github.com/octo/public",
                     "isPrivate": False,
-                    "description": "",
-                    "primaryLanguage": None,
                 },
                 {
                     "nameWithOwner": "octo/private",
                     "url": "https://github.com/octo/private",
                     "isPrivate": True,
-                    "description": "",
-                    "primaryLanguage": None,
                 },
                 {
                     "nameWithOwner": "octo/excluded",
                     "url": "https://github.com/octo/excluded",
                     "isPrivate": False,
-                    "description": "",
-                    "primaryLanguage": None,
                 },
             ]
         assert "octo/private" not in " ".join(args)
@@ -192,15 +192,11 @@ def test_discover_github_candidates_keeps_partial_results_when_repo_activity_fai
                     "nameWithOwner": "octo/ok",
                     "url": "https://github.com/octo/ok",
                     "isPrivate": False,
-                    "description": "",
-                    "primaryLanguage": None,
                 },
                 {
                     "nameWithOwner": "octo/flaky",
                     "url": "https://github.com/octo/flaky",
                     "isPrivate": False,
-                    "description": "",
-                    "primaryLanguage": None,
                 },
             ]
         if args[:2] == ["pr", "list"] and args[3] == "octo/ok":

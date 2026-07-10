@@ -155,8 +155,6 @@ def test_discover_sources_includes_github_candidates(workspace, tmp_path, monkey
                     name_with_owner="octo/demo",
                     url="https://github.com/octo/demo",
                     is_private=False,
-                    description="Demo portfolio project",
-                    primary_language="Python",
                 )
             ],
             [
@@ -295,22 +293,16 @@ def test_discover_sources_filters_private_and_excluded_github_repos(workspace, t
                     name_with_owner="octo/public",
                     url="https://github.com/octo/public",
                     is_private=False,
-                    description="Public",
-                    primary_language="Python",
                 ),
                 GitHubRepositoryCandidate(
                     name_with_owner="octo/private",
                     url="https://github.com/octo/private",
                     is_private=True,
-                    description="Private",
-                    primary_language="Python",
                 ),
                 GitHubRepositoryCandidate(
                     name_with_owner="octo/excluded",
                     url="https://github.com/octo/excluded",
                     is_private=False,
-                    description="Excluded",
-                    primary_language="Python",
                 ),
             ],
             [

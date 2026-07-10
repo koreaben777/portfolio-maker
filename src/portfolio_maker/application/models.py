@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 
@@ -73,10 +73,3 @@ class DraftPortfolioRequest:
 class DraftPortfolioResult:
     markdown_path: Path
     project_count: int
-
-
-@dataclass
-class DiscoveryReport:
-    local_candidates: list[dict[str, str]] = field(default_factory=list)
-    github_candidates: list[dict[str, str]] = field(default_factory=list)
-    skipped: list[dict[str, str]] = field(default_factory=list)

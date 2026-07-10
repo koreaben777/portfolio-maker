@@ -1,9 +1,9 @@
 # Portfolio Maker Architecture Design
 
 Date: 2026-07-09
-Status: Written spec pending user review
+Status: Approved historical architecture; implemented 0.1.0 MVP uses GitHub discovery only
 
-This document records the approved architecture design. Implementation planning starts only after the user reviews this written spec and approves proceeding.
+This document records the approved architecture design and its implemented 0.1.0 MVP boundary.
 
 ## Planning Summary
 
@@ -15,11 +15,11 @@ The initial product form was narrowed from a general local app into a Codex-nati
 - The MVP starts with **Codex Skill + CLI Engine**.
 - The architecture must keep enough separation to later support a deeper **Codex app-server companion** without rewriting the core engine.
 - The priority order is:
-  1. Build a career knowledge base from owned files and GitHub activity.
+  1. Build a career knowledge base from approved local files, with GitHub metadata available for discovery review.
   2. Generate evidence-based master profile and portfolio drafts.
   3. Add company-specific strategy and tailored job materials later.
 - Initial data sources are **local files and GitHub**. Google Drive is explicitly deferred.
-- GitHub scope includes repositories, commits, pull requests, issues, reviews, and Actions activity.
+- GitHub scope includes repositories, commits, pull requests, issues, reviews, and Actions activity as discovery metadata; it does not enter snapshots, profiles, or portfolio drafts in the 0.1.0 MVP.
 - Local discovery may scan the home directory for candidates, but users must be able to mark forbidden folders.
 - Ingestion cannot proceed until the user reviews and approves discovered sources.
 - Storage is **SQLite-centered**, with a minimal file-based raw snapshot store for extracted text and metadata that should not be normalized into the database.
@@ -72,7 +72,7 @@ The repository does not initially provide:
 2. Discover local file and GitHub source candidates.
 3. Let the user exclude forbidden folders, repositories, and source classes.
 4. Block body ingestion until source approval is explicit.
-5. Ingest approved local files and GitHub activity into SQLite and minimal snapshots.
+5. Ingest approved local files into SQLite and minimal snapshots; retain GitHub repositories and activities only as discovery metadata.
 6. Create an evidence-based master profile in JSON and Markdown.
 7. Create a public portfolio draft in Markdown.
 8. Keep public artifacts free of secrets, tokens, and private raw paths.
@@ -204,18 +204,12 @@ These rules are what keep the system open to a future Codex app-server companion
 
 ### Domain Layer
 
-The domain layer represents career evidence and generated claims.
+The implemented 0.1.0 domain keeps only the concepts used by the MVP runtime:
 
-Core domain concepts:
+- `Source`: an approved local file or discovered GitHub repository record
+- `GitHubActivity`: repository/activity discovery metadata
 
-- `Source`: local file, folder, repository, GitHub activity stream, or other discoverable input
-- `SourceSnapshot`: extracted text and metadata from a source at a point in time
-- `EvidenceItem`: a specific support item, such as a file range, commit, PR, issue, review, or README section
-- `GitHubActivity`: normalized GitHub event or object
-- `Project`: inferred or user-approved project grouping
-- `CareerClaim`: a statement about the user's work, skill, role, or result
-- `ClaimEvidence`: relation between a claim and supporting evidence
-- `Artifact`: generated output and its source profile version
+Company-specific generation may add normalized evidence, project, claim, and artifact models when a runtime reader and writer require them.
 
 ### Infrastructure Layer
 
@@ -252,6 +246,7 @@ GitHub discovery:
 - includes commits, pull requests, issues, reviews, and Actions activity
 - marks private and organization resources separately
 - prioritizes resources with direct user activity
+- stores repositories and activities as discovery metadata only; it does not ingest GitHub bodies or use GitHub activity in current artifacts
 
 Output:
 
@@ -279,9 +274,11 @@ Approval can include:
 
 Ingestion must fail closed when approval is missing.
 
+In 0.1.0, GitHub approval settings control discovery visibility only. They do not authorize GitHub artifact input.
+
 ### 3. Ingestion
 
-Ingestion reads only approved sources.
+Ingestion reads only approved local file sources.
 
 It stores:
 
@@ -297,22 +294,13 @@ It does not copy original files into the project store.
 
 ### 4. Synthesis
 
-The synthesis stage builds an evidence-based master profile.
+The 0.1.0 synthesis stage builds a master profile from the latest approved local snapshots. It lists ingested sources and one `project_evidence` claim per source. GitHub activity is not artifact input until the later company-specific generation phase.
 
-It creates:
-
-- project summaries
-- technical skill inventory
-- role and contribution summaries
-- implementation evidence
-- activity evidence
-- career claims with confidence values
-
-Claims without sufficient evidence should either be omitted or marked as low-confidence/inferred.
+Detailed project summaries, skill inventories, role analyses, and confidence-scored claims are deferred with company-specific generation.
 
 ### 5. Portfolio Drafting
 
-The portfolio draft is generated from public-safe master-profile content.
+The portfolio draft is generated from current local-snapshot-based master-profile content.
 
 It should include:
 
@@ -338,7 +326,6 @@ The MVP stores project-local state under:
   raw/
     snapshots/
       local/
-      github/
   artifacts/
     master-profile.json
     master-profile.md
@@ -375,16 +362,6 @@ source_snapshots
   extractor
   extracted_at
 
-evidence_items
-  id
-  source_id
-  snapshot_id
-  kind
-  locator
-  quote_hash
-  summary
-  confidence
-
 github_activities
   id
   source_id
@@ -397,45 +374,16 @@ github_activities
   created_at
   merged_at
 
-projects
-  id
-  name
-  summary
-  status
-  visibility
-  primary_source_id
-
-career_claims
-  id
-  claim_type
-  text
-  confidence
-  public_safe
-  created_at
-
-claim_evidence
-  claim_id
-  evidence_id
-  support_level
-
-artifacts
-  id
-  type
-  path
-  source_profile_version
-  created_at
 ```
 
-The schema should leave room for later vector search by adding fields such as `embedding_status` or `semantic_index_ref` when needed. A vector database is not part of the MVP.
+`evidence_items`, `projects`, `career_claims`, `claim_evidence`, and `artifacts` are intentionally deferred until company-specific generation has runtime readers and writers. A vector database is not part of the MVP.
 
 ## Evidence Rules
 
-1. Important claims must be backed by evidence.
-2. Evidence should point to stable locators where possible: file path plus hash, GitHub URL, commit SHA, PR URL, issue URL, review URL, or workflow run URL.
-3. Weak claims must be marked with low confidence or omitted.
-4. Public-safe claims must be separated from internal evidence.
-5. Internal evidence may reference private resources, but public artifacts must not expose private raw paths or sensitive content.
-6. If a source disappears or its hash changes, the source should be marked stale instead of silently reusing old confidence.
+1. Current profile claims are derived from approved local snapshots.
+2. GitHub URLs and activities remain discovery-report metadata in the 0.1.0 MVP.
+3. Public artifacts must not expose private raw paths or sensitive content.
+4. If an ingested local source disappears, mark it stale; if its hash changes, create a current snapshot before generating artifacts.
 
 ## Security and Privacy
 
@@ -477,9 +425,9 @@ Rules:
 - prefer read-only access
 - never store or print token values
 - distinguish public, private, and organization repositories
-- ingest private repositories only after explicit approval
-- handle rate limits by pausing and resuming
-- treat GitHub Actions as weak evidence unless supported by code or PR activity
+- show private repositories only when explicitly allowed
+- report GitHub rate-limit and per-repository failures without discarding unrelated discovery results
+- do not use GitHub repositories or activities as profile or portfolio input in the 0.1.0 MVP
 
 ### Approval Gate
 
@@ -491,25 +439,12 @@ This gate also applies when `run-mvp` is used.
 
 The pipeline should be resumable and fail partially rather than destroying prior state.
 
-Expected states:
-
-- `skipped_permission_denied`
-- `skipped_policy`
-- `extract_failed`
-- `paused_rate_limit`
-- `network_failed`
-- `auth_failed`
-- `stale_source`
-- `approved`
-- `ingested`
+Expected local-source states: `skipped_policy`, `extract_failed`, `stale_source`, `approved`, and `ingested`.
 
 Failure handling:
 
-- Permission errors are recorded and skipped.
-- Parser failures store error type, not raw content.
-- Rate limits store progress and allow resume.
-- Network errors are separated from auth and permission errors.
-- Missing evidence prevents or weakens claims.
+- File extraction failures are recorded without raw content.
+- Missing local evidence prevents current artifact claims.
 - Public-risk findings are excluded from public artifacts.
 
 ## Testing Strategy
@@ -521,8 +456,7 @@ Cover:
 - path exclusion rules
 - forbidden-folder matching
 - secret masking
-- source and evidence model creation
-- GitHub activity confidence classification
+- source and GitHub discovery model creation
 - artifact writer structure
 - approval gate behavior
 
@@ -531,7 +465,7 @@ Cover:
 Cover:
 
 - fixture home-directory discovery
-- fixture GitHub API response ingestion
+- fixture GitHub API response discovery and metadata storage
 - SQLite persistence and reload
 - master-profile generation from fixtures
 - portfolio draft generation from a fixture profile
@@ -549,7 +483,7 @@ Then verify:
 
 - discovery report is understandable
 - forbidden paths are respected
-- master profile claims have evidence references
+- master profile claims derive from approved local snapshots
 - portfolio draft omits private raw paths and secrets
 - generated artifacts are saved in the documented paths
 

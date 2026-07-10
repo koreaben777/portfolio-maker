@@ -43,7 +43,7 @@ pytest
 
 - The evidence store uses `sources`, `source_snapshots`, and `github_activities` at runtime.
 - GitHub repositories and activities are discovered and reviewed, but are not ingested into profile or portfolio artifacts until the later company-specific generation phase.
-- Normalized `evidence_items`, `career_claims`, and artifact rows remain reserved for the later company-specific generation phase.
+- Normalized evidence, claim, and artifact tables are not created until the later company-specific generation phase needs runtime readers and writers.
 
 ## Codex App Workflow
 

@@ -29,17 +29,6 @@ CREATE TABLE IF NOT EXISTS source_snapshots (
     extracted_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE TABLE IF NOT EXISTS evidence_items (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    source_id INTEGER NOT NULL REFERENCES sources(id),
-    snapshot_id INTEGER REFERENCES source_snapshots(id),
-    kind TEXT NOT NULL,
-    locator TEXT NOT NULL,
-    quote_hash TEXT,
-    summary TEXT NOT NULL,
-    confidence TEXT NOT NULL
-);
-
 CREATE TABLE IF NOT EXISTS github_activities (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     source_id INTEGER REFERENCES sources(id),
@@ -54,38 +43,6 @@ CREATE TABLE IF NOT EXISTS github_activities (
     UNIQUE(repo, activity_type, url)
 );
 
-CREATE TABLE IF NOT EXISTS projects (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    summary TEXT NOT NULL,
-    status TEXT NOT NULL,
-    visibility TEXT NOT NULL,
-    primary_source_id INTEGER REFERENCES sources(id)
-);
-
-CREATE TABLE IF NOT EXISTS career_claims (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    claim_type TEXT NOT NULL,
-    text TEXT NOT NULL,
-    confidence TEXT NOT NULL,
-    public_safe INTEGER NOT NULL,
-    created_at TEXT DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE IF NOT EXISTS claim_evidence (
-    claim_id INTEGER NOT NULL REFERENCES career_claims(id),
-    evidence_id INTEGER NOT NULL REFERENCES evidence_items(id),
-    support_level TEXT NOT NULL,
-    PRIMARY KEY (claim_id, evidence_id)
-);
-
-CREATE TABLE IF NOT EXISTS artifacts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    type TEXT NOT NULL,
-    path TEXT NOT NULL,
-    source_profile_version TEXT NOT NULL,
-    created_at TEXT DEFAULT CURRENT_TIMESTAMP
-);
 """
 
 
@@ -219,6 +176,21 @@ class SQLiteRepository:
                 """
             ).fetchall()
         return {int(row["source_id"]): Path(row["snapshot_path"]) for row in rows}
+
+    def latest_snapshot_hashes_by_source_id(self) -> dict[int, str]:
+        with self._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT source_id, content_hash
+                FROM source_snapshots
+                WHERE id IN (
+                    SELECT MAX(id)
+                    FROM source_snapshots
+                    GROUP BY source_id
+                )
+                """
+            ).fetchall()
+        return {int(row["source_id"]): str(row["content_hash"]) for row in rows}
 
     def list_sources(self, status: SourceStatus | None = None) -> list[Source]:
         sql = "SELECT id, type, uri, display_name, owner, status FROM sources"

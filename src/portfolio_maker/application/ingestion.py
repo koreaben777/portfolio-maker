@@ -31,6 +31,7 @@ def ingest_sources(request: IngestSourcesRequest) -> IngestSourcesResult:
     repository = SQLiteRepository(paths.db_path)
     repository.initialize()
     snapshots = SnapshotStore(paths)
+    latest_hashes = repository.latest_snapshot_hashes_by_source_id()
     ingested_count = 0
     skipped_count = 0
     snapshot_paths: list[Path] = []
@@ -41,10 +42,6 @@ def ingest_sources(request: IngestSourcesRequest) -> IngestSourcesResult:
             continue
 
         if source.id is None:
-            skipped_count += 1
-            continue
-
-        if source.status == SourceStatus.INGESTED:
             skipped_count += 1
             continue
 
@@ -64,6 +61,12 @@ def ingest_sources(request: IngestSourcesRequest) -> IngestSourcesResult:
             continue
         except OSError:
             repository.update_source_status(source.id, SourceStatus.EXTRACT_FAILED)
+            skipped_count += 1
+            continue
+        if (
+            source.status == SourceStatus.INGESTED
+            and latest_hashes.get(source.id) == extracted.content_hash
+        ):
             skipped_count += 1
             continue
         snapshot_path = snapshots.write_local_snapshot(source.id, source_path, extracted)
