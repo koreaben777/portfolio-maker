@@ -47,6 +47,25 @@ def test_secret_masking_removes_token_values():
     assert masked == "GITHUB_TOKEN=[REDACTED]\npassword = [REDACTED]"
 
 
+def test_secret_masking_redacts_prefixed_environment_secret_keys():
+    text = (
+        "OPENAI_API_KEY=fake-openai-secret\n"
+        "GITHUB_TOKEN=fake-github-secret\n"
+        "AWS_SECRET_ACCESS_KEY=fake-aws-secret"
+    )
+
+    masked = mask_secrets(text)
+
+    assert "fake-openai-secret" not in masked
+    assert "fake-github-secret" not in masked
+    assert "fake-aws-secret" not in masked
+    assert masked == (
+        "OPENAI_API_KEY=[REDACTED]\n"
+        "GITHUB_TOKEN=[REDACTED]\n"
+        "AWS_SECRET_ACCESS_KEY=[REDACTED]"
+    )
+
+
 def test_secret_masking_redacts_colon_and_json_styles():
     text = (
         'password: "my secret value"\n'
@@ -105,3 +124,9 @@ def test_relative_forbidden_path_blocks_descendants(tmp_path, monkeypatch):
 
     assert policy.is_forbidden(target)
     assert policy.classify_path(target) == "forbidden"
+
+
+def test_default_excluded_directory_names_are_case_insensitive(tmp_path):
+    policy = FilePolicy()
+
+    assert policy.classify_path(tmp_path / "NODE_MODULES" / "pkg.js") == "skipped_policy"

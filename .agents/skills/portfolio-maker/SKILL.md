@@ -1,11 +1,13 @@
 ---
 name: portfolio-maker
-description: Use when generating a local evidence-based career profile or portfolio draft from approved local files and GitHub activity in this repository.
+description: Use when generating a local evidence-based career profile or portfolio draft from approved local files in this repository. GitHub activity is discovery-only in this MVP.
 ---
 
 # Portfolio Maker Workflow
 
 Use this skill to run the Portfolio Maker MVP safely from Codex app.
+
+GitHub repositories and activities can be discovered for review, but this MVP does not ingest them into profile or portfolio artifacts.
 
 ## Safety Rules
 

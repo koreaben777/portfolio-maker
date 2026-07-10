@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from portfolio_maker.application.approval import load_approval
 from portfolio_maker.application.models import DiscoverSourcesRequest, DiscoverSourcesResult, ProgressEvent
 from portfolio_maker.domain.models import GitHubActivity, Source, SourceStatus, SourceType
@@ -21,7 +23,14 @@ def discover_sources(request: DiscoverSourcesRequest) -> DiscoverSourcesResult:
     repository = SQLiteRepository(paths.db_path)
     repository.initialize()
 
-    candidates, skipped = discover_local_candidates(request.home, request.forbidden_paths)
+    approval = load_approval(paths) if paths.approval_path.exists() else None
+    approval_forbidden_paths = (
+        tuple(Path(path) for path in approval.forbidden_paths) if approval else ()
+    )
+    candidates, skipped = discover_local_candidates(
+        request.home,
+        request.forbidden_paths + approval_forbidden_paths,
+    )
     for candidate in candidates:
         repository.upsert_source(
             Source(
@@ -36,19 +45,17 @@ def discover_sources(request: DiscoverSourcesRequest) -> DiscoverSourcesResult:
 
     github_repos: list[GitHubRepositoryCandidate] = []
     github_activities: list[GitHubActivityCandidate] = []
-    github_error: str | None = None
+    github_statuses: list[str] = []
     if request.include_github:
+        excluded_repositories = set(approval.excluded_repositories) if approval else set()
+        private_sources_allowed = approval.private_sources_allowed if approval else False
         try:
-            github_repos, github_activities = discover_github_candidates()
+            github_repos, github_activities, github_statuses = discover_github_candidates(
+                excluded_repositories=tuple(excluded_repositories),
+                private_sources_allowed=private_sources_allowed,
+            )
         except (GitHubDiscoveryError, FileNotFoundError) as error:
-            github_error = str(error) or "GitHub discovery failed"
-
-        excluded_repositories: set[str] = set()
-        private_sources_allowed = False
-        if paths.approval_path.exists():
-            approval = load_approval(paths)
-            excluded_repositories = set(approval.excluded_repositories)
-            private_sources_allowed = approval.private_sources_allowed
+            github_statuses = [str(error) or "GitHub discovery failed"]
 
         github_repos = [
             repo
@@ -89,7 +96,7 @@ def discover_sources(request: DiscoverSourcesRequest) -> DiscoverSourcesResult:
             )
 
     paths.discovery_report_path.write_text(
-        _render_report(candidates, skipped, github_repos, github_activities, github_error),
+        _render_report(candidates, skipped, github_repos, github_activities, github_statuses),
         encoding="utf-8",
     )
     discovered_count = len(candidates) + len(github_repos) + len(github_activities)
@@ -113,7 +120,7 @@ def _render_report(
     skipped: list[SkippedPath],
     github_repos: list[GitHubRepositoryCandidate],
     github_activities: list[GitHubActivityCandidate],
-    github_error: str | None = None,
+    github_statuses: list[str] | None = None,
 ) -> str:
     lines = ["# Discovery Report", "", "## Local candidates"]
     for candidate in candidates:
@@ -125,8 +132,10 @@ def _render_report(
     lines.extend(["", "## GitHub Activities"])
     for activity in github_activities:
         lines.append(f"- `{activity.activity_type}` `{activity.repo}`: {activity.title} {activity.url}")
-    if github_error:
-        lines.extend(["", "## GitHub Status", f"- GitHub discovery failed: {github_error}"])
+    if github_statuses:
+        lines.extend(["", "## GitHub Status"])
+        for status in github_statuses:
+            lines.append(f"- GitHub discovery failed: {status}")
     lines.extend(["", "## Skipped"])
     for item in skipped:
         path = "[redacted]" if item.reason in {"forbidden", "skipped_policy"} else item.path

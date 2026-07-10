@@ -49,7 +49,10 @@ def ingest_sources(request: IngestSourcesRequest) -> IngestSourcesResult:
             continue
 
         source_path = _path_from_file_uri(source.uri)
-        if policy.is_forbidden(source_path):
+        classification = policy.classify_path(source_path)
+        if classification != "candidate":
+            if classification == "skipped_policy":
+                repository.update_source_status(source.id, SourceStatus.SKIPPED_POLICY)
             skipped_count += 1
             continue
 

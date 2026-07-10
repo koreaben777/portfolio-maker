@@ -152,7 +152,10 @@ def run_gh_json(args: list[str]) -> Any:
         raise GitHubDiscoveryError("GitHub discovery failed; check gh auth or use --no-github.") from error
 
 
-def discover_github_candidates() -> tuple[list[GitHubRepositoryCandidate], list[GitHubActivityCandidate]]:
+def discover_github_candidates(
+    excluded_repositories: tuple[str, ...] = (),
+    private_sources_allowed: bool = False,
+) -> tuple[list[GitHubRepositoryCandidate], list[GitHubActivityCandidate], list[str]]:
     repos = parse_repo_list(
         run_gh_json(
             [
@@ -165,62 +168,75 @@ def discover_github_candidates() -> tuple[list[GitHubRepositoryCandidate], list[
             ]
         )
     )
+    excluded = set(excluded_repositories)
+    repos = [
+        repo
+        for repo in repos
+        if repo.name_with_owner not in excluded
+        and (private_sources_allowed or not repo.is_private)
+    ]
     activities: list[GitHubActivityCandidate] = []
+    statuses: list[str] = []
     for repo in repos:
-        activities.extend(
-            parse_pr_list(
-                repo.name_with_owner,
-                run_gh_json(
-                    [
-                        "pr",
-                        "list",
-                        "--repo",
-                        repo.name_with_owner,
-                        "--state",
-                        "all",
-                        "--json",
-                        "title,url,state,createdAt,mergedAt,author",
-                        "--limit",
-                        "100",
-                    ]
-                ),
+        try:
+            repo_activities: list[GitHubActivityCandidate] = []
+            repo_activities.extend(
+                parse_pr_list(
+                    repo.name_with_owner,
+                    run_gh_json(
+                        [
+                            "pr",
+                            "list",
+                            "--repo",
+                            repo.name_with_owner,
+                            "--state",
+                            "all",
+                            "--json",
+                            "title,url,state,createdAt,mergedAt,author",
+                            "--limit",
+                            "100",
+                        ]
+                    ),
+                )
             )
-        )
-        activities.extend(
-            parse_commit_list(
-                repo.name_with_owner,
-                run_gh_json(["api", f"repos/{repo.name_with_owner}/commits"]),
+            repo_activities.extend(
+                parse_commit_list(
+                    repo.name_with_owner,
+                    run_gh_json(["api", f"repos/{repo.name_with_owner}/commits"]),
+                )
             )
-        )
-        activities.extend(
-            parse_issue_list(
-                repo.name_with_owner,
-                run_gh_json(
-                    [
-                        "issue",
-                        "list",
-                        "--repo",
-                        repo.name_with_owner,
-                        "--state",
-                        "all",
-                        "--json",
-                        "title,url,state,createdAt,author",
-                        "--limit",
-                        "100",
-                    ]
-                ),
+            repo_activities.extend(
+                parse_issue_list(
+                    repo.name_with_owner,
+                    run_gh_json(
+                        [
+                            "issue",
+                            "list",
+                            "--repo",
+                            repo.name_with_owner,
+                            "--state",
+                            "all",
+                            "--json",
+                            "title,url,state,createdAt,author",
+                            "--limit",
+                            "100",
+                        ]
+                    ),
+                )
             )
-        )
-        activities.extend(
-            parse_review_list(
-                repo.name_with_owner,
-                run_gh_json(["api", f"repos/{repo.name_with_owner}/pulls/comments"]),
+            repo_activities.extend(
+                parse_review_list(
+                    repo.name_with_owner,
+                    run_gh_json(["api", f"repos/{repo.name_with_owner}/pulls/comments"]),
+                )
             )
-        )
-        activities.extend(
-            parse_workflow_run_list(
-                repo.name_with_owner,
-                run_gh_json(["api", f"repos/{repo.name_with_owner}/actions/runs"]),
+            repo_activities.extend(
+                parse_workflow_run_list(
+                    repo.name_with_owner,
+                    run_gh_json(["api", f"repos/{repo.name_with_owner}/actions/runs"]),
+                )
             )
-        )
-    return repos, activities
+            activities.extend(repo_activities)
+        except GitHubDiscoveryError as error:
+            statuses.append(f"GitHub activity discovery failed for {repo.name_with_owner}: {error}")
+    return repos, activities, statuses

@@ -166,6 +166,38 @@ def test_ingest_sources_skips_approved_file_under_forbidden_path(tmp_path):
         assert conn.execute("SELECT COUNT(*) FROM source_snapshots").fetchone()[0] == 0
 
 
+def test_ingest_sources_skips_approved_sensitive_file(tmp_path):
+    workspace = tmp_path / "workspace"
+    source_path = tmp_path / ".env"
+    source_path.write_text("OPENAI_API_KEY=fake-secret", encoding="utf-8")
+    paths = WorkspacePaths.from_root(workspace)
+    write_sample_approval(paths)
+    approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    approval["approved_source_uris"] = [source_path.resolve().as_uri()]
+    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    repository.upsert_source(
+        Source(
+            id=None,
+            type=SourceType.LOCAL_FILE,
+            uri=source_path.resolve().as_uri(),
+            display_name=".env",
+            owner=None,
+            status=SourceStatus.APPROVED,
+        )
+    )
+
+    result = ingest_sources(IngestSourcesRequest(workspace=workspace))
+
+    assert result.ingested_count == 0
+    assert result.skipped_count == 1
+    assert result.snapshot_paths == ()
+    assert repository.list_sources()[0].status == SourceStatus.SKIPPED_POLICY
+    with repository.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM source_snapshots").fetchone()[0] == 0
+
+
 def test_ingest_sources_continues_after_missing_approved_file(tmp_path):
     workspace = tmp_path / "workspace"
     missing_path = tmp_path / "missing.txt"

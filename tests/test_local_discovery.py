@@ -144,7 +144,11 @@ def test_discover_sources_redacts_policy_skipped_paths_in_report(tmp_path):
 
 
 def test_discover_sources_includes_github_candidates(workspace, tmp_path, monkeypatch):
-    def fake_discover_github_candidates():
+    def fake_discover_github_candidates(**kwargs):
+        assert kwargs == {
+            "excluded_repositories": (),
+            "private_sources_allowed": False,
+        }
         return (
             [
                 GitHubRepositoryCandidate(
@@ -167,6 +171,7 @@ def test_discover_sources_includes_github_candidates(workspace, tmp_path, monkey
                     merged_at="2026-01-02T00:00:00Z",
                 )
             ],
+            [],
         )
 
     monkeypatch.setattr(
@@ -204,7 +209,7 @@ def test_discover_sources_keeps_local_report_when_github_fails(workspace, tmp_pa
     readme = tmp_path / "README.md"
     readme.write_text("# Demo\n", encoding="utf-8")
 
-    def fail_github():
+    def fail_github(**kwargs):
         raise FileNotFoundError("gh")
 
     monkeypatch.setattr(
@@ -227,6 +232,41 @@ def test_discover_sources_keeps_local_report_when_github_fails(workspace, tmp_pa
     assert "GitHub discovery failed" in report
 
 
+def test_discover_sources_uses_approval_forbidden_paths_on_rerun(workspace, tmp_path):
+    home = tmp_path / "home"
+    private = home / "private"
+    private.mkdir(parents=True)
+    secret = private / "README.md"
+    secret.write_text("# Secret\n", encoding="utf-8")
+    paths = WorkspacePaths.from_root(workspace)
+    paths.ensure()
+    paths.approval_path.write_text(
+        f"""
+{{
+  "approved_source_uris": [],
+  "forbidden_paths": ["{private}"],
+  "excluded_repositories": [],
+  "private_sources_allowed": false
+}}
+""".strip(),
+        encoding="utf-8",
+    )
+
+    result = discover_sources(
+        DiscoverSourcesRequest(
+            workspace=workspace,
+            home=home,
+            include_github=False,
+            forbidden_paths=(),
+        )
+    )
+
+    report = result.report_path.read_text(encoding="utf-8")
+    assert result.discovered_count == 0
+    assert "forbidden: [redacted]" in report
+    assert secret.name not in report
+
+
 def test_discover_sources_filters_private_and_excluded_github_repos(workspace, tmp_path, monkeypatch):
     home = tmp_path / "home"
     home.mkdir()
@@ -244,7 +284,11 @@ def test_discover_sources_filters_private_and_excluded_github_repos(workspace, t
         encoding="utf-8",
     )
 
-    def fake_discover_github_candidates():
+    def fake_discover_github_candidates(**kwargs):
+        assert kwargs == {
+            "excluded_repositories": ("octo/excluded",),
+            "private_sources_allowed": False,
+        }
         return (
             [
                 GitHubRepositoryCandidate(
@@ -301,6 +345,7 @@ def test_discover_sources_filters_private_and_excluded_github_repos(workspace, t
                     merged_at=None,
                 ),
             ],
+            [],
         )
 
     monkeypatch.setattr(

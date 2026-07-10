@@ -7,11 +7,11 @@ Plan: `docs/superpowers/plans/2026-07-09-portfolio-maker-mvp.md`
 
 ## Stop Reason
 
-Work is intentionally paused to conserve Codex usage. Continue broad implementation only when the user explicitly resumes.
+Historical handoff. Implementation continued after this pause; do not treat the commit/test state below as current without running the resume commands near the end of this file.
 
 ## Current Git State
 
-Last implementation commit before this handoff update:
+Last implementation commit before the original handoff pause:
 
 ```text
 8eb2540 fix: enforce sqlite foreign keys

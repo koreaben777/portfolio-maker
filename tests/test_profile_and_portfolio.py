@@ -8,6 +8,29 @@ from portfolio_maker.infrastructure.sqlite_repository import SQLiteRepository
 from portfolio_maker.workspace import WorkspacePaths
 
 
+def test_build_profile_treats_github_sources_as_discovery_only_in_mvp(tmp_path):
+    workspace = tmp_path / "workspace"
+    paths = WorkspacePaths.from_root(workspace)
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    repository.upsert_source(
+        Source(
+            id=None,
+            type=SourceType.GITHUB_REPOSITORY,
+            uri="https://github.com/octo/demo",
+            display_name="octo/demo",
+            owner="octo",
+            status=SourceStatus.APPROVED,
+        )
+    )
+
+    profile_result = build_profile(BuildProfileRequest(workspace=workspace))
+
+    profile = json.loads(profile_result.json_path.read_text(encoding="utf-8"))
+    assert profile_result.claim_count == 0
+    assert profile == {"version": 1, "sources": [], "claims": []}
+
+
 def test_build_profile_and_draft_portfolio_from_ingested_source(tmp_path):
     workspace = tmp_path / "workspace"
     paths = WorkspacePaths.from_root(workspace)

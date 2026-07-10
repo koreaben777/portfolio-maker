@@ -1,6 +1,6 @@
 # Portfolio Maker
 
-Portfolio Maker is a Codex app guided local workflow for building an evidence-based career profile and public portfolio draft from approved local files and GitHub activity.
+Portfolio Maker is a Codex app guided local workflow for building an evidence-based career profile and public portfolio draft from approved local files. GitHub activity is discovery-only in this MVP.
 
 ## MVP Scope
 
@@ -42,6 +42,7 @@ pytest
 ## MVP Contract
 
 - The evidence store uses `sources`, `source_snapshots`, and `github_activities` at runtime.
+- GitHub repositories and activities are discovered and reviewed, but are not ingested into profile or portfolio artifacts until the later company-specific generation phase.
 - Normalized `evidence_items`, `career_claims`, and artifact rows remain reserved for the later company-specific generation phase.
 
 ## Codex App Workflow

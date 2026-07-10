@@ -3,6 +3,7 @@ from pathlib import Path
 
 from portfolio_maker.infrastructure.github_connector import (
     GitHubActivityCandidate,
+    GitHubDiscoveryError,
     GitHubRepositoryCandidate,
     discover_github_candidates,
     parse_commit_list,
@@ -111,10 +112,11 @@ def test_discover_github_candidates_collects_repo_activities(monkeypatch):
         fake_run_gh_json,
     )
 
-    repos, activities = discover_github_candidates()
+    repos, activities, statuses = discover_github_candidates()
 
     assert len(repos) == 1
     assert len(activities) == 5
+    assert statuses == []
     assert [activity.activity_type for activity in activities] == [
         "pull_request",
         "commit",
@@ -122,3 +124,106 @@ def test_discover_github_candidates_collects_repo_activities(monkeypatch):
         "review_comment",
         "workflow_run",
     ]
+
+
+def test_discover_github_candidates_filters_repos_before_activity_calls(monkeypatch):
+    calls = []
+
+    def fake_run_gh_json(args):
+        calls.append(args)
+        if args[:2] == ["repo", "list"]:
+            return [
+                {
+                    "nameWithOwner": "octo/public",
+                    "url": "https://github.com/octo/public",
+                    "isPrivate": False,
+                    "description": "",
+                    "primaryLanguage": None,
+                },
+                {
+                    "nameWithOwner": "octo/private",
+                    "url": "https://github.com/octo/private",
+                    "isPrivate": True,
+                    "description": "",
+                    "primaryLanguage": None,
+                },
+                {
+                    "nameWithOwner": "octo/excluded",
+                    "url": "https://github.com/octo/excluded",
+                    "isPrivate": False,
+                    "description": "",
+                    "primaryLanguage": None,
+                },
+            ]
+        assert "octo/private" not in " ".join(args)
+        assert "octo/excluded" not in " ".join(args)
+        if args[:2] in (["pr", "list"], ["issue", "list"]):
+            return []
+        if args == ["api", "repos/octo/public/commits"]:
+            return []
+        if args == ["api", "repos/octo/public/pulls/comments"]:
+            return []
+        if args == ["api", "repos/octo/public/actions/runs"]:
+            return {"workflow_runs": []}
+        raise AssertionError(args)
+
+    monkeypatch.setattr(
+        "portfolio_maker.infrastructure.github_connector.run_gh_json",
+        fake_run_gh_json,
+    )
+
+    repos, activities, statuses = discover_github_candidates(
+        excluded_repositories=("octo/excluded",),
+        private_sources_allowed=False,
+    )
+
+    assert [repo.name_with_owner for repo in repos] == ["octo/public"]
+    assert activities == []
+    assert statuses == []
+    assert all("octo/private" not in " ".join(call) for call in calls)
+    assert all("octo/excluded" not in " ".join(call) for call in calls)
+
+
+def test_discover_github_candidates_keeps_partial_results_when_repo_activity_fails(monkeypatch):
+    def fake_run_gh_json(args):
+        if args[:2] == ["repo", "list"]:
+            return [
+                {
+                    "nameWithOwner": "octo/ok",
+                    "url": "https://github.com/octo/ok",
+                    "isPrivate": False,
+                    "description": "",
+                    "primaryLanguage": None,
+                },
+                {
+                    "nameWithOwner": "octo/flaky",
+                    "url": "https://github.com/octo/flaky",
+                    "isPrivate": False,
+                    "description": "",
+                    "primaryLanguage": None,
+                },
+            ]
+        if args[:2] == ["pr", "list"] and args[3] == "octo/ok":
+            return load_fixture("gh_pr_list.json")
+        if "octo/flaky" in " ".join(args):
+            raise GitHubDiscoveryError("rate limited")
+        if args[:2] in (["pr", "list"], ["issue", "list"]):
+            return []
+        if args[0] == "api" and args[1].endswith("/commits"):
+            return []
+        if args[0] == "api" and args[1].endswith("/pulls/comments"):
+            return []
+        if args[0] == "api" and args[1].endswith("/actions/runs"):
+            return {"workflow_runs": []}
+        raise AssertionError(args)
+
+    monkeypatch.setattr(
+        "portfolio_maker.infrastructure.github_connector.run_gh_json",
+        fake_run_gh_json,
+    )
+
+    repos, activities, statuses = discover_github_candidates()
+
+    assert [repo.name_with_owner for repo in repos] == ["octo/ok", "octo/flaky"]
+    assert [activity.repo for activity in activities] == ["octo/ok"]
+    assert statuses == ["GitHub activity discovery failed for octo/flaky: rate limited"]

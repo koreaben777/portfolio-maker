@@ -25,26 +25,29 @@ SENSITIVE_FILE_NAMES = {
     "credentials.json",
 }
 
+SENSITIVE_KEY = r"[A-Za-z0-9_-]*(?:password|api[_-]?key|token|secret(?:[_-]?access)?[_-]?key|secret)[A-Za-z0-9_-]*"
+
 SECRET_PATTERNS = [
     (re.compile(r"github_pat_[A-Za-z0-9_]{20,}"), "literal"),
     (re.compile(r"gh[pousr]_[A-Za-z0-9_]{20,}"), "literal"),
     (
-        re.compile(r'(?i)(["\'](?:password|api[_-]?key|token)["\']\s*:\s*)(["\'])(.*?)\2'),
+        re.compile(r'(?i)(["\']%s["\']\s*:\s*)(["\'])(.*?)\2' % SENSITIVE_KEY),
         "quoted_key_value",
     ),
     (
-        re.compile(r"(?i)(\b(?:password|api[_-]?key|token)\b\s*[:=]\s*)(['\"])(.*?)\2"),
+        re.compile(r"(?i)(\b%s\b\s*[:=]\s*)(['\"])(.*?)\2" % SENSITIVE_KEY),
         "quoted_key_value",
     ),
     (
-        re.compile(r'(?i)(["\'](?:password|api[_-]?key|token)["\']\s*:\s*)([^"\'}\n]+?)(?=,\s*["\']|})'),
+        re.compile(r'(?i)(["\']%s["\']\s*:\s*)([^"\'}\n]+?)(?=,\s*["\']|})' % SENSITIVE_KEY),
         "bare_key_value",
     ),
     (
-        re.compile(r"(?i)(\b(?:password|api[_-]?key|token)\b\s*[:=]\s*)([^\s\"'}]+)"),
+        re.compile(r"(?i)(\b%s\b\s*[:=]\s*)([^\s\"'}]+)" % SENSITIVE_KEY),
         "bare_key_value",
     ),
 ]
+DEFAULT_EXCLUDED_NAMES_CASEFOLD = {name.casefold() for name in DEFAULT_EXCLUDED_NAMES}
 
 
 @dataclass(frozen=True)
@@ -68,7 +71,7 @@ class FilePolicy:
             return "forbidden"
         if path.name.lower() in SENSITIVE_FILE_NAMES:
             return "skipped_policy"
-        if any(part in DEFAULT_EXCLUDED_NAMES for part in path.parts):
+        if any(part.casefold() in DEFAULT_EXCLUDED_NAMES_CASEFOLD for part in path.parts):
             return "skipped_policy"
         return "candidate"
 

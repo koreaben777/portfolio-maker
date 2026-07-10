@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Codex app에서 호출 가능한 CLI 기반 MVP를 만들어 로컬 파일과 GitHub 활동 후보를 발견하고, 승인된 source만 ingest한 뒤 근거 기반 master profile과 portfolio draft를 생성한다.
+**Goal:** Codex app에서 호출 가능한 CLI 기반 MVP를 만들어 로컬 파일과 GitHub 활동 후보를 발견하고, 승인된 로컬 source만 ingest한 뒤 근거 기반 master profile과 portfolio draft를 생성한다. GitHub 활동은 이 MVP에서 discovery-only이며, artifact 입력은 후속 회사별 맞춤 생성 단계로 남긴다.
 
 **Architecture:** MVP는 Codex Skill + CLI adapter + reusable application use cases 구조로 구현한다. 핵심 로직은 CLI나 Codex thread에 의존하지 않는 Python package에 두고, 저장소는 SQLite와 최소 snapshot file store를 사용한다. 향후 Codex app-server나 MCP adapter가 같은 use case를 재사용할 수 있도록 request/result dataclass와 structured progress event를 사용한다.
 
@@ -23,7 +23,7 @@
 - approval gate
 - SQLite schema and repositories
 - minimal raw snapshot store
-- source ingestion
+- approved local source ingestion
 - evidence-based master profile JSON/Markdown
 - public portfolio draft Markdown
 - README setup guide
@@ -165,7 +165,7 @@ Create `README.md`:
 ```markdown
 # Portfolio Maker
 
-Portfolio Maker is a Codex app guided local workflow for building an evidence-based career profile and public portfolio draft from approved local files and GitHub activity.
+Portfolio Maker is a Codex app guided local workflow for building an evidence-based career profile and public portfolio draft from approved local files. GitHub activity is discovery-only in this MVP.
 
 ## MVP Scope
 
@@ -2605,7 +2605,7 @@ def draft_portfolio(request: DraftPortfolioRequest) -> DraftPortfolioResult:
             [
                 f"### {display_name}",
                 "",
-                "This project is included because approved local or GitHub evidence was found.",
+                "This project is included because approved local evidence was found.",
                 "",
                 "- Role: Evidence review required",
                 "- Technical approach: Evidence review required",
@@ -2830,7 +2830,7 @@ Create `.agents/skills/portfolio-maker/SKILL.md`:
 ```markdown
 ---
 name: portfolio-maker
-description: Use when generating a local evidence-based career profile or portfolio draft from approved local files and GitHub activity in this repository.
+description: Use when generating a local evidence-based career profile or portfolio draft from approved local files in this repository. GitHub activity is discovery-only in this MVP.
 ---
 
 # Portfolio Maker Workflow
@@ -2936,7 +2936,7 @@ Replace `README.md` with:
 ```markdown
 # Portfolio Maker
 
-Portfolio Maker is a Codex app guided local workflow for building an evidence-based career profile and public portfolio draft from approved local files and GitHub activity.
+Portfolio Maker is a Codex app guided local workflow for building an evidence-based career profile and public portfolio draft from approved local files. GitHub activity is discovery-only in this MVP.
 
 ## MVP Scope
 
