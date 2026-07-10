@@ -77,7 +77,8 @@ SECRET_PATTERNS = [
 DEFAULT_EXCLUDED_NAMES_CASEFOLD = {name.casefold() for name in DEFAULT_EXCLUDED_NAMES}
 SENSITIVE_FILE_NAMES_CASEFOLD = {name.casefold() for name in SENSITIVE_FILE_NAMES}
 PASSWORD_MANAGER_EXPORT_FILENAME = re.compile(
-    r"(?i)^(?:bitwarden|lastpass|1password|chrome|firefox)[_-]export"
+    r"(?i)^(?:(?:bitwarden|lastpass|1password|chrome|firefox)[_-]export"
+    r"|chrome[_-]passwords|firefox[_-]logins)"
     r"(?:[_-](?:\d{8}|\d{4}-\d{2}-\d{2})(?:[_-]?\d{6})?)?\.(?:csv|json)$"
 )
 SECRET_SHAPED_FILENAME = re.compile(

@@ -16,7 +16,7 @@
 - 향후 더 깊은 **Codex app-server companion**으로 확장할 수 있도록 핵심 엔진 경계를 분리합니다.
 - 우선순위는 다음과 같습니다.
   1. 승인된 로컬 파일로 커리어 지식베이스를 구축하고, GitHub 메타데이터는 discovery 검토에 사용합니다.
-  2. 근거 기반 마스터 프로필과 포트폴리오 초안을 생성합니다.
+  2. 근거 기반 마스터 프로필과 검토가 필요한 포트폴리오 skeleton을 생성하고, 근거가 렌더링된 포트폴리오 초안은 후순위로 둡니다.
   3. 회사별 전략과 맞춤형 취업 자료는 이후에 추가합니다.
 - 초기 데이터 소스는 **로컬 파일과 GitHub**입니다. Google Drive는 명시적으로 후순위로 둡니다.
 - GitHub 범위에는 repository, commit, pull request, issue, review, Actions 활동이 discovery 메타데이터로 포함되며, 0.1.0 MVP에서는 snapshot, profile, portfolio draft에 들어가지 않습니다.

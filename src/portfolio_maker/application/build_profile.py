@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from portfolio_maker.application.approval import approval_forbidden_paths, load_approval
+from portfolio_maker.application.approval import load_approval
 from portfolio_maker.application.models import BuildProfileRequest, BuildProfileResult
 from portfolio_maker.domain.models import Source, SourceStatus, SourceType
 from portfolio_maker.infrastructure.artifacts import write_json, write_markdown
@@ -16,7 +16,7 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
     paths.ensure()
     approval = load_approval(paths)
     approved_uris = set(approval.approved_source_uris)
-    policy = FilePolicy(forbidden_paths=approval_forbidden_paths(paths, approval))
+    policy = FilePolicy(forbidden_paths=approval.forbidden_paths)
     repository = SQLiteRepository(paths.db_path)
     repository.initialize()
     snapshots = repository.latest_snapshot_metadata_by_source_id()
@@ -41,12 +41,12 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
         snapshot_metadata = snapshots.get(source.id)
         if (
             snapshot_metadata is None
-            or snapshot_metadata[1] != extracted.content_hash
-            or snapshot_metadata[2] != extracted.extractor
+            or snapshot_metadata[2] != extracted.content_hash
+            or snapshot_metadata[3] != extracted.extractor
         ):
             repository.update_source_status(source.id, SourceStatus.STALE_SOURCE)
             continue
-        snapshot_path = snapshot_metadata[0]
+        snapshot_path = snapshot_metadata[1]
         snapshot = load_valid_local_snapshot(
             snapshot_path,
             source.id,

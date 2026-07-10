@@ -160,6 +160,8 @@ def test_file_policy_skips_timestamped_password_manager_exports(tmp_path):
 
     assert policy.classify_path(tmp_path / "bitwarden_export_20260710.json") == "skipped_policy"
     assert policy.classify_path(tmp_path / "LastPass-Export-2026-07-10-123456.CSV") == "skipped_policy"
+    assert policy.classify_path(tmp_path / "chrome_passwords_20260710.csv") == "skipped_policy"
+    assert policy.classify_path(tmp_path / "firefox_logins_20260710.json") == "skipped_policy"
 
 
 def test_secret_masking_redacts_bearer_private_key_and_token_prefixes():

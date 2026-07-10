@@ -224,7 +224,7 @@ def test_build_profile_marks_changed_source_stale_and_requires_reingestion(tmp_p
 def test_build_profile_marks_missing_snapshot_stale_without_fallback_claim(tmp_path):
     workspace, _, paths = _ingest_approved_source(tmp_path)
     repository = SQLiteRepository(paths.db_path)
-    snapshot_path = repository.latest_snapshots_by_source_id()[repository.list_sources()[0].id]
+    snapshot_path = repository.latest_snapshot_metadata_by_source_id()[repository.list_sources()[0].id][1]
     snapshot_path.unlink()
 
     profile_result = build_profile(BuildProfileRequest(workspace=workspace))
@@ -269,7 +269,7 @@ def test_build_profile_rejects_legacy_or_tampered_snapshot_text(tmp_path):
     workspace, _, paths = _ingest_approved_source(tmp_path)
     repository = SQLiteRepository(paths.db_path)
     source = repository.list_sources()[0]
-    snapshot_path = repository.latest_snapshots_by_source_id()[source.id]
+    snapshot_path = repository.latest_snapshot_metadata_by_source_id()[source.id][1]
     payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
     payload["extractor"] = "text-v1"
     payload["text"] = "fabricated synthetic evidence"
@@ -330,7 +330,15 @@ def test_draft_portfolio_masks_timestamped_password_export_display_name(tmp_path
     paths = WorkspacePaths.from_root(tmp_path / "workspace")
     paths.ensure()
     paths.master_profile_json_path.write_text(
-        json.dumps({"sources": [{"display_name": "bitwarden_export_20260710.json"}]}),
+        json.dumps(
+            {
+                "sources": [
+                    {"display_name": "bitwarden_export_20260710.json"},
+                    {"display_name": "chrome_passwords_20260710.csv"},
+                    {"display_name": "firefox_logins_20260710.json"},
+                ]
+            }
+        ),
         encoding="utf-8",
     )
     monkeypatch.setattr(draft_portfolio_module, "build_profile", lambda request: None)
@@ -339,6 +347,8 @@ def test_draft_portfolio_masks_timestamped_password_export_display_name(tmp_path
 
     draft = paths.portfolio_draft_path.read_text(encoding="utf-8")
     assert "bitwarden_export_20260710.json" not in draft
+    assert "chrome_passwords_20260710.csv" not in draft
+    assert "firefox_logins_20260710.json" not in draft
     assert "[REDACTED]" in draft
 
 

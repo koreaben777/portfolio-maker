@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import json
-import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from portfolio_maker.workspace import WorkspacePaths
+from portfolio_maker.infrastructure.github_connector import canonical_repository_name
 
 
 class ApprovalMissingError(RuntimeError):
@@ -37,14 +37,17 @@ def sample_approval_payload() -> dict[str, Any]:
 
 def write_sample_approval(paths: WorkspacePaths, force: bool = False) -> Path:
     paths.ensure()
-    if paths.approval_path.exists() and not force:
+    payload = json.dumps(sample_approval_payload(), indent=2) + "\n"
+    if force:
+        paths.approval_path.write_text(payload, encoding="utf-8")
+        return paths.approval_path
+    try:
+        with paths.approval_path.open("x", encoding="utf-8") as approval_file:
+            approval_file.write(payload)
+    except FileExistsError as error:
         raise ApprovalFormatError(
             f"Approval file already exists: {paths.approval_path}. Use --force to reset it"
-        )
-    paths.approval_path.write_text(
-        json.dumps(sample_approval_payload(), indent=2) + "\n",
-        encoding="utf-8",
-    )
+        ) from error
     return paths.approval_path
 
 
@@ -66,8 +69,15 @@ def load_approval(paths: WorkspacePaths) -> SourceApproval:
         normalize_workspace_path(paths, value)
         for value in _string_list(payload, "forbidden_paths")
     )
-    excluded_repositories = _string_list(payload, "excluded_repositories")
-    _validate_repository_exclusions(excluded_repositories)
+    try:
+        excluded_repositories = tuple(
+            canonical_repository_name(repository)
+            for repository in _string_list(payload, "excluded_repositories")
+        )
+    except ValueError as error:
+        raise ApprovalFormatError(
+            "excluded_repositories entries must use owner/repo form"
+        ) from error
 
     return SourceApproval(
         approved_source_uris=_string_list(payload, "approved_source_uris"),
@@ -75,10 +85,6 @@ def load_approval(paths: WorkspacePaths) -> SourceApproval:
         excluded_repositories=excluded_repositories,
         private_sources_allowed=private_sources_allowed,
     )
-
-
-def approval_forbidden_paths(_paths: WorkspacePaths, approval: SourceApproval) -> tuple[Path, ...]:
-    return approval.forbidden_paths
 
 
 def normalize_workspace_path(paths: WorkspacePaths, value: Path | str) -> Path:
@@ -96,11 +102,3 @@ def _string_list(payload: dict[str, Any], key: str) -> tuple[str, ...]:
     if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
         raise ApprovalFormatError(f"{key} must be a list of strings")
     return tuple(value)
-
-
-REPOSITORY_EXCLUSION = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
-
-
-def _validate_repository_exclusions(excluded_repositories: tuple[str, ...]) -> None:
-    if any(REPOSITORY_EXCLUSION.fullmatch(repository) is None for repository in excluded_repositories):
-        raise ApprovalFormatError("excluded_repositories entries must use owner/repo form")

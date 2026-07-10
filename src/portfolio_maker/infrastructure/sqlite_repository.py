@@ -162,9 +162,9 @@ class SQLiteRepository:
             )
         return int(cursor.lastrowid)
 
-    def update_latest_source_snapshot(
+    def update_source_snapshot(
         self,
-        source_id: int,
+        snapshot_id: int,
         snapshot_path: Path,
         content_hash: str,
         extractor: str,
@@ -174,50 +174,36 @@ class SQLiteRepository:
                 """
                 UPDATE source_snapshots
                 SET snapshot_path = ?, content_hash = ?, extractor = ?, extracted_at = CURRENT_TIMESTAMP
-                WHERE id = (
-                    SELECT MAX(id)
-                    FROM source_snapshots
-                    WHERE source_id = ?
-                )
+                WHERE id = ?
                 """,
-                (str(snapshot_path), content_hash, extractor, source_id),
+                (str(snapshot_path), content_hash, extractor, snapshot_id),
             )
 
-    def latest_snapshots_by_source_id(self) -> dict[int, Path]:
+    def delete_source_snapshot(self, snapshot_id: int) -> None:
         with self._connection() as conn:
-            rows = conn.execute(
-                """
-                SELECT source_id, snapshot_path
-                FROM source_snapshots
-                WHERE id IN (
-                    SELECT MAX(id)
-                    FROM source_snapshots
-                    GROUP BY source_id
-                )
-                """
-            ).fetchall()
-        return {int(row["source_id"]): Path(row["snapshot_path"]) for row in rows}
+            conn.execute("DELETE FROM source_snapshots WHERE id = ?", (snapshot_id,))
 
-    def latest_snapshot_hashes_by_source_id(self) -> dict[int, str]:
+    def snapshot_metadata_for_source(self, source_id: int) -> list[tuple[int, Path, str, str]]:
         with self._connection() as conn:
             rows = conn.execute(
                 """
-                SELECT source_id, content_hash
+                SELECT id, snapshot_path, content_hash, extractor
                 FROM source_snapshots
-                WHERE id IN (
-                    SELECT MAX(id)
-                    FROM source_snapshots
-                    GROUP BY source_id
-                )
-                """
+                WHERE source_id = ?
+                ORDER BY id
+                """,
+                (source_id,),
             ).fetchall()
-        return {int(row["source_id"]): str(row["content_hash"]) for row in rows}
+        return [
+            (int(row["id"]), Path(row["snapshot_path"]), str(row["content_hash"]), str(row["extractor"]))
+            for row in rows
+        ]
 
-    def latest_snapshot_metadata_by_source_id(self) -> dict[int, tuple[Path, str, str]]:
+    def latest_snapshot_metadata_by_source_id(self) -> dict[int, tuple[int, Path, str, str]]:
         with self._connection() as conn:
             rows = conn.execute(
                 """
-                SELECT source_id, snapshot_path, content_hash, extractor
+                SELECT id, source_id, snapshot_path, content_hash, extractor
                 FROM source_snapshots
                 WHERE id IN (
                     SELECT MAX(id)
@@ -228,6 +214,7 @@ class SQLiteRepository:
             ).fetchall()
         return {
             int(row["source_id"]): (
+                int(row["id"]),
                 Path(row["snapshot_path"]),
                 str(row["content_hash"]),
                 str(row["extractor"]),

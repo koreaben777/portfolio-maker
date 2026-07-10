@@ -167,11 +167,11 @@ def discover_github_candidates(
             ]
         )
     )
-    excluded = {_canonical_repository_name(name) for name in excluded_repositories}
+    excluded = {canonical_repository_name(name) for name in excluded_repositories}
     repos = [
         repo
         for repo in repos
-        if _canonical_repository_name(repo.name_with_owner) not in excluded
+        if canonical_repository_name(repo.name_with_owner) not in excluded
         and (private_sources_allowed or not repo.is_private)
     ]
     activities: list[GitHubActivityCandidate] = []
@@ -284,5 +284,22 @@ def _required_one_of_strings(
     raise GitHubDiscoveryError(f"GitHub {label} payload is invalid")
 
 
-def _canonical_repository_name(name: str) -> str:
-    return name.strip().casefold()
+def canonical_repository_name(name: str) -> str:
+    owner, separator, repository = name.strip().partition("/")
+    if (
+        separator != "/"
+        or "/" in repository
+        or not _is_canonical_repository_component(owner, allow_dots=False)
+        or not _is_canonical_repository_component(repository, allow_dots=True)
+    ):
+        raise ValueError("repository name must use canonical owner/repo form")
+    return f"{owner.casefold()}/{repository.casefold()}"
+
+
+def _is_canonical_repository_component(value: str, allow_dots: bool) -> bool:
+    if not value or value in {".", ".."} or not value[0].isalnum():
+        return False
+    allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+    if allow_dots:
+        allowed += "."
+    return all(character in allowed for character in value)

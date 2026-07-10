@@ -16,7 +16,7 @@ The initial product form was narrowed from a general local app into a Codex-nati
 - The architecture must keep enough separation to later support a deeper **Codex app-server companion** without rewriting the core engine.
 - The priority order is:
   1. Build a career knowledge base from approved local files, with GitHub metadata available for discovery review.
-  2. Generate evidence-based master profile and portfolio drafts.
+  2. Generate an evidence-based master profile and a review-required portfolio skeleton; defer evidence-rendered portfolio drafts.
   3. Add company-specific strategy and tailored job materials later.
 - Initial data sources are **local files and GitHub**. Google Drive is explicitly deferred.
 - GitHub scope includes repositories, commits, pull requests, issues, reviews, and Actions activity as discovery metadata; it does not enter snapshots, profiles, or portfolio drafts in the 0.1.0 MVP.

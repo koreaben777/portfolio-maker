@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 import portfolio_maker.infrastructure.extractors as extractors
+import portfolio_maker.infrastructure.snapshots as snapshots
 from portfolio_maker.application.approval import ApprovalMissingError, write_sample_approval
 from portfolio_maker.application.ingestion import ingest_sources
 from portfolio_maker.application.models import IngestSourcesRequest
@@ -662,7 +663,8 @@ def test_ingest_sources_migrates_verified_managed_legacy_snapshot(tmp_path):
 
     result = ingest_sources(IngestSourcesRequest(workspace=workspace))
 
-    assert result.ingested_count == 1
+    assert result.ingested_count == 0
+    assert result.skipped_count == 1
     assert not legacy_path.exists()
     with repository.connect() as conn:
         rows = conn.execute(
@@ -673,6 +675,135 @@ def test_ingest_sources_migrates_verified_managed_legacy_snapshot(tmp_path):
     assert rows[0]["id"] == legacy_row_id
     assert rows[0]["snapshot_path"] != str(legacy_path)
     assert rows[0]["extractor"] == "text-v2"
+
+
+def test_ingest_sources_retries_legacy_cleanup_after_unlink_failure(tmp_path, monkeypatch):
+    workspace, source_path, paths, repository, source_id, legacy_path = _legacy_snapshot_state(
+        tmp_path,
+        "api_key=synthetic-placeholder",
+    )
+    original_unlink = snapshots.os.unlink
+    failed_once = False
+
+    def fail_legacy_unlink_once(path, *args, **kwargs):
+        nonlocal failed_once
+        if path == legacy_path.name and not failed_once:
+            failed_once = True
+            raise OSError("synthetic cleanup interruption")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(snapshots.os, "unlink", fail_legacy_unlink_once)
+    with pytest.raises(OSError, match="synthetic cleanup interruption"):
+        ingest_sources(IngestSourcesRequest(workspace=workspace))
+    monkeypatch.setattr(snapshots.os, "unlink", original_unlink)
+
+    result = ingest_sources(IngestSourcesRequest(workspace=workspace))
+
+    assert result.skipped_count == 1
+    assert not legacy_path.exists()
+    with repository.connect() as conn:
+        rows = conn.execute(
+            "SELECT snapshot_path, extractor FROM source_snapshots WHERE source_id = ?",
+            (source_id,),
+        ).fetchall()
+    assert len(rows) == 1
+    assert rows[0]["extractor"] == "text-v2"
+    assert rows[0]["snapshot_path"] != str(legacy_path)
+
+
+def test_ingest_sources_migrates_legacy_snapshot_when_source_content_changed(tmp_path):
+    workspace, source_path, paths, repository, source_id, legacy_path = _legacy_snapshot_state(
+        tmp_path,
+        "old api_key=synthetic-placeholder",
+    )
+    source_path.write_text("new approved evidence", encoding="utf-8")
+
+    result = ingest_sources(IngestSourcesRequest(workspace=workspace))
+
+    assert result.ingested_count == 1
+    assert not legacy_path.exists()
+    with repository.connect() as conn:
+        rows = conn.execute(
+            "SELECT snapshot_path, extractor FROM source_snapshots WHERE source_id = ? ORDER BY id",
+            (source_id,),
+        ).fetchall()
+    assert len(rows) == 2
+    assert all(row["extractor"] == "text-v2" for row in rows)
+    assert all(row["snapshot_path"] != str(legacy_path) for row in rows)
+
+
+def test_ingest_sources_legacy_cleanup_does_not_follow_replaced_managed_directory(
+    tmp_path,
+    monkeypatch,
+):
+    workspace, _, paths, _, _, legacy_path = _legacy_snapshot_state(
+        tmp_path,
+        "api_key=synthetic-placeholder",
+    )
+    external_dir = tmp_path / "external"
+    external_dir.mkdir()
+    external_file = external_dir / legacy_path.name
+    external_file.write_text("external marker", encoding="utf-8")
+    original_dir = paths.local_snapshots_dir.with_name("local-original")
+    original_unlink = snapshots.os.unlink
+    swapped = False
+
+    def replace_directory_before_path_unlink(path, *args, **kwargs):
+        nonlocal swapped
+        if path == legacy_path.name and not swapped:
+            swapped = True
+            paths.local_snapshots_dir.rename(original_dir)
+            paths.local_snapshots_dir.symlink_to(external_dir, target_is_directory=True)
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(snapshots.os, "unlink", replace_directory_before_path_unlink)
+
+    with pytest.raises(OSError, match="managed snapshot directory changed"):
+        ingest_sources(IngestSourcesRequest(workspace=workspace))
+
+    assert external_file.read_text(encoding="utf-8") == "external marker"
+
+
+def _legacy_snapshot_state(tmp_path, text):
+    workspace = tmp_path / "workspace"
+    source_path = tmp_path / "note.txt"
+    source_path.write_text(text, encoding="utf-8")
+    paths = WorkspacePaths.from_root(workspace)
+    write_sample_approval(paths)
+    approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    approval["approved_source_uris"] = [source_path.resolve().as_uri()]
+    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    source_id = repository.upsert_source(
+        Source(
+            id=None,
+            type=SourceType.LOCAL_FILE,
+            uri=source_path.resolve().as_uri(),
+            display_name=source_path.name,
+            owner=None,
+            status=SourceStatus.APPROVED,
+        )
+    )
+    content_hash = hashlib.sha256(source_path.read_bytes()).hexdigest()
+    legacy_path = paths.local_snapshots_dir / f"source-{source_id}.json"
+    legacy_path.parent.mkdir(parents=True, exist_ok=True)
+    legacy_path.write_text(
+        json.dumps(
+            {
+                "source_id": source_id,
+                "source_uri": source_path.resolve().as_uri(),
+                "display_name": source_path.name,
+                "content_hash": content_hash,
+                "extractor": "text-v1",
+                "extracted_at": "2026-07-10T00:00:00Z",
+                "text": text,
+            }
+        ),
+        encoding="utf-8",
+    )
+    repository.insert_source_snapshot(source_id, legacy_path, content_hash, "text-v1")
+    return workspace, source_path, paths, repository, source_id, legacy_path
 
 
 def test_ingest_sources_repairs_stale_db_extractor_before_idempotent_skip(tmp_path):
