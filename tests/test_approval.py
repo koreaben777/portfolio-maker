@@ -2,6 +2,7 @@ import json
 
 import pytest
 
+import portfolio_maker.infrastructure.managed_files as managed_files
 from portfolio_maker.application.approval import (
     ApprovalFormatError,
     ApprovalMissingError,
@@ -30,18 +31,17 @@ def test_write_sample_approval_exclusively_preserves_concurrent_file(workspace, 
     paths = WorkspacePaths.from_root(workspace)
     paths.ensure()
     competing_payload = '{"approved_source_uris": ["file:///kept.txt"]}'
-    original_open = type(paths.approval_path).open
+    original_link = managed_files.os.link
     injected = False
 
-    def create_competing_file_before_open(path, mode="r", *args, **kwargs):
+    def create_competing_file_before_link(source, destination, *args, **kwargs):
         nonlocal injected
-        if path == paths.approval_path and mode in {"w", "x"} and not injected:
+        if destination == paths.approval_path.name and not injected:
             injected = True
-            with original_open(path, "w", encoding="utf-8") as competing:
-                competing.write(competing_payload)
-        return original_open(path, mode, *args, **kwargs)
+            paths.approval_path.write_text(competing_payload, encoding="utf-8")
+        return original_link(source, destination, *args, **kwargs)
 
-    monkeypatch.setattr(type(paths.approval_path), "open", create_competing_file_before_open)
+    monkeypatch.setattr(managed_files.os, "link", create_competing_file_before_link)
 
     with pytest.raises(ApprovalFormatError, match="already exists"):
         write_sample_approval(paths)
@@ -49,11 +49,39 @@ def test_write_sample_approval_exclusively_preserves_concurrent_file(workspace, 
     assert paths.approval_path.read_text(encoding="utf-8") == competing_payload
 
 
+def test_force_write_sample_approval_rejects_symlink_and_preserves_external_file(
+    workspace,
+    tmp_path,
+):
+    paths = WorkspacePaths.from_root(workspace)
+    paths.ensure()
+    external = tmp_path / "external-approval.json"
+    external.write_text('{"preserve": true}', encoding="utf-8")
+    paths.approval_path.symlink_to(external)
+
+    with pytest.raises(OSError, match="regular file"):
+        write_sample_approval(paths, force=True)
+
+    assert external.read_text(encoding="utf-8") == '{"preserve": true}'
+
+
 def test_load_approval_missing_file_fails_closed(workspace):
     paths = WorkspacePaths.from_root(workspace)
 
     with pytest.raises(ApprovalMissingError):
         load_approval(paths)
+
+
+def test_load_approval_maps_invalid_utf8_to_format_error_without_modifying_file(workspace):
+    paths = WorkspacePaths.from_root(workspace)
+    paths.ensure()
+    damaged = b"\xff\xfe"
+    paths.approval_path.write_bytes(damaged)
+
+    with pytest.raises(ApprovalFormatError, match="invalid UTF-8"):
+        load_approval(paths)
+
+    assert paths.approval_path.read_bytes() == damaged
 
 
 def test_load_approval_reads_valid_payload(workspace):

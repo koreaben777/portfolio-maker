@@ -19,6 +19,7 @@ from portfolio_maker.application.models import (
 )
 from portfolio_maker.infrastructure.github_connector import GitHubDiscoveryError
 from portfolio_maker.infrastructure.local_discovery import DiscoveryRootError
+from portfolio_maker.infrastructure.sqlite_repository import RepositoryError
 from portfolio_maker.workspace import WorkspacePaths
 
 
@@ -64,6 +65,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         DiscoveryRootError,
         GitHubDiscoveryError,
         ProfileFormatError,
+        RepositoryError,
         json.JSONDecodeError,
         OSError,
     ) as error:

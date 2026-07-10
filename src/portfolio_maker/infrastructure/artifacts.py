@@ -4,14 +4,15 @@ import json
 from pathlib import Path
 from typing import Any
 
+from portfolio_maker.infrastructure.managed_files import write_managed_text
+
 
 def write_json(path: Path, payload: dict[str, Any]) -> Path:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    return path
+    return write_managed_text(
+        path,
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+    )
 
 
 def write_markdown(path: Path, content: str) -> Path:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8")
-    return path
+    return write_managed_text(path, content)

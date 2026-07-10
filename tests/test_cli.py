@@ -87,6 +87,98 @@ def test_cli_ingest_non_object_approval_exits_without_traceback(workspace, capsy
     assert "Traceback" not in captured.err
 
 
+def test_cli_ingest_invalid_utf8_approval_exits_cleanly_and_preserves_state(workspace, capsys):
+    approval_path = workspace / ".portfolio-maker" / "reviews" / "source-approval.json"
+    approval_path.parent.mkdir(parents=True)
+    damaged = b"\xff\xfe"
+    approval_path.write_bytes(damaged)
+
+    exit_code = main(["ingest", "--workspace", str(workspace)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "invalid UTF-8" in captured.err
+    assert "repair or replace" in captured.err.casefold()
+    assert "Traceback" not in captured.err
+    assert approval_path.read_bytes() == damaged
+
+
+def test_cli_ingest_invalid_json_approval_exits_cleanly_and_preserves_state(workspace, capsys):
+    approval_path = workspace / ".portfolio-maker" / "reviews" / "source-approval.json"
+    approval_path.parent.mkdir(parents=True)
+    damaged = b"{invalid-json"
+    approval_path.write_bytes(damaged)
+
+    exit_code = main(["ingest", "--workspace", str(workspace)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "invalid JSON" in captured.err
+    assert "repair or replace" in captured.err.casefold()
+    assert "Traceback" not in captured.err
+    assert approval_path.read_bytes() == damaged
+
+
+def test_cli_discover_invalid_sqlite_exits_cleanly_and_preserves_state(
+    workspace,
+    tmp_path,
+    capsys,
+):
+    database_path = workspace / ".portfolio-maker" / "portfolio.db"
+    database_path.parent.mkdir(parents=True)
+    damaged = b"not-a-sqlite-database"
+    database_path.write_bytes(damaged)
+    home = tmp_path / "home"
+    home.mkdir()
+
+    exit_code = main(
+        [
+            "discover",
+            "--workspace",
+            str(workspace),
+            "--home",
+            str(home),
+            "--no-github",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "database" in captured.err.casefold()
+    assert "repair or replace" in captured.err.casefold()
+    assert "Traceback" not in captured.err
+    assert database_path.read_bytes() == damaged
+
+
+def test_cli_discover_skips_self_referential_symlink_and_keeps_valid_candidate(
+    workspace,
+    tmp_path,
+    capsys,
+):
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "valid.md").write_text("valid evidence", encoding="utf-8")
+    (home / "loop.md").symlink_to("loop.md")
+
+    exit_code = main(
+        [
+            "discover",
+            "--workspace",
+            str(workspace),
+            "--home",
+            str(home),
+            "--no-github",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    report = workspace / ".portfolio-maker" / "reviews" / "discovery-report.md"
+    assert exit_code == 0
+    assert "Traceback" not in captured.err
+    assert "valid.md" in report.read_text(encoding="utf-8")
+    assert "skipped_unresolvable" in report.read_text(encoding="utf-8")
+
+
 def test_cli_discover_missing_root_exits_without_traceback(workspace, tmp_path, capsys):
     exit_code = main(
         [

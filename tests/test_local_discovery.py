@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from portfolio_maker.application.discovery import discover_sources
 from portfolio_maker.application.models import DiscoverSourcesRequest
 from portfolio_maker.domain.models import SourceStatus, SourceType
@@ -10,6 +12,7 @@ from portfolio_maker.infrastructure.github_connector import (
     GitHubRepositoryCandidate,
 )
 from portfolio_maker.infrastructure.local_discovery import discover_local_candidates
+from portfolio_maker.infrastructure.local_discovery import DiscoveryRootError
 from portfolio_maker.infrastructure.sqlite_repository import SQLiteRepository
 from portfolio_maker.workspace import WorkspacePaths
 
@@ -77,6 +80,32 @@ def test_discover_local_candidates_respects_zero_max_candidates(tmp_path):
     assert skipped == []
 
 
+def test_discover_local_candidates_maps_unresolvable_root_to_controlled_error(tmp_path):
+    loop = tmp_path / "loop"
+    loop.symlink_to("loop")
+
+    with pytest.raises(DiscoveryRootError, match="cannot be resolved"):
+        discover_local_candidates(loop)
+
+
+def test_discover_local_candidates_deduplicates_canonical_uri_before_cap(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    original = home / "a-original.md"
+    alias = home / "b-alias.md"
+    distinct = home / "c-distinct.md"
+    original.write_text("original", encoding="utf-8")
+    alias.symlink_to(original)
+    distinct.write_text("distinct", encoding="utf-8")
+
+    candidates, _ = discover_local_candidates(home, max_candidates=2)
+
+    assert [candidate.uri for candidate in candidates] == [
+        original.resolve().as_uri(),
+        distinct.resolve().as_uri(),
+    ]
+
+
 def test_discover_local_candidates_uses_contract_skip_reasons_for_oversize_and_oserror(tmp_path, monkeypatch):
     home = tmp_path / "home"
     home.mkdir()
@@ -131,6 +160,42 @@ def test_discover_sources_writes_report_and_persists_local_files(tmp_path):
     assert "may be incomplete" in report
 
 
+def test_discover_sources_rejects_report_symlink_and_preserves_external_file(tmp_path):
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    home.mkdir()
+    paths = WorkspacePaths.from_root(workspace)
+    paths.ensure()
+    external = tmp_path / "external-report.md"
+    external.write_text("external marker", encoding="utf-8")
+    paths.discovery_report_path.symlink_to(external)
+
+    with pytest.raises(OSError, match="regular file"):
+        discover_sources(
+            DiscoverSourcesRequest(workspace=workspace, home=home, include_github=False)
+        )
+
+    assert external.read_text(encoding="utf-8") == "external marker"
+
+
+def test_discovery_normalizes_control_characters_and_markdown_in_local_label(tmp_path):
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    home.mkdir()
+    source = home / "safe\n## Forged.md"
+    source.write_text("evidence", encoding="utf-8")
+
+    result = discover_sources(
+        DiscoverSourcesRequest(workspace=workspace, home=home, include_github=False)
+    )
+
+    report = result.report_path.read_text(encoding="utf-8")
+    repository = SQLiteRepository(WorkspacePaths.from_root(workspace).db_path)
+    assert "\n## Forged" not in report
+    assert "\\#\\# Forged" in report
+    assert "\n" not in repository.list_sources()[0].display_name
+
+
 def test_discover_sources_redacts_policy_skipped_paths_in_report(tmp_path):
     home = tmp_path / "home"
     workspace = tmp_path / "workspace"
@@ -178,7 +243,7 @@ def test_discover_sources_includes_github_candidates(workspace, tmp_path, monkey
                     repo="octo/demo",
                     activity_type="pull_request",
                     url="https://github.com/octo/demo/pull/1",
-                    title="Add RAG ingestion",
+                    title="Add RAG\n## Forged",
                     state="MERGED",
                     author="octo",
                     created_at="2026-01-01T00:00:00Z",
@@ -216,7 +281,8 @@ def test_discover_sources_includes_github_candidates(workspace, tmp_path, monkey
     assert result.discovered_count == 2
     assert activity["source_id"] == repo_source.id
     assert "octo/demo" in report
-    assert "Add RAG ingestion" in report
+    assert "\n## Forged" not in report
+    assert "Add RAG \\#\\# Forged" in report
 
 
 def test_discover_sources_keeps_local_report_when_github_fails(workspace, tmp_path, monkeypatch):

@@ -125,13 +125,13 @@ These are documented `0.1.0` product boundaries, not remaining reviewer improvem
 
 ## Publication State
 
-Publication is approved by the final PASS result. The intended GitHub destination is `koreaben777/portfolio-maker`, with this branch to be published as `main`.
+Version `0.1.0` was published to `koreaben777/portfolio-maker`; `origin/main` was verified at `473f5c045b24f7703c48fa6438ec9dba63ff058f`.
 
 The repository publication should include:
 
 - Portfolio Maker `0.1.0` source, tests, README, architecture specs, plan, and handoff documents.
 - The `portfolio-maker` Codex skill.
 - The reusable `team-based-review-loop` skill.
-- The complete in-repository review reports through Loop 10 and this final report.
+- The available in-repository review reports through Loop 10 and this final report.
 
 Local `.codex-fable5/` runtime state and generated user data under `.portfolio-maker/` are excluded from publication.

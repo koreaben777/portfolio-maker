@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from portfolio_maker.infrastructure.policy import FilePolicy
+from portfolio_maker.infrastructure.presentation import normalize_label
 
 
 TEXT_EXTENSIONS = {".md", ".txt", ".py", ".js", ".ts", ".tsx", ".json", ".yaml", ".yml", ".toml"}
@@ -35,8 +36,12 @@ def discover_local_candidates(
     policy = FilePolicy(forbidden_paths=forbidden_paths)
     candidates: list[LocalCandidate] = []
     skipped: list[SkippedPath] = []
+    seen_uris: set[str] = set()
 
-    home_resolved = home.resolve(strict=False)
+    try:
+        home_resolved = home.resolve(strict=False)
+    except (OSError, RuntimeError) as error:
+        raise DiscoveryRootError(f"Discovery root cannot be resolved: {home}") from error
     if not home_resolved.exists():
         raise DiscoveryRootError(f"Discovery root does not exist: {home}")
     if not home_resolved.is_dir():
@@ -51,17 +56,33 @@ def discover_local_candidates(
 
     def record_permission_error(error: OSError) -> None:
         filename = error.filename
-        skipped_path = Path(filename).resolve(strict=False) if filename else home_resolved
+        if not filename:
+            skipped.append(SkippedPath(home_resolved, "skipped_permission_denied"))
+            return
+        path = Path(filename)
+        try:
+            skipped_path = path.resolve(strict=False)
+        except RuntimeError:
+            skipped.append(SkippedPath(path.absolute(), "skipped_unresolvable"))
+            return
+        except OSError:
+            skipped_path = path.absolute()
         skipped.append(SkippedPath(skipped_path, "skipped_permission_denied"))
 
     for root, dirs, files in os.walk(home_resolved, topdown=True, onerror=record_permission_error):
+        dirs.sort()
+        files.sort()
         for dirname in dirs[:]:
             path = Path(root) / dirname
             try:
                 resolved = path.resolve()
                 classification = policy.classify_path(resolved)
+            except RuntimeError:
+                skipped.append(SkippedPath(path.absolute(), "skipped_unresolvable"))
+                dirs.remove(dirname)
+                continue
             except OSError:
-                skipped.append(SkippedPath(path.resolve(strict=False), "skipped_permission_denied"))
+                skipped.append(SkippedPath(path.absolute(), "skipped_permission_denied"))
                 dirs.remove(dirname)
                 continue
             if classification != "candidate":
@@ -82,13 +103,22 @@ def discover_local_candidates(
                 if resolved.stat().st_size > policy.max_file_size_bytes:
                     skipped.append(SkippedPath(resolved, "skipped_policy"))
                     continue
-                candidates.append(LocalCandidate(resolved, resolved.as_uri(), resolved.name))
+                uri = resolved.as_uri()
+                if uri in seen_uris:
+                    skipped.append(SkippedPath(resolved, "duplicate"))
+                    continue
+                seen_uris.add(uri)
+                candidates.append(
+                    LocalCandidate(resolved, uri, normalize_label(resolved.name))
+                )
                 if len(candidates) >= max_candidates:
                     return candidates, skipped
+            except RuntimeError:
+                skipped.append(SkippedPath(path.absolute(), "skipped_unresolvable"))
             except OSError:
                 try:
                     skipped_path = path.resolve(strict=False)
-                except OSError:
+                except (OSError, RuntimeError):
                     skipped_path = path.absolute()
                 skipped.append(SkippedPath(skipped_path, "skipped_permission_denied"))
 

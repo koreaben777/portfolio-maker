@@ -6,6 +6,7 @@ import sqlite3
 from pathlib import Path
 
 from portfolio_maker.domain.models import GitHubActivity, Source, SourceStatus, SourceType
+from portfolio_maker.infrastructure.managed_files import ensure_managed_directory
 
 
 SCHEMA = """
@@ -46,16 +47,26 @@ CREATE TABLE IF NOT EXISTS github_activities (
 """
 
 
+class RepositoryError(RuntimeError):
+    pass
+
+
 class SQLiteRepository:
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
 
     def connect(self) -> sqlite3.Connection:
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(self.db_path)
-        conn.execute("PRAGMA foreign_keys = ON")
-        conn.row_factory = sqlite3.Row
-        return conn
+        ensure_managed_directory(self.db_path.parent)
+        conn: sqlite3.Connection | None = None
+        try:
+            conn = sqlite3.connect(self.db_path)
+            conn.execute("PRAGMA foreign_keys = ON")
+            conn.row_factory = sqlite3.Row
+            return conn
+        except sqlite3.Error as error:
+            if conn is not None:
+                conn.close()
+            raise self._controlled_error() from error
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
@@ -63,8 +74,16 @@ class SQLiteRepository:
         try:
             with conn:
                 yield conn
+        except sqlite3.Error as error:
+            raise self._controlled_error() from error
         finally:
             conn.close()
+
+    def _controlled_error(self) -> RepositoryError:
+        return RepositoryError(
+            f"Portfolio database is invalid or unavailable: {self.db_path}. "
+            "Repair or replace the damaged database, then rerun the command"
+        )
 
     def initialize(self) -> None:
         with self._connection() as conn:

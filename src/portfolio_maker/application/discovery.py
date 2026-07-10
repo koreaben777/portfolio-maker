@@ -9,7 +9,9 @@ from portfolio_maker.infrastructure.github_connector import (
     GitHubRepositoryCandidate,
     discover_github_candidates,
 )
+from portfolio_maker.infrastructure.artifacts import write_markdown
 from portfolio_maker.infrastructure.local_discovery import LocalCandidate, SkippedPath, discover_local_candidates
+from portfolio_maker.infrastructure.presentation import markdown_text, normalize_label
 from portfolio_maker.infrastructure.sqlite_repository import SQLiteRepository
 from portfolio_maker.workspace import WorkspacePaths
 
@@ -84,9 +86,9 @@ def discover_sources(request: DiscoverSourcesRequest) -> DiscoverSourcesResult:
                 )
             )
 
-    paths.discovery_report_path.write_text(
+    write_markdown(
+        paths.discovery_report_path,
         _render_report(candidates, skipped, github_repos, github_activities, github_statuses),
-        encoding="utf-8",
     )
     discovered_count = len(candidates) + len(github_repos) + len(github_activities)
 
@@ -119,21 +121,30 @@ def _render_report(
         "## Local candidates",
     ]
     for candidate in candidates:
-        lines.append(f"- {candidate.display_name}: {candidate.uri}")
+        lines.append(
+            f"- {markdown_text(candidate.display_name)}: {normalize_label(candidate.uri)}"
+        )
     lines.extend(["", "## GitHub Repositories"])
     for repo in github_repos:
         visibility = "private" if repo.is_private else "public"
-        lines.append(f"- `{repo.name_with_owner}` ({visibility}): {repo.url}")
+        lines.append(
+            f"- `{markdown_text(repo.name_with_owner)}` ({visibility}): "
+            f"{normalize_label(repo.url)}"
+        )
     lines.extend(["", "## GitHub Activities"])
     for activity in github_activities:
-        lines.append(f"- `{activity.activity_type}` `{activity.repo}`: {activity.title} {activity.url}")
+        lines.append(
+            f"- `{markdown_text(activity.activity_type)}` `{markdown_text(activity.repo)}`: "
+            f"{markdown_text(activity.title)} {normalize_label(activity.url)}"
+        )
     if github_statuses:
         lines.extend(["", "## GitHub Status"])
         for status in github_statuses:
-            lines.append(f"- GitHub discovery failed: {status}")
+            lines.append(f"- GitHub discovery failed: {markdown_text(status)}")
     lines.extend(["", "## Skipped"])
     for item in skipped:
         path = "[redacted]" if item.reason in {"forbidden", "skipped_policy"} else item.path
-        lines.append(f"- {item.reason}: {path}")
+        rendered_path = str(path) if path == "[redacted]" else markdown_text(str(path))
+        lines.append(f"- {item.reason}: {rendered_path}")
     lines.append("")
     return "\n".join(lines)

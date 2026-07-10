@@ -309,7 +309,59 @@ def test_discover_github_candidates_rejects_malformed_repository_payload(monkeyp
 def test_parse_commit_list_handles_empty_commit_message():
     activities = parse_commit_list(
         "octo/demo",
-        [{"commit": {"message": "", "author": {}}}],
+        [
+            {
+                "html_url": "https://github.com/octo/demo/commit/synthetic",
+                "commit": {"message": "", "author": {}},
+            }
+        ],
     )
 
     assert activities[0].title == ""
+
+
+@pytest.mark.parametrize("html_url", (None, ""))
+def test_parse_commit_list_requires_nonempty_stable_url(html_url):
+    item = {
+        "commit": {"message": "Synthetic commit", "author": {}},
+    }
+    if html_url is not None:
+        item["html_url"] = html_url
+
+    with pytest.raises(GitHubDiscoveryError, match="commit list payload is invalid"):
+        parse_commit_list("octo/demo", [item])
+
+
+def test_discover_github_candidates_isolates_commit_without_stable_url(monkeypatch):
+    def fake_run_gh_json(args):
+        if args[:2] == ["repo", "list"]:
+            return [
+                {
+                    "nameWithOwner": "octo/demo",
+                    "url": "https://github.com/octo/demo",
+                    "isPrivate": False,
+                }
+            ]
+        if args == ["api", "repos/octo/demo/commits"]:
+            return [{"commit": {"message": "Synthetic commit", "author": {}}}]
+        if args[:2] in (["pr", "list"], ["issue", "list"]):
+            return []
+        if args == ["api", "repos/octo/demo/pulls/comments"]:
+            return []
+        if args == ["api", "repos/octo/demo/actions/runs"]:
+            return {"workflow_runs": []}
+        raise AssertionError(args)
+
+    monkeypatch.setattr(
+        "portfolio_maker.infrastructure.github_connector.run_gh_json",
+        fake_run_gh_json,
+    )
+
+    repos, activities, statuses = discover_github_candidates()
+
+    assert [repo.name_with_owner for repo in repos] == ["octo/demo"]
+    assert activities == []
+    assert statuses == [
+        "GitHub commits discovery failed for octo/demo: "
+        "GitHub commit list payload is invalid"
+    ]

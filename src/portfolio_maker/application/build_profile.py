@@ -6,6 +6,8 @@ from portfolio_maker.domain.models import Source, SourceStatus, SourceType
 from portfolio_maker.infrastructure.artifacts import write_json, write_markdown
 from portfolio_maker.infrastructure.extractors import extract_approved_text
 from portfolio_maker.infrastructure.policy import FilePolicy, SourcePathPolicyError
+from portfolio_maker.infrastructure.managed_files import remove_managed_file
+from portfolio_maker.infrastructure.presentation import markdown_text, normalize_label
 from portfolio_maker.infrastructure.sqlite_repository import SQLiteRepository
 from portfolio_maker.infrastructure.snapshots import load_valid_local_snapshot
 from portfolio_maker.workspace import WorkspacePaths
@@ -57,15 +59,17 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
         if snapshot is None:
             repository.update_source_status(source.id, SourceStatus.STALE_SOURCE)
             continue
-        evidence = _snapshot_evidence(source.display_name, str(snapshot["text"]))
+        display_name = normalize_label(source.display_name)
+        evidence = _snapshot_evidence(display_name, str(snapshot["text"]))
         if evidence is None:
             continue
+        evidence = normalize_label(evidence)
 
         sources.append(source)
         claims.append(
             {
                 "claim_type": "project_evidence",
-                "text": f"{source.display_name}: {evidence}",
+                "text": f"{display_name}: {evidence}",
                 "confidence": "medium",
                 "public_safe": False,
                 "evidence_uri": source.uri,
@@ -80,7 +84,7 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
                 "id": source.id,
                 "type": source.type.value,
                 "uri": source.uri,
-                "display_name": source.display_name,
+                "display_name": normalize_label(source.display_name),
                 "owner": source.owner,
                 "status": source.status.value,
             }
@@ -90,9 +94,13 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
     }
 
     write_json(paths.master_profile_json_path, payload)
-    source_lines = [f"- {source.display_name} ({source.type.value})" for source in sources]
+    source_lines = [
+        f"- {markdown_text(source.display_name)} ({markdown_text(source.type.value)})"
+        for source in sources
+    ]
     claim_lines = [
-        f"- {claim['text']} ({claim['confidence']})\n  Evidence: {claim['evidence_uri']}"
+        f"- {markdown_text(str(claim['text']))} ({markdown_text(str(claim['confidence']))})"
+        f"\n  Evidence: {markdown_text(str(claim['evidence_uri']))}"
         for claim in claims
     ]
     write_markdown(
@@ -106,6 +114,7 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
         )
         + "\n",
     )
+    remove_managed_file(paths.portfolio_draft_path, missing_ok=True)
     return BuildProfileResult(
         json_path=paths.master_profile_json_path,
         markdown_path=paths.master_profile_md_path,

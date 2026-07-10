@@ -94,7 +94,7 @@ def parse_commit_list(repo: str, payload: Any) -> list[GitHubActivityCandidate]:
             GitHubActivityCandidate(
                 repo=repo,
                 activity_type="commit",
-                url=_optional_string(item, "html_url", "commit list") or "",
+                url=_required_nonempty_string(item, "html_url", "commit list"),
                 title=message.splitlines()[0] if message else "",
                 state="committed",
                 author=_optional_string(author, "name", "commit list") or "",
@@ -247,6 +247,13 @@ def _object(value: Any, label: str) -> dict[str, Any]:
 def _required_string(item: dict[str, Any], key: str, label: str) -> str:
     value = item.get(key)
     if not isinstance(value, str):
+        raise GitHubDiscoveryError(f"GitHub {label} payload is invalid")
+    return value
+
+
+def _required_nonempty_string(item: dict[str, Any], key: str, label: str) -> str:
+    value = _required_string(item, key, label)
+    if not value.strip():
         raise GitHubDiscoveryError(f"GitHub {label} payload is invalid")
     return value
 

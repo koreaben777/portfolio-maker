@@ -177,6 +177,19 @@ def test_build_profile_excludes_ingested_source_after_approval_revoked(tmp_path)
     assert source_path.name not in portfolio_result.markdown_path.read_text(encoding="utf-8")
 
 
+def test_build_profile_invalidates_existing_portfolio_after_approval_revoked(tmp_path):
+    workspace, source_path, paths = _ingest_approved_source(tmp_path)
+    draft_portfolio(DraftPortfolioRequest(workspace=workspace))
+    assert source_path.name in paths.portfolio_draft_path.read_text(encoding="utf-8")
+    approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    approval["approved_source_uris"] = []
+    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+
+    build_profile(BuildProfileRequest(workspace=workspace))
+
+    assert not paths.portfolio_draft_path.exists()
+
+
 def test_build_profile_excludes_ingested_source_under_new_forbidden_path(tmp_path):
     workspace, source_path, paths = _ingest_approved_source(tmp_path)
     approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
@@ -350,6 +363,22 @@ def test_draft_portfolio_masks_timestamped_password_export_display_name(tmp_path
     assert "chrome_passwords_20260710.csv" not in draft
     assert "firefox_logins_20260710.json" not in draft
     assert "[REDACTED]" in draft
+
+
+def test_draft_portfolio_normalizes_control_characters_and_markdown_label(tmp_path, monkeypatch):
+    paths = WorkspacePaths.from_root(tmp_path / "workspace")
+    paths.ensure()
+    paths.master_profile_json_path.write_text(
+        json.dumps({"sources": [{"display_name": "safe\n## Forged"}]}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(draft_portfolio_module, "build_profile", lambda request: None)
+
+    draft_portfolio_module.draft_portfolio(DraftPortfolioRequest(workspace=paths.workspace))
+
+    draft = paths.portfolio_draft_path.read_text(encoding="utf-8")
+    assert "\n## Forged" not in draft
+    assert "\\#\\# Forged" in draft
 
 
 def test_build_profile_rejects_snapshot_with_stale_db_extractor_metadata(tmp_path):

@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from portfolio_maker.infrastructure.managed_files import ensure_managed_directory
+
 
 @dataclass(frozen=True)
 class WorkspacePaths:
@@ -53,4 +55,4 @@ class WorkspacePaths:
             self.artifacts_dir,
             self.reviews_dir,
         ):
-            path.mkdir(parents=True, exist_ok=True)
+            ensure_managed_directory(path)

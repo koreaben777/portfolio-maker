@@ -5,8 +5,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from portfolio_maker.workspace import WorkspacePaths
 from portfolio_maker.infrastructure.github_connector import canonical_repository_name
+from portfolio_maker.infrastructure.managed_files import read_managed_bytes, write_managed_text
+from portfolio_maker.workspace import WorkspacePaths
 
 
 class ApprovalMissingError(RuntimeError):
@@ -38,24 +39,31 @@ def sample_approval_payload() -> dict[str, Any]:
 def write_sample_approval(paths: WorkspacePaths, force: bool = False) -> Path:
     paths.ensure()
     payload = json.dumps(sample_approval_payload(), indent=2) + "\n"
-    if force:
-        paths.approval_path.write_text(payload, encoding="utf-8")
-        return paths.approval_path
     try:
-        with paths.approval_path.open("x", encoding="utf-8") as approval_file:
-            approval_file.write(payload)
+        return write_managed_text(paths.approval_path, payload, overwrite=force)
     except FileExistsError as error:
         raise ApprovalFormatError(
             f"Approval file already exists: {paths.approval_path}. Use --force to reset it"
         ) from error
-    return paths.approval_path
 
 
 def load_approval(paths: WorkspacePaths) -> SourceApproval:
-    if not paths.approval_path.exists():
+    try:
+        raw_payload = read_managed_bytes(paths.approval_path)
+    except FileNotFoundError:
         raise ApprovalMissingError(f"Approval file missing: {paths.approval_path}")
-
-    payload = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    try:
+        payload = json.loads(raw_payload.decode("utf-8"))
+    except UnicodeDecodeError as error:
+        raise ApprovalFormatError(
+            f"Approval file has invalid UTF-8: {paths.approval_path}. "
+            "Repair or replace the damaged approval file"
+        ) from error
+    except json.JSONDecodeError as error:
+        raise ApprovalFormatError(
+            f"Approval file has invalid JSON: {paths.approval_path}. "
+            "Repair or replace the damaged approval file"
+        ) from error
     if not isinstance(payload, dict):
         raise ApprovalFormatError("approval payload must be an object")
     version = payload.get("version", 1)

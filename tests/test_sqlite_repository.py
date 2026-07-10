@@ -1,9 +1,7 @@
-import sqlite3
-
 import pytest
 
 from portfolio_maker.domain.models import GitHubActivity, Source, SourceStatus, SourceType
-from portfolio_maker.infrastructure.sqlite_repository import SQLiteRepository
+from portfolio_maker.infrastructure.sqlite_repository import RepositoryError, SQLiteRepository
 from portfolio_maker.workspace import WorkspacePaths
 
 
@@ -60,8 +58,8 @@ def test_sqlite_repository_enforces_foreign_keys(workspace):
     repository = SQLiteRepository(paths.db_path)
     repository.initialize()
 
-    with repository._connection() as conn:
-        with pytest.raises(sqlite3.IntegrityError):
+    with pytest.raises(RepositoryError):
+        with repository._connection() as conn:
             conn.execute(
                 """
                 INSERT INTO source_snapshots (
