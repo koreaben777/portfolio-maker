@@ -134,6 +134,10 @@ gh auth login
 
 권한이 없는 경로는 건너뛰고 보고서에 기록됩니다. 민감한 폴더는 `.portfolio-maker/reviews/source-approval.json`의 `forbidden_paths`에 추가하세요.
 
+### 데이터베이스 복구
+
+CLI가 안전하지 않은 관리 데이터베이스 경로를 보고하면 먼저 `.portfolio-maker/`를 보존하거나 백업하세요. 보고된 `portfolio.db` 또는 SQLite sidecar 항목은 직접 확인한 뒤에만 제거하고, 그다음 명령을 다시 실행하세요. 데이터베이스 손상 메시지가 나오면 `portfolio.db`를 복구하거나 교체하기 전에 작업 공간 상태를 먼저 보존하세요.
+
 ### GitHub rate limit 또는 탐색 실패
 
 GitHub 탐색 실패는 로컬 파일 탐색을 멈추지 않고 탐색 보고서에 기록됩니다. 제한이 해제된 뒤 다시 시도하거나 `--no-github` 옵션으로 GitHub 탐색을 끌 수 있습니다.

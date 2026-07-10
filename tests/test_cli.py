@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import sqlite3
+
 from portfolio_maker.adapters.cli import main
+from portfolio_maker.workspace import WorkspacePaths
 
 
 def test_cli_discover_command_creates_report(workspace, tmp_path):
@@ -148,6 +151,74 @@ def test_cli_discover_invalid_sqlite_exits_cleanly_and_preserves_state(
     assert "repair or replace" in captured.err.casefold()
     assert "Traceback" not in captured.err
     assert database_path.read_bytes() == damaged
+
+
+def test_cli_discover_unsafe_database_path_preserves_state_without_corruption_advice(
+    workspace,
+    tmp_path,
+    capsys,
+):
+    database_path = workspace / ".portfolio-maker" / "portfolio.db"
+    database_path.parent.mkdir(parents=True)
+    external = tmp_path / "external.db"
+    external.write_bytes(b"external marker")
+    database_path.symlink_to(external)
+    home = tmp_path / "home"
+    home.mkdir()
+
+    exit_code = main(
+        [
+            "discover",
+            "--workspace",
+            str(workspace),
+            "--home",
+            str(home),
+            "--no-github",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "Unsafe managed database path: portfolio.db" in captured.err
+    assert "preserve or back up" in captured.err.casefold()
+    assert "repair or replace" not in captured.err.casefold()
+    assert "Traceback" not in captured.err
+    assert external.read_bytes() == b"external marker"
+
+
+def test_cli_ingest_invalid_enum_row_exits_without_traceback(workspace, capsys):
+    paths = WorkspacePaths.from_root(workspace)
+    paths.ensure()
+    paths.approval_path.write_text("{}", encoding="utf-8")
+    with sqlite3.connect(paths.db_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE sources (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                type TEXT NOT NULL,
+                uri TEXT NOT NULL UNIQUE,
+                display_name TEXT NOT NULL,
+                owner TEXT,
+                status TEXT NOT NULL,
+                discovered_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                approved_at TEXT
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO sources (type, uri, display_name, owner, status)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            ("local_file", "file:///invalid.md", "invalid.md", None, "invalid-status"),
+        )
+
+    exit_code = main(["ingest", "--workspace", str(workspace)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "stored data is invalid" in captured.err
+    assert "Traceback" not in captured.err
 
 
 def test_cli_discover_skips_self_referential_symlink_and_keeps_valid_candidate(

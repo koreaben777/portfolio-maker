@@ -11,11 +11,19 @@ _DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK
 
 def ensure_managed_directory(path: Path) -> None:
     descriptor = _open_directory(path, create=True)
-    os.close(descriptor)
+    try:
+        os.fchmod(descriptor, 0o700)
+    finally:
+        os.close(descriptor)
+
+
+def open_managed_directory(path: Path, *, create: bool = False) -> int:
+    return _open_directory(path, create=create)
 
 
 def write_managed_text(path: Path, content: str, *, overwrite: bool = True) -> Path:
-    directory_descriptor = _open_directory(path.parent, create=True)
+    ensure_managed_directory(path.parent)
+    directory_descriptor = _open_directory(path.parent, create=False)
     temporary_name = f".{path.name}.{os.getpid()}.{uuid4().hex}.tmp"
     try:
         _validate_filename(path.name)

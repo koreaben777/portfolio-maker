@@ -1,3 +1,8 @@
+import os
+import sqlite3
+from pathlib import Path
+from stat import S_IMODE
+
 import pytest
 
 from portfolio_maker.domain.models import GitHubActivity, Source, SourceStatus, SourceType
@@ -240,3 +245,246 @@ def test_sqlite_repository_upserts_github_activity_by_repo_type_and_url(workspac
         rows = conn.execute("SELECT id, title FROM github_activities").fetchall()
     assert second_id == first_id
     assert [(row["id"], row["title"]) for row in rows] == [(first_id, "Updated title")]
+
+
+def test_sqlite_repository_creates_private_unlinked_database_and_upgrades_permissions(workspace):
+    paths = WorkspacePaths.from_root(workspace)
+    paths.root.mkdir(parents=True)
+    paths.root.chmod(0o755)
+    repository = SQLiteRepository(paths.db_path)
+
+    repository.initialize()
+
+    assert S_IMODE(paths.root.stat().st_mode) == 0o700
+    assert S_IMODE(paths.db_path.stat().st_mode) == 0o600
+    assert paths.db_path.stat().st_nlink == 1
+
+
+@pytest.mark.parametrize("alias_kind", ("symlink", "hardlink", "directory", "fifo"))
+def test_sqlite_repository_rejects_unsafe_main_database_entry(
+    workspace,
+    tmp_path,
+    alias_kind,
+):
+    paths = WorkspacePaths.from_root(workspace)
+    paths.ensure()
+    external = tmp_path / "external.db"
+    sqlite3.connect(external).close()
+    if alias_kind == "symlink":
+        paths.db_path.symlink_to(external)
+    elif alias_kind == "hardlink":
+        os.link(external, paths.db_path)
+    elif alias_kind == "directory":
+        paths.db_path.mkdir()
+    else:
+        os.mkfifo(paths.db_path)
+
+    with pytest.raises(RepositoryError, match="Unsafe managed database path: portfolio.db"):
+        SQLiteRepository(paths.db_path).initialize()
+
+    assert external.stat().st_size == 0
+
+
+@pytest.mark.parametrize(
+    ("suffix", "alias_kind"),
+    [
+        (suffix, alias_kind)
+        for suffix in ("-journal", "-wal", "-shm")
+        for alias_kind in ("symlink", "hardlink", "directory", "fifo")
+    ],
+)
+def test_sqlite_repository_rejects_unsafe_database_sidecars_before_write(
+    workspace,
+    tmp_path,
+    suffix,
+    alias_kind,
+):
+    paths = WorkspacePaths.from_root(workspace)
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    sidecar = paths.db_path.with_name(paths.db_path.name + suffix)
+    external = tmp_path / f"external{suffix}"
+    external.write_bytes(b"external sidecar marker")
+    if alias_kind == "symlink":
+        sidecar.symlink_to(external)
+    elif alias_kind == "hardlink":
+        os.link(external, sidecar)
+    elif alias_kind == "directory":
+        sidecar.mkdir()
+    else:
+        os.mkfifo(sidecar)
+
+    with pytest.raises(RepositoryError, match=f"Unsafe managed database path: portfolio.db{suffix}"):
+        repository.upsert_source(
+            Source(
+                id=None,
+                type=SourceType.LOCAL_FILE,
+                uri="file:///safe.md",
+                display_name="safe.md",
+                owner=None,
+                status=SourceStatus.DISCOVERED,
+            )
+        )
+
+    assert external.read_bytes() == b"external sidecar marker"
+
+
+def test_sqlite_repository_accepts_normal_persisted_wal_and_shm_sidecars(workspace):
+    paths = WorkspacePaths.from_root(workspace)
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    writer = sqlite3.connect(paths.db_path)
+    try:
+        writer.execute("PRAGMA journal_mode=WAL")
+        writer.execute("CREATE TABLE wal_marker (value TEXT)")
+        writer.commit()
+        assert paths.db_path.with_name("portfolio.db-wal").exists()
+        assert paths.db_path.with_name("portfolio.db-shm").exists()
+
+        assert "sources" in repository.table_names()
+    finally:
+        writer.close()
+
+
+def test_sqlite_repository_rejects_main_replacement_before_connect(workspace, tmp_path, monkeypatch):
+    paths = WorkspacePaths.from_root(workspace)
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    replacement = tmp_path / "replacement.db"
+    sqlite3.connect(replacement).close()
+    original_connect = sqlite3.connect
+    replaced = False
+
+    def replace_before_connect(path, *args, **kwargs):
+        nonlocal replaced
+        if Path(path) == paths.db_path and not replaced:
+            replaced = True
+            os.replace(replacement, paths.db_path)
+        return original_connect(path, *args, **kwargs)
+
+    monkeypatch.setattr("portfolio_maker.infrastructure.sqlite_repository.sqlite3.connect", replace_before_connect)
+
+    with pytest.raises(RepositoryError, match="database changed"):
+        repository.table_names()
+
+
+def test_sqlite_repository_rolls_back_when_database_replaced_before_commit(
+    workspace,
+    tmp_path,
+    monkeypatch,
+):
+    paths = WorkspacePaths.from_root(workspace)
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    source_id = repository.upsert_source(
+        Source(
+            id=None,
+            type=SourceType.LOCAL_FILE,
+            uri="file:///before-replacement.md",
+            display_name="before-replacement.md",
+            owner=None,
+            status=SourceStatus.DISCOVERED,
+        )
+    )
+    replacement = tmp_path / "replacement.db"
+    sqlite3.connect(replacement).close()
+    original_connect = sqlite3.connect
+    original_stat = os.stat
+    replaced = False
+
+    def connect_with_replacement_trace(path, *args, **kwargs):
+        connection = original_connect(path, *args, **kwargs)
+
+        def replace_on_insert(statement):
+            nonlocal replaced
+            if "UPDATE sources" in statement and not replaced:
+                replaced = True
+
+        connection.set_trace_callback(replace_on_insert)
+        return connection
+
+    def report_replacement_after_update(path, *args, **kwargs):
+        if replaced and path == paths.db_path.name and "dir_fd" in kwargs:
+            return original_stat(replacement)
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(
+        "portfolio_maker.infrastructure.sqlite_repository.sqlite3.connect",
+        connect_with_replacement_trace,
+    )
+    monkeypatch.setattr(
+        "portfolio_maker.infrastructure.sqlite_repository.os.stat",
+        report_replacement_after_update,
+    )
+
+    with pytest.raises(RepositoryError, match="database changed"):
+        repository.update_source_status(source_id, SourceStatus.APPROVED)
+
+    replaced = False
+    assert repository.list_sources()[0].status == SourceStatus.DISCOVERED
+
+
+def test_sqlite_repository_maps_invalid_existing_enum_row_to_controlled_error(workspace):
+    paths = WorkspacePaths.from_root(workspace)
+    paths.ensure()
+    with sqlite3.connect(paths.db_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE sources (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                type TEXT NOT NULL,
+                uri TEXT NOT NULL UNIQUE,
+                display_name TEXT NOT NULL,
+                owner TEXT,
+                status TEXT NOT NULL,
+                discovered_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                approved_at TEXT
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO sources (type, uri, display_name, owner, status)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            ("local_file", "file:///invalid.md", "invalid.md", None, "invalid-status"),
+        )
+
+    with pytest.raises(RepositoryError, match="stored data is invalid"):
+        SQLiteRepository(paths.db_path).list_sources()
+
+
+def test_sqlite_repository_new_schema_rejects_invalid_enum_values(workspace):
+    paths = WorkspacePaths.from_root(workspace)
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+
+    with sqlite3.connect(paths.db_path) as connection:
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                INSERT INTO sources (type, uri, display_name, owner, status)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                ("invalid-type", "file:///invalid.md", "invalid.md", None, "invalid-status"),
+            )
+
+
+def test_sqlite_repository_repeated_initialize_and_discovery_write_remain_supported(workspace):
+    paths = WorkspacePaths.from_root(workspace)
+    repository = SQLiteRepository(paths.db_path)
+
+    repository.initialize()
+    repository.initialize()
+    source_id = repository.upsert_source(
+        Source(
+            id=None,
+            type=SourceType.LOCAL_FILE,
+            uri="file:///repeat.md",
+            display_name="repeat.md",
+            owner=None,
+            status=SourceStatus.DISCOVERED,
+        )
+    )
+
+    assert repository.list_sources()[0].id == source_id
