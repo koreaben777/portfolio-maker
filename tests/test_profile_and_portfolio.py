@@ -10,6 +10,7 @@ from portfolio_maker.application.models import (
     IngestSourcesRequest,
 )
 from portfolio_maker.domain.models import Source, SourceStatus, SourceType
+from portfolio_maker.infrastructure.extractors import extract_text
 from portfolio_maker.infrastructure.sqlite_repository import SQLiteRepository
 from portfolio_maker.workspace import WorkspacePaths
 
@@ -72,7 +73,10 @@ def test_build_profile_and_draft_portfolio_from_ingested_source(tmp_path):
     paths = WorkspacePaths.from_root(workspace)
     source_path = tmp_path / "project" / "README.md"
     source_path.parent.mkdir()
-    source_path.write_text("# Portfolio Maker", encoding="utf-8")
+    source_path.write_text(
+        "# Portfolio Maker\nBuilt an approval-gated evidence pipeline.",
+        encoding="utf-8",
+    )
     write_sample_approval(paths)
     approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
     approval["approved_source_uris"] = [source_path.resolve().as_uri()]
@@ -89,7 +93,8 @@ def test_build_profile_and_draft_portfolio_from_ingested_source(tmp_path):
             status=SourceStatus.INGESTED,
         )
     )
-    snapshot_path = paths.local_snapshots_dir / f"source-{source_id}.json"
+    content_hash = extract_text(source_path).content_hash
+    snapshot_path = paths.local_snapshots_dir / f"source-{source_id}-{content_hash}.json"
     snapshot_path.parent.mkdir(parents=True, exist_ok=True)
     snapshot_path.write_text(
         json.dumps(
@@ -97,7 +102,7 @@ def test_build_profile_and_draft_portfolio_from_ingested_source(tmp_path):
                 "source_id": source_id,
                 "source_uri": source_path.resolve().as_uri(),
                 "display_name": "Portfolio Maker",
-                "content_hash": "abc123",
+                "content_hash": content_hash,
                 "extractor": "text-v1",
                 "extracted_at": "2026-07-09T00:00:00Z",
                 "text": "# Portfolio Maker\nBuilt an approval-gated evidence pipeline.",
@@ -105,7 +110,7 @@ def test_build_profile_and_draft_portfolio_from_ingested_source(tmp_path):
         ),
         encoding="utf-8",
     )
-    repository.insert_source_snapshot(source_id, snapshot_path, "abc123", "text-v1")
+    repository.insert_source_snapshot(source_id, snapshot_path, content_hash, "text-v1")
 
     profile_result = build_profile(BuildProfileRequest(workspace=workspace))
 
@@ -189,3 +194,71 @@ def test_build_profile_excludes_ingested_source_under_new_forbidden_path(tmp_pat
     assert source_path.name not in profile_result.markdown_path.read_text(encoding="utf-8")
     assert portfolio_result.project_count == 0
     assert source_path.name not in portfolio_result.markdown_path.read_text(encoding="utf-8")
+
+
+def test_draft_portfolio_rebuilds_profile_after_approval_revoked(tmp_path):
+    workspace, source_path, paths = _ingest_approved_source(tmp_path)
+    build_profile(BuildProfileRequest(workspace=workspace))
+    approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    approval["approved_source_uris"] = []
+    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+
+    portfolio_result = draft_portfolio(DraftPortfolioRequest(workspace=workspace))
+
+    assert portfolio_result.project_count == 0
+    assert source_path.name not in portfolio_result.markdown_path.read_text(encoding="utf-8")
+
+
+def test_build_profile_marks_changed_source_stale_and_requires_reingestion(tmp_path):
+    workspace, source_path, paths = _ingest_approved_source(tmp_path)
+    source_path.write_text("changed evidence", encoding="utf-8")
+
+    profile_result = build_profile(BuildProfileRequest(workspace=workspace))
+
+    repository = SQLiteRepository(paths.db_path)
+    assert profile_result.claim_count == 0
+    assert repository.list_sources()[0].status == SourceStatus.STALE_SOURCE
+
+
+def test_build_profile_marks_missing_snapshot_stale_without_fallback_claim(tmp_path):
+    workspace, _, paths = _ingest_approved_source(tmp_path)
+    repository = SQLiteRepository(paths.db_path)
+    snapshot_path = repository.latest_snapshots_by_source_id()[repository.list_sources()[0].id]
+    snapshot_path.unlink()
+
+    profile_result = build_profile(BuildProfileRequest(workspace=workspace))
+
+    assert profile_result.claim_count == 0
+    assert repository.list_sources()[0].status == SourceStatus.STALE_SOURCE
+
+
+def test_relative_forbidden_path_is_anchored_to_workspace_for_profile(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    source_path = workspace / "private" / "notes.md"
+    source_path.parent.mkdir(parents=True)
+    source_path.write_text("private evidence", encoding="utf-8")
+    paths = WorkspacePaths.from_root(workspace)
+    write_sample_approval(paths)
+    approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    approval["approved_source_uris"] = [source_path.resolve().as_uri()]
+    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    repository.upsert_source(
+        Source(
+            id=None,
+            type=SourceType.LOCAL_FILE,
+            uri=source_path.resolve().as_uri(),
+            display_name="notes.md",
+            owner=None,
+            status=SourceStatus.APPROVED,
+        )
+    )
+    ingest_sources(IngestSourcesRequest(workspace=workspace))
+    approval["forbidden_paths"] = ["private"]
+    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    profile_result = build_profile(BuildProfileRequest(workspace=workspace))
+
+    assert profile_result.claim_count == 0

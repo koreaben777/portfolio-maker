@@ -47,7 +47,7 @@ def test_snapshot_store_writes_local_snapshot_json(tmp_path):
 
     snapshot_path = write_local_snapshot(paths, 7, source, extracted)
 
-    assert snapshot_path == paths.local_snapshots_dir / "source-7.json"
+    assert snapshot_path == paths.local_snapshots_dir / f"source-7-{extracted.content_hash}.json"
     payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
     assert payload["source_id"] == 7
     assert payload["source_uri"] == source.resolve().as_uri()
@@ -89,7 +89,10 @@ def test_ingest_sources_ingests_approved_local_file(tmp_path):
 
     assert result.ingested_count == 1
     assert result.skipped_count == 0
-    assert result.snapshot_paths == (paths.local_snapshots_dir / f"source-{source_id}.json",)
+    expected_hash = hashlib.sha256(source_path.read_bytes()).hexdigest()
+    assert result.snapshot_paths == (
+        paths.local_snapshots_dir / f"source-{source_id}-{expected_hash}.json",
+    )
     assert repository.list_sources()[0].status == SourceStatus.INGESTED
     payload = json.loads(result.snapshot_paths[0].read_text(encoding="utf-8"))
     assert payload["text"] == "hello\napi_key=[REDACTED]"
@@ -173,9 +176,41 @@ def test_ingest_sources_skips_approved_file_under_forbidden_path(tmp_path):
     assert result.skipped_count == 1
     assert result.snapshot_paths == ()
     assert not any(paths.local_snapshots_dir.iterdir())
-    assert repository.list_sources()[0].status == SourceStatus.APPROVED
+    assert repository.list_sources()[0].status == SourceStatus.SKIPPED_POLICY
     with repository.connect() as conn:
         assert conn.execute("SELECT COUNT(*) FROM source_snapshots").fetchone()[0] == 0
+
+
+def test_ingest_sources_anchors_relative_forbidden_path_to_workspace(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    source_path = workspace / "private" / "note.txt"
+    source_path.parent.mkdir(parents=True)
+    source_path.write_text("private evidence", encoding="utf-8")
+    paths = WorkspacePaths.from_root(workspace)
+    write_sample_approval(paths)
+    approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    approval["approved_source_uris"] = [source_path.resolve().as_uri()]
+    approval["forbidden_paths"] = ["private"]
+    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    repository.upsert_source(
+        Source(
+            id=None,
+            type=SourceType.LOCAL_FILE,
+            uri=source_path.resolve().as_uri(),
+            display_name="note.txt",
+            owner=None,
+            status=SourceStatus.APPROVED,
+        )
+    )
+    monkeypatch.chdir(tmp_path)
+
+    result = ingest_sources(IngestSourcesRequest(workspace=workspace))
+
+    assert result.ingested_count == 0
+    assert result.skipped_count == 1
+    assert not any(paths.local_snapshots_dir.iterdir())
 
 
 def test_ingest_sources_skips_approved_sensitive_file(tmp_path):
@@ -348,23 +383,105 @@ def test_ingest_sources_reingests_changed_ingested_source(tmp_path):
         )
     )
 
-    ingest_sources(IngestSourcesRequest(workspace=workspace))
+    first = ingest_sources(IngestSourcesRequest(workspace=workspace))
     source_path.write_text("changed evidence", encoding="utf-8")
-    result = ingest_sources(IngestSourcesRequest(workspace=workspace))
+    second = ingest_sources(IngestSourcesRequest(workspace=workspace))
 
-    assert result.ingested_count == 1
-    assert result.skipped_count == 0
+    assert second.ingested_count == 1
+    assert second.skipped_count == 0
     assert repository.list_sources()[0].status == SourceStatus.INGESTED
     with repository.connect() as conn:
-        hashes = [
-            row["content_hash"]
+        snapshots = [
+            (row["content_hash"], row["snapshot_path"])
             for row in conn.execute(
-                "SELECT content_hash FROM source_snapshots WHERE source_id = ? ORDER BY id",
+                "SELECT content_hash, snapshot_path FROM source_snapshots WHERE source_id = ? ORDER BY id",
                 (source_id,),
             )
         ]
-    assert len(hashes) == 2
-    assert hashes[0] != hashes[1]
+    assert len(snapshots) == 2
+    assert snapshots[0][0] != snapshots[1][0]
+    assert snapshots[0][1] != snapshots[1][1]
+    assert json.loads(first.snapshot_paths[0].read_text(encoding="utf-8"))["text"] == "first evidence"
+    assert json.loads(second.snapshot_paths[0].read_text(encoding="utf-8"))["text"] == "changed evidence"
+
+
+def test_ingest_sources_rejects_replaced_approved_path_symlink(tmp_path):
+    workspace = tmp_path / "workspace"
+    source_path = tmp_path / "note.txt"
+    target_path = tmp_path / "replacement.txt"
+    source_path.write_text("approved evidence", encoding="utf-8")
+    target_path.write_text("unapproved evidence", encoding="utf-8")
+    paths = WorkspacePaths.from_root(workspace)
+    write_sample_approval(paths)
+    approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    approval["approved_source_uris"] = [source_path.resolve().as_uri()]
+    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    source_id = repository.upsert_source(
+        Source(
+            id=None,
+            type=SourceType.LOCAL_FILE,
+            uri=source_path.resolve().as_uri(),
+            display_name="note.txt",
+            owner=None,
+            status=SourceStatus.APPROVED,
+        )
+    )
+    source_path.unlink()
+    source_path.symlink_to(target_path)
+
+    result = ingest_sources(IngestSourcesRequest(workspace=workspace))
+
+    assert result.ingested_count == 0
+    assert repository.list_sources()[0].status == SourceStatus.SKIPPED_POLICY
+    with repository.connect() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM source_snapshots WHERE source_id = ?", (source_id,)
+        ).fetchone()[0] == 0
+
+
+def test_ingest_sources_rejects_nonregular_noncanonical_and_oversized_approved_paths(tmp_path):
+    workspace = tmp_path / "workspace"
+    directory_path = tmp_path / "directory"
+    directory_path.mkdir()
+    source_path = tmp_path / "note.txt"
+    source_path.write_text("evidence", encoding="utf-8")
+    oversized_path = tmp_path / "oversized.txt"
+    oversized_path.write_bytes(b"x" * 2_000_001)
+    (tmp_path / "nested").mkdir()
+    noncanonical_uri = (tmp_path / "nested" / ".." / "note.txt").as_uri()
+    paths = WorkspacePaths.from_root(workspace)
+    write_sample_approval(paths)
+    approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    approval["approved_source_uris"] = [
+        directory_path.resolve().as_uri(),
+        noncanonical_uri,
+        oversized_path.resolve().as_uri(),
+    ]
+    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    for uri, display_name in (
+        (directory_path.resolve().as_uri(), "directory"),
+        (noncanonical_uri, "note.txt"),
+        (oversized_path.resolve().as_uri(), "oversized.txt"),
+    ):
+        repository.upsert_source(
+            Source(
+                id=None,
+                type=SourceType.LOCAL_FILE,
+                uri=uri,
+                display_name=display_name,
+                owner=None,
+                status=SourceStatus.APPROVED,
+            )
+        )
+
+    result = ingest_sources(IngestSourcesRequest(workspace=workspace))
+
+    assert result.ingested_count == 0
+    assert {source.status for source in repository.list_sources()} == {SourceStatus.SKIPPED_POLICY}
 
 
 def test_upsert_source_does_not_downgrade_ingested_to_discovered(tmp_path):

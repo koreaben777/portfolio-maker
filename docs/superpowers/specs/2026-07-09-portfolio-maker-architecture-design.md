@@ -70,7 +70,7 @@ The repository does not initially provide:
 
 1. Guide the user through the career-data discovery workflow from Codex app.
 2. Discover local file and GitHub source candidates.
-3. Let the user exclude forbidden folders, repositories, and source classes.
+3. Let the user exclude forbidden folders and repositories; source-class exclusion is deferred until company-specific generation.
 4. Block body ingestion until source approval is explicit.
 5. Ingest approved local files into SQLite and minimal snapshots; retain GitHub repositories and activities only as discovery metadata.
 6. Create an evidence-based master profile in JSON and Markdown.
@@ -241,8 +241,8 @@ GitHub discovery:
 
 - lists repositories and activity candidates
 - includes commits, pull requests, issues, reviews, and Actions activity
-- marks private and organization resources separately
-- prioritizes resources with direct user activity
+- marks public and private repository visibility
+- defers organization-resource marking and direct-user-activity prioritization until a later discovery upgrade
 - stores repositories and activities as discovery metadata only; it does not ingest GitHub bodies or use GitHub activity in current artifacts
 
 Output:
@@ -262,6 +262,7 @@ Approval state is stored in:
 
 The 0.1.0 approval fields are:
 
+- `version`: optional approval-format version; omitted values default to `1`, and only version `1` is supported
 - `approved_source_uris`: approved local source URIs
 - `forbidden_paths`: local paths that must not be read or used in artifacts
 - `excluded_repositories`: GitHub repositories excluded from discovery
@@ -275,7 +276,7 @@ In 0.1.0, GitHub approval settings control discovery visibility only. They do no
 
 ### 3. Ingestion
 
-Ingestion reads only approved local file sources.
+Ingestion reads only approved local file sources. Immediately before reading, it rejects symbolic links, non-regular files, non-canonical file URIs, policy-blocked paths, and files over the MVP size limit.
 
 It stores:
 
@@ -291,7 +292,7 @@ It does not copy original files into the project store.
 
 ### 4. Synthesis
 
-The 0.1.0 synthesis stage builds a master profile from the latest approved local snapshots. It lists ingested sources and one `project_evidence` claim per source. GitHub activity is not artifact input until the later company-specific generation phase.
+The 0.1.0 synthesis stage builds a master profile from the latest approved local snapshots whose original source still exists and has the same current hash. Missing, changed, policy-blocked, or unavailable snapshots are excluded until re-ingestion. It lists one `project_evidence` claim per remaining source. GitHub activity is not artifact input until the later company-specific generation phase.
 
 Detailed project summaries, skill inventories, role analyses, and confidence-scored claims are deferred with company-specific generation.
 
@@ -378,7 +379,7 @@ github_activities
 1. Current profile claims are derived from approved local snapshots.
 2. GitHub URLs and activities remain discovery-report metadata in the 0.1.0 MVP.
 3. Public artifacts must not expose private raw paths or sensitive content.
-4. If an ingested local source disappears, mark it stale; if its hash changes, create a current snapshot before generating artifacts.
+4. If an ingested local source disappears or its hash changes, mark it stale and require re-ingestion before generating artifacts.
 
 ## Security and Privacy
 
@@ -419,7 +420,7 @@ Rules:
 
 - prefer read-only access
 - never store or print token values
-- distinguish public, private, and organization repositories
+- distinguish public and private repositories; organization classification is deferred
 - show private repositories only when explicitly allowed
 - report GitHub rate-limit and per-repository failures without discarding unrelated discovery results
 - do not use GitHub repositories or activities as profile or portfolio input in the 0.1.0 MVP
@@ -430,7 +431,7 @@ Rules:
 
 This gate also applies when `run-mvp` is used.
 
-`build-profile` rechecks the current approval and forbidden-path policy before using an existing snapshot.
+`build-profile` rechecks current approval, forbidden-path policy, original-file hash, and latest snapshot integrity before using an existing snapshot.
 
 ## Error Handling
 

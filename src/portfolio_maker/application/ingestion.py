@@ -1,23 +1,17 @@
 from __future__ import annotations
 
-from pathlib import Path
-from urllib.parse import unquote, urlparse
-
-from portfolio_maker.application.approval import load_approval
+from portfolio_maker.application.approval import approval_forbidden_paths, load_approval
 from portfolio_maker.application.models import IngestSourcesRequest, IngestSourcesResult
 from portfolio_maker.domain.models import SourceStatus, SourceType
 from portfolio_maker.infrastructure.extractors import extract_text
-from portfolio_maker.infrastructure.policy import FilePolicy
+from portfolio_maker.infrastructure.policy import (
+    FilePolicy,
+    SourcePathPolicyError,
+    approved_regular_file_path,
+)
 from portfolio_maker.infrastructure.sqlite_repository import SQLiteRepository
 from portfolio_maker.infrastructure.snapshots import write_local_snapshot
 from portfolio_maker.workspace import WorkspacePaths
-
-
-def _path_from_file_uri(uri: str) -> Path:
-    parsed = urlparse(uri)
-    if parsed.scheme != "file":
-        raise ValueError("Only file URIs are supported")
-    return Path(unquote(parsed.path))
 
 
 def ingest_sources(request: IngestSourcesRequest) -> IngestSourcesResult:
@@ -25,9 +19,7 @@ def ingest_sources(request: IngestSourcesRequest) -> IngestSourcesResult:
     paths.ensure()
     approval = load_approval(paths)
     approved_uris = set(approval.approved_source_uris)
-    policy = FilePolicy(
-        forbidden_paths=tuple(Path(path) for path in approval.forbidden_paths)
-    )
+    policy = FilePolicy(forbidden_paths=approval_forbidden_paths(paths, approval))
     repository = SQLiteRepository(paths.db_path)
     repository.initialize()
     latest_hashes = repository.latest_snapshot_hashes_by_source_id()
@@ -44,11 +36,18 @@ def ingest_sources(request: IngestSourcesRequest) -> IngestSourcesResult:
             skipped_count += 1
             continue
 
-        source_path = _path_from_file_uri(source.uri)
-        classification = policy.classify_path(source_path)
-        if classification != "candidate":
-            if classification == "skipped_policy":
-                repository.update_source_status(source.id, SourceStatus.SKIPPED_POLICY)
+        try:
+            source_path = approved_regular_file_path(source.uri, policy)
+        except FileNotFoundError:
+            repository.update_source_status(source.id, SourceStatus.STALE_SOURCE)
+            skipped_count += 1
+            continue
+        except SourcePathPolicyError:
+            repository.update_source_status(source.id, SourceStatus.SKIPPED_POLICY)
+            skipped_count += 1
+            continue
+        except OSError:
+            repository.update_source_status(source.id, SourceStatus.EXTRACT_FAILED)
             skipped_count += 1
             continue
 
@@ -68,7 +67,13 @@ def ingest_sources(request: IngestSourcesRequest) -> IngestSourcesResult:
         ):
             skipped_count += 1
             continue
-        snapshot_path = write_local_snapshot(paths, source.id, source_path, extracted)
+        snapshot_path = write_local_snapshot(
+            paths,
+            source.id,
+            source_path,
+            extracted,
+            source_uri=source.uri,
+        )
         repository.insert_source_snapshot(
             source.id,
             snapshot_path,

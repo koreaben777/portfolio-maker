@@ -1,16 +1,29 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
-from portfolio_maker.application.models import DraftPortfolioRequest, DraftPortfolioResult
+from portfolio_maker.application.build_profile import build_profile
+from portfolio_maker.application.models import (
+    BuildProfileRequest,
+    DraftPortfolioRequest,
+    DraftPortfolioResult,
+)
 from portfolio_maker.infrastructure.artifacts import write_markdown
 from portfolio_maker.workspace import WorkspacePaths
+
+
+class ProfileFormatError(ValueError):
+    pass
 
 
 def draft_portfolio(request: DraftPortfolioRequest) -> DraftPortfolioResult:
     paths = WorkspacePaths.from_root(request.workspace)
     paths.ensure()
-    profile = json.loads(paths.master_profile_json_path.read_text(encoding="utf-8"))
+    if paths.master_profile_json_path.exists():
+        _load_profile(paths.master_profile_json_path)
+    build_profile(BuildProfileRequest(workspace=request.workspace))
+    profile = _load_profile(paths.master_profile_json_path)
     sources = profile["sources"]
     sections = []
     for source in sources:
@@ -37,3 +50,19 @@ def draft_portfolio(request: DraftPortfolioRequest) -> DraftPortfolioResult:
         markdown_path=paths.portfolio_draft_path,
         project_count=len(sources),
     )
+
+
+def _load_profile(path: Path) -> dict[str, object]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ProfileFormatError("master profile must be an object")
+    sources = payload.get("sources")
+    if not isinstance(sources, list):
+        raise ProfileFormatError("master profile sources must be a list")
+    if any(
+        not isinstance(source, dict)
+        or not isinstance(source.get("display_name"), str)
+        for source in sources
+    ):
+        raise ProfileFormatError("master profile sources must contain display names")
+    return payload

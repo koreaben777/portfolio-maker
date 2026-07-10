@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from portfolio_maker.infrastructure.github_connector import (
     GitHubActivityCandidate,
     GitHubDiscoveryError,
@@ -222,4 +224,64 @@ def test_discover_github_candidates_keeps_partial_results_when_repo_activity_fai
 
     assert [repo.name_with_owner for repo in repos] == ["octo/ok", "octo/flaky"]
     assert [activity.repo for activity in activities] == ["octo/ok"]
-    assert statuses == ["GitHub activity discovery failed for octo/flaky: rate limited"]
+    assert statuses == [
+        "GitHub pull requests discovery failed for octo/flaky: rate limited",
+        "GitHub commits discovery failed for octo/flaky: rate limited",
+        "GitHub issues discovery failed for octo/flaky: rate limited",
+        "GitHub review comments discovery failed for octo/flaky: rate limited",
+        "GitHub workflow runs discovery failed for octo/flaky: rate limited",
+    ]
+
+
+def test_discover_github_candidates_keeps_early_endpoint_success_on_late_failure(monkeypatch):
+    def fake_run_gh_json(args):
+        if args[:2] == ["repo", "list"]:
+            return [
+                {
+                    "nameWithOwner": "octo/demo",
+                    "url": "https://github.com/octo/demo",
+                    "isPrivate": False,
+                }
+            ]
+        if args[:2] == ["pr", "list"]:
+            return load_fixture("gh_pr_list.json")
+        if args[:2] == ["issue", "list"]:
+            return []
+        if args == ["api", "repos/octo/demo/commits"]:
+            return []
+        if args == ["api", "repos/octo/demo/pulls/comments"]:
+            return []
+        if args == ["api", "repos/octo/demo/actions/runs"]:
+            raise GitHubDiscoveryError("synthetic endpoint failure")
+        raise AssertionError(args)
+
+    monkeypatch.setattr(
+        "portfolio_maker.infrastructure.github_connector.run_gh_json",
+        fake_run_gh_json,
+    )
+
+    _, activities, statuses = discover_github_candidates()
+
+    assert [activity.activity_type for activity in activities] == ["pull_request"]
+    assert statuses == [
+        "GitHub workflow runs discovery failed for octo/demo: synthetic endpoint failure"
+    ]
+
+
+def test_discover_github_candidates_rejects_malformed_repository_payload(monkeypatch):
+    monkeypatch.setattr(
+        "portfolio_maker.infrastructure.github_connector.run_gh_json",
+        lambda args: {"unexpected": "object"},
+    )
+
+    with pytest.raises(GitHubDiscoveryError, match="repository list payload is invalid"):
+        discover_github_candidates()
+
+
+def test_parse_commit_list_handles_empty_commit_message():
+    activities = parse_commit_list(
+        "octo/demo",
+        [{"commit": {"message": "", "author": {}}}],
+    )
+
+    assert activities[0].title == ""

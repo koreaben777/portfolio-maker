@@ -128,6 +128,7 @@ def test_discover_sources_writes_report_and_persists_local_files(tmp_path):
     assert sources[0].type == SourceType.LOCAL_FILE
     assert sources[0].status == SourceStatus.DISCOVERED
     assert sources[0].uri == readme.resolve().as_uri()
+    assert "may be incomplete" in report
 
 
 def test_discover_sources_redacts_policy_skipped_paths_in_report(tmp_path):
@@ -329,3 +330,23 @@ def test_discover_sources_filters_private_and_excluded_github_repos(workspace, t
     assert "octo/public" in report
     assert "octo/private" not in report
     assert "octo/excluded" not in report
+
+
+def test_discover_sources_excludes_its_workspace_store_on_rerun(tmp_path):
+    workspace = tmp_path / "workspace"
+    readme = workspace / "README.md"
+    workspace.mkdir()
+    readme.write_text("# Portfolio\n", encoding="utf-8")
+
+    discover_sources(
+        DiscoverSourcesRequest(workspace=workspace, home=workspace, include_github=False)
+    )
+    result = discover_sources(
+        DiscoverSourcesRequest(workspace=workspace, home=workspace, include_github=False)
+    )
+
+    paths = WorkspacePaths.from_root(workspace)
+    repository = SQLiteRepository(paths.db_path)
+    report = result.report_path.read_text(encoding="utf-8")
+    assert all(".portfolio-maker" not in source.uri for source in repository.list_sources())
+    assert ".portfolio-maker" not in report

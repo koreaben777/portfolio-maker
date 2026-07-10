@@ -10,6 +10,10 @@ from portfolio_maker.infrastructure.policy import FilePolicy
 TEXT_EXTENSIONS = {".md", ".txt", ".py", ".js", ".ts", ".tsx", ".json", ".yaml", ".yml", ".toml"}
 
 
+class DiscoveryRootError(ValueError):
+    pass
+
+
 @dataclass(frozen=True)
 class LocalCandidate:
     path: Path
@@ -32,10 +36,15 @@ def discover_local_candidates(
     candidates: list[LocalCandidate] = []
     skipped: list[SkippedPath] = []
 
+    home_resolved = home.resolve(strict=False)
+    if not home_resolved.exists():
+        raise DiscoveryRootError(f"Discovery root does not exist: {home}")
+    if not home_resolved.is_dir():
+        raise DiscoveryRootError(f"Discovery root is not a directory: {home}")
+
     if max_candidates <= 0:
         return candidates, skipped
 
-    home_resolved = home.resolve(strict=False)
     home_classification = policy.classify_path(home_resolved)
     if home_classification != "candidate":
         return candidates, [SkippedPath(home_resolved, home_classification)]

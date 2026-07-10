@@ -13,12 +13,15 @@ def write_local_snapshot(
     source_id: int,
     source_path: Path,
     extracted: ExtractedText,
+    source_uri: str | None = None,
 ) -> Path:
     paths.ensure()
-    snapshot_path = paths.local_snapshots_dir / f"source-{source_id}.json"
+    snapshot_path = paths.local_snapshots_dir / f"source-{source_id}-{extracted.content_hash}.json"
+    if snapshot_path.exists():
+        return snapshot_path
     payload = {
         "source_id": source_id,
-        "source_uri": source_path.resolve().as_uri(),
+        "source_uri": source_uri or source_path.resolve().as_uri(),
         "display_name": source_path.name,
         "content_hash": extracted.content_hash,
         "extractor": extracted.extractor,

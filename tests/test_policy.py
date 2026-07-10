@@ -139,3 +139,25 @@ def test_default_excluded_directory_names_are_case_insensitive(tmp_path):
     policy = FilePolicy()
 
     assert policy.classify_path(tmp_path / "NODE_MODULES" / "pkg.js") == "skipped_policy"
+
+
+def test_file_policy_skips_common_password_export_names(tmp_path):
+    policy = FilePolicy()
+
+    assert policy.classify_path(tmp_path / "passwords.csv") == "skipped_policy"
+
+
+def test_secret_masking_redacts_bearer_private_key_and_token_prefixes():
+    text = (
+        "Authorization: Bearer synthetic-bearer-token\n"
+        "-----BEGIN PRIVATE KEY-----\n"
+        "synthetic-private-key-material\n"
+        "-----END PRIVATE KEY-----\n"
+        "credential=sk-synthetic-token"
+    )
+
+    masked = mask_secrets(text)
+
+    assert "synthetic-bearer-token" not in masked
+    assert "synthetic-private-key-material" not in masked
+    assert "sk-synthetic-token" not in masked

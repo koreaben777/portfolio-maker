@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-from pathlib import Path
-
-from portfolio_maker.application.approval import load_approval
+from portfolio_maker.application.approval import approval_forbidden_paths, load_approval
 from portfolio_maker.application.models import DiscoverSourcesRequest, DiscoverSourcesResult, ProgressEvent
 from portfolio_maker.domain.models import GitHubActivity, Source, SourceStatus, SourceType
 from portfolio_maker.infrastructure.github_connector import (
@@ -24,12 +22,12 @@ def discover_sources(request: DiscoverSourcesRequest) -> DiscoverSourcesResult:
     repository.initialize()
 
     approval = load_approval(paths) if paths.approval_path.exists() else None
-    approval_forbidden_paths = (
-        tuple(Path(path) for path in approval.forbidden_paths) if approval else ()
+    approved_forbidden_paths = (
+        approval_forbidden_paths(paths, approval) if approval else ()
     )
     candidates, skipped = discover_local_candidates(
         request.home,
-        request.forbidden_paths + approval_forbidden_paths,
+        request.forbidden_paths + (paths.root,) + approved_forbidden_paths,
     )
     for candidate in candidates:
         repository.upsert_source(
@@ -112,7 +110,13 @@ def _render_report(
     github_activities: list[GitHubActivityCandidate],
     github_statuses: list[str] | None = None,
 ) -> str:
-    lines = ["# Discovery Report", "", "## Local candidates"]
+    lines = [
+        "# Discovery Report",
+        "",
+        "> MVP limits: local discovery records at most 500 candidates. GitHub repository, pull request, and issue commands request at most 100 items; GitHub API endpoints are not paginated, so results may be incomplete.",
+        "",
+        "## Local candidates",
+    ]
     for candidate in candidates:
         lines.append(f"- {candidate.display_name}: {candidate.uri}")
     lines.extend(["", "## GitHub Repositories"])

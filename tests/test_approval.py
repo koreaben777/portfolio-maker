@@ -79,3 +79,15 @@ def test_load_approval_rejects_private_sources_allowed_string(workspace):
 
     with pytest.raises(ApprovalFormatError):
         load_approval(paths)
+
+
+def test_load_approval_rejects_unsupported_version(workspace):
+    paths = WorkspacePaths.from_root(workspace)
+    paths.ensure()
+    paths.approval_path.write_text(
+        json.dumps({"version": 2}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ApprovalFormatError, match="version must be 1"):
+        load_approval(paths)

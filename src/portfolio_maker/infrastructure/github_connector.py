@@ -29,105 +29,113 @@ class GitHubActivityCandidate:
     merged_at: str | None
 
 
-def parse_repo_list(payload: list[dict]) -> list[GitHubRepositoryCandidate]:
+def parse_repo_list(payload: Any) -> list[GitHubRepositoryCandidate]:
     repos: list[GitHubRepositoryCandidate] = []
-    for item in payload:
+    for item in _list_payload(payload, "repository list"):
+        is_private = item.get("isPrivate", False)
+        if not isinstance(is_private, bool):
+            raise GitHubDiscoveryError("GitHub repository list payload is invalid")
         repos.append(
             GitHubRepositoryCandidate(
-                name_with_owner=item["nameWithOwner"],
-                url=item["url"],
-                is_private=bool(item.get("isPrivate", False)),
+                name_with_owner=_required_string(item, "nameWithOwner", "repository list"),
+                url=_required_string(item, "url", "repository list"),
+                is_private=is_private,
             )
         )
     return repos
 
 
-def parse_pr_list(repo: str, payload: list[dict]) -> list[GitHubActivityCandidate]:
+def parse_pr_list(repo: str, payload: Any) -> list[GitHubActivityCandidate]:
     return [
         GitHubActivityCandidate(
             repo=repo,
             activity_type="pull_request",
-            url=item["url"],
-            title=item["title"],
-            state=item["state"],
-            author=(item.get("author") or {}).get("login", ""),
-            created_at=item["createdAt"],
-            merged_at=item.get("mergedAt"),
+            url=_required_string(item, "url", "pull request list"),
+            title=_required_string(item, "title", "pull request list"),
+            state=_required_string(item, "state", "pull request list"),
+            author=_nested_optional_string(item, "author", "login", "pull request list"),
+            created_at=_required_string(item, "createdAt", "pull request list"),
+            merged_at=_optional_string(item, "mergedAt", "pull request list"),
         )
-        for item in payload
+        for item in _list_payload(payload, "pull request list")
     ]
 
 
-def parse_issue_list(repo: str, payload: list[dict]) -> list[GitHubActivityCandidate]:
+def parse_issue_list(repo: str, payload: Any) -> list[GitHubActivityCandidate]:
     return [
         GitHubActivityCandidate(
             repo=repo,
             activity_type="issue",
-            url=item["url"],
-            title=item["title"],
-            state=item["state"],
-            author=(item.get("author") or {}).get("login", ""),
-            created_at=item["createdAt"],
+            url=_required_string(item, "url", "issue list"),
+            title=_required_string(item, "title", "issue list"),
+            state=_required_string(item, "state", "issue list"),
+            author=_nested_optional_string(item, "author", "login", "issue list"),
+            created_at=_required_string(item, "createdAt", "issue list"),
             merged_at=None,
         )
-        for item in payload
+        for item in _list_payload(payload, "issue list")
     ]
 
 
-def parse_commit_list(repo: str, payload: list[dict]) -> list[GitHubActivityCandidate]:
+def parse_commit_list(repo: str, payload: Any) -> list[GitHubActivityCandidate]:
     activities: list[GitHubActivityCandidate] = []
-    for item in payload:
-        commit = item.get("commit") or {}
-        author = commit.get("author") or {}
-        message = str(commit.get("message") or "").splitlines()[0]
+    for item in _list_payload(payload, "commit list"):
+        commit = _object(item.get("commit") or {}, "commit list")
+        author = _object(commit.get("author") or {}, "commit list")
+        message = _required_string(commit, "message", "commit list")
         activities.append(
             GitHubActivityCandidate(
                 repo=repo,
                 activity_type="commit",
-                url=item.get("html_url") or "",
-                title=message,
+                url=_optional_string(item, "html_url", "commit list") or "",
+                title=message.splitlines()[0] if message else "",
                 state="committed",
-                author=author.get("name") or "",
-                created_at=author.get("date") or "",
+                author=_optional_string(author, "name", "commit list") or "",
+                created_at=_optional_string(author, "date", "commit list") or "",
                 merged_at=None,
             )
         )
     return activities
 
 
-def parse_review_list(repo: str, payload: list[dict]) -> list[GitHubActivityCandidate]:
+def parse_review_list(repo: str, payload: Any) -> list[GitHubActivityCandidate]:
     activities: list[GitHubActivityCandidate] = []
-    for item in payload:
-        user = item.get("user") or {}
-        body = str(item.get("body") or "pull request").splitlines()[0]
+    for item in _list_payload(payload, "review comment list"):
         activities.append(
             GitHubActivityCandidate(
                 repo=repo,
                 activity_type="review_comment",
-                url=item.get("html_url") or "",
-                title=f"Review comment: {body}",
+                url=_optional_string(item, "html_url", "review comment list") or "",
+                title=f"Review comment: {_optional_string(item, 'body', 'review comment list') or 'pull request'}".splitlines()[0],
                 state="commented",
-                author=user.get("login", ""),
-                created_at=item.get("created_at") or "",
+                author=_nested_optional_string(item, "user", "login", "review comment list"),
+                created_at=_optional_string(item, "created_at", "review comment list") or "",
                 merged_at=None,
             )
         )
     return activities
 
 
-def parse_workflow_run_list(repo: str, payload: dict) -> list[GitHubActivityCandidate]:
+def parse_workflow_run_list(repo: str, payload: Any) -> list[GitHubActivityCandidate]:
+    body = _object(payload, "workflow run list")
+    runs = body.get("workflow_runs", [])
+    if not isinstance(runs, list):
+        raise GitHubDiscoveryError("GitHub workflow run list payload is invalid")
     activities: list[GitHubActivityCandidate] = []
-    for item in payload.get("workflow_runs", []):
-        actor = item.get("actor") or {}
+    for item in _list_payload(runs, "workflow run list"):
         activities.append(
             GitHubActivityCandidate(
                 repo=repo,
                 activity_type="workflow_run",
-                url=item.get("html_url") or "",
-                title=item.get("name") or "workflow",
-                state=item.get("conclusion") or item.get("status") or "",
-                author=actor.get("login") or "",
-                created_at=item.get("created_at") or "",
+                url=_optional_string(item, "html_url", "workflow run list") or "",
+                title=_optional_string(item, "name", "workflow run list") or "workflow",
+                state=(
+                    _optional_string(item, "conclusion", "workflow run list")
+                    or _optional_string(item, "status", "workflow run list")
+                    or ""
+                ),
+                author=_nested_optional_string(item, "actor", "login", "workflow run list"),
+                created_at=_optional_string(item, "created_at", "workflow run list") or "",
                 merged_at=None,
             )
         )
@@ -172,66 +180,92 @@ def discover_github_candidates(
     ]
     activities: list[GitHubActivityCandidate] = []
     statuses: list[str] = []
+    endpoints = (
+        (
+            "pull requests",
+            parse_pr_list,
+            [
+                "pr",
+                "list",
+                "--repo",
+                "{repo}",
+                "--state",
+                "all",
+                "--json",
+                "title,url,state,createdAt,mergedAt,author",
+                "--limit",
+                "100",
+            ],
+        ),
+        ("commits", parse_commit_list, ["api", "repos/{repo}/commits"]),
+        (
+            "issues",
+            parse_issue_list,
+            [
+                "issue",
+                "list",
+                "--repo",
+                "{repo}",
+                "--state",
+                "all",
+                "--json",
+                "title,url,state,createdAt,author",
+                "--limit",
+                "100",
+            ],
+        ),
+        ("review comments", parse_review_list, ["api", "repos/{repo}/pulls/comments"]),
+        ("workflow runs", parse_workflow_run_list, ["api", "repos/{repo}/actions/runs"]),
+    )
     for repo in repos:
-        try:
-            repo_activities: list[GitHubActivityCandidate] = []
-            repo_activities.extend(
-                parse_pr_list(
-                    repo.name_with_owner,
-                    run_gh_json(
-                        [
-                            "pr",
-                            "list",
-                            "--repo",
-                            repo.name_with_owner,
-                            "--state",
-                            "all",
-                            "--json",
-                            "title,url,state,createdAt,mergedAt,author",
-                            "--limit",
-                            "100",
-                        ]
-                    ),
+        for label, parser, args_template in endpoints:
+            args = [part.format(repo=repo.name_with_owner) for part in args_template]
+            try:
+                activities.extend(parser(repo.name_with_owner, run_gh_json(args)))
+            except GitHubDiscoveryError as error:
+                statuses.append(
+                    f"GitHub {label} discovery failed for {repo.name_with_owner}: {error}"
                 )
-            )
-            repo_activities.extend(
-                parse_commit_list(
-                    repo.name_with_owner,
-                    run_gh_json(["api", f"repos/{repo.name_with_owner}/commits"]),
-                )
-            )
-            repo_activities.extend(
-                parse_issue_list(
-                    repo.name_with_owner,
-                    run_gh_json(
-                        [
-                            "issue",
-                            "list",
-                            "--repo",
-                            repo.name_with_owner,
-                            "--state",
-                            "all",
-                            "--json",
-                            "title,url,state,createdAt,author",
-                            "--limit",
-                            "100",
-                        ]
-                    ),
-                )
-            )
-            repo_activities.extend(
-                parse_review_list(
-                    repo.name_with_owner,
-                    run_gh_json(["api", f"repos/{repo.name_with_owner}/pulls/comments"]),
-                )
-            )
-            repo_activities.extend(
-                parse_workflow_run_list(
-                    repo.name_with_owner,
-                    run_gh_json(["api", f"repos/{repo.name_with_owner}/actions/runs"]),
-                )
-            )
-            activities.extend(repo_activities)
-        except GitHubDiscoveryError as error:
-            statuses.append(f"GitHub activity discovery failed for {repo.name_with_owner}: {error}")
     return repos, activities, statuses
+
+
+def _list_payload(payload: Any, label: str) -> list[dict[str, Any]]:
+    if not isinstance(payload, list):
+        raise GitHubDiscoveryError(f"GitHub {label} payload is invalid")
+    return [_object(item, label) for item in payload]
+
+
+def _object(value: Any, label: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise GitHubDiscoveryError(f"GitHub {label} payload is invalid")
+    return value
+
+
+def _required_string(item: dict[str, Any], key: str, label: str) -> str:
+    value = item.get(key)
+    if not isinstance(value, str):
+        raise GitHubDiscoveryError(f"GitHub {label} payload is invalid")
+    return value
+
+
+def _optional_string(item: dict[str, Any], key: str, label: str) -> str | None:
+    value = item.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise GitHubDiscoveryError(f"GitHub {label} payload is invalid")
+    return value
+
+
+def _nested_optional_string(
+    item: dict[str, Any], key: str, nested_key: str, label: str
+) -> str:
+    value = item.get(key)
+    if value is None:
+        return ""
+    nested = _object(value, label).get(nested_key)
+    if nested is None:
+        return ""
+    if not isinstance(nested, str):
+        raise GitHubDiscoveryError(f"GitHub {label} payload is invalid")
+    return nested

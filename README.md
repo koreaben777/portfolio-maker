@@ -32,7 +32,7 @@ pytest
 ## Safety Rules
 
 - Discovery may list candidates, but ingestion is blocked until `.portfolio-maker/reviews/source-approval.json` exists.
-- Profile generation rechecks the current approval and forbidden-path policy before using an ingested snapshot.
+- Profile generation rechecks the current approval and forbidden-path policy, the original file hash, and the latest snapshot before using an ingested source.
 - Original files are not copied into `.portfolio-maker/`.
 - Extracted snapshots are masked for common secret patterns.
 - Private GitHub repositories are skipped unless `private_sources_allowed` is set to `true` in the approval file.
@@ -109,3 +109,7 @@ Permission-denied paths are skipped and recorded. Add sensitive folders to `forb
 ### Rate limits
 
 GitHub discovery failures are recorded in the discovery report while local discovery continues. Re-run after the limit resets, or use `--no-github`.
+
+### Discovery limits
+
+Local discovery records at most 500 candidates. GitHub repository, pull request, and issue commands request at most 100 items; GitHub API endpoints are not paginated. Discovery reports may therefore be incomplete.

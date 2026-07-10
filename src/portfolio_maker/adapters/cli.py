@@ -9,7 +9,7 @@ from pathlib import Path
 from portfolio_maker.application.approval import ApprovalFormatError, ApprovalMissingError, write_sample_approval
 from portfolio_maker.application.build_profile import build_profile
 from portfolio_maker.application.discovery import discover_sources
-from portfolio_maker.application.draft_portfolio import draft_portfolio
+from portfolio_maker.application.draft_portfolio import ProfileFormatError, draft_portfolio
 from portfolio_maker.application.ingestion import ingest_sources
 from portfolio_maker.application.models import (
     BuildProfileRequest,
@@ -18,6 +18,7 @@ from portfolio_maker.application.models import (
     IngestSourcesRequest,
 )
 from portfolio_maker.infrastructure.github_connector import GitHubDiscoveryError
+from portfolio_maker.infrastructure.local_discovery import DiscoveryRootError
 from portfolio_maker.workspace import WorkspacePaths
 
 
@@ -56,7 +57,15 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     try:
         return _main(argv)
-    except (ApprovalMissingError, ApprovalFormatError, GitHubDiscoveryError, json.JSONDecodeError, OSError) as error:
+    except (
+        ApprovalMissingError,
+        ApprovalFormatError,
+        DiscoveryRootError,
+        GitHubDiscoveryError,
+        ProfileFormatError,
+        json.JSONDecodeError,
+        OSError,
+    ) as error:
         print(str(error), file=sys.stderr)
         return 1
 
