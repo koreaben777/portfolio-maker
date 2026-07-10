@@ -48,6 +48,8 @@ def load_approval(paths: WorkspacePaths) -> SourceApproval:
         raise ApprovalMissingError(f"Approval file missing: {paths.approval_path}")
 
     payload = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ApprovalFormatError("approval payload must be an object")
     private_sources_allowed = payload.get("private_sources_allowed", False)
     if not isinstance(private_sources_allowed, bool):
         raise ApprovalFormatError("private_sources_allowed must be a bool")
