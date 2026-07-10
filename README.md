@@ -10,14 +10,14 @@ Portfolio Maker는 원본 파일을 자동으로 업로드하거나 공개하지
 - 처리할 로컬 자료를 직접 검토·승인하기
 - 승인된 자료에서 텍스트 스냅샷과 커리어 근거 저장하기
 - 마스터 프로필을 JSON·Markdown으로 만들기
-- 승인 자료 목록을 바탕으로 검토용 포트폴리오 skeleton 만들기
+- 승인 자료 목록을 바탕으로 검토용 포트폴리오 초안 골격 만들기
 
 > 현재 버전은 **근거 기반 마스터 프로필**과 **검토가 필요한 포트폴리오 뼈대**를 제공합니다. 역할·기술적 접근·성과를 근거와 함께 작성하는 회사별 맞춤 포트폴리오 생성은 다음 단계의 로드맵입니다.
 
 ## 이렇게 동작합니다
 
 ```text
-후보 탐색 → 사용자 승인 → 자료 수집 → 마스터 프로필 생성 → 포트폴리오 skeleton 생성
+후보 탐색 → 사용자 승인 → 자료 수집 → 마스터 프로필 생성 → 포트폴리오 초안 골격 생성
 ```
 
 1. 로컬 파일과 GitHub 활동을 후보로 탐색합니다.
@@ -104,7 +104,7 @@ portfolio-maker approve --workspace . --write-sample --force
 
 ## 현재 범위와 로드맵
 
-0.1.0에서는 로컬 자료 기반의 프로필 생성과 검토용 포트폴리오 skeleton에 집중합니다. GitHub 활동의 산출물 반영, 회사·채용공고별 맞춤 작성, Google Drive 연동, 이력서·자기소개서·면접 자료, OCR·시맨틱 검색, MCP/app-server 인터페이스는 [GitHub Issues](https://github.com/koreaben777/portfolio-maker/issues)에서 관리합니다.
+0.1.0에서는 로컬 자료 기반의 프로필 생성과 검토용 포트폴리오 초안 골격에 집중합니다. GitHub 활동의 산출물 반영, 회사·채용공고별 맞춤 작성, Google Drive 연동, 이력서·자기소개서·면접 자료, OCR·시맨틱 검색, MCP/app-server 인터페이스는 [GitHub Issues](https://github.com/koreaben777/portfolio-maker/issues)에서 관리합니다.
 
 ## 버그와 제안
 
