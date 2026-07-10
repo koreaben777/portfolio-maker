@@ -32,6 +32,7 @@ pytest
 ## Safety Rules
 
 - Discovery may list candidates, but ingestion is blocked until `.portfolio-maker/reviews/source-approval.json` exists.
+- Profile generation rechecks the current approval and forbidden-path policy before using an ingested snapshot.
 - Original files are not copied into `.portfolio-maker/`.
 - Extracted snapshots are masked for common secret patterns.
 - Private GitHub repositories are skipped unless `private_sources_allowed` is set to `true` in the approval file.

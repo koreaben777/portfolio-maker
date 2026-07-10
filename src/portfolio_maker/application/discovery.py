@@ -47,7 +47,7 @@ def discover_sources(request: DiscoverSourcesRequest) -> DiscoverSourcesResult:
     github_activities: list[GitHubActivityCandidate] = []
     github_statuses: list[str] = []
     if request.include_github:
-        excluded_repositories = set(approval.excluded_repositories) if approval else set()
+        excluded_repositories = approval.excluded_repositories if approval else ()
         private_sources_allowed = approval.private_sources_allowed if approval else False
         try:
             github_repos, github_activities, github_statuses = discover_github_candidates(
@@ -57,16 +57,6 @@ def discover_sources(request: DiscoverSourcesRequest) -> DiscoverSourcesResult:
         except (GitHubDiscoveryError, FileNotFoundError) as error:
             github_statuses = [str(error) or "GitHub discovery failed"]
 
-        github_repos = [
-            repo
-            for repo in github_repos
-            if repo.name_with_owner not in excluded_repositories
-            and (private_sources_allowed or not repo.is_private)
-        ]
-        allowed_repos = {repo.name_with_owner for repo in github_repos}
-        github_activities = [
-            activity for activity in github_activities if activity.repo in allowed_repos
-        ]
         repo_source_ids: dict[str, int] = {}
         for repo in github_repos:
             repo_source_ids[repo.name_with_owner] = repository.upsert_source(

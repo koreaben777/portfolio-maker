@@ -114,7 +114,6 @@ src/portfolio_maker/
     ingest_sources
     build_profile
     draft_portfolio
-    export_artifacts
   domain/
     source
     evidence
@@ -190,7 +189,6 @@ Initial use cases:
 - `ingest_sources`
 - `build_profile`
 - `draft_portfolio`
-- `export_artifacts`
 
 Rules:
 
@@ -223,7 +221,6 @@ Initial infrastructure:
 - SQLite repository
 - raw snapshot file store
 - secret masking and policy filters
-- audit logging
 
 Infrastructure modules must return structured errors rather than leaking raw command output or secret values into logs.
 
@@ -333,8 +330,6 @@ The MVP stores project-local state under:
   reviews/
     discovery-report.md
     source-approval.json
-  logs/
-    audit.jsonl
 ```
 
 `.portfolio-maker/` is local working data. The implementation plan should decide which subpaths are ignored by Git and whether example templates are committed separately.
@@ -434,6 +429,8 @@ Rules:
 `discover` may produce candidate reports. `ingest` may not read source bodies until `source-approval.json` exists and approves the target sources.
 
 This gate also applies when `run-mvp` is used.
+
+`build-profile` rechecks the current approval and forbidden-path policy before using an existing snapshot.
 
 ## Error Handling
 

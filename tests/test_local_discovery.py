@@ -294,16 +294,6 @@ def test_discover_sources_filters_private_and_excluded_github_repos(workspace, t
                     url="https://github.com/octo/public",
                     is_private=False,
                 ),
-                GitHubRepositoryCandidate(
-                    name_with_owner="octo/private",
-                    url="https://github.com/octo/private",
-                    is_private=True,
-                ),
-                GitHubRepositoryCandidate(
-                    name_with_owner="octo/excluded",
-                    url="https://github.com/octo/excluded",
-                    is_private=False,
-                ),
             ],
             [
                 GitHubActivityCandidate(
@@ -311,26 +301,6 @@ def test_discover_sources_filters_private_and_excluded_github_repos(workspace, t
                     activity_type="issue",
                     url="https://github.com/octo/public/issues/1",
                     title="Keep",
-                    state="OPEN",
-                    author="octo",
-                    created_at="2026-01-01T00:00:00Z",
-                    merged_at=None,
-                ),
-                GitHubActivityCandidate(
-                    repo="octo/private",
-                    activity_type="issue",
-                    url="https://github.com/octo/private/issues/1",
-                    title="Drop private",
-                    state="OPEN",
-                    author="octo",
-                    created_at="2026-01-01T00:00:00Z",
-                    merged_at=None,
-                ),
-                GitHubActivityCandidate(
-                    repo="octo/excluded",
-                    activity_type="issue",
-                    url="https://github.com/octo/excluded/issues/1",
-                    title="Drop excluded",
                     state="OPEN",
                     author="octo",
                     created_at="2026-01-01T00:00:00Z",

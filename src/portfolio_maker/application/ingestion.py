@@ -9,7 +9,7 @@ from portfolio_maker.domain.models import SourceStatus, SourceType
 from portfolio_maker.infrastructure.extractors import extract_text
 from portfolio_maker.infrastructure.policy import FilePolicy
 from portfolio_maker.infrastructure.sqlite_repository import SQLiteRepository
-from portfolio_maker.infrastructure.snapshots import SnapshotStore
+from portfolio_maker.infrastructure.snapshots import write_local_snapshot
 from portfolio_maker.workspace import WorkspacePaths
 
 
@@ -30,7 +30,6 @@ def ingest_sources(request: IngestSourcesRequest) -> IngestSourcesResult:
     )
     repository = SQLiteRepository(paths.db_path)
     repository.initialize()
-    snapshots = SnapshotStore(paths)
     latest_hashes = repository.latest_snapshot_hashes_by_source_id()
     ingested_count = 0
     skipped_count = 0
@@ -69,7 +68,7 @@ def ingest_sources(request: IngestSourcesRequest) -> IngestSourcesResult:
         ):
             skipped_count += 1
             continue
-        snapshot_path = snapshots.write_local_snapshot(source.id, source_path, extracted)
+        snapshot_path = write_local_snapshot(paths, source.id, source_path, extracted)
         repository.insert_source_snapshot(
             source.id,
             snapshot_path,

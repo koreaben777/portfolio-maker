@@ -14,8 +14,6 @@ class WorkspacePaths:
     local_snapshots_dir: Path
     artifacts_dir: Path
     reviews_dir: Path
-    logs_dir: Path
-    audit_log_path: Path
     discovery_report_path: Path
     approval_path: Path
     master_profile_json_path: Path
@@ -30,7 +28,6 @@ class WorkspacePaths:
         snapshots_dir = raw_dir / "snapshots"
         artifacts_dir = root / "artifacts"
         reviews_dir = root / "reviews"
-        logs_dir = root / "logs"
         return cls(
             workspace=workspace,
             root=root,
@@ -40,8 +37,6 @@ class WorkspacePaths:
             local_snapshots_dir=snapshots_dir / "local",
             artifacts_dir=artifacts_dir,
             reviews_dir=reviews_dir,
-            logs_dir=logs_dir,
-            audit_log_path=logs_dir / "audit.jsonl",
             discovery_report_path=reviews_dir / "discovery-report.md",
             approval_path=reviews_dir / "source-approval.json",
             master_profile_json_path=artifacts_dir / "master-profile.json",
@@ -57,6 +52,5 @@ class WorkspacePaths:
             self.local_snapshots_dir,
             self.artifacts_dir,
             self.reviews_dir,
-            self.logs_dir,
         ):
             path.mkdir(parents=True, exist_ok=True)

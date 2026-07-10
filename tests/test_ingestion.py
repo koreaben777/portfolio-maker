@@ -11,7 +11,7 @@ from portfolio_maker.application.models import IngestSourcesRequest
 from portfolio_maker.domain.models import Source, SourceStatus, SourceType
 from portfolio_maker.infrastructure.extractors import extract_text
 from portfolio_maker.infrastructure.sqlite_repository import SQLiteRepository
-from portfolio_maker.infrastructure.snapshots import SnapshotStore
+from portfolio_maker.infrastructure.snapshots import write_local_snapshot
 from portfolio_maker.workspace import WorkspacePaths
 
 
@@ -45,7 +45,7 @@ def test_snapshot_store_writes_local_snapshot_json(tmp_path):
     extracted = extract_text(source)
     paths = WorkspacePaths.from_root(tmp_path / "workspace")
 
-    snapshot_path = SnapshotStore(paths).write_local_snapshot(7, source, extracted)
+    snapshot_path = write_local_snapshot(paths, 7, source, extracted)
 
     assert snapshot_path == paths.local_snapshots_dir / "source-7.json"
     payload = json.loads(snapshot_path.read_text(encoding="utf-8"))

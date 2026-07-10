@@ -28,19 +28,6 @@ class DiscoverSourcesResult:
 
 
 @dataclass(frozen=True)
-class ApprovalRequest:
-    workspace: Path
-    write_sample: bool = False
-
-
-@dataclass(frozen=True)
-class ApprovalResult:
-    approval_path: Path
-    approved_sources: int
-    forbidden_paths: tuple[str, ...] = ()
-
-
-@dataclass(frozen=True)
 class IngestSourcesRequest:
     workspace: Path
 

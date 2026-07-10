@@ -114,7 +114,6 @@ src/portfolio_maker/
     ingest_sources
     build_profile
     draft_portfolio
-    export_artifacts
   domain/
     source
     evidence
@@ -190,7 +189,6 @@ Application use case는 재사용 가능한 engine boundary입니다.
 - `ingest_sources`
 - `build_profile`
 - `draft_portfolio`
-- `export_artifacts`
 
 규칙:
 
@@ -223,7 +221,6 @@ Infrastructure는 side effect를 구현합니다.
 - SQLite repository
 - raw snapshot file store
 - secret masking 및 policy filter
-- audit logging
 
 Infrastructure module은 raw command output이나 secret 값을 log에 흘리지 않고 structured error를 반환해야 합니다.
 
@@ -333,8 +330,6 @@ MVP는 project-local state를 다음 경로 아래에 저장합니다.
   reviews/
     discovery-report.md
     source-approval.json
-  logs/
-    audit.jsonl
 ```
 
 `.portfolio-maker/`는 로컬 작업 데이터입니다. 어떤 subpath를 Git에서 ignore할지, example template을 따로 commit할지는 implementation plan에서 결정합니다.
@@ -434,6 +429,8 @@ MVP는 GitHub CLI auth 또는 fine-grained token을 사용할 수 있습니다.
 `discover`는 candidate report를 만들 수 있습니다. `ingest`는 `source-approval.json`이 존재하고 target source를 승인하기 전까지 source body를 읽으면 안 됩니다.
 
 이 gate는 `run-mvp`를 사용할 때도 동일하게 적용됩니다.
+
+`build-profile`은 기존 snapshot을 사용하기 전에 현재 approval과 forbidden-path policy를 다시 확인합니다.
 
 ## 오류 처리
 

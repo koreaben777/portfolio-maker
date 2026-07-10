@@ -8,6 +8,8 @@
 
 **Tech Stack:** Python 3.11+, standard library `argparse`, `dataclasses`, `json`, `sqlite3`, `pathlib`, `subprocess`; test runner `pytest`; packaging via `pyproject.toml`.
 
+> **Historical implementation note:** The checklist and code snippets below record the original implementation sequence. The implemented 0.1.0 contract is defined by the README, architecture specs, and runtime: only `sources`, `source_snapshots`, and `github_activities` are created. Snippets for `evidence_items`, `projects`, `career_claims`, `claim_evidence`, and `artifacts` are deferred design, not current implementation work.
+
 ---
 
 ## Scope Notes

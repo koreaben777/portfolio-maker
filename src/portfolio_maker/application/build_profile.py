@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 
+from portfolio_maker.application.approval import load_approval
 from portfolio_maker.application.models import BuildProfileRequest, BuildProfileResult
-from portfolio_maker.domain.models import SourceStatus
+from portfolio_maker.domain.models import SourceStatus, SourceType
 from portfolio_maker.infrastructure.artifacts import write_json, write_markdown
+from portfolio_maker.infrastructure.policy import FilePolicy
 from portfolio_maker.infrastructure.sqlite_repository import SQLiteRepository
 from portfolio_maker.workspace import WorkspacePaths
 
@@ -13,9 +16,20 @@ from portfolio_maker.workspace import WorkspacePaths
 def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
     paths = WorkspacePaths.from_root(request.workspace)
     paths.ensure()
+    approval = load_approval(paths)
+    approved_uris = set(approval.approved_source_uris)
+    policy = FilePolicy(
+        forbidden_paths=tuple(Path(path) for path in approval.forbidden_paths)
+    )
     repository = SQLiteRepository(paths.db_path)
     repository.initialize()
-    sources = repository.list_sources(status=SourceStatus.INGESTED)
+    sources = [
+        source
+        for source in repository.list_sources(status=SourceStatus.INGESTED)
+        if source.type == SourceType.LOCAL_FILE
+        and source.uri in approved_uris
+        and policy.classify_path(_path_from_file_uri(source.uri)) == "candidate"
+    ]
     snapshots = repository.latest_snapshots_by_source_id()
     claims = [
         {
@@ -81,3 +95,10 @@ def _snapshot_evidence(display_name: str, snapshot_path: Path | None) -> str:
         if line != display_name:
             return line
     return lines[0] if lines else "Approved evidence captured."
+
+
+def _path_from_file_uri(uri: str) -> Path:
+    parsed = urlparse(uri)
+    if parsed.scheme != "file":
+        raise ValueError("Only file URIs are supported")
+    return Path(unquote(parsed.path))
