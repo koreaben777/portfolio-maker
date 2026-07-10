@@ -300,6 +300,8 @@ Ingestion은 승인된 로컬 파일 source만 읽습니다. 읽기 직전에 sy
 
 Portfolio draft는 현재 로컬 snapshot 기반 master-profile content에서 생성합니다.
 
+0.1.0에서는 검토가 필요한 portfolio skeleton입니다. 승인된 source를 나열하지만 role, technical approach, outcome은 placeholder로 남으며, evidence를 반영한 portfolio 작성은 후속 생성 단계로 미룹니다.
+
 포함해야 할 항목:
 
 - project title

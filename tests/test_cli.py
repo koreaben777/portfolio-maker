@@ -82,14 +82,57 @@ def test_cli_discover_missing_root_exits_without_traceback(workspace, tmp_path, 
     assert "Traceback" not in captured.err
 
 
-def test_cli_draft_malformed_profile_exits_without_traceback(workspace, capsys):
+def test_cli_draft_malformed_profile_recovers_by_rebuilding(workspace, capsys):
     profile_path = workspace / ".portfolio-maker" / "artifacts" / "master-profile.json"
     profile_path.parent.mkdir(parents=True)
     profile_path.write_text('["unexpected"]', encoding="utf-8")
+    approval_path = workspace / ".portfolio-maker" / "reviews" / "source-approval.json"
+    approval_path.parent.mkdir(parents=True)
+    approval_path.write_text("{}", encoding="utf-8")
 
     exit_code = main(["draft-portfolio", "--workspace", str(workspace)])
 
     captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "Portfolio draft:" in captured.out
+    assert "Traceback" not in captured.err
+
+
+def test_cli_discover_anchors_relative_forbidden_path_to_workspace(workspace, monkeypatch):
+    private_path = workspace / "private" / "notes.md"
+    private_path.parent.mkdir()
+    private_path.write_text("private evidence", encoding="utf-8")
+    monkeypatch.chdir(workspace.parent)
+
+    exit_code = main(
+        [
+            "discover",
+            "--workspace",
+            str(workspace),
+            "--home",
+            str(workspace),
+            "--forbidden-path",
+            "private",
+            "--no-github",
+        ]
+    )
+
+    report = workspace / ".portfolio-maker" / "reviews" / "discovery-report.md"
+    assert exit_code == 0
+    assert private_path.name not in report.read_text(encoding="utf-8")
+
+
+def test_cli_ingest_invalid_tilde_forbidden_path_exits_without_traceback(workspace, capsys):
+    approval_path = workspace / ".portfolio-maker" / "reviews" / "source-approval.json"
+    approval_path.parent.mkdir(parents=True)
+    approval_path.write_text(
+        '{"forbidden_paths": ["~portfolio_maker_missing_user/private"]}',
+        encoding="utf-8",
+    )
+
+    exit_code = main(["ingest", "--workspace", str(workspace)])
+
+    captured = capsys.readouterr()
     assert exit_code == 1
-    assert "master profile must be an object" in captured.err
+    assert "invalid forbidden path" in captured.err
     assert "Traceback" not in captured.err

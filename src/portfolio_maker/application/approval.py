@@ -58,23 +58,31 @@ def load_approval(paths: WorkspacePaths) -> SourceApproval:
     if not isinstance(private_sources_allowed, bool):
         raise ApprovalFormatError("private_sources_allowed must be a bool")
 
+    forbidden_paths = _string_list(payload, "forbidden_paths")
+    for value in forbidden_paths:
+        normalize_workspace_path(paths, value)
+
     return SourceApproval(
         version=version,
         approved_source_uris=_string_list(payload, "approved_source_uris"),
-        forbidden_paths=_string_list(payload, "forbidden_paths"),
+        forbidden_paths=forbidden_paths,
         excluded_repositories=_string_list(payload, "excluded_repositories"),
         private_sources_allowed=private_sources_allowed,
     )
 
 
 def approval_forbidden_paths(paths: WorkspacePaths, approval: SourceApproval) -> tuple[Path, ...]:
-    normalized: list[Path] = []
-    for value in approval.forbidden_paths:
+    return tuple(normalize_workspace_path(paths, value) for value in approval.forbidden_paths)
+
+
+def normalize_workspace_path(paths: WorkspacePaths, value: Path | str) -> Path:
+    try:
         path = Path(value).expanduser()
-        if not path.is_absolute():
-            path = paths.workspace / path
-        normalized.append(path.resolve(strict=False))
-    return tuple(normalized)
+    except RuntimeError as error:
+        raise ApprovalFormatError("invalid forbidden path") from error
+    if not path.is_absolute():
+        path = paths.workspace / path
+    return path.resolve(strict=False)
 
 
 def _string_list(payload: dict[str, Any], key: str) -> tuple[str, ...]:

@@ -45,6 +45,7 @@ pytest
 - The evidence store uses `sources`, `source_snapshots`, and `github_activities` at runtime.
 - GitHub repositories and activities are discovered and reviewed, but are not ingested into profile or portfolio artifacts until the later company-specific generation phase.
 - Normalized evidence, claim, and artifact tables are not created until the later company-specific generation phase needs runtime readers and writers.
+- The 0.1.0 portfolio draft is a review-required portfolio skeleton: it lists approved sources but does not render evidence into role, technical approach, or outcome claims. Evidence-rendered portfolio writing is deferred.
 
 ## Codex App Workflow
 
@@ -57,11 +58,16 @@ $portfolio-maker
 Then follow the approval flow:
 
 ```bash
-portfolio-maker discover --workspace .
 portfolio-maker approve --workspace . --write-sample
 ```
 
-Review:
+Before the first GitHub discovery, edit `excluded_repositories` and `private_sources_allowed` in the sample approval file when needed. Then run:
+
+```bash
+portfolio-maker discover --workspace .
+```
+
+Review and complete local source approvals:
 
 ```text
 .portfolio-maker/reviews/discovery-report.md

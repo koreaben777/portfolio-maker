@@ -3,8 +3,6 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from stat import S_ISREG
-from urllib.parse import unquote, urlparse
 
 
 DEFAULT_EXCLUDED_NAMES = {
@@ -32,6 +30,20 @@ SENSITIVE_FILE_NAMES = {
     "password-export.json",
     "password_export.csv",
     "password_export.json",
+    "lastpass.csv",
+    "lastpass_export.csv",
+    "lastpass-export.csv",
+    "bitwarden.csv",
+    "bitwarden_export.csv",
+    "bitwarden-export.csv",
+    "1password.csv",
+    "1password_export.csv",
+    "1password-export.csv",
+    "chrome_passwords.csv",
+    "chrome-passwords.csv",
+    "firefox_logins.csv",
+    "firefox-logins.csv",
+    "firefox_logins.json",
 }
 
 SENSITIVE_KEY = r"[A-Za-z0-9_-]*(?:password|api[_-]?key|token|secret(?:[_-]?access)?[_-]?key|secret)[A-Za-z0-9_-]*"
@@ -63,6 +75,10 @@ SECRET_PATTERNS = [
     ),
 ]
 DEFAULT_EXCLUDED_NAMES_CASEFOLD = {name.casefold() for name in DEFAULT_EXCLUDED_NAMES}
+SENSITIVE_FILE_NAMES_CASEFOLD = {name.casefold() for name in SENSITIVE_FILE_NAMES}
+SECRET_SHAPED_FILENAME = re.compile(
+    r"(?i)(?:\bsk-|\bgithub_pat_|\bgh[pousr]_)[A-Za-z0-9_-]{8,}"
+)
 
 
 class SourcePathPolicyError(ValueError):
@@ -88,29 +104,13 @@ class FilePolicy:
     def classify_path(self, path: Path) -> str:
         if self.is_forbidden(path):
             return "forbidden"
-        if path.name.lower() in SENSITIVE_FILE_NAMES:
+        if path.name.casefold() in SENSITIVE_FILE_NAMES_CASEFOLD:
+            return "skipped_policy"
+        if SECRET_SHAPED_FILENAME.search(path.name):
             return "skipped_policy"
         if any(part.casefold() in DEFAULT_EXCLUDED_NAMES_CASEFOLD for part in path.parts):
             return "skipped_policy"
         return "candidate"
-
-
-def approved_regular_file_path(uri: str, policy: FilePolicy) -> Path:
-    parsed = urlparse(uri)
-    if parsed.scheme != "file" or parsed.netloc:
-        raise SourcePathPolicyError("Approved source must use a local file URI")
-
-    path = Path(unquote(parsed.path))
-    stat = path.lstat()
-    if not S_ISREG(stat.st_mode):
-        raise SourcePathPolicyError("Approved source must be a regular file")
-    if path.resolve(strict=True).as_uri() != uri:
-        raise SourcePathPolicyError("Approved source URI is not canonical")
-    if policy.classify_path(path) != "candidate":
-        raise SourcePathPolicyError("Approved source is blocked by file policy")
-    if stat.st_size > policy.max_file_size_bytes:
-        raise SourcePathPolicyError("Approved source exceeds the size limit")
-    return path
 
 
 def mask_secrets(text: str) -> str:

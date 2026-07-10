@@ -9,6 +9,8 @@ Use this skill to run the Portfolio Maker MVP safely from Codex app.
 
 GitHub repositories and activities can be discovered for review, but this MVP does not ingest them into profile or portfolio artifacts.
 
+The generated portfolio draft is a review-required portfolio skeleton. It lists approved sources but leaves role, technical approach, and outcome as placeholders; evidence-rendered portfolio writing is deferred.
+
 ## Safety Rules
 
 - Do not run `portfolio-maker ingest` until the user has reviewed `.portfolio-maker/reviews/discovery-report.md` and approved `.portfolio-maker/reviews/source-approval.json`.
@@ -23,7 +25,15 @@ GitHub repositories and activities can be discovered for review, but this MVP do
    - portfolio draft
    - both
 2. Ask for forbidden folders and repositories.
-3. Run discovery:
+3. Before the first GitHub discovery, create an approval sample:
+
+```bash
+portfolio-maker approve --workspace . --write-sample
+```
+
+4. Edit `excluded_repositories` and `private_sources_allowed` in `.portfolio-maker/reviews/source-approval.json` when GitHub visibility rules are needed.
+
+5. Run discovery:
 
 ```bash
 portfolio-maker discover --workspace .
@@ -31,25 +41,19 @@ portfolio-maker discover --workspace .
 
 If the user supplied forbidden paths, pass one `--forbidden-path` argument per path.
 
-4. Ask the user to review:
+6. Ask the user to review:
 
 ```text
 .portfolio-maker/reviews/discovery-report.md
 ```
 
-5. Create a sample approval file when needed:
-
-```bash
-portfolio-maker approve --workspace . --write-sample
-```
-
-6. Ask the user to edit and approve:
+7. Ask the user to complete local source approval:
 
 ```text
 .portfolio-maker/reviews/source-approval.json
 ```
 
-7. After approval only, run:
+8. After approval only, run:
 
 ```bash
 portfolio-maker ingest --workspace .
@@ -57,7 +61,7 @@ portfolio-maker build-profile --workspace .
 portfolio-maker draft-portfolio --workspace .
 ```
 
-8. Review generated artifacts:
+9. Review generated artifacts:
 
 ```text
 .portfolio-maker/artifacts/master-profile.json
@@ -65,7 +69,7 @@ portfolio-maker draft-portfolio --workspace .
 .portfolio-maker/artifacts/portfolio-draft.md
 ```
 
-9. Report:
+10. Report:
    - what was generated
    - which commands were run
    - whether public artifacts avoided secrets and private raw paths

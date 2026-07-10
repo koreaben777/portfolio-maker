@@ -300,6 +300,8 @@ Detailed project summaries, skill inventories, role analyses, and confidence-sco
 
 The portfolio draft is generated from current local-snapshot-based master-profile content.
 
+In 0.1.0 it is a review-required portfolio skeleton: approved sources are listed, while role, technical approach, and outcome remain placeholders. Evidence-rendered portfolio writing is deferred to a later generation phase.
+
 It should include:
 
 - project title

@@ -162,6 +162,27 @@ class SQLiteRepository:
             )
         return int(cursor.lastrowid)
 
+    def update_latest_source_snapshot(
+        self,
+        source_id: int,
+        snapshot_path: Path,
+        content_hash: str,
+        extractor: str,
+    ) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                """
+                UPDATE source_snapshots
+                SET snapshot_path = ?, content_hash = ?, extractor = ?, extracted_at = CURRENT_TIMESTAMP
+                WHERE id = (
+                    SELECT MAX(id)
+                    FROM source_snapshots
+                    WHERE source_id = ?
+                )
+                """,
+                (str(snapshot_path), content_hash, extractor, source_id),
+            )
+
     def latest_snapshots_by_source_id(self) -> dict[int, Path]:
         with self._connection() as conn:
             rows = conn.execute(

@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-from portfolio_maker.application.approval import approval_forbidden_paths, load_approval
+from portfolio_maker.application.approval import (
+    approval_forbidden_paths,
+    load_approval,
+    normalize_workspace_path,
+)
 from portfolio_maker.application.models import DiscoverSourcesRequest, DiscoverSourcesResult, ProgressEvent
 from portfolio_maker.domain.models import GitHubActivity, Source, SourceStatus, SourceType
 from portfolio_maker.infrastructure.github_connector import (
@@ -25,9 +29,12 @@ def discover_sources(request: DiscoverSourcesRequest) -> DiscoverSourcesResult:
     approved_forbidden_paths = (
         approval_forbidden_paths(paths, approval) if approval else ()
     )
+    requested_forbidden_paths = tuple(
+        normalize_workspace_path(paths, path) for path in request.forbidden_paths
+    )
     candidates, skipped = discover_local_candidates(
         request.home,
-        request.forbidden_paths + (paths.root,) + approved_forbidden_paths,
+        requested_forbidden_paths + (paths.root,) + approved_forbidden_paths,
     )
     for candidate in candidates:
         repository.upsert_source(

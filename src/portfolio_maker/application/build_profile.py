@@ -1,19 +1,13 @@
 from __future__ import annotations
 
-import json
-from pathlib import Path
-
 from portfolio_maker.application.approval import approval_forbidden_paths, load_approval
 from portfolio_maker.application.models import BuildProfileRequest, BuildProfileResult
 from portfolio_maker.domain.models import Source, SourceStatus, SourceType
 from portfolio_maker.infrastructure.artifacts import write_json, write_markdown
-from portfolio_maker.infrastructure.extractors import extract_text
-from portfolio_maker.infrastructure.policy import (
-    FilePolicy,
-    SourcePathPolicyError,
-    approved_regular_file_path,
-)
+from portfolio_maker.infrastructure.extractors import extract_approved_text
+from portfolio_maker.infrastructure.policy import FilePolicy, SourcePathPolicyError
 from portfolio_maker.infrastructure.sqlite_repository import SQLiteRepository
+from portfolio_maker.infrastructure.snapshots import load_valid_local_snapshot
 from portfolio_maker.workspace import WorkspacePaths
 
 
@@ -34,8 +28,7 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
         if source.type != SourceType.LOCAL_FILE or source.uri not in approved_uris or source.id is None:
             continue
         try:
-            source_path = approved_regular_file_path(source.uri, policy)
-            extracted = extract_text(source_path)
+            source_path, extracted = extract_approved_text(source.uri, policy)
         except FileNotFoundError:
             repository.update_source_status(source.id, SourceStatus.STALE_SOURCE)
             continue
@@ -47,14 +40,21 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
             continue
 
         snapshot_path = snapshots.get(source.id)
-        evidence = _snapshot_evidence(
-            source,
-            snapshot_path,
-            extracted.content_hash,
-            snapshot_hashes.get(source.id),
-        )
-        if evidence is None:
+        if snapshot_path is None or snapshot_hashes.get(source.id) != extracted.content_hash:
             repository.update_source_status(source.id, SourceStatus.STALE_SOURCE)
+            continue
+        snapshot = load_valid_local_snapshot(
+            snapshot_path,
+            source.id,
+            source.uri,
+            source_path.name,
+            extracted,
+        )
+        if snapshot is None:
+            repository.update_source_status(source.id, SourceStatus.STALE_SOURCE)
+            continue
+        evidence = _snapshot_evidence(source.display_name, str(snapshot["text"]))
+        if evidence is None:
             continue
 
         sources.append(source)
@@ -109,32 +109,13 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
     )
 
 
-def _snapshot_evidence(
-    source: Source,
-    snapshot_path: Path | None,
-    content_hash: str,
-    snapshot_hash: str | None,
-) -> str | None:
-    if snapshot_path is None or not snapshot_path.exists() or snapshot_hash != content_hash:
-        return None
-    try:
-        payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    if (
-        not isinstance(payload, dict)
-        or payload.get("source_id") != source.id
-        or payload.get("source_uri") != source.uri
-        or payload.get("content_hash") != content_hash
-        or not isinstance(payload.get("text"), str)
-    ):
-        return None
+def _snapshot_evidence(display_name: str, text: str) -> str | None:
     lines = [
         line.strip().lstrip("#").strip()
-        for line in payload["text"].splitlines()
+        for line in text.splitlines()
         if line.strip()
     ]
     for line in lines:
-        if line != source.display_name:
+        if line != display_name:
             return line
-    return lines[0] if lines else "Approved evidence captured."
+    return lines[0] if lines else None

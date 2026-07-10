@@ -91,3 +91,15 @@ def test_load_approval_rejects_unsupported_version(workspace):
 
     with pytest.raises(ApprovalFormatError, match="version must be 1"):
         load_approval(paths)
+
+
+def test_load_approval_rejects_unknown_tilde_user_as_format_error(workspace):
+    paths = WorkspacePaths.from_root(workspace)
+    paths.ensure()
+    paths.approval_path.write_text(
+        json.dumps({"forbidden_paths": ["~portfolio_maker_missing_user/private"]}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ApprovalFormatError, match="invalid forbidden path"):
+        load_approval(paths)

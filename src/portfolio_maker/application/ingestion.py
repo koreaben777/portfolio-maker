@@ -1,16 +1,17 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from portfolio_maker.application.approval import approval_forbidden_paths, load_approval
 from portfolio_maker.application.models import IngestSourcesRequest, IngestSourcesResult
 from portfolio_maker.domain.models import SourceStatus, SourceType
-from portfolio_maker.infrastructure.extractors import extract_text
-from portfolio_maker.infrastructure.policy import (
-    FilePolicy,
-    SourcePathPolicyError,
-    approved_regular_file_path,
-)
+from portfolio_maker.infrastructure.extractors import extract_approved_text
+from portfolio_maker.infrastructure.policy import FilePolicy, SourcePathPolicyError
 from portfolio_maker.infrastructure.sqlite_repository import SQLiteRepository
-from portfolio_maker.infrastructure.snapshots import write_local_snapshot
+from portfolio_maker.infrastructure.snapshots import (
+    load_valid_local_snapshot,
+    write_local_snapshot,
+)
 from portfolio_maker.workspace import WorkspacePaths
 
 
@@ -23,6 +24,7 @@ def ingest_sources(request: IngestSourcesRequest) -> IngestSourcesResult:
     repository = SQLiteRepository(paths.db_path)
     repository.initialize()
     latest_hashes = repository.latest_snapshot_hashes_by_source_id()
+    latest_snapshots = repository.latest_snapshots_by_source_id()
     ingested_count = 0
     skipped_count = 0
     snapshot_paths: list[Path] = []
@@ -37,7 +39,7 @@ def ingest_sources(request: IngestSourcesRequest) -> IngestSourcesResult:
             continue
 
         try:
-            source_path = approved_regular_file_path(source.uri, policy)
+            source_path, extracted = extract_approved_text(source.uri, policy)
         except FileNotFoundError:
             repository.update_source_status(source.id, SourceStatus.STALE_SOURCE)
             skipped_count += 1
@@ -51,20 +53,19 @@ def ingest_sources(request: IngestSourcesRequest) -> IngestSourcesResult:
             skipped_count += 1
             continue
 
-        try:
-            extracted = extract_text(source_path)
-        except FileNotFoundError:
-            repository.update_source_status(source.id, SourceStatus.STALE_SOURCE)
-            skipped_count += 1
-            continue
-        except OSError:
-            repository.update_source_status(source.id, SourceStatus.EXTRACT_FAILED)
-            skipped_count += 1
-            continue
+        latest_snapshot = latest_snapshots.get(source.id)
         if (
-            source.status == SourceStatus.INGESTED
+            latest_snapshot is not None
             and latest_hashes.get(source.id) == extracted.content_hash
+            and load_valid_local_snapshot(
+                latest_snapshot,
+                source.id,
+                source.uri,
+                source_path.name,
+                extracted,
+            ) is not None
         ):
+            repository.update_source_status(source.id, SourceStatus.INGESTED)
             skipped_count += 1
             continue
         snapshot_path = write_local_snapshot(
@@ -74,12 +75,20 @@ def ingest_sources(request: IngestSourcesRequest) -> IngestSourcesResult:
             extracted,
             source_uri=source.uri,
         )
-        repository.insert_source_snapshot(
-            source.id,
-            snapshot_path,
-            extracted.content_hash,
-            extracted.extractor,
-        )
+        if latest_snapshot == snapshot_path and latest_hashes.get(source.id) == extracted.content_hash:
+            repository.update_latest_source_snapshot(
+                source.id,
+                snapshot_path,
+                extracted.content_hash,
+                extracted.extractor,
+            )
+        else:
+            repository.insert_source_snapshot(
+                source.id,
+                snapshot_path,
+                extracted.content_hash,
+                extracted.extractor,
+            )
         repository.update_source_status(source.id, SourceStatus.INGESTED)
         snapshot_paths.append(snapshot_path)
         ingested_count += 1

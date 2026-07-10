@@ -32,8 +32,8 @@ class GitHubActivityCandidate:
 def parse_repo_list(payload: Any) -> list[GitHubRepositoryCandidate]:
     repos: list[GitHubRepositoryCandidate] = []
     for item in _list_payload(payload, "repository list"):
-        is_private = item.get("isPrivate", False)
-        if not isinstance(is_private, bool):
+        is_private = item.get("isPrivate")
+        if "isPrivate" not in item or not isinstance(is_private, bool):
             raise GitHubDiscoveryError("GitHub repository list payload is invalid")
         repos.append(
             GitHubRepositoryCandidate(
@@ -105,11 +105,11 @@ def parse_review_list(repo: str, payload: Any) -> list[GitHubActivityCandidate]:
             GitHubActivityCandidate(
                 repo=repo,
                 activity_type="review_comment",
-                url=_optional_string(item, "html_url", "review comment list") or "",
-                title=f"Review comment: {_optional_string(item, 'body', 'review comment list') or 'pull request'}".splitlines()[0],
+                url=_required_string(item, "html_url", "review comment list"),
+                title=f"Review comment: {_required_string(item, 'body', 'review comment list')}".splitlines()[0],
                 state="commented",
-                author=_nested_optional_string(item, "user", "login", "review comment list"),
-                created_at=_optional_string(item, "created_at", "review comment list") or "",
+                author=_nested_required_string(item, "user", "login", "review comment list"),
+                created_at=_required_string(item, "created_at", "review comment list"),
                 merged_at=None,
             )
         )
@@ -118,7 +118,7 @@ def parse_review_list(repo: str, payload: Any) -> list[GitHubActivityCandidate]:
 
 def parse_workflow_run_list(repo: str, payload: Any) -> list[GitHubActivityCandidate]:
     body = _object(payload, "workflow run list")
-    runs = body.get("workflow_runs", [])
+    runs = body.get("workflow_runs")
     if not isinstance(runs, list):
         raise GitHubDiscoveryError("GitHub workflow run list payload is invalid")
     activities: list[GitHubActivityCandidate] = []
@@ -127,15 +127,11 @@ def parse_workflow_run_list(repo: str, payload: Any) -> list[GitHubActivityCandi
             GitHubActivityCandidate(
                 repo=repo,
                 activity_type="workflow_run",
-                url=_optional_string(item, "html_url", "workflow run list") or "",
-                title=_optional_string(item, "name", "workflow run list") or "workflow",
-                state=(
-                    _optional_string(item, "conclusion", "workflow run list")
-                    or _optional_string(item, "status", "workflow run list")
-                    or ""
-                ),
-                author=_nested_optional_string(item, "actor", "login", "workflow run list"),
-                created_at=_optional_string(item, "created_at", "workflow run list") or "",
+                url=_required_string(item, "html_url", "workflow run list"),
+                title=_required_string(item, "name", "workflow run list"),
+                state=_required_one_of_strings(item, ("conclusion", "status"), "workflow run list"),
+                author=_nested_required_string(item, "actor", "login", "workflow run list"),
+                created_at=_required_string(item, "created_at", "workflow run list"),
                 merged_at=None,
             )
         )
@@ -171,11 +167,11 @@ def discover_github_candidates(
             ]
         )
     )
-    excluded = set(excluded_repositories)
+    excluded = {_canonical_repository_name(name) for name in excluded_repositories}
     repos = [
         repo
         for repo in repos
-        if repo.name_with_owner not in excluded
+        if _canonical_repository_name(repo.name_with_owner) not in excluded
         and (private_sources_allowed or not repo.is_private)
     ]
     activities: list[GitHubActivityCandidate] = []
@@ -269,3 +265,24 @@ def _nested_optional_string(
     if not isinstance(nested, str):
         raise GitHubDiscoveryError(f"GitHub {label} payload is invalid")
     return nested
+
+
+def _nested_required_string(
+    item: dict[str, Any], key: str, nested_key: str, label: str
+) -> str:
+    value = _object(item.get(key), label)
+    return _required_string(value, nested_key, label)
+
+
+def _required_one_of_strings(
+    item: dict[str, Any], keys: tuple[str, ...], label: str
+) -> str:
+    for key in keys:
+        value = item.get(key)
+        if isinstance(value, str):
+            return value
+    raise GitHubDiscoveryError(f"GitHub {label} payload is invalid")
+
+
+def _canonical_repository_name(name: str) -> str:
+    return name.strip().casefold()

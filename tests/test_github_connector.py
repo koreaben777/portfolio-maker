@@ -34,6 +34,13 @@ def test_parse_repo_list():
     ]
 
 
+def test_parse_repo_list_requires_boolean_privacy_field():
+    with pytest.raises(GitHubDiscoveryError, match="repository list payload is invalid"):
+        parse_repo_list(
+            [{"nameWithOwner": "octo/demo", "url": "https://github.com/octo/demo"}]
+        )
+
+
 def test_github_repository_candidate_keeps_only_discovery_fields():
     assert set(GitHubRepositoryCandidate.__dataclass_fields__) == {
         "name_with_owner",
@@ -94,6 +101,13 @@ def test_parse_commit_review_and_workflow_run_lists():
         created_at="2026-01-05T00:00:00Z",
         merged_at=None,
     )
+
+
+def test_review_and_workflow_parsers_reject_missing_stable_fields():
+    with pytest.raises(GitHubDiscoveryError, match="review comment list payload is invalid"):
+        parse_review_list("octo/demo", [{}])
+    with pytest.raises(GitHubDiscoveryError, match="workflow run list payload is invalid"):
+        parse_workflow_run_list("octo/demo", {})
 
 
 def test_discover_github_candidates_collects_repo_activities(monkeypatch):
@@ -158,7 +172,7 @@ def test_discover_github_candidates_filters_repos_before_activity_calls(monkeypa
                 },
             ]
         assert "octo/private" not in " ".join(args)
-        assert "octo/excluded" not in " ".join(args)
+        assert "octo/excluded" not in " ".join(args).casefold()
         if args[:2] in (["pr", "list"], ["issue", "list"]):
             return []
         if args == ["api", "repos/octo/public/commits"]:
@@ -175,7 +189,7 @@ def test_discover_github_candidates_filters_repos_before_activity_calls(monkeypa
     )
 
     repos, activities, statuses = discover_github_candidates(
-        excluded_repositories=("octo/excluded",),
+        excluded_repositories=("OCTO/EXCLUDED",),
         private_sources_allowed=False,
     )
 
@@ -183,7 +197,7 @@ def test_discover_github_candidates_filters_repos_before_activity_calls(monkeypa
     assert activities == []
     assert statuses == []
     assert all("octo/private" not in " ".join(call) for call in calls)
-    assert all("octo/excluded" not in " ".join(call) for call in calls)
+    assert all("octo/excluded" not in " ".join(call).casefold() for call in calls)
 
 
 def test_discover_github_candidates_keeps_partial_results_when_repo_activity_fails(monkeypatch):

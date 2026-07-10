@@ -1,5 +1,6 @@
 import json
 
+import portfolio_maker.application.draft_portfolio as draft_portfolio_module
 from portfolio_maker.application.approval import write_sample_approval
 from portfolio_maker.application.build_profile import build_profile
 from portfolio_maker.application.draft_portfolio import draft_portfolio
@@ -101,16 +102,16 @@ def test_build_profile_and_draft_portfolio_from_ingested_source(tmp_path):
             {
                 "source_id": source_id,
                 "source_uri": source_path.resolve().as_uri(),
-                "display_name": "Portfolio Maker",
+                "display_name": "README.md",
                 "content_hash": content_hash,
-                "extractor": "text-v1",
+                "extractor": "text-v2",
                 "extracted_at": "2026-07-09T00:00:00Z",
                 "text": "# Portfolio Maker\nBuilt an approval-gated evidence pipeline.",
             }
         ),
         encoding="utf-8",
     )
-    repository.insert_source_snapshot(source_id, snapshot_path, content_hash, "text-v1")
+    repository.insert_source_snapshot(source_id, snapshot_path, content_hash, "text-v2")
 
     profile_result = build_profile(BuildProfileRequest(workspace=workspace))
 
@@ -262,3 +263,64 @@ def test_relative_forbidden_path_is_anchored_to_workspace_for_profile(tmp_path, 
     profile_result = build_profile(BuildProfileRequest(workspace=workspace))
 
     assert profile_result.claim_count == 0
+
+
+def test_build_profile_rejects_legacy_or_tampered_snapshot_text(tmp_path):
+    workspace, _, paths = _ingest_approved_source(tmp_path)
+    repository = SQLiteRepository(paths.db_path)
+    source = repository.list_sources()[0]
+    snapshot_path = repository.latest_snapshots_by_source_id()[source.id]
+    payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    payload["extractor"] = "text-v1"
+    payload["text"] = "fabricated synthetic evidence"
+    snapshot_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    profile_result = build_profile(BuildProfileRequest(workspace=workspace))
+
+    assert profile_result.claim_count == 0
+    assert repository.list_sources()[0].status == SourceStatus.STALE_SOURCE
+
+
+def test_build_profile_excludes_empty_snapshot_from_claims(tmp_path):
+    workspace = tmp_path / "workspace"
+    source_path = tmp_path / "empty.txt"
+    source_path.write_text("", encoding="utf-8")
+    paths = WorkspacePaths.from_root(workspace)
+    write_sample_approval(paths)
+    approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    approval["approved_source_uris"] = [source_path.resolve().as_uri()]
+    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    repository.upsert_source(
+        Source(
+            id=None,
+            type=SourceType.LOCAL_FILE,
+            uri=source_path.resolve().as_uri(),
+            display_name="empty.txt",
+            owner=None,
+            status=SourceStatus.APPROVED,
+        )
+    )
+    ingest_sources(IngestSourcesRequest(workspace=workspace))
+
+    profile_result = build_profile(BuildProfileRequest(workspace=workspace))
+
+    assert profile_result.claim_count == 0
+    assert json.loads(profile_result.json_path.read_text(encoding="utf-8"))["claims"] == []
+
+
+def test_draft_portfolio_masks_secret_shaped_display_names(tmp_path, monkeypatch):
+    paths = WorkspacePaths.from_root(tmp_path / "workspace")
+    paths.ensure()
+    paths.master_profile_json_path.write_text(
+        json.dumps({"sources": [{"display_name": "sk-synthetic-file-token"}]}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(draft_portfolio_module, "build_profile", lambda request: None)
+
+    draft_portfolio_module.draft_portfolio(DraftPortfolioRequest(workspace=paths.workspace))
+
+    draft = paths.portfolio_draft_path.read_text(encoding="utf-8")
+    assert "sk-synthetic-file-token" not in draft
+    assert "[REDACTED]" in draft
