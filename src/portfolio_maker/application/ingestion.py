@@ -11,9 +11,7 @@ from portfolio_maker.infrastructure.sqlite_repository import SQLiteRepository
 from portfolio_maker.infrastructure.snapshots import (
     has_valid_migrated_snapshot,
     load_valid_local_snapshot,
-    load_verified_managed_legacy_snapshot,
     migrate_verified_managed_legacy_snapshot,
-    remove_verified_managed_legacy_snapshot,
     write_local_snapshot,
 )
 from portfolio_maker.workspace import WorkspacePaths
@@ -58,7 +56,8 @@ def ingest_sources(request: IngestSourcesRequest) -> IngestSourcesResult:
             skipped_count += 1
             continue
 
-        latest = repository.latest_snapshot_metadata_by_source_id().get(source.id)
+        snapshot_rows = repository.snapshot_metadata_for_source(source.id)
+        latest = snapshot_rows[-1] if snapshot_rows else None
         latest_id = latest[0] if latest else None
         latest_snapshot = latest[1] if latest else None
         latest_hash = latest[2] if latest else None
@@ -125,18 +124,13 @@ def _cleanup_legacy_snapshot_state(
         return
     rows = repository.snapshot_metadata_for_source(source.id)
     legacy_path = paths.local_snapshots_dir / f"source-{source.id}.json"
-    legacy_payload = load_verified_managed_legacy_snapshot(
-        paths,
-        source.id,
-        source.uri,
-    )
     legacy_rows = [
         row
         for row in rows
         if row[1] == legacy_path and row[3] == "text-v1"
     ]
-
-    if legacy_payload is None:
+    migration = migrate_verified_managed_legacy_snapshot(paths, source.id, source.uri)
+    if migration is None:
         if legacy_path.exists() or legacy_path.is_symlink():
             return
         for snapshot_id, _, content_hash, _ in legacy_rows:
@@ -154,13 +148,8 @@ def _cleanup_legacy_snapshot_state(
                 repository.delete_source_snapshot(snapshot_id)
         return
 
-    content_hash = str(legacy_payload["content_hash"])
-    migrated_path, extracted = migrate_verified_managed_legacy_snapshot(
-        paths,
-        source.id,
-        source.uri,
-        legacy_payload,
-    )
+    migrated_path, extracted = migration
+    content_hash = extracted.content_hash
     matching_v2_rows = [
         row
         for row in rows
@@ -168,12 +157,6 @@ def _cleanup_legacy_snapshot_state(
         and row[2] == content_hash
         and row[3] == extracted.extractor
     ]
-    remove_verified_managed_legacy_snapshot(
-        paths,
-        source.id,
-        source.uri,
-        content_hash,
-    )
     if legacy_rows:
         for snapshot_id, _, _, _ in legacy_rows:
             if matching_v2_rows:

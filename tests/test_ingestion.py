@@ -764,6 +764,42 @@ def test_ingest_sources_legacy_cleanup_does_not_follow_replaced_managed_director
     assert external_file.read_text(encoding="utf-8") == "external marker"
 
 
+def test_ingest_sources_legacy_migration_does_not_write_through_replaced_directory(
+    tmp_path,
+    monkeypatch,
+):
+    workspace, _, paths, _, source_id, legacy_path = _legacy_snapshot_state(
+        tmp_path,
+        "api_key=synthetic-placeholder",
+    )
+    payload = json.loads(legacy_path.read_text(encoding="utf-8"))
+    original_dir = paths.local_snapshots_dir.with_name("local-original")
+    replacement_snapshot = paths.local_snapshots_dir / f"source-{source_id}-{payload['content_hash']}.json"
+    original_read_json = snapshots._read_regular_json
+    swapped = False
+
+    def replace_directory_after_legacy_read(directory_descriptor, filename):
+        nonlocal swapped
+        loaded = original_read_json(directory_descriptor, filename)
+        if filename == legacy_path.name and loaded is not None and not swapped:
+            swapped = True
+            paths.local_snapshots_dir.rename(original_dir)
+            paths.local_snapshots_dir.mkdir()
+        return loaded
+
+    monkeypatch.setattr(
+        snapshots,
+        "_read_regular_json",
+        replace_directory_after_legacy_read,
+    )
+
+    with pytest.raises(OSError, match="managed snapshot directory changed"):
+        ingest_sources(IngestSourcesRequest(workspace=workspace))
+
+    assert not replacement_snapshot.exists()
+    assert (original_dir / legacy_path.name).exists()
+
+
 def _legacy_snapshot_state(tmp_path, text):
     workspace = tmp_path / "workspace"
     source_path = tmp_path / "note.txt"

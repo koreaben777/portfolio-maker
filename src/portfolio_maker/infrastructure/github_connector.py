@@ -35,9 +35,16 @@ def parse_repo_list(payload: Any) -> list[GitHubRepositoryCandidate]:
         is_private = item.get("isPrivate")
         if "isPrivate" not in item or not isinstance(is_private, bool):
             raise GitHubDiscoveryError("GitHub repository list payload is invalid")
+        name_with_owner = _required_string(item, "nameWithOwner", "repository list")
+        try:
+            canonical_repository_name(name_with_owner)
+        except ValueError as error:
+            raise GitHubDiscoveryError(
+                "GitHub repository list payload is invalid"
+            ) from error
         repos.append(
             GitHubRepositoryCandidate(
-                name_with_owner=_required_string(item, "nameWithOwner", "repository list"),
+                name_with_owner=name_with_owner,
                 url=_required_string(item, "url", "repository list"),
                 is_private=is_private,
             )

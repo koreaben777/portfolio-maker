@@ -41,6 +41,20 @@ def test_parse_repo_list_requires_boolean_privacy_field():
         )
 
 
+@pytest.mark.parametrize("repository", ("../repo", "owner/..", "_owner/repo", "-owner/repo"))
+def test_parse_repo_list_rejects_noncanonical_repository_name(repository):
+    with pytest.raises(GitHubDiscoveryError, match="repository list payload is invalid"):
+        parse_repo_list(
+            [
+                {
+                    "nameWithOwner": repository,
+                    "url": "https://github.com/octo/demo",
+                    "isPrivate": False,
+                }
+            ]
+        )
+
+
 def test_github_repository_candidate_keeps_only_discovery_fields():
     assert set(GitHubRepositoryCandidate.__dataclass_fields__) == {
         "name_with_owner",
