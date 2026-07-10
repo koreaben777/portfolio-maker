@@ -1,0 +1,4 @@
+interface:
+  display_name: "Team Based Review Loop"
+  short_description: "Run team review and fixback loops"
+  default_prompt: "Use $team-based-review-loop to run a one-cycle team review, fixback, and re-review workflow."
