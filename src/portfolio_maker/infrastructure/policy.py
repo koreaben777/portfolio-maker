@@ -76,6 +76,10 @@ SECRET_PATTERNS = [
 ]
 DEFAULT_EXCLUDED_NAMES_CASEFOLD = {name.casefold() for name in DEFAULT_EXCLUDED_NAMES}
 SENSITIVE_FILE_NAMES_CASEFOLD = {name.casefold() for name in SENSITIVE_FILE_NAMES}
+PASSWORD_MANAGER_EXPORT_FILENAME = re.compile(
+    r"(?i)^(?:bitwarden|lastpass|1password|chrome|firefox)[_-]export"
+    r"(?:[_-](?:\d{8}|\d{4}-\d{2}-\d{2})(?:[_-]?\d{6})?)?\.(?:csv|json)$"
+)
 SECRET_SHAPED_FILENAME = re.compile(
     r"(?i)(?:\bsk-|\bgithub_pat_|\bgh[pousr]_)[A-Za-z0-9_-]{8,}"
 )
@@ -104,9 +108,7 @@ class FilePolicy:
     def classify_path(self, path: Path) -> str:
         if self.is_forbidden(path):
             return "forbidden"
-        if path.name.casefold() in SENSITIVE_FILE_NAMES_CASEFOLD:
-            return "skipped_policy"
-        if SECRET_SHAPED_FILENAME.search(path.name):
+        if is_sensitive_filename(path):
             return "skipped_policy"
         if any(part.casefold() in DEFAULT_EXCLUDED_NAMES_CASEFOLD for part in path.parts):
             return "skipped_policy"
@@ -123,3 +125,18 @@ def mask_secrets(text: str) -> str:
         else:
             masked = pattern.sub("[REDACTED]", masked)
     return masked
+
+
+def is_sensitive_filename(path: Path | str) -> bool:
+    name = Path(path).name
+    return (
+        name.casefold() in SENSITIVE_FILE_NAMES_CASEFOLD
+        or PASSWORD_MANAGER_EXPORT_FILENAME.fullmatch(name) is not None
+        or SECRET_SHAPED_FILENAME.search(name) is not None
+    )
+
+
+def mask_public_value(value: str) -> str:
+    if is_sensitive_filename(value):
+        return "[REDACTED]"
+    return mask_secrets(value)

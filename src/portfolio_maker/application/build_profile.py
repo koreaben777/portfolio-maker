@@ -19,8 +19,7 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
     policy = FilePolicy(forbidden_paths=approval_forbidden_paths(paths, approval))
     repository = SQLiteRepository(paths.db_path)
     repository.initialize()
-    snapshots = repository.latest_snapshots_by_source_id()
-    snapshot_hashes = repository.latest_snapshot_hashes_by_source_id()
+    snapshots = repository.latest_snapshot_metadata_by_source_id()
     sources: list[Source] = []
     claims: list[dict[str, object]] = []
 
@@ -39,10 +38,15 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
             repository.update_source_status(source.id, SourceStatus.EXTRACT_FAILED)
             continue
 
-        snapshot_path = snapshots.get(source.id)
-        if snapshot_path is None or snapshot_hashes.get(source.id) != extracted.content_hash:
+        snapshot_metadata = snapshots.get(source.id)
+        if (
+            snapshot_metadata is None
+            or snapshot_metadata[1] != extracted.content_hash
+            or snapshot_metadata[2] != extracted.extractor
+        ):
             repository.update_source_status(source.id, SourceStatus.STALE_SOURCE)
             continue
+        snapshot_path = snapshot_metadata[0]
         snapshot = load_valid_local_snapshot(
             snapshot_path,
             source.id,

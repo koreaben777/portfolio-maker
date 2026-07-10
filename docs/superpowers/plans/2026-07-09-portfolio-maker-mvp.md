@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Codex app에서 호출 가능한 CLI 기반 MVP를 만들어 로컬 파일과 GitHub 활동 후보를 발견하고, 승인된 로컬 source만 ingest한 뒤 근거 기반 master profile과 portfolio draft를 생성한다. GitHub 활동은 이 MVP에서 discovery-only이며, artifact 입력은 후속 회사별 맞춤 생성 단계로 남긴다.
+**Goal:** Codex app에서 호출 가능한 CLI 기반 MVP를 만들어 로컬 파일과 GitHub 활동 후보를 발견하고, 승인된 로컬 source만 ingest한 뒤 근거 기반 master profile과 승인 source를 나열한 검토용 portfolio skeleton을 생성한다. GitHub 활동은 이 MVP에서 discovery-only이며, artifact 입력은 후속 회사별 맞춤 생성 단계로 남긴다.
 
 **Architecture:** MVP는 Codex Skill + CLI adapter + reusable application use cases 구조로 구현한다. 핵심 로직은 CLI나 Codex thread에 의존하지 않는 Python package에 두고, 저장소는 SQLite와 최소 snapshot file store를 사용한다. 향후 Codex app-server나 MCP adapter가 같은 use case를 재사용할 수 있도록 request/result dataclass와 structured progress event를 사용한다.
 
@@ -27,7 +27,7 @@
 - minimal raw snapshot store
 - approved local source ingestion
 - evidence-based master profile JSON/Markdown
-- public portfolio draft Markdown
+- review-required public portfolio skeleton Markdown
 - README setup guide
 - automated tests for core policy, storage, and artifact behavior
 
@@ -41,6 +41,7 @@
 - MCP server
 - Codex app-server companion
 - standalone GUI
+- evidence-rendered portfolio writing (project summary, implementation details, stack, outcome)
 
 ## File Structure
 

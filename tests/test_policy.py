@@ -155,6 +155,13 @@ def test_file_policy_skips_password_export_variants_and_secret_shaped_names(tmp_
     assert policy.classify_path(tmp_path / "sk-synthetic-file-token.txt") == "skipped_policy"
 
 
+def test_file_policy_skips_timestamped_password_manager_exports(tmp_path):
+    policy = FilePolicy()
+
+    assert policy.classify_path(tmp_path / "bitwarden_export_20260710.json") == "skipped_policy"
+    assert policy.classify_path(tmp_path / "LastPass-Export-2026-07-10-123456.CSV") == "skipped_policy"
+
+
 def test_secret_masking_redacts_bearer_private_key_and_token_prefixes():
     text = (
         "Authorization: Bearer synthetic-bearer-token\n"

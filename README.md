@@ -61,7 +61,13 @@ Then follow the approval flow:
 portfolio-maker approve --workspace . --write-sample
 ```
 
-Before the first GitHub discovery, edit `excluded_repositories` and `private_sources_allowed` in the sample approval file when needed. Then run:
+The command writes only when the approval file is absent. Reset an existing approval file only with the explicit destructive action:
+
+```bash
+portfolio-maker approve --workspace . --write-sample --force
+```
+
+Before the first GitHub discovery, edit `excluded_repositories` (canonical `owner/repo` values only) and `private_sources_allowed` in the sample approval file when needed. Then run:
 
 ```bash
 portfolio-maker discover --workspace .

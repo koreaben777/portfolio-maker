@@ -324,3 +324,35 @@ def test_draft_portfolio_masks_secret_shaped_display_names(tmp_path, monkeypatch
     draft = paths.portfolio_draft_path.read_text(encoding="utf-8")
     assert "sk-synthetic-file-token" not in draft
     assert "[REDACTED]" in draft
+
+
+def test_draft_portfolio_masks_timestamped_password_export_display_name(tmp_path, monkeypatch):
+    paths = WorkspacePaths.from_root(tmp_path / "workspace")
+    paths.ensure()
+    paths.master_profile_json_path.write_text(
+        json.dumps({"sources": [{"display_name": "bitwarden_export_20260710.json"}]}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(draft_portfolio_module, "build_profile", lambda request: None)
+
+    draft_portfolio_module.draft_portfolio(DraftPortfolioRequest(workspace=paths.workspace))
+
+    draft = paths.portfolio_draft_path.read_text(encoding="utf-8")
+    assert "bitwarden_export_20260710.json" not in draft
+    assert "[REDACTED]" in draft
+
+
+def test_build_profile_rejects_snapshot_with_stale_db_extractor_metadata(tmp_path):
+    workspace, _, paths = _ingest_approved_source(tmp_path)
+    repository = SQLiteRepository(paths.db_path)
+    source_id = repository.list_sources()[0].id
+    with repository.connect() as conn:
+        conn.execute(
+            "UPDATE source_snapshots SET extractor = ? WHERE source_id = ?",
+            ("text-v1", source_id),
+        )
+
+    profile_result = build_profile(BuildProfileRequest(workspace=workspace))
+
+    assert profile_result.claim_count == 0
+    assert repository.list_sources()[0].status == SourceStatus.STALE_SOURCE

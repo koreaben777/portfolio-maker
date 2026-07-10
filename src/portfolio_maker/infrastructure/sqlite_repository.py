@@ -213,6 +213,28 @@ class SQLiteRepository:
             ).fetchall()
         return {int(row["source_id"]): str(row["content_hash"]) for row in rows}
 
+    def latest_snapshot_metadata_by_source_id(self) -> dict[int, tuple[Path, str, str]]:
+        with self._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT source_id, snapshot_path, content_hash, extractor
+                FROM source_snapshots
+                WHERE id IN (
+                    SELECT MAX(id)
+                    FROM source_snapshots
+                    GROUP BY source_id
+                )
+                """
+            ).fetchall()
+        return {
+            int(row["source_id"]): (
+                Path(row["snapshot_path"]),
+                str(row["content_hash"]),
+                str(row["extractor"]),
+            )
+            for row in rows
+        }
+
     def list_sources(self, status: SourceStatus | None = None) -> list[Source]:
         sql = "SELECT id, type, uri, display_name, owner, status FROM sources"
         params: tuple[str, ...] = ()

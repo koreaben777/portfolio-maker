@@ -10,7 +10,7 @@ from portfolio_maker.application.models import (
     DraftPortfolioResult,
 )
 from portfolio_maker.infrastructure.artifacts import write_markdown
-from portfolio_maker.infrastructure.policy import mask_secrets
+from portfolio_maker.infrastructure.policy import mask_public_value
 from portfolio_maker.workspace import WorkspacePaths
 
 
@@ -26,7 +26,7 @@ def draft_portfolio(request: DraftPortfolioRequest) -> DraftPortfolioResult:
     sources = profile["sources"]
     sections = []
     for source in sources:
-        display_name = mask_secrets(str(source["display_name"]))
+        display_name = mask_public_value(str(source["display_name"]))
         sections.append(
             "\n".join(
                 [

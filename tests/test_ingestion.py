@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -68,10 +72,14 @@ def test_approved_extraction_reads_open_file_after_path_replacement(tmp_path, mo
     source_uri = source_path.resolve().as_uri()
     original_open = extractors.os.open
 
-    def replace_path_after_open(path, flags):
-        descriptor = original_open(path, flags)
-        source_path.unlink()
-        source_path.symlink_to(replacement_path)
+    def replace_path_after_open(path, flags, *, dir_fd=None):
+        if dir_fd is None:
+            descriptor = original_open(path, flags)
+        else:
+            descriptor = original_open(path, flags, dir_fd=dir_fd)
+        if path == source_path.name and dir_fd is not None:
+            source_path.unlink()
+            source_path.symlink_to(replacement_path)
         return descriptor
 
     monkeypatch.setattr(extractors.os, "open", replace_path_after_open)
@@ -82,6 +90,65 @@ def test_approved_extraction_reads_open_file_after_path_replacement(tmp_path, mo
     )
 
     assert extracted.text == "approved evidence"
+
+
+def test_approved_extraction_keeps_parent_descriptor_after_parent_replacement(tmp_path, monkeypatch):
+    source_parent = tmp_path / "approved"
+    source_path = source_parent / "note.txt"
+    target_parent = tmp_path / "target"
+    target_path = target_parent / "note.txt"
+    source_parent.mkdir()
+    target_parent.mkdir()
+    source_path.write_text("approved evidence", encoding="utf-8")
+    target_path.write_text("unapproved evidence", encoding="utf-8")
+    source_uri = source_path.resolve().as_uri()
+    original_open = extractors.os.open
+    replaced = False
+
+    def replace_parent_before_final_open(path, flags, *, dir_fd=None):
+        nonlocal replaced
+        if not replaced and (
+            path == source_path or (path == source_path.name and dir_fd is not None)
+        ):
+            source_parent.rename(tmp_path / "approved-original")
+            source_parent.symlink_to(target_parent, target_is_directory=True)
+            replaced = True
+        if dir_fd is None:
+            return original_open(path, flags)
+        return original_open(path, flags, dir_fd=dir_fd)
+
+    monkeypatch.setattr(extractors.os, "open", replace_parent_before_final_open)
+
+    _, extracted = extractors.extract_approved_text(source_uri, FilePolicy())
+
+    assert extracted.text == "approved evidence"
+
+
+def test_approved_extraction_rejects_fifo_without_blocking(tmp_path):
+    fifo_path = tmp_path / "source.fifo"
+    os.mkfifo(fifo_path)
+    environment = os.environ | {"PYTHONPATH": str(Path.cwd() / "src")}
+    script = """
+from pathlib import Path
+import sys
+from portfolio_maker.infrastructure.extractors import extract_approved_text
+from portfolio_maker.infrastructure.policy import FilePolicy, SourcePathPolicyError
+
+try:
+    extract_approved_text(Path(sys.argv[1]).as_uri(), FilePolicy())
+except SourcePathPolicyError:
+    raise SystemExit(0)
+raise SystemExit(1)
+"""
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(fifo_path)],
+        check=False,
+        env=environment,
+        timeout=2,
+    )
+
+    assert completed.returncode == 0
 
 
 def test_snapshot_store_repairs_damaged_content_addressed_file(tmp_path):
@@ -283,6 +350,34 @@ def test_ingest_sources_skips_approved_sensitive_file(tmp_path):
     assert repository.list_sources()[0].status == SourceStatus.SKIPPED_POLICY
     with repository.connect() as conn:
         assert conn.execute("SELECT COUNT(*) FROM source_snapshots").fetchone()[0] == 0
+
+
+def test_ingest_sources_skips_timestamped_password_export(tmp_path):
+    workspace = tmp_path / "workspace"
+    source_path = tmp_path / "bitwarden_export_20260710.json"
+    source_path.write_text("{}", encoding="utf-8")
+    paths = WorkspacePaths.from_root(workspace)
+    write_sample_approval(paths)
+    approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    approval["approved_source_uris"] = [source_path.resolve().as_uri()]
+    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    repository.upsert_source(
+        Source(
+            id=None,
+            type=SourceType.LOCAL_FILE,
+            uri=source_path.resolve().as_uri(),
+            display_name=source_path.name,
+            owner=None,
+            status=SourceStatus.APPROVED,
+        )
+    )
+
+    result = ingest_sources(IngestSourcesRequest(workspace=workspace))
+
+    assert result.ingested_count == 0
+    assert repository.list_sources()[0].status == SourceStatus.SKIPPED_POLICY
 
 
 def test_ingest_sources_continues_after_missing_approved_file(tmp_path):
@@ -517,6 +612,105 @@ def test_ingest_sources_rewrites_legacy_snapshot_metadata_in_place(tmp_path):
             "SELECT extractor FROM source_snapshots WHERE source_id = ?", (source_id,)
         ).fetchall()
     assert [row["extractor"] for row in rows] == ["text-v2"]
+
+
+def test_ingest_sources_migrates_verified_managed_legacy_snapshot(tmp_path):
+    workspace = tmp_path / "workspace"
+    source_path = tmp_path / "note.txt"
+    source_path.write_text("api_key=synthetic-placeholder", encoding="utf-8")
+    paths = WorkspacePaths.from_root(workspace)
+    write_sample_approval(paths)
+    approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    approval["approved_source_uris"] = [source_path.resolve().as_uri()]
+    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    source_id = repository.upsert_source(
+        Source(
+            id=None,
+            type=SourceType.LOCAL_FILE,
+            uri=source_path.resolve().as_uri(),
+            display_name="note.txt",
+            owner=None,
+            status=SourceStatus.APPROVED,
+        )
+    )
+    raw = source_path.read_bytes()
+    content_hash = hashlib.sha256(raw).hexdigest()
+    legacy_path = paths.local_snapshots_dir / f"source-{source_id}.json"
+    legacy_path.parent.mkdir(parents=True, exist_ok=True)
+    legacy_path.write_text(
+        json.dumps(
+            {
+                "source_id": source_id,
+                "source_uri": source_path.resolve().as_uri(),
+                "display_name": source_path.name,
+                "content_hash": content_hash,
+                "extractor": "text-v1",
+                "extracted_at": "2026-07-10T00:00:00Z",
+                "text": "api_key=synthetic-placeholder",
+            }
+        ),
+        encoding="utf-8",
+    )
+    legacy_row_id = repository.insert_source_snapshot(
+        source_id,
+        legacy_path,
+        content_hash,
+        "text-v1",
+    )
+
+    result = ingest_sources(IngestSourcesRequest(workspace=workspace))
+
+    assert result.ingested_count == 1
+    assert not legacy_path.exists()
+    with repository.connect() as conn:
+        rows = conn.execute(
+            "SELECT id, snapshot_path, extractor FROM source_snapshots WHERE source_id = ?",
+            (source_id,),
+        ).fetchall()
+    assert len(rows) == 1
+    assert rows[0]["id"] == legacy_row_id
+    assert rows[0]["snapshot_path"] != str(legacy_path)
+    assert rows[0]["extractor"] == "text-v2"
+
+
+def test_ingest_sources_repairs_stale_db_extractor_before_idempotent_skip(tmp_path):
+    workspace = tmp_path / "workspace"
+    source_path = tmp_path / "note.txt"
+    source_path.write_text("approved evidence", encoding="utf-8")
+    paths = WorkspacePaths.from_root(workspace)
+    write_sample_approval(paths)
+    approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    approval["approved_source_uris"] = [source_path.resolve().as_uri()]
+    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    source_id = repository.upsert_source(
+        Source(
+            id=None,
+            type=SourceType.LOCAL_FILE,
+            uri=source_path.resolve().as_uri(),
+            display_name="note.txt",
+            owner=None,
+            status=SourceStatus.APPROVED,
+        )
+    )
+    ingest_sources(IngestSourcesRequest(workspace=workspace))
+    with repository.connect() as conn:
+        conn.execute(
+            "UPDATE source_snapshots SET extractor = ? WHERE source_id = ?",
+            ("text-v1", source_id),
+        )
+
+    result = ingest_sources(IngestSourcesRequest(workspace=workspace))
+
+    assert result.ingested_count == 0
+    with repository.connect() as conn:
+        extractor = conn.execute(
+            "SELECT extractor FROM source_snapshots WHERE source_id = ?", (source_id,)
+        ).fetchone()["extractor"]
+    assert extractor == "text-v2"
 
 
 def test_ingest_sources_rejects_replaced_approved_path_symlink(tmp_path):

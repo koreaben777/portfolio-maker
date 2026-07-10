@@ -42,7 +42,7 @@ def test_load_approval_reads_valid_payload(workspace):
                 "version": 1,
                 "approved_source_uris": ["file:///source.pdf"],
                 "forbidden_paths": ["secrets/"],
-                "excluded_repositories": ["private-repo"],
+                "excluded_repositories": ["private-org/private-repo"],
                 "private_sources_allowed": True,
             }
         ),
@@ -52,8 +52,8 @@ def test_load_approval_reads_valid_payload(workspace):
     approval = load_approval(paths)
 
     assert approval.approved_source_uris == ("file:///source.pdf",)
-    assert approval.forbidden_paths == ("secrets/",)
-    assert approval.excluded_repositories == ("private-repo",)
+    assert approval.forbidden_paths == ((workspace / "secrets").resolve(),)
+    assert approval.excluded_repositories == ("private-org/private-repo",)
     assert approval.private_sources_allowed is True
 
 
@@ -102,4 +102,16 @@ def test_load_approval_rejects_unknown_tilde_user_as_format_error(workspace):
     )
 
     with pytest.raises(ApprovalFormatError, match="invalid forbidden path"):
+        load_approval(paths)
+
+
+def test_load_approval_rejects_short_repository_exclusion(workspace):
+    paths = WorkspacePaths.from_root(workspace)
+    paths.ensure()
+    paths.approval_path.write_text(
+        json.dumps({"excluded_repositories": ["demo"]}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ApprovalFormatError, match="owner/repo"):
         load_approval(paths)

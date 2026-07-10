@@ -66,6 +66,35 @@ def load_valid_local_snapshot(
     return payload
 
 
+def is_verified_managed_legacy_snapshot(
+    paths: WorkspacePaths,
+    snapshot_path: Path,
+    source_id: int,
+    source_uri: str,
+    content_hash: str,
+) -> bool:
+    if (
+        snapshot_path.parent != paths.local_snapshots_dir
+        or snapshot_path.name != f"source-{source_id}.json"
+        or snapshot_path.is_symlink()
+    ):
+        return False
+    try:
+        payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return (
+        isinstance(payload, dict)
+        and payload.get("source_id") == source_id
+        and payload.get("source_uri") == source_uri
+        and payload.get("content_hash") == content_hash
+        and payload.get("extractor") == "text-v1"
+        and isinstance(payload.get("display_name"), str)
+        and isinstance(payload.get("extracted_at"), str)
+        and isinstance(payload.get("text"), str)
+    )
+
+
 def _write_json_atomically(path: Path, payload: dict[str, object]) -> None:
     temporary_path: Path | None = None
     try:

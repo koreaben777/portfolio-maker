@@ -302,17 +302,14 @@ The portfolio draft is generated from current local-snapshot-based master-profil
 
 In 0.1.0 it is a review-required portfolio skeleton: approved sources are listed, while role, technical approach, and outcome remain placeholders. Evidence-rendered portfolio writing is deferred to a later generation phase.
 
-It should include:
+The 0.1.0 skeleton includes only:
 
-- project title
-- short summary
-- problem or context
-- user's role
-- technical approach
-- implementation details
-- outcome or impact where supported
-- public-safe technology stack
-- internal evidence references for review
+- approved source title
+- generic inclusion notice
+- placeholder role, technical approach, and outcome fields
+- internal evidence reference for review
+
+Project summaries, problem/context, implementation details, evidence-backed outcomes, and public-safe technology stacks are deferred until evidence-rendered portfolio generation is implemented.
 
 The public draft must not expose secrets, tokens, or private raw paths.
 

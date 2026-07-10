@@ -144,6 +144,21 @@ def test_discover_sources_redacts_policy_skipped_paths_in_report(tmp_path):
     assert ".env" not in report
 
 
+def test_discover_sources_skips_timestamped_password_export(tmp_path):
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    home.mkdir()
+    (home / "bitwarden_export_20260710.json").write_text("{}", encoding="utf-8")
+
+    result = discover_sources(
+        DiscoverSourcesRequest(workspace=workspace, home=home, include_github=False)
+    )
+
+    report = result.report_path.read_text(encoding="utf-8")
+    assert result.discovered_count == 0
+    assert "bitwarden_export_20260710.json" not in report
+
+
 def test_discover_sources_includes_github_candidates(workspace, tmp_path, monkeypatch):
     def fake_discover_github_candidates(**kwargs):
         assert kwargs == {

@@ -31,7 +31,9 @@ The generated portfolio draft is a review-required portfolio skeleton. It lists 
 portfolio-maker approve --workspace . --write-sample
 ```
 
-4. Edit `excluded_repositories` and `private_sources_allowed` in `.portfolio-maker/reviews/source-approval.json` when GitHub visibility rules are needed.
+This creates the sample only when no approval file exists. Use `portfolio-maker approve --workspace . --write-sample --force` only to deliberately reset an existing approval file.
+
+4. Edit `excluded_repositories` (canonical `owner/repo` values only) and `private_sources_allowed` in `.portfolio-maker/reviews/source-approval.json` when GitHub visibility rules are needed.
 
 5. Run discovery:
 

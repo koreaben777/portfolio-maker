@@ -29,6 +29,29 @@ def test_cli_approve_write_sample(workspace):
     assert (workspace / ".portfolio-maker" / "reviews" / "source-approval.json").exists()
 
 
+def test_cli_approve_sample_preserves_existing_approval_unless_forced(workspace, capsys):
+    approval_path = workspace / ".portfolio-maker" / "reviews" / "source-approval.json"
+    approval_path.parent.mkdir(parents=True)
+    approval_path.write_text(
+        '{"approved_source_uris": ["file:///approved.txt"]}',
+        encoding="utf-8",
+    )
+
+    rejected_exit_code = main(["approve", "--workspace", str(workspace), "--write-sample"])
+
+    rejected = capsys.readouterr()
+    assert rejected_exit_code == 1
+    assert "already exists" in rejected.err
+    assert "file:///approved.txt" in approval_path.read_text(encoding="utf-8")
+
+    forced_exit_code = main(
+        ["approve", "--workspace", str(workspace), "--write-sample", "--force"]
+    )
+
+    assert forced_exit_code == 0
+    assert "file:///approved.txt" not in approval_path.read_text(encoding="utf-8")
+
+
 def test_cli_ingest_missing_approval_exits_without_traceback(workspace, capsys):
     exit_code = main(["ingest", "--workspace", str(workspace)])
 

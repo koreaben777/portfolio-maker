@@ -35,6 +35,7 @@ def build_parser() -> argparse.ArgumentParser:
     approve = subparsers.add_parser("approve")
     approve.add_argument("--workspace", type=Path, default=Path("."))
     approve.add_argument("--write-sample", action="store_true")
+    approve.add_argument("--force", action="store_true")
 
     ingest = subparsers.add_parser("ingest")
     ingest.add_argument("--workspace", type=Path, default=Path("."))
@@ -89,7 +90,7 @@ def _main(argv: Sequence[str] | None = None) -> int:
     if args.command == "approve":
         paths = WorkspacePaths.from_root(args.workspace)
         if args.write_sample:
-            print(f"Sample approval file: {write_sample_approval(paths)}")
+            print(f"Sample approval file: {write_sample_approval(paths, force=args.force)}")
         else:
             print(f"Approval file: {paths.approval_path}")
         return 0
