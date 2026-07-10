@@ -260,14 +260,14 @@ Approval state is stored in:
 .portfolio-maker/reviews/source-approval.json
 ```
 
-Approval can include:
+The 0.1.0 approval fields are:
 
-- approved local roots
-- forbidden local roots
-- approved repositories
-- excluded repositories
-- excluded file patterns
-- private-source handling rules
+- `approved_source_uris`: approved local source URIs
+- `forbidden_paths`: local paths that must not be read or used in artifacts
+- `excluded_repositories`: GitHub repositories excluded from discovery
+- `private_sources_allowed`: whether private GitHub repositories may appear in discovery
+
+Repository allowlists and excluded file patterns are deferred and not implemented in 0.1.0.
 
 Ingestion must fail closed when approval is missing.
 

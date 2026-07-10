@@ -260,14 +260,14 @@ Approval state는 다음 파일에 저장합니다.
 .portfolio-maker/reviews/source-approval.json
 ```
 
-Approval에는 다음이 포함될 수 있습니다.
+0.1.0 approval field는 다음과 같습니다.
 
-- 승인된 local root
-- forbidden local root
-- 승인된 repository
-- 제외 repository
-- 제외 file pattern
-- private-source handling rule
+- `approved_source_uris`: 승인된 로컬 source URI
+- `forbidden_paths`: 읽거나 artifact에 사용하면 안 되는 로컬 경로
+- `excluded_repositories`: discovery에서 제외할 GitHub repository
+- `private_sources_allowed`: private GitHub repository를 discovery에 표시할지 여부
+
+Repository allowlist와 제외 file pattern은 0.1.0에서 후순위이며 구현되지 않았습니다.
 
 Approval이 없으면 ingestion은 fail closed 방식으로 실패해야 합니다.
 
