@@ -54,6 +54,49 @@ CREATE TABLE IF NOT EXISTS github_activities (
     UNIQUE(repo, activity_type, url)
 );
 
+CREATE TABLE IF NOT EXISTS evidence_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_id INTEGER REFERENCES sources(id),
+    snapshot_id INTEGER REFERENCES source_snapshots(id),
+    github_activity_id INTEGER REFERENCES github_activities(id),
+    locator TEXT NOT NULL,
+    stable_id TEXT NOT NULL UNIQUE,
+    content_hash TEXT,
+    public_safe INTEGER NOT NULL DEFAULT 0 CHECK(public_safe IN (0, 1)),
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    CHECK(source_id IS NOT NULL OR github_activity_id IS NOT NULL)
+);
+
+CREATE TABLE IF NOT EXISTS projects (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    public_safe INTEGER NOT NULL DEFAULT 0 CHECK(public_safe IN (0, 1)),
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS career_claims (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER REFERENCES projects(id),
+    text TEXT NOT NULL,
+    public_safe INTEGER NOT NULL DEFAULT 0 CHECK(public_safe IN (0, 1)),
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS claim_evidence (
+    claim_id INTEGER NOT NULL REFERENCES career_claims(id),
+    evidence_id INTEGER NOT NULL REFERENCES evidence_items(id),
+    support_level TEXT NOT NULL CHECK(support_level IN ('direct', 'contextual')),
+    PRIMARY KEY (claim_id, evidence_id)
+);
+
+CREATE TABLE IF NOT EXISTS artifacts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    input_manifest TEXT NOT NULL,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
 """
 
 

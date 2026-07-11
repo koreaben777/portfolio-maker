@@ -74,18 +74,30 @@ def test_sqlite_repository_keeps_schema_creation_inside_guarded_transaction(
     assert first_schema_statement < first_commit
 
 
-def test_sqlite_repository_omits_future_generation_tables(workspace):
+def test_sqlite_repository_creates_phase_one_evidence_tables(workspace):
     paths = WorkspacePaths.from_root(workspace)
     repository = SQLiteRepository(paths.db_path)
     repository.initialize()
 
-    assert not repository.table_names() & {
+    assert {
         "evidence_items",
         "projects",
         "career_claims",
         "claim_evidence",
         "artifacts",
-    }
+    } <= repository.table_names()
+
+
+def test_sqlite_repository_evidence_relationships_enforce_foreign_keys(workspace):
+    paths = WorkspacePaths.from_root(workspace)
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+
+    with pytest.raises(RepositoryError):
+        with repository._connection() as conn:
+            conn.execute(
+                "INSERT INTO claim_evidence (claim_id, evidence_id, support_level) VALUES (1, 1, 'direct')"
+            )
 
 
 def test_sqlite_repository_enforces_foreign_keys(workspace):

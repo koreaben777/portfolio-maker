@@ -12,6 +12,7 @@ Portfolio Maker는 원본 파일을 자동으로 업로드하거나 공개하지
 - 처리할 로컬 자료를 직접 검토·승인하기
 - 승인된 자료에서 텍스트 스냅샷과 커리어 근거 저장하기
 - SQLite 데이터베이스와 journal/WAL/SHM sidecar를 하나의 작업 공간 상태로 안전하게 관리하기
+- source, snapshot, activity와 생성 claim/artifact의 추적용 evidence 관계를 로컬 SQLite에 보관하기
 - 동시에 실행된 Portfolio Maker 프로세스 사이의 저장소 작업을 조율하기
 - 마스터 프로필을 JSON·Markdown으로 만들기
 - 승인 자료 목록을 바탕으로 검토용 포트폴리오 초안 골격 만들기
