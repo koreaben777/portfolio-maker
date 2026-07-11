@@ -272,7 +272,7 @@ def test_discover_sources_includes_github_candidates(workspace, tmp_path, monkey
     sources = repository.list_sources()
     report = result.report_path.read_text(encoding="utf-8")
     repo_source = next(source for source in sources if source.type == SourceType.GITHUB_REPOSITORY)
-    with repository.connect() as conn:
+    with repository._connection() as conn:
         activity = conn.execute(
             "SELECT source_id FROM github_activities WHERE repo = ?",
             ("octo/demo",),

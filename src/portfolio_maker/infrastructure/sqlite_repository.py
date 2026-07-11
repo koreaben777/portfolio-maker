@@ -72,24 +72,20 @@ class SQLiteRepository:
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
 
-    def connect(self) -> sqlite3.Connection:
-        directory_descriptor, identity = self._open_database_family()
-        try:
-            return self._connect_validated(directory_descriptor, identity)
-        except OSError as error:
-            raise self._unsafe_path_error(self.db_path.name) from error
-        finally:
-            os.close(directory_descriptor)
-
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
         directory_descriptor, identity = self._open_database_family()
         conn: sqlite3.Connection | None = None
         try:
             conn = self._connect_validated(directory_descriptor, identity)
+            conn.execute("BEGIN IMMEDIATE")
+            # Force SQLite to open its journal/WAL before checking the full DB family.
+            conn.execute("PRAGMA user_version = user_version")
+            self._validate_database_family(directory_descriptor, identity, "after write transaction")
             yield conn
             self._validate_database_family(directory_descriptor, identity, "before commit")
             conn.commit()
+            self._validate_database_family(directory_descriptor, identity, "after commit")
         except RepositoryError:
             self._rollback(conn)
             raise
@@ -132,10 +128,11 @@ class SQLiteRepository:
         conn: sqlite3.Connection | None = None
         try:
             self._verify_current_database_directory(directory_descriptor)
-            conn = sqlite3.connect(self.db_path)
+            database_uri = f"{self.db_path.absolute().as_uri()}?mode=rw"
+            conn = sqlite3.connect(database_uri, uri=True)
             conn.execute("PRAGMA foreign_keys = ON")
             conn.row_factory = sqlite3.Row
-            self._validate_database_family(directory_descriptor, identity, "before first write")
+            self._validate_database_family(directory_descriptor, identity, "after connect")
             return conn
         except RepositoryError:
             if conn is not None:
@@ -256,7 +253,9 @@ class SQLiteRepository:
 
     def initialize(self) -> None:
         with self._connection() as conn:
-            conn.executescript(SCHEMA)
+            for statement in SCHEMA.split(";"):
+                if statement.strip():
+                    conn.execute(statement)
 
     def table_names(self) -> set[str]:
         with self._connection() as conn:
@@ -385,14 +384,14 @@ class SQLiteRepository:
         try:
             return [
                 (
-                    int(row["id"]),
-                    Path(row["snapshot_path"]),
-                    str(row["content_hash"]),
-                    str(row["extractor"]),
+                    self._required_int(row, "id"),
+                    Path(self._required_text(row, "snapshot_path")),
+                    self._required_text(row, "content_hash"),
+                    self._required_text(row, "extractor"),
                 )
                 for row in rows
             ]
-        except (TypeError, ValueError) as error:
+        except (KeyError, TypeError, ValueError) as error:
             raise self._semantic_error() from error
 
     def latest_snapshot_metadata_by_source_id(self) -> dict[int, tuple[int, Path, str, str]]:
@@ -410,15 +409,15 @@ class SQLiteRepository:
             ).fetchall()
         try:
             return {
-                int(row["source_id"]): (
-                    int(row["id"]),
-                    Path(row["snapshot_path"]),
-                    str(row["content_hash"]),
-                    str(row["extractor"]),
+                self._required_int(row, "source_id"): (
+                    self._required_int(row, "id"),
+                    Path(self._required_text(row, "snapshot_path")),
+                    self._required_text(row, "content_hash"),
+                    self._required_text(row, "extractor"),
                 )
                 for row in rows
             }
-        except (TypeError, ValueError) as error:
+        except (KeyError, TypeError, ValueError) as error:
             raise self._semantic_error() from error
 
     def list_sources(self, status: SourceStatus | None = None) -> list[Source]:
@@ -435,17 +434,38 @@ class SQLiteRepository:
         try:
             return [
                 Source(
-                    id=row["id"],
-                    type=SourceType(row["type"]),
-                    uri=row["uri"],
-                    display_name=row["display_name"],
-                    owner=row["owner"],
-                    status=SourceStatus(row["status"]),
+                    id=self._required_int(row, "id"),
+                    type=SourceType(self._required_text(row, "type")),
+                    uri=self._required_text(row, "uri"),
+                    display_name=self._required_text(row, "display_name"),
+                    owner=self._optional_text(row, "owner"),
+                    status=SourceStatus(self._required_text(row, "status")),
                 )
                 for row in rows
             ]
-        except (TypeError, ValueError) as error:
+        except (KeyError, TypeError, ValueError) as error:
             raise self._semantic_error() from error
+
+    @staticmethod
+    def _required_int(row: sqlite3.Row, name: str) -> int:
+        value = row[name]
+        if type(value) is not int:
+            raise TypeError(f"{name} must be an integer")
+        return value
+
+    @staticmethod
+    def _required_text(row: sqlite3.Row, name: str) -> str:
+        value = row[name]
+        if not isinstance(value, str):
+            raise TypeError(f"{name} must be text")
+        return value
+
+    @staticmethod
+    def _optional_text(row: sqlite3.Row, name: str) -> str | None:
+        value = row[name]
+        if value is not None and not isinstance(value, str):
+            raise TypeError(f"{name} must be text or null")
+        return value
 
     def update_source_status(self, source_id: int, status: SourceStatus) -> None:
         with self._connection() as conn:

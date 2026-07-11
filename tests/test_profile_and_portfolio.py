@@ -385,7 +385,7 @@ def test_build_profile_rejects_snapshot_with_stale_db_extractor_metadata(tmp_pat
     workspace, _, paths = _ingest_approved_source(tmp_path)
     repository = SQLiteRepository(paths.db_path)
     source_id = repository.list_sources()[0].id
-    with repository.connect() as conn:
+    with repository._connection() as conn:
         conn.execute(
             "UPDATE source_snapshots SET extractor = ? WHERE source_id = ?",
             ("text-v1", source_id),

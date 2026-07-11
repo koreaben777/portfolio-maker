@@ -44,6 +44,33 @@ def test_sqlite_repository_initialize_creates_schema_tables(workspace):
     } <= repository.table_names()
 
 
+def test_sqlite_repository_keeps_schema_creation_inside_guarded_transaction(
+    workspace,
+    monkeypatch,
+):
+    paths = WorkspacePaths.from_root(workspace)
+    traces: list[str] = []
+    original_connect = sqlite3.connect
+
+    def traced_connect(*args, **kwargs):
+        connection = original_connect(*args, **kwargs)
+        connection.set_trace_callback(traces.append)
+        return connection
+
+    monkeypatch.setattr(
+        "portfolio_maker.infrastructure.sqlite_repository.sqlite3.connect",
+        traced_connect,
+    )
+
+    SQLiteRepository(paths.db_path).initialize()
+
+    first_schema_statement = next(
+        index for index, statement in enumerate(traces) if "CREATE TABLE" in statement
+    )
+    first_commit = traces.index("COMMIT")
+    assert first_schema_statement < first_commit
+
+
 def test_sqlite_repository_omits_future_generation_tables(workspace):
     paths = WorkspacePaths.from_root(workspace)
     repository = SQLiteRepository(paths.db_path)
@@ -241,7 +268,7 @@ def test_sqlite_repository_upserts_github_activity_by_repo_type_and_url(workspac
         )
     )
 
-    with repository.connect() as conn:
+    with repository._connection() as conn:
         rows = conn.execute("SELECT id, title FROM github_activities").fetchall()
     assert second_id == first_id
     assert [(row["id"], row["title"]) for row in rows] == [(first_id, "Updated title")]
@@ -357,7 +384,7 @@ def test_sqlite_repository_rejects_main_replacement_before_connect(workspace, tm
 
     def replace_before_connect(path, *args, **kwargs):
         nonlocal replaced
-        if Path(path) == paths.db_path and not replaced:
+        if not replaced:
             replaced = True
             os.replace(replacement, paths.db_path)
         return original_connect(path, *args, **kwargs)
@@ -366,6 +393,149 @@ def test_sqlite_repository_rejects_main_replacement_before_connect(workspace, tm
 
     with pytest.raises(RepositoryError, match="database changed"):
         repository.table_names()
+
+
+def test_sqlite_repository_does_not_create_missing_replacement_target_during_connect(
+    workspace,
+    tmp_path,
+    monkeypatch,
+):
+    paths = WorkspacePaths.from_root(workspace)
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    missing_external = tmp_path / "missing-external.db"
+    original_connect = sqlite3.connect
+    replaced = False
+
+    def replace_with_missing_target(path, *args, **kwargs):
+        nonlocal replaced
+        if not replaced:
+            replaced = True
+            paths.db_path.unlink()
+            paths.db_path.symlink_to(missing_external)
+        return original_connect(path, *args, **kwargs)
+
+    monkeypatch.setattr(
+        "portfolio_maker.infrastructure.sqlite_repository.sqlite3.connect",
+        replace_with_missing_target,
+    )
+
+    with pytest.raises(RepositoryError):
+        repository.table_names()
+
+    assert not missing_external.exists()
+
+
+def test_sqlite_repository_prevents_late_journal_alias_before_dml(
+    workspace,
+    tmp_path,
+    monkeypatch,
+):
+    paths = WorkspacePaths.from_root(workspace)
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    sidecar = paths.db_path.with_name("portfolio.db-journal")
+    external = tmp_path / "external-journal"
+    marker = b"external journal marker"
+    external.write_bytes(marker)
+    original_validate = repository._validate_database_family
+    attempts = 0
+    injected = False
+
+    def inject_after_validation(directory_descriptor, identity, stage):
+        nonlocal attempts, injected
+        original_validate(directory_descriptor, identity, stage)
+        if stage == "before first write":
+            attempts += 1
+            os.link(external, sidecar)
+            injected = True
+        elif stage == "after write transaction":
+            attempts += 1
+            try:
+                os.link(external, sidecar)
+            except FileExistsError:
+                pass
+            else:
+                injected = True
+
+    monkeypatch.setattr(repository, "_validate_database_family", inject_after_validation)
+
+    repository.upsert_source(
+        Source(
+            id=None,
+            type=SourceType.LOCAL_FILE,
+            uri="file:///late-journal.md",
+            display_name="late-journal.md",
+            owner=None,
+            status=SourceStatus.DISCOVERED,
+        )
+    )
+
+    assert attempts == 1
+    assert injected is False
+    assert external.read_bytes() == marker
+
+
+def test_sqlite_repository_rejects_commit_replacement_without_visible_persistence(
+    workspace,
+    tmp_path,
+    monkeypatch,
+):
+    paths = WorkspacePaths.from_root(workspace)
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    source_id = repository.upsert_source(
+        Source(
+            id=None,
+            type=SourceType.LOCAL_FILE,
+            uri="file:///commit-replacement.md",
+            display_name="commit-replacement.md",
+            owner=None,
+            status=SourceStatus.DISCOVERED,
+        )
+    )
+    replacement = tmp_path / "replacement.db"
+    with sqlite3.connect(paths.db_path) as visible:
+        with sqlite3.connect(replacement) as replacement_connection:
+            visible.backup(replacement_connection)
+    detached = sqlite3.connect(paths.db_path)
+    original_connect = sqlite3.connect
+    replaced = False
+
+    def replace_inside_commit(path, *args, **kwargs):
+        connection = original_connect(path, *args, **kwargs)
+
+        def replace_on_commit(statement):
+            nonlocal replaced
+            if statement == "COMMIT" and not replaced:
+                replaced = True
+                os.replace(replacement, paths.db_path)
+
+        connection.set_trace_callback(replace_on_commit)
+        return connection
+
+    monkeypatch.setattr(
+        "portfolio_maker.infrastructure.sqlite_repository.sqlite3.connect",
+        replace_inside_commit,
+    )
+
+    try:
+        with pytest.raises(RepositoryError, match="database changed"):
+            repository.update_source_status(source_id, SourceStatus.APPROVED)
+
+        with sqlite3.connect(paths.db_path) as visible:
+            visible_status = visible.execute(
+                "SELECT status FROM sources WHERE id = ?", (source_id,)
+            ).fetchone()[0]
+        detached_status = detached.execute(
+            "SELECT status FROM sources WHERE id = ?", (source_id,)
+        ).fetchone()[0]
+    finally:
+        detached.close()
+
+    assert replaced is True
+    assert visible_status == SourceStatus.DISCOVERED
+    assert detached_status == SourceStatus.APPROVED
 
 
 def test_sqlite_repository_rolls_back_when_database_replaced_before_commit(
@@ -452,6 +622,86 @@ def test_sqlite_repository_maps_invalid_existing_enum_row_to_controlled_error(wo
 
     with pytest.raises(RepositoryError, match="stored data is invalid"):
         SQLiteRepository(paths.db_path).list_sources()
+
+
+@pytest.mark.parametrize("column", ("uri", "owner"))
+def test_sqlite_repository_maps_blob_source_text_to_controlled_error(workspace, column):
+    paths = WorkspacePaths.from_root(workspace)
+    paths.ensure()
+    values = {
+        "type": "local_file",
+        "uri": "file:///blob.md",
+        "display_name": "blob.md",
+        "owner": "owner",
+        "status": "discovered",
+    }
+    values[column] = sqlite3.Binary(b"blob")
+    with sqlite3.connect(paths.db_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE sources (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                type TEXT NOT NULL,
+                uri TEXT NOT NULL UNIQUE,
+                display_name TEXT NOT NULL,
+                owner TEXT,
+                status TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO sources (type, uri, display_name, owner, status)
+            VALUES (:type, :uri, :display_name, :owner, :status)
+            """,
+            values,
+        )
+
+    with pytest.raises(RepositoryError, match="stored data is invalid"):
+        SQLiteRepository(paths.db_path).list_sources()
+
+
+@pytest.mark.parametrize("column", ("source_id", "snapshot_path", "content_hash", "extractor"))
+def test_sqlite_repository_maps_blob_snapshot_text_to_controlled_error(workspace, column):
+    paths = WorkspacePaths.from_root(workspace)
+    paths.ensure()
+    values = {
+        "source_id": 1,
+        "snapshot_path": "/safe/snapshot.json",
+        "content_hash": "hash",
+        "extractor": "text-v2",
+    }
+    values[column] = sqlite3.Binary(b"blob")
+    with sqlite3.connect(paths.db_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE source_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_id INTEGER NOT NULL,
+                snapshot_path TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                extractor TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO source_snapshots (source_id, snapshot_path, content_hash, extractor)
+            VALUES (:source_id, :snapshot_path, :content_hash, :extractor)
+            """,
+            values,
+        )
+
+    with pytest.raises(RepositoryError, match="stored data is invalid"):
+        repository = SQLiteRepository(paths.db_path)
+        if column == "source_id":
+            repository.latest_snapshot_metadata_by_source_id()
+        else:
+            repository.snapshot_metadata_for_source(1)
+
+
+def test_sqlite_repository_does_not_expose_raw_connection_bypass():
+    assert not hasattr(SQLiteRepository, "connect")
 
 
 def test_sqlite_repository_new_schema_rejects_invalid_enum_values(workspace):

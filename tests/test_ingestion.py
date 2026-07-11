@@ -204,7 +204,7 @@ def test_ingest_sources_ingests_approved_local_file(tmp_path):
     assert repository.list_sources()[0].status == SourceStatus.INGESTED
     payload = json.loads(result.snapshot_paths[0].read_text(encoding="utf-8"))
     assert payload["text"] == "hello\napi_key=[REDACTED]"
-    with repository.connect() as conn:
+    with repository._connection() as conn:
         row = conn.execute("SELECT source_id, snapshot_path FROM source_snapshots").fetchone()
     assert row["source_id"] == source_id
     assert row["snapshot_path"] == str(result.snapshot_paths[0])
@@ -249,7 +249,7 @@ def test_ingest_sources_skips_unapproved_local_and_approved_github_sources(tmp_p
     assert result.skipped_count == 2
     assert result.snapshot_paths == ()
     assert not any(paths.local_snapshots_dir.iterdir())
-    with repository.connect() as conn:
+    with repository._connection() as conn:
         assert conn.execute("SELECT COUNT(*) FROM source_snapshots").fetchone()[0] == 0
 
 
@@ -285,7 +285,7 @@ def test_ingest_sources_skips_approved_file_under_forbidden_path(tmp_path):
     assert result.snapshot_paths == ()
     assert not any(paths.local_snapshots_dir.iterdir())
     assert repository.list_sources()[0].status == SourceStatus.SKIPPED_POLICY
-    with repository.connect() as conn:
+    with repository._connection() as conn:
         assert conn.execute("SELECT COUNT(*) FROM source_snapshots").fetchone()[0] == 0
 
 
@@ -349,7 +349,7 @@ def test_ingest_sources_skips_approved_sensitive_file(tmp_path):
     assert result.skipped_count == 1
     assert result.snapshot_paths == ()
     assert repository.list_sources()[0].status == SourceStatus.SKIPPED_POLICY
-    with repository.connect() as conn:
+    with repository._connection() as conn:
         assert conn.execute("SELECT COUNT(*) FROM source_snapshots").fetchone()[0] == 0
 
 
@@ -424,7 +424,7 @@ def test_ingest_sources_continues_after_missing_approved_file(tmp_path):
     assert result.skipped_count == 1
     assert sources[missing_id] == SourceStatus.STALE_SOURCE
     assert sources[valid_id] == SourceStatus.INGESTED
-    with repository.connect() as conn:
+    with repository._connection() as conn:
         assert conn.execute("SELECT COUNT(*) FROM source_snapshots").fetchone()[0] == 1
 
 
@@ -456,7 +456,7 @@ def test_ingest_sources_skips_already_ingested_source_without_duplicate_snapshot
     assert first.ingested_count == 1
     assert second.ingested_count == 0
     assert second.skipped_count == 1
-    with repository.connect() as conn:
+    with repository._connection() as conn:
         assert conn.execute("SELECT COUNT(*) FROM source_snapshots").fetchone()[0] == 1
 
 
@@ -489,7 +489,7 @@ def test_ingest_sources_marks_deleted_ingested_source_stale(tmp_path):
     assert result.ingested_count == 0
     assert result.skipped_count == 1
     assert repository.list_sources()[0].status == SourceStatus.STALE_SOURCE
-    with repository.connect() as conn:
+    with repository._connection() as conn:
         count = conn.execute(
             "SELECT COUNT(*) FROM source_snapshots WHERE source_id = ?",
             (source_id,),
@@ -526,7 +526,7 @@ def test_ingest_sources_reingests_changed_ingested_source(tmp_path):
     assert second.ingested_count == 1
     assert second.skipped_count == 0
     assert repository.list_sources()[0].status == SourceStatus.INGESTED
-    with repository.connect() as conn:
+    with repository._connection() as conn:
         snapshots = [
             (row["content_hash"], row["snapshot_path"])
             for row in conn.execute(
@@ -569,7 +569,7 @@ def test_ingest_sources_recovers_stale_same_content_without_duplicate_snapshot(t
 
     assert result.ingested_count == 0
     assert repository.list_sources()[0].status == SourceStatus.INGESTED
-    with repository.connect() as conn:
+    with repository._connection() as conn:
         assert conn.execute(
             "SELECT COUNT(*) FROM source_snapshots WHERE source_id = ?", (source_id,)
         ).fetchone()[0] == 1
@@ -600,7 +600,7 @@ def test_ingest_sources_rewrites_legacy_snapshot_metadata_in_place(tmp_path):
     payload = json.loads(first.snapshot_paths[0].read_text(encoding="utf-8"))
     payload["extractor"] = "text-v1"
     first.snapshot_paths[0].write_text(json.dumps(payload), encoding="utf-8")
-    with repository.connect() as conn:
+    with repository._connection() as conn:
         conn.execute(
             "UPDATE source_snapshots SET extractor = ? WHERE source_id = ?",
             ("text-v1", source_id),
@@ -608,7 +608,7 @@ def test_ingest_sources_rewrites_legacy_snapshot_metadata_in_place(tmp_path):
 
     ingest_sources(IngestSourcesRequest(workspace=workspace))
 
-    with repository.connect() as conn:
+    with repository._connection() as conn:
         rows = conn.execute(
             "SELECT extractor FROM source_snapshots WHERE source_id = ?", (source_id,)
         ).fetchall()
@@ -666,7 +666,7 @@ def test_ingest_sources_migrates_verified_managed_legacy_snapshot(tmp_path):
     assert result.ingested_count == 0
     assert result.skipped_count == 1
     assert not legacy_path.exists()
-    with repository.connect() as conn:
+    with repository._connection() as conn:
         rows = conn.execute(
             "SELECT id, snapshot_path, extractor FROM source_snapshots WHERE source_id = ?",
             (source_id,),
@@ -701,7 +701,7 @@ def test_ingest_sources_retries_legacy_cleanup_after_unlink_failure(tmp_path, mo
 
     assert result.skipped_count == 1
     assert not legacy_path.exists()
-    with repository.connect() as conn:
+    with repository._connection() as conn:
         rows = conn.execute(
             "SELECT snapshot_path, extractor FROM source_snapshots WHERE source_id = ?",
             (source_id,),
@@ -722,7 +722,7 @@ def test_ingest_sources_migrates_legacy_snapshot_when_source_content_changed(tmp
 
     assert result.ingested_count == 1
     assert not legacy_path.exists()
-    with repository.connect() as conn:
+    with repository._connection() as conn:
         rows = conn.execute(
             "SELECT snapshot_path, extractor FROM source_snapshots WHERE source_id = ? ORDER BY id",
             (source_id,),
@@ -864,7 +864,7 @@ def test_ingest_sources_repairs_stale_db_extractor_before_idempotent_skip(tmp_pa
         )
     )
     ingest_sources(IngestSourcesRequest(workspace=workspace))
-    with repository.connect() as conn:
+    with repository._connection() as conn:
         conn.execute(
             "UPDATE source_snapshots SET extractor = ? WHERE source_id = ?",
             ("text-v1", source_id),
@@ -873,7 +873,7 @@ def test_ingest_sources_repairs_stale_db_extractor_before_idempotent_skip(tmp_pa
     result = ingest_sources(IngestSourcesRequest(workspace=workspace))
 
     assert result.ingested_count == 0
-    with repository.connect() as conn:
+    with repository._connection() as conn:
         extractor = conn.execute(
             "SELECT extractor FROM source_snapshots WHERE source_id = ?", (source_id,)
         ).fetchone()["extractor"]
@@ -910,7 +910,7 @@ def test_ingest_sources_rejects_replaced_approved_path_symlink(tmp_path):
 
     assert result.ingested_count == 0
     assert repository.list_sources()[0].status == SourceStatus.SKIPPED_POLICY
-    with repository.connect() as conn:
+    with repository._connection() as conn:
         assert conn.execute(
             "SELECT COUNT(*) FROM source_snapshots WHERE source_id = ?", (source_id,)
         ).fetchone()[0] == 0
