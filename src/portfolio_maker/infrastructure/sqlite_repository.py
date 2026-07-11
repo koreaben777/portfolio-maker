@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+import fcntl
 import os
 import sqlite3
 import threading
@@ -146,13 +147,47 @@ class SQLiteRepository:
             depth = depths.get(key, 0)
             depths[key] = depth + 1
             _REPOSITORY_OPERATION_STATE.depths = depths
+            lock_descriptor: int | None = None
+            lock_acquired = False
             try:
+                if depth == 0:
+                    lock_descriptor = self._open_repository_lock()
+                    try:
+                        fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
+                    except OSError as error:
+                        raise RepositoryError("Portfolio repository is busy; try again shortly") from error
+                    lock_acquired = True
                 yield depth == 0
             finally:
-                if depth:
-                    depths[key] = depth
-                else:
-                    del depths[key]
+                try:
+                    if lock_descriptor is not None:
+                        if lock_acquired:
+                            fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
+                        os.close(lock_descriptor)
+                finally:
+                    if depth:
+                        depths[key] = depth
+                    else:
+                        del depths[key]
+
+    def _open_repository_lock(self) -> int:
+        workspace = self.db_path.parent.parent
+        try:
+            workspace.mkdir(parents=True, mode=0o700, exist_ok=True)
+            descriptor = os.open(
+                workspace,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK,
+            )
+        except OSError as error:
+            raise RepositoryError("Portfolio repository is busy; try again shortly") from error
+        try:
+            stat_result = os.fstat(descriptor)
+            if not S_ISDIR(stat_result.st_mode):
+                raise RepositoryError("Unsafe repository lock directory; preserve the workspace and rerun")
+            return descriptor
+        except Exception:
+            os.close(descriptor)
+            raise
 
     def _open_database_family(self, *, ensure_directory: bool) -> tuple[int, _DatabaseIdentity]:
         try:

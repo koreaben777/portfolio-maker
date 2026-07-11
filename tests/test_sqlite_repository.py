@@ -1,5 +1,8 @@
 import os
 import sqlite3
+import subprocess
+import sys
+import time
 from pathlib import Path
 from stat import S_IMODE
 
@@ -533,6 +536,89 @@ def test_sqlite_repository_prevents_journal_alias_after_overlapping_read(
     assert external.stat().st_size == 0
     assert error is None
     assert overlapping_read_completed is True
+    assert injection_blocked is True
+    assert injected is False
+    assert S_IMODE(paths.root.stat().st_mode) == 0o700
+
+
+def test_sqlite_repository_prevents_journal_alias_after_child_process_read(
+    workspace,
+    tmp_path,
+    monkeypatch,
+):
+    paths = WorkspacePaths.from_root(workspace)
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    sidecar = paths.db_path.with_name("portfolio.db-journal")
+    external = tmp_path / "external-journal"
+    external.write_bytes(b"")
+    original_validate = repository._validate_database_family
+    child: subprocess.Popen[str] | None = None
+    child_completed_before_injection = False
+    injected = False
+    injection_blocked = False
+    child_script = (
+        "from pathlib import Path\n"
+        "import sys\n"
+        "from portfolio_maker.infrastructure.sqlite_repository import SQLiteRepository\n"
+        "print('started', flush=True)\n"
+        "print('sources' in SQLiteRepository(Path(sys.argv[1])).table_names(), flush=True)\n"
+    )
+    environment = os.environ | {
+        "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src")
+    }
+
+    def inject_after_write_validation(directory_descriptor, identity, stage):
+        nonlocal child, child_completed_before_injection, injected, injection_blocked
+        original_validate(directory_descriptor, identity, stage)
+        if stage != "after write transaction":
+            return
+        child = subprocess.Popen(
+            [sys.executable, "-c", child_script, str(paths.db_path)],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        assert child.stdout is not None
+        assert child.stdout.readline().strip() == "started"
+        deadline = time.monotonic() + 1
+        while child.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        child_completed_before_injection = child.poll() is not None
+        try:
+            sidecar.unlink()
+            os.link(external, sidecar)
+        except PermissionError:
+            injection_blocked = True
+        else:
+            injected = True
+
+    monkeypatch.setattr(repository, "_validate_database_family", inject_after_write_validation)
+
+    error: RepositoryError | None = None
+    try:
+        repository.upsert_source(
+            Source(
+                id=None,
+                type=SourceType.LOCAL_FILE,
+                uri="file:///child-read.md",
+                display_name="child-read.md",
+                owner=None,
+                status=SourceStatus.DISCOVERED,
+            )
+        )
+    except RepositoryError as caught:
+        error = caught
+
+    assert child is not None
+    stdout, stderr = child.communicate(timeout=5)
+    assert external.stat().st_size == 0
+    assert error is None
+    assert child_completed_before_injection is False
+    assert child.returncode == 0
+    assert stdout.strip() == "True"
+    assert stderr == ""
     assert injection_blocked is True
     assert injected is False
     assert S_IMODE(paths.root.stat().st_mode) == 0o700
