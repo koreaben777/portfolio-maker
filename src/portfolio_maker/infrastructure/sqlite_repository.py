@@ -51,6 +51,7 @@ CREATE TABLE IF NOT EXISTS github_activities (
     author TEXT NOT NULL,
     created_at TEXT NOT NULL,
     merged_at TEXT,
+    is_private INTEGER NOT NULL DEFAULT 0 CHECK(is_private IN (0, 1)),
     UNIQUE(repo, activity_type, url)
 );
 
@@ -436,6 +437,20 @@ class SQLiteRepository:
             for statement in SCHEMA.split(";"):
                 if statement.strip():
                     conn.execute(statement)
+            self._ensure_github_activity_visibility_column(conn)
+
+    @staticmethod
+    def _ensure_github_activity_visibility_column(conn: sqlite3.Connection) -> None:
+        columns = {
+            SQLiteRepository._required_text(row, "name")
+            for row in conn.execute("PRAGMA table_info(github_activities)").fetchall()
+        }
+        if "is_private" not in columns:
+            # Existing rows predate explicit visibility. Keep them out of public artifacts.
+            conn.execute(
+                "ALTER TABLE github_activities "
+                "ADD COLUMN is_private INTEGER NOT NULL DEFAULT 1 CHECK(is_private IN (0, 1))"
+            )
 
     def table_names(self) -> set[str]:
         with self._read_connection() as conn:
@@ -480,15 +495,16 @@ class SQLiteRepository:
             conn.execute(
                 """
                 INSERT INTO github_activities
-                    (source_id, repo, activity_type, url, title, state, author, created_at, merged_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (source_id, repo, activity_type, url, title, state, author, created_at, merged_at, is_private)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(repo, activity_type, url) DO UPDATE SET
                     source_id = excluded.source_id,
                     title = excluded.title,
                     state = excluded.state,
                     author = excluded.author,
                     created_at = excluded.created_at,
-                    merged_at = excluded.merged_at
+                    merged_at = excluded.merged_at,
+                    is_private = excluded.is_private
                 """,
                 (
                     activity.source_id,
@@ -500,6 +516,7 @@ class SQLiteRepository:
                     activity.author,
                     activity.created_at,
                     activity.merged_at,
+                    int(activity.is_private),
                 ),
             )
             row = conn.execute(
@@ -510,6 +527,112 @@ class SQLiteRepository:
                 (activity.repo, activity.activity_type, activity.url),
             ).fetchone()
         return int(row["id"])
+
+    def list_github_activities(self) -> list[GitHubActivity]:
+        with self._read_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, source_id, repo, activity_type, url, title, state, author,
+                       created_at, merged_at, is_private
+                FROM github_activities
+                ORDER BY id
+                """
+            ).fetchall()
+        try:
+            return [
+                GitHubActivity(
+                    id=self._required_int(row, "id"),
+                    source_id=self._optional_int(row, "source_id"),
+                    repo=self._required_text(row, "repo"),
+                    activity_type=self._required_text(row, "activity_type"),
+                    url=self._required_text(row, "url"),
+                    title=self._required_text(row, "title"),
+                    state=self._required_text(row, "state"),
+                    author=self._required_text(row, "author"),
+                    created_at=self._required_text(row, "created_at"),
+                    merged_at=self._optional_text(row, "merged_at"),
+                    is_private=bool(self._required_boolean(row, "is_private")),
+                )
+                for row in rows
+            ]
+        except (KeyError, TypeError, ValueError) as error:
+            raise self._semantic_error() from error
+
+    def upsert_evidence_item(
+        self,
+        *,
+        source_id: int | None,
+        snapshot_id: int | None,
+        github_activity_id: int | None,
+        locator: str,
+        stable_id: str,
+        content_hash: str | None,
+        public_safe: bool,
+    ) -> int:
+        with self._connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO evidence_items
+                    (source_id, snapshot_id, github_activity_id, locator, stable_id, content_hash, public_safe)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(stable_id) DO UPDATE SET
+                    source_id = excluded.source_id,
+                    snapshot_id = excluded.snapshot_id,
+                    github_activity_id = excluded.github_activity_id,
+                    locator = excluded.locator,
+                    content_hash = excluded.content_hash,
+                    public_safe = excluded.public_safe
+                """,
+                (
+                    source_id,
+                    snapshot_id,
+                    github_activity_id,
+                    locator,
+                    stable_id,
+                    content_hash,
+                    int(public_safe),
+                ),
+            )
+            row = conn.execute(
+                "SELECT id FROM evidence_items WHERE stable_id = ?", (stable_id,)
+            ).fetchone()
+        return self._required_int(row, "id")
+
+    def upsert_career_claim(self, text: str, public_safe: bool) -> int:
+        with self._connection() as conn:
+            row = conn.execute(
+                """
+                SELECT id FROM career_claims
+                WHERE project_id IS NULL AND text = ? AND public_safe = ?
+                ORDER BY id LIMIT 1
+                """,
+                (text, int(public_safe)),
+            ).fetchone()
+            if row is not None:
+                return self._required_int(row, "id")
+            cursor = conn.execute(
+                "INSERT INTO career_claims (text, public_safe) VALUES (?, ?)",
+                (text, int(public_safe)),
+            )
+        return int(cursor.lastrowid)
+
+    def link_claim_evidence(self, claim_id: int, evidence_id: int, support_level: str) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO claim_evidence (claim_id, evidence_id, support_level)
+                VALUES (?, ?, ?)
+                """,
+                (claim_id, evidence_id, support_level),
+            )
+
+    def record_artifact(self, kind: str, version: int, input_manifest: str) -> int:
+        with self._connection() as conn:
+            cursor = conn.execute(
+                "INSERT INTO artifacts (kind, version, input_manifest) VALUES (?, ?, ?)",
+                (kind, version, input_manifest),
+            )
+        return int(cursor.lastrowid)
 
     def insert_source_snapshot(
         self,
@@ -639,6 +762,20 @@ class SQLiteRepository:
         if not isinstance(value, str):
             raise TypeError(f"{name} must be text")
         return value
+
+    @staticmethod
+    def _optional_int(row: sqlite3.Row, name: str) -> int | None:
+        value = row[name]
+        if value is not None and type(value) is not int:
+            raise TypeError(f"{name} must be an integer or null")
+        return value
+
+    @staticmethod
+    def _required_boolean(row: sqlite3.Row, name: str) -> bool:
+        value = row[name]
+        if value not in (0, 1) or type(value) is not int:
+            raise TypeError(f"{name} must be a boolean integer")
+        return bool(value)
 
     @staticmethod
     def _optional_text(row: sqlite3.Row, name: str) -> str | None:

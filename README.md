@@ -4,7 +4,7 @@
 
 승인한 내 작업 자료를 바탕으로, **근거를 확인할 수 있는 커리어 프로필**과 **검토용 포트폴리오 초안**을 만드는 로컬 우선 도구입니다.
 
-Portfolio Maker는 원본 파일을 자동으로 업로드하거나 공개하지 않습니다. 먼저 후보를 확인하고, 사용자가 명시적으로 승인한 로컬 자료만 처리합니다. GitHub 활동도 발견해 검토할 수 있지만, 현재 버전에서는 포트폴리오 문장에 자동 반영하지 않습니다.
+Portfolio Maker는 원본 파일을 자동으로 업로드하거나 공개하지 않습니다. 먼저 후보를 확인하고, 사용자가 명시적으로 승인한 로컬 자료만 처리합니다. 공개 GitHub 활동도 `approved_github_activity_urls`에서 URL 단위로 명시 승인한 항목만 profile의 검토 근거로 반영합니다.
 
 ## 지금 할 수 있는 일
 
@@ -100,6 +100,7 @@ portfolio-maker draft-portfolio --workspace .
 - `excluded_repositories`에 넣은 저장소는 GitHub 탐색에서 제외합니다.
 - `allowed_repositories`가 비어 있지 않으면 그 `owner/repo`만 GitHub 탐색 대상으로 남습니다.
 - `excluded_file_patterns`는 대소문자를 구분하지 않는 파일명 glob으로 로컬 후보와 재수집을 제외합니다.
+- `approved_github_activity_urls`는 discovery가 저장한 공개 GitHub activity URL을 정확히 지정합니다. private activity 또는 allowlist 밖·excluded repository activity는 승인되어도 산출물 입력으로 쓰지 않습니다.
 - 공개 포트폴리오에는 비밀값, 토큰, 원본의 비공개 경로를 넣지 않아야 합니다.
 - `.portfolio-maker/`는 Git에 커밋하지 마세요.
 - `portfolio.db`와 journal/WAL/SHM sidecar는 하나의 관리 단위입니다. 개별 sidecar를 임의로 바꾸거나 삭제하지 마세요.
@@ -112,7 +113,7 @@ portfolio-maker approve --workspace . --write-sample --force
 
 ## 현재 범위와 로드맵
 
-0.1.0에서는 로컬 자료 기반의 프로필 생성과 검토용 포트폴리오 초안 골격에 집중합니다. 작업 이력은 사용자가 `.portfolio-maker/`를 직접 정리할 때까지 로컬에 남으며, 자동 보존·정리 기능은 아직 제공하지 않습니다. GitHub 활동의 산출물 반영, 회사·채용공고별 맞춤 작성, Google Drive 연동, 이력서·자기소개서·면접 자료, OCR, 시맨틱 검색, 공개용 인터랙티브 HTML 포트폴리오(`@sites`를 활용한 디자인 선택·빌드 검증·선택적 호스팅 계획 포함), MCP/app-server 인터페이스는 [GitHub Issues](https://github.com/koreaben777/portfolio-maker/issues)에서 관리합니다.
+0.1.0에서는 승인된 로컬 자료와 명시 승인된 공개 GitHub activity를 profile 근거로 사용하고, 검토용 포트폴리오 초안 골격에 집중합니다. 작업 이력은 사용자가 `.portfolio-maker/`를 직접 정리할 때까지 로컬에 남으며, 자동 보존·정리 기능은 아직 제공하지 않습니다. 회사·채용공고별 맞춤 작성, Google Drive 연동, 이력서·자기소개서·면접 자료, OCR, 시맨틱 검색, 공개용 인터랙티브 HTML 포트폴리오(`@sites`를 활용한 디자인 선택·빌드 검증·선택적 호스팅 계획 포함), MCP/app-server 인터페이스는 [GitHub Issues](https://github.com/koreaben777/portfolio-maker/issues)에서 관리합니다.
 
 ## 버그와 제안
 

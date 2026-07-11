@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from portfolio_maker.application.approval import load_approval
 from portfolio_maker.application.models import BuildProfileRequest, BuildProfileResult
 from portfolio_maker.domain.models import Source, SourceStatus, SourceType
@@ -8,6 +10,7 @@ from portfolio_maker.infrastructure.extractors import extract_approved_text
 from portfolio_maker.infrastructure.policy import FilePolicy, SourcePathPolicyError
 from portfolio_maker.infrastructure.managed_files import remove_managed_file
 from portfolio_maker.infrastructure.presentation import markdown_text, normalize_label
+from portfolio_maker.infrastructure.github_connector import canonical_repository_name
 from portfolio_maker.infrastructure.sqlite_repository import SQLiteRepository
 from portfolio_maker.infrastructure.snapshots import load_valid_local_snapshot
 from portfolio_maker.workspace import WorkspacePaths
@@ -27,6 +30,9 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
     snapshots = repository.latest_snapshot_metadata_by_source_id()
     sources: list[Source] = []
     claims: list[dict[str, object]] = []
+    evidence_ids: list[int] = []
+    claim_ids: list[int] = []
+    source_by_id = {source.id: source for source in repository.list_sources() if source.id is not None}
 
     for source in repository.list_sources(status=SourceStatus.INGESTED):
         if source.type != SourceType.LOCAL_FILE or source.uri not in approved_uris or source.id is None:
@@ -67,16 +73,90 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
         if evidence is None:
             continue
         evidence = normalize_label(evidence)
+        claim_text = f"{display_name}: {evidence}"
+        evidence_id = repository.upsert_evidence_item(
+            source_id=source.id,
+            snapshot_id=snapshot_metadata[0],
+            github_activity_id=None,
+            locator=source.uri,
+            stable_id=f"source-snapshot:{source.id}:{snapshot_metadata[2]}",
+            content_hash=snapshot_metadata[2],
+            public_safe=False,
+        )
+        claim_id = repository.upsert_career_claim(claim_text, public_safe=False)
+        repository.link_claim_evidence(claim_id, evidence_id, "direct")
+        evidence_ids.append(evidence_id)
+        claim_ids.append(claim_id)
 
         sources.append(source)
         claims.append(
             {
                 "claim_type": "project_evidence",
-                "text": f"{display_name}: {evidence}",
+                "text": claim_text,
                 "confidence": "medium",
                 "public_safe": False,
                 "evidence_uri": source.uri,
                 "evidence_snapshot": str(snapshot_path),
+            }
+        )
+
+    approved_activity_urls = set(approval.approved_github_activity_urls)
+    allowed_repositories = set(approval.allowed_repositories)
+    excluded_repositories = set(approval.excluded_repositories)
+    for activity in repository.list_github_activities():
+        if (
+            activity.id is None
+            or activity.source_id is None
+            or activity.is_private
+            or activity.url not in approved_activity_urls
+        ):
+            continue
+        try:
+            repository_name = canonical_repository_name(activity.repo)
+        except ValueError:
+            continue
+        source = source_by_id.get(activity.source_id)
+        if (
+            source is None
+            or source.type != SourceType.GITHUB_REPOSITORY
+            or source.status in {
+                SourceStatus.SKIPPED_POLICY,
+                SourceStatus.EXTRACT_FAILED,
+                SourceStatus.STALE_SOURCE,
+            }
+            or repository_name in excluded_repositories
+            or (allowed_repositories and repository_name not in allowed_repositories)
+        ):
+            continue
+        if source not in sources:
+            sources.append(source)
+        title = normalize_label(activity.title)
+        claim_text = f"{repository_name}: {title}"
+        evidence_id = repository.upsert_evidence_item(
+            source_id=source.id,
+            snapshot_id=None,
+            github_activity_id=activity.id,
+            locator=activity.url,
+            stable_id=f"github-activity:{activity.id}",
+            content_hash=None,
+            public_safe=True,
+        )
+        claim_id = repository.upsert_career_claim(claim_text, public_safe=True)
+        repository.link_claim_evidence(claim_id, evidence_id, "direct")
+        evidence_ids.append(evidence_id)
+        claim_ids.append(claim_id)
+        claims.append(
+            {
+                "claim_type": "approved_github_activity",
+                "text": claim_text,
+                "confidence": "high",
+                "public_safe": True,
+                "evidence_uri": activity.url,
+                "evidence_snapshot": None,
+                "activity_type": activity.activity_type,
+                "author": normalize_label(activity.author),
+                "created_at": activity.created_at,
+                "state": activity.state,
             }
         )
 
@@ -116,6 +196,15 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
             ]
         )
         + "\n",
+    )
+    repository.record_artifact(
+        "master_profile",
+        1,
+        json.dumps(
+            {"claim_ids": claim_ids, "evidence_ids": evidence_ids},
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
     )
     remove_managed_file(paths.portfolio_draft_path, missing_ok=True)
     return BuildProfileResult(

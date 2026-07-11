@@ -40,3 +40,4 @@ class GitHubActivity:
     author: str
     created_at: str
     merged_at: str | None
+    is_private: bool = False

@@ -26,6 +26,7 @@ def test_write_sample_approval_creates_empty_versioned_json(workspace):
         "private_sources_allowed": False,
         "allowed_repositories": [],
         "excluded_file_patterns": [],
+        "approved_github_activity_urls": [],
     }
 
 
@@ -127,6 +128,39 @@ def test_load_approval_reads_repository_allowlist_and_filename_patterns(workspac
 
     assert approval.allowed_repositories == ("octo/demo",)
     assert approval.excluded_file_patterns == ("*.secret", "PRIVATE*")
+
+
+def test_load_approval_reads_public_github_activity_urls(workspace):
+    paths = WorkspacePaths.from_root(workspace)
+    paths.ensure()
+    paths.approval_path.write_text(
+        json.dumps({"approved_github_activity_urls": ["https://github.com/octo/demo/pull/1"]}),
+        encoding="utf-8",
+    )
+
+    assert load_approval(paths).approved_github_activity_urls == (
+        "https://github.com/octo/demo/pull/1",
+    )
+
+
+@pytest.mark.parametrize(
+    "url",
+    (
+        "https://github.com/octo/demo",
+        "http://github.com/octo/demo/pull/1",
+        "https://example.test/octo/demo/pull/1",
+        "https://github.com/octo/demo/releases/tag/v1",
+    ),
+)
+def test_load_approval_rejects_non_activity_github_urls(workspace, url):
+    paths = WorkspacePaths.from_root(workspace)
+    paths.ensure()
+    paths.approval_path.write_text(
+        json.dumps({"approved_github_activity_urls": [url]}), encoding="utf-8"
+    )
+
+    with pytest.raises(ApprovalFormatError, match="approved_github_activity_urls"):
+        load_approval(paths)
 
 
 @pytest.mark.parametrize("pattern", ("", "nested/file.md", r"nested\\file.md", "bad\npattern"))

@@ -10,7 +10,7 @@ from portfolio_maker.application.models import (
     DraftPortfolioRequest,
     IngestSourcesRequest,
 )
-from portfolio_maker.domain.models import Source, SourceStatus, SourceType
+from portfolio_maker.domain.models import GitHubActivity, Source, SourceStatus, SourceType
 from portfolio_maker.infrastructure.extractors import extract_text
 from portfolio_maker.infrastructure.sqlite_repository import SQLiteRepository
 from portfolio_maker.workspace import WorkspacePaths
@@ -155,6 +155,159 @@ def test_build_profile_and_draft_portfolio_from_ingested_source(tmp_path):
     assert "- Outcome: Evidence review required" in draft
     assert "Internal evidence reference: `Portfolio Maker`" in draft
     assert str(source_path) not in draft
+
+
+def test_build_profile_includes_only_explicitly_approved_public_github_activity(tmp_path):
+    workspace = tmp_path / "workspace"
+    paths = WorkspacePaths.from_root(workspace)
+    write_sample_approval(paths)
+    approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    activity_url = "https://github.com/octo/demo/pull/1"
+    approval["approved_github_activity_urls"] = [activity_url]
+    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    source_id = repository.upsert_source(
+        Source(
+            id=None,
+            type=SourceType.GITHUB_REPOSITORY,
+            uri="https://github.com/octo/demo",
+            display_name="octo/demo",
+            owner="octo",
+            status=SourceStatus.DISCOVERED,
+        )
+    )
+    repository.insert_github_activity(
+        GitHubActivity(
+            id=None,
+            source_id=source_id,
+            repo="octo/demo",
+            activity_type="pull_request",
+            url=activity_url,
+            title="Add evidence",
+            state="MERGED",
+            author="octo",
+            created_at="2026-01-01T00:00:00Z",
+            merged_at="2026-01-02T00:00:00Z",
+        )
+    )
+
+    result = build_profile(BuildProfileRequest(workspace=workspace))
+    profile = json.loads(result.json_path.read_text(encoding="utf-8"))
+
+    assert result.claim_count == 1
+    assert profile["claims"][0]["evidence_uri"] == activity_url
+    assert profile["claims"][0]["public_safe"] is True
+
+
+def test_build_profile_revalidates_github_activity_policy_before_use(tmp_path):
+    workspace = tmp_path / "workspace"
+    paths = WorkspacePaths.from_root(workspace)
+    write_sample_approval(paths)
+    approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    approved_url = "https://github.com/octo/demo/pull/1"
+    approval.update(
+        {
+            "approved_github_activity_urls": [
+                approved_url,
+                "https://github.com/other/demo/pull/2",
+                "https://github.com/octo/private/pull/3",
+            ],
+            "allowed_repositories": ["octo/demo", "octo/private"],
+            "excluded_repositories": ["octo/private"],
+        }
+    )
+    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    for repo in ("octo/demo", "other/demo", "octo/private"):
+        source_id = repository.upsert_source(
+            Source(
+                id=None,
+                type=SourceType.GITHUB_REPOSITORY,
+                uri=f"https://github.com/{repo}",
+                display_name=repo,
+                owner=repo.split("/", 1)[0],
+                status=SourceStatus.DISCOVERED,
+            )
+        )
+        url = {
+            "octo/demo": approved_url,
+            "other/demo": "https://github.com/other/demo/pull/2",
+            "octo/private": "https://github.com/octo/private/pull/3",
+        }[repo]
+        repository.insert_github_activity(
+            GitHubActivity(
+                id=None,
+                source_id=source_id,
+                repo=repo,
+                activity_type="pull_request",
+                url=url,
+                title=f"{repo} evidence",
+                state="MERGED",
+                author="octo",
+                created_at="2026-01-01T00:00:00Z",
+                merged_at="2026-01-02T00:00:00Z",
+                is_private=repo == "octo/private",
+            )
+        )
+
+    result = build_profile(BuildProfileRequest(workspace=workspace))
+    profile = json.loads(result.json_path.read_text(encoding="utf-8"))
+
+    assert result.claim_count == 1
+    assert [claim["evidence_uri"] for claim in profile["claims"]] == [approved_url]
+
+
+def test_build_profile_traces_approved_github_claim_to_evidence(tmp_path):
+    workspace = tmp_path / "workspace"
+    paths = WorkspacePaths.from_root(workspace)
+    write_sample_approval(paths)
+    approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    activity_url = "https://github.com/octo/demo/commit/abc123"
+    approval["approved_github_activity_urls"] = [activity_url]
+    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    source_id = repository.upsert_source(
+        Source(
+            id=None,
+            type=SourceType.GITHUB_REPOSITORY,
+            uri="https://github.com/octo/demo",
+            display_name="octo/demo",
+            owner="octo",
+            status=SourceStatus.DISCOVERED,
+        )
+    )
+    activity_id = repository.insert_github_activity(
+        GitHubActivity(
+            id=None,
+            source_id=source_id,
+            repo="octo/demo",
+            activity_type="commit",
+            url=activity_url,
+            title="Add traceable evidence",
+            state="committed",
+            author="octo",
+            created_at="2026-01-01T00:00:00Z",
+            merged_at=None,
+        )
+    )
+
+    build_profile(BuildProfileRequest(workspace=workspace))
+
+    with repository._read_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT evidence_items.github_activity_id, evidence_items.locator,
+                   evidence_items.public_safe, claim_evidence.support_level,
+                   career_claims.public_safe
+            FROM evidence_items
+            JOIN claim_evidence ON claim_evidence.evidence_id = evidence_items.id
+            JOIN career_claims ON career_claims.id = claim_evidence.claim_id
+            """
+        ).fetchone()
+    assert tuple(row) == (activity_id, activity_url, 1, "direct", 1)
 
 
 def test_build_profile_excludes_ingested_source_after_approval_revoked(tmp_path):

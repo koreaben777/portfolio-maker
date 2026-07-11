@@ -62,6 +62,7 @@ def discover_sources(request: DiscoverSourcesRequest) -> DiscoverSourcesResult:
             github_statuses = [str(error) or "GitHub discovery failed"]
 
         repo_source_ids: dict[str, int] = {}
+        repo_visibility: dict[str, bool] = {}
         for repo in github_repos:
             repo_source_ids[repo.name_with_owner] = repository.upsert_source(
                 Source(
@@ -73,6 +74,7 @@ def discover_sources(request: DiscoverSourcesRequest) -> DiscoverSourcesResult:
                     status=SourceStatus.DISCOVERED,
                 )
             )
+            repo_visibility[repo.name_with_owner] = repo.is_private
         for activity in github_activities:
             repository.insert_github_activity(
                 GitHubActivity(
@@ -86,6 +88,7 @@ def discover_sources(request: DiscoverSourcesRequest) -> DiscoverSourcesResult:
                     author=activity.author,
                     created_at=activity.created_at,
                     merged_at=activity.merged_at,
+                    is_private=repo_visibility.get(activity.repo, True),
                 )
             )
 
