@@ -40,6 +40,21 @@ def test_discover_local_candidates_finds_readme_and_skips_forbidden_and_policy_p
     assert (node_modules.resolve(), "skipped_policy") in [(item.path, item.reason) for item in skipped]
 
 
+def test_discover_local_candidates_skips_filename_pattern_before_candidate(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    excluded = home / "PRIVATE-notes.md"
+    excluded.write_text("private", encoding="utf-8")
+
+    candidates, skipped = discover_local_candidates(
+        home,
+        excluded_file_patterns=("private*",),
+    )
+
+    assert candidates == []
+    assert (excluded.resolve(), "skipped_policy") in [(item.path, item.reason) for item in skipped]
+
+
 def test_discover_local_candidates_prunes_forbidden_children(tmp_path):
     home = tmp_path / "home"
     forbidden = home / "private"
@@ -228,6 +243,7 @@ def test_discover_sources_includes_github_candidates(workspace, tmp_path, monkey
     def fake_discover_github_candidates(**kwargs):
         assert kwargs == {
             "excluded_repositories": (),
+            "allowed_repositories": (),
             "private_sources_allowed": False,
         }
         return (
@@ -367,6 +383,7 @@ def test_discover_sources_filters_private_and_excluded_github_repos(workspace, t
     def fake_discover_github_candidates(**kwargs):
         assert kwargs == {
             "excluded_repositories": ("octo/excluded",),
+            "allowed_repositories": (),
             "private_sources_allowed": False,
         }
         return (

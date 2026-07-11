@@ -22,7 +22,10 @@ def ingest_sources(request: IngestSourcesRequest) -> IngestSourcesResult:
     paths.ensure()
     approval = load_approval(paths)
     approved_uris = set(approval.approved_source_uris)
-    policy = FilePolicy(forbidden_paths=approval.forbidden_paths)
+    policy = FilePolicy(
+        forbidden_paths=approval.forbidden_paths,
+        excluded_file_patterns=approval.excluded_file_patterns,
+    )
     repository = SQLiteRepository(paths.db_path)
     repository.initialize()
     ingested_count = 0

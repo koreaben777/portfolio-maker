@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from fnmatch import fnmatchcase
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -93,6 +94,7 @@ class SourcePathPolicyError(ValueError):
 @dataclass(frozen=True)
 class FilePolicy:
     forbidden_paths: tuple[Path, ...] = ()
+    excluded_file_patterns: tuple[str, ...] = ()
     max_file_size_bytes: int = 2_000_000
 
     def is_forbidden(self, path: Path) -> bool:
@@ -110,6 +112,11 @@ class FilePolicy:
         if self.is_forbidden(path):
             return "forbidden"
         if is_sensitive_filename(path):
+            return "skipped_policy"
+        if any(
+            fnmatchcase(path.name.casefold(), pattern.casefold())
+            for pattern in self.excluded_file_patterns
+        ):
             return "skipped_policy"
         if any(part.casefold() in DEFAULT_EXCLUDED_NAMES_CASEFOLD for part in path.parts):
             return "skipped_policy"

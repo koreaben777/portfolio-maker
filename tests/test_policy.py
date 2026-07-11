@@ -33,6 +33,14 @@ def test_env_and_private_key_files_are_skipped(tmp_path):
     assert policy.classify_path(tmp_path / "project.md") == "candidate"
 
 
+def test_file_policy_excludes_case_insensitive_filename_globs(tmp_path):
+    policy = FilePolicy(excluded_file_patterns=("*.secret", "private*"))
+
+    assert policy.classify_path(tmp_path / "PLAN.SECRET") == "skipped_policy"
+    assert policy.classify_path(tmp_path / "PrivateNotes.md") == "skipped_policy"
+    assert policy.classify_path(tmp_path / "nested" / "PLAN.md") == "candidate"
+
+
 def test_secret_masking_removes_token_values():
     text = (
         "GITHUB_TOKEN=github_pat_abcdefghijklmnopqrstuvwxyz1234567890abcd\n"

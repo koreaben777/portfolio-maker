@@ -18,7 +18,10 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
     paths.ensure()
     approval = load_approval(paths)
     approved_uris = set(approval.approved_source_uris)
-    policy = FilePolicy(forbidden_paths=approval.forbidden_paths)
+    policy = FilePolicy(
+        forbidden_paths=approval.forbidden_paths,
+        excluded_file_patterns=approval.excluded_file_patterns,
+    )
     repository = SQLiteRepository(paths.db_path)
     repository.initialize()
     snapshots = repository.latest_snapshot_metadata_by_source_id()

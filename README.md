@@ -97,6 +97,8 @@ portfolio-maker draft-portfolio --workspace .
 - 프로필 생성 전에는 승인 상태, 금지 경로, 원본 파일 해시, 최신 스냅샷을 다시 확인합니다.
 - 비공개 GitHub 저장소는 `private_sources_allowed`를 명시적으로 허용하지 않는 한 건너뜁니다.
 - `excluded_repositories`에 넣은 저장소는 GitHub 탐색에서 제외합니다.
+- `allowed_repositories`가 비어 있지 않으면 그 `owner/repo`만 GitHub 탐색 대상으로 남습니다.
+- `excluded_file_patterns`는 대소문자를 구분하지 않는 파일명 glob으로 로컬 후보와 재수집을 제외합니다.
 - 공개 포트폴리오에는 비밀값, 토큰, 원본의 비공개 경로를 넣지 않아야 합니다.
 - `.portfolio-maker/`는 Git에 커밋하지 마세요.
 - `portfolio.db`와 journal/WAL/SHM sidecar는 하나의 관리 단위입니다. 개별 sidecar를 임의로 바꾸거나 삭제하지 마세요.

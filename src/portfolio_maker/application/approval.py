@@ -24,6 +24,8 @@ class SourceApproval:
     forbidden_paths: tuple[Path, ...]
     excluded_repositories: tuple[str, ...]
     private_sources_allowed: bool
+    allowed_repositories: tuple[str, ...]
+    excluded_file_patterns: tuple[str, ...]
 
 
 def sample_approval_payload() -> dict[str, Any]:
@@ -33,6 +35,8 @@ def sample_approval_payload() -> dict[str, Any]:
         "forbidden_paths": [],
         "excluded_repositories": [],
         "private_sources_allowed": False,
+        "allowed_repositories": [],
+        "excluded_file_patterns": [],
     }
 
 
@@ -86,12 +90,32 @@ def load_approval(paths: WorkspacePaths) -> SourceApproval:
         raise ApprovalFormatError(
             "excluded_repositories entries must use owner/repo form"
         ) from error
+    try:
+        allowed_repositories = tuple(
+            canonical_repository_name(repository)
+            for repository in _string_list(payload, "allowed_repositories")
+        )
+    except ValueError as error:
+        raise ApprovalFormatError(
+            "allowed_repositories entries must use owner/repo form"
+        ) from error
+    excluded_file_patterns = _string_list(payload, "excluded_file_patterns")
+    if any(
+        not pattern
+        or "/" in pattern
+        or "\\" in pattern
+        or any(character.isspace() and character not in {" ", "\t"} for character in pattern)
+        for pattern in excluded_file_patterns
+    ):
+        raise ApprovalFormatError("excluded_file_patterns entries must be safe filenames globs")
 
     return SourceApproval(
         approved_source_uris=_string_list(payload, "approved_source_uris"),
         forbidden_paths=forbidden_paths,
         excluded_repositories=excluded_repositories,
         private_sources_allowed=private_sources_allowed,
+        allowed_repositories=allowed_repositories,
+        excluded_file_patterns=excluded_file_patterns,
     )
 
 

@@ -160,6 +160,7 @@ def run_gh_json(args: list[str]) -> Any:
 
 def discover_github_candidates(
     excluded_repositories: tuple[str, ...] = (),
+    allowed_repositories: tuple[str, ...] = (),
     private_sources_allowed: bool = False,
 ) -> tuple[list[GitHubRepositoryCandidate], list[GitHubActivityCandidate], list[str]]:
     repos = parse_repo_list(
@@ -175,10 +176,12 @@ def discover_github_candidates(
         )
     )
     excluded = {canonical_repository_name(name) for name in excluded_repositories}
+    allowed = {canonical_repository_name(name) for name in allowed_repositories}
     repos = [
         repo
         for repo in repos
         if canonical_repository_name(repo.name_with_owner) not in excluded
+        and (not allowed or canonical_repository_name(repo.name_with_owner) in allowed)
         and (private_sources_allowed or not repo.is_private)
     ]
     activities: list[GitHubActivityCandidate] = []

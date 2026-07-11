@@ -31,9 +31,13 @@ class SkippedPath:
 def discover_local_candidates(
     home: Path,
     forbidden_paths: tuple[Path, ...] = (),
+    excluded_file_patterns: tuple[str, ...] = (),
     max_candidates: int = 500,
 ) -> tuple[list[LocalCandidate], list[SkippedPath]]:
-    policy = FilePolicy(forbidden_paths=forbidden_paths)
+    policy = FilePolicy(
+        forbidden_paths=forbidden_paths,
+        excluded_file_patterns=excluded_file_patterns,
+    )
     candidates: list[LocalCandidate] = []
     skipped: list[SkippedPath] = []
     seen_uris: set[str] = set()

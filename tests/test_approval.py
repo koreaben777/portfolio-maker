@@ -24,6 +24,8 @@ def test_write_sample_approval_creates_empty_versioned_json(workspace):
         "forbidden_paths": [],
         "excluded_repositories": [],
         "private_sources_allowed": False,
+        "allowed_repositories": [],
+        "excluded_file_patterns": [],
     }
 
 
@@ -106,6 +108,38 @@ def test_load_approval_reads_valid_payload(workspace):
     assert approval.forbidden_paths == ((workspace / "secrets").resolve(),)
     assert approval.excluded_repositories == ("private-org/private-repo",)
     assert approval.private_sources_allowed is True
+
+
+def test_load_approval_reads_repository_allowlist_and_filename_patterns(workspace):
+    paths = WorkspacePaths.from_root(workspace)
+    paths.ensure()
+    paths.approval_path.write_text(
+        json.dumps(
+            {
+                "allowed_repositories": ["octo/demo"],
+                "excluded_file_patterns": ["*.secret", "PRIVATE*"],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    approval = load_approval(paths)
+
+    assert approval.allowed_repositories == ("octo/demo",)
+    assert approval.excluded_file_patterns == ("*.secret", "PRIVATE*")
+
+
+@pytest.mark.parametrize("pattern", ("", "nested/file.md", r"nested\\file.md", "bad\npattern"))
+def test_load_approval_rejects_unsafe_filename_pattern(workspace, pattern):
+    paths = WorkspacePaths.from_root(workspace)
+    paths.ensure()
+    paths.approval_path.write_text(
+        json.dumps({"excluded_file_patterns": [pattern]}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ApprovalFormatError, match="excluded_file_patterns"):
+        load_approval(paths)
 
 
 def test_load_approval_rejects_source_uri_string(workspace):

@@ -31,6 +31,7 @@ def discover_sources(request: DiscoverSourcesRequest) -> DiscoverSourcesResult:
     candidates, skipped = discover_local_candidates(
         request.home,
         requested_forbidden_paths + (paths.root,) + approved_forbidden_paths,
+        approval.excluded_file_patterns if approval else (),
     )
     for candidate in candidates:
         repository.upsert_source(
@@ -49,10 +50,12 @@ def discover_sources(request: DiscoverSourcesRequest) -> DiscoverSourcesResult:
     github_statuses: list[str] = []
     if request.include_github:
         excluded_repositories = approval.excluded_repositories if approval else ()
+        allowed_repositories = approval.allowed_repositories if approval else ()
         private_sources_allowed = approval.private_sources_allowed if approval else False
         try:
             github_repos, github_activities, github_statuses = discover_github_candidates(
                 excluded_repositories=tuple(excluded_repositories),
+                allowed_repositories=tuple(allowed_repositories),
                 private_sources_allowed=private_sources_allowed,
             )
         except (GitHubDiscoveryError, FileNotFoundError) as error:
