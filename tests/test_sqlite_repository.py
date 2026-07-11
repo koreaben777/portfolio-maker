@@ -330,6 +330,7 @@ def test_sqlite_repository_rejects_unsafe_database_sidecars_before_write(
     repository = SQLiteRepository(paths.db_path)
     repository.initialize()
     sidecar = paths.db_path.with_name(paths.db_path.name + suffix)
+    sidecar.unlink()
     external = tmp_path / f"external{suffix}"
     external.write_bytes(b"external sidecar marker")
     if alias_kind == "symlink":
@@ -379,6 +380,7 @@ def test_sqlite_repository_rejects_main_replacement_before_connect(workspace, tm
     repository.initialize()
     replacement = tmp_path / "replacement.db"
     sqlite3.connect(replacement).close()
+    monkeypatch.setattr(repository, "_lock_database_directory", lambda directory_descriptor: None)
     original_connect = sqlite3.connect
     replaced = False
 
@@ -426,7 +428,7 @@ def test_sqlite_repository_does_not_create_missing_replacement_target_during_con
     assert not missing_external.exists()
 
 
-def test_sqlite_repository_prevents_late_journal_alias_before_dml(
+def test_sqlite_repository_prevents_empty_late_journal_alias_after_connect(
     workspace,
     tmp_path,
     monkeypatch,
@@ -436,25 +438,28 @@ def test_sqlite_repository_prevents_late_journal_alias_before_dml(
     repository.initialize()
     sidecar = paths.db_path.with_name("portfolio.db-journal")
     external = tmp_path / "external-journal"
-    marker = b"external journal marker"
-    external.write_bytes(marker)
+    external.write_bytes(b"")
     original_validate = repository._validate_database_family
     attempts = 0
+    injection_blocked = False
     injected = False
 
     def inject_after_validation(directory_descriptor, identity, stage):
-        nonlocal attempts, injected
+        nonlocal attempts, injected, injection_blocked
         original_validate(directory_descriptor, identity, stage)
-        if stage == "before first write":
-            attempts += 1
-            os.link(external, sidecar)
-            injected = True
-        elif stage == "after write transaction":
+        if stage == "after connect":
             attempts += 1
             try:
-                os.link(external, sidecar)
-            except FileExistsError:
+                sidecar.unlink()
+            except FileNotFoundError:
                 pass
+            except PermissionError:
+                injection_blocked = True
+                return
+            try:
+                os.link(external, sidecar)
+            except PermissionError:
+                injection_blocked = True
             else:
                 injected = True
 
@@ -472,8 +477,48 @@ def test_sqlite_repository_prevents_late_journal_alias_before_dml(
     )
 
     assert attempts == 1
+    assert injection_blocked is True
     assert injected is False
-    assert external.read_bytes() == marker
+    assert external.stat().st_size == 0
+
+
+@pytest.mark.parametrize("operation", ("read", "write"))
+def test_sqlite_repository_preserves_nonzero_user_version(workspace, operation):
+    paths = WorkspacePaths.from_root(workspace)
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    with sqlite3.connect(paths.db_path) as connection:
+        connection.execute("PRAGMA user_version = 37")
+
+    if operation == "read":
+        assert "sources" in repository.table_names()
+    else:
+        repository.upsert_source(
+            Source(
+                id=None,
+                type=SourceType.LOCAL_FILE,
+                uri="file:///user-version.md",
+                display_name="user-version.md",
+                owner=None,
+                status=SourceStatus.DISCOVERED,
+            )
+        )
+
+    with sqlite3.connect(paths.db_path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 37
+
+
+def test_sqlite_repository_read_does_not_block_on_healthy_writer(workspace):
+    paths = WorkspacePaths.from_root(workspace)
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    writer = sqlite3.connect(paths.db_path)
+    try:
+        writer.execute("BEGIN IMMEDIATE")
+        assert "sources" in repository.table_names()
+    finally:
+        writer.rollback()
+        writer.close()
 
 
 def test_sqlite_repository_rejects_commit_replacement_without_visible_persistence(
@@ -499,6 +544,7 @@ def test_sqlite_repository_rejects_commit_replacement_without_visible_persistenc
         with sqlite3.connect(replacement) as replacement_connection:
             visible.backup(replacement_connection)
     detached = sqlite3.connect(paths.db_path)
+    monkeypatch.setattr(repository, "_lock_database_directory", lambda directory_descriptor: None)
     original_connect = sqlite3.connect
     replaced = False
 

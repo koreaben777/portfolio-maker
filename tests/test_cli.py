@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 
 from portfolio_maker.adapters.cli import main
+from portfolio_maker.infrastructure.sqlite_repository import SQLiteRepository
 from portfolio_maker.workspace import WorkspacePaths
 
 
@@ -151,6 +152,39 @@ def test_cli_discover_invalid_sqlite_exits_cleanly_and_preserves_state(
     assert "repair or replace" in captured.err.casefold()
     assert "Traceback" not in captured.err
     assert database_path.read_bytes() == damaged
+
+
+def test_cli_discover_busy_database_exits_with_retryable_contention_error(
+    workspace,
+    tmp_path,
+    capsys,
+):
+    paths = WorkspacePaths.from_root(workspace)
+    SQLiteRepository(paths.db_path).initialize()
+    home = tmp_path / "home"
+    home.mkdir()
+    writer = sqlite3.connect(paths.db_path)
+    try:
+        writer.execute("BEGIN IMMEDIATE")
+        exit_code = main(
+            [
+                "discover",
+                "--workspace",
+                str(workspace),
+                "--home",
+                str(home),
+                "--no-github",
+            ]
+        )
+    finally:
+        writer.rollback()
+        writer.close()
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "try again" in captured.err.casefold()
+    assert "repair or replace" not in captured.err.casefold()
+    assert "Traceback" not in captured.err
 
 
 def test_cli_discover_unsafe_database_path_preserves_state_without_corruption_advice(

@@ -76,11 +76,14 @@ class SQLiteRepository:
     def _connection(self) -> Iterator[sqlite3.Connection]:
         directory_descriptor, identity = self._open_database_family()
         conn: sqlite3.Connection | None = None
+        directory_locked = False
         try:
-            conn = self._connect_validated(directory_descriptor, identity)
+            self._lock_database_directory(directory_descriptor)
+            directory_locked = True
+            conn = self._connect_validated(directory_descriptor, identity, read_only=False)
+            self._configure_write_journal(conn)
+            self._validate_database_family(directory_descriptor, identity, "after journal setup")
             conn.execute("BEGIN IMMEDIATE")
-            # Force SQLite to open its journal/WAL before checking the full DB family.
-            conn.execute("PRAGMA user_version = user_version")
             self._validate_database_family(directory_descriptor, identity, "after write transaction")
             yield conn
             self._validate_database_family(directory_descriptor, identity, "before commit")
@@ -91,14 +94,47 @@ class SQLiteRepository:
             raise
         except sqlite3.Error as error:
             self._rollback(conn)
-            raise self._controlled_error() from error
+            raise self._repository_error(error) from error
         except OSError as error:
             self._rollback(conn)
             raise self._unsafe_path_error(self.db_path.name) from error
         finally:
-            if conn is not None:
-                conn.close()
-            os.close(directory_descriptor)
+            try:
+                if conn is not None:
+                    conn.close()
+            finally:
+                try:
+                    if directory_locked:
+                        self._unlock_database_directory(directory_descriptor)
+                finally:
+                    os.close(directory_descriptor)
+
+    @contextmanager
+    def _read_connection(self) -> Iterator[sqlite3.Connection]:
+        directory_descriptor, identity = self._open_database_family()
+        conn: sqlite3.Connection | None = None
+        directory_locked = False
+        try:
+            self._lock_database_directory(directory_descriptor)
+            directory_locked = True
+            conn = self._connect_validated(directory_descriptor, identity, read_only=True)
+            yield conn
+        except RepositoryError:
+            raise
+        except sqlite3.Error as error:
+            raise self._repository_error(error) from error
+        except OSError as error:
+            raise self._unsafe_path_error(self.db_path.name) from error
+        finally:
+            try:
+                if conn is not None:
+                    conn.close()
+            finally:
+                try:
+                    if directory_locked:
+                        self._unlock_database_directory(directory_descriptor)
+                finally:
+                    os.close(directory_descriptor)
 
     def _open_database_family(self) -> tuple[int, _DatabaseIdentity]:
         try:
@@ -114,6 +150,7 @@ class SQLiteRepository:
         try:
             self._verify_current_database_directory(directory_descriptor)
             identity = self._validate_or_create_main_database(directory_descriptor)
+            self._ensure_database_sidecars(directory_descriptor)
             self._validate_database_family(directory_descriptor, identity, "before connect")
             return directory_descriptor, identity
         except Exception:
@@ -124,13 +161,17 @@ class SQLiteRepository:
         self,
         directory_descriptor: int,
         identity: _DatabaseIdentity,
+        *,
+        read_only: bool,
     ) -> sqlite3.Connection:
         conn: sqlite3.Connection | None = None
         try:
             self._verify_current_database_directory(directory_descriptor)
-            database_uri = f"{self.db_path.absolute().as_uri()}?mode=rw"
+            mode = "ro" if read_only else "rw"
+            database_uri = f"{self.db_path.absolute().as_uri()}?mode={mode}"
             conn = sqlite3.connect(database_uri, uri=True)
-            conn.execute("PRAGMA foreign_keys = ON")
+            if not read_only:
+                conn.execute("PRAGMA foreign_keys = ON")
             conn.row_factory = sqlite3.Row
             self._validate_database_family(directory_descriptor, identity, "after connect")
             return conn
@@ -141,7 +182,43 @@ class SQLiteRepository:
         except sqlite3.Error as error:
             if conn is not None:
                 conn.close()
-            raise self._controlled_error() from error
+            raise self._repository_error(error) from error
+
+    def _ensure_database_sidecars(self, directory_descriptor: int) -> None:
+        for suffix in _DATABASE_SIDECARS:
+            name = f"{self.db_path.name}{suffix}"
+            if self._validated_family_entry(directory_descriptor, name) is not None:
+                continue
+            try:
+                descriptor = os.open(
+                    name,
+                    os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    0o600,
+                    dir_fd=directory_descriptor,
+                )
+            except FileExistsError:
+                self._validated_family_entry(directory_descriptor, name)
+                continue
+            try:
+                os.fchmod(descriptor, 0o600)
+                created = os.fstat(descriptor)
+                if not S_ISREG(created.st_mode) or created.st_nlink != 1:
+                    raise self._unsafe_path_error(name)
+            finally:
+                os.close(descriptor)
+
+    def _lock_database_directory(self, directory_descriptor: int) -> None:
+        os.fchmod(directory_descriptor, 0o500)
+
+    def _unlock_database_directory(self, directory_descriptor: int) -> None:
+        os.fchmod(directory_descriptor, 0o700)
+
+    def _configure_write_journal(self, conn: sqlite3.Connection) -> None:
+        row = conn.execute("PRAGMA journal_mode").fetchone()
+        if row is None or not isinstance(row[0], str):
+            raise self._controlled_error()
+        if row[0].casefold() != "wal":
+            conn.execute("PRAGMA journal_mode = PERSIST")
 
     def _validate_or_create_main_database(self, directory_descriptor: int) -> _DatabaseIdentity:
         name = self.db_path.name
@@ -245,6 +322,12 @@ class SQLiteRepository:
             "Preserve or back up the workspace state, then repair or replace the damaged database"
         )
 
+    def _repository_error(self, error: sqlite3.Error) -> RepositoryError:
+        code = getattr(error, "sqlite_errorcode", None)
+        if isinstance(code, int) and (code & 0xFF) in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}:
+            return RepositoryError("Portfolio database is busy; try again shortly")
+        return self._controlled_error()
+
     def _semantic_error(self) -> RepositoryError:
         return RepositoryError(
             "stored data is invalid; preserve or back up the workspace state, "
@@ -258,7 +341,7 @@ class SQLiteRepository:
                     conn.execute(statement)
 
     def table_names(self) -> set[str]:
-        with self._connection() as conn:
+        with self._read_connection() as conn:
             rows = conn.execute(
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
@@ -371,7 +454,7 @@ class SQLiteRepository:
             conn.execute("DELETE FROM source_snapshots WHERE id = ?", (snapshot_id,))
 
     def snapshot_metadata_for_source(self, source_id: int) -> list[tuple[int, Path, str, str]]:
-        with self._connection() as conn:
+        with self._read_connection() as conn:
             rows = conn.execute(
                 """
                 SELECT id, snapshot_path, content_hash, extractor
@@ -395,7 +478,7 @@ class SQLiteRepository:
             raise self._semantic_error() from error
 
     def latest_snapshot_metadata_by_source_id(self) -> dict[int, tuple[int, Path, str, str]]:
-        with self._connection() as conn:
+        with self._read_connection() as conn:
             rows = conn.execute(
                 """
                 SELECT id, source_id, snapshot_path, content_hash, extractor
@@ -428,7 +511,7 @@ class SQLiteRepository:
             params = (status.value,)
         sql += " ORDER BY id"
 
-        with self._connection() as conn:
+        with self._read_connection() as conn:
             rows = conn.execute(sql, params).fetchall()
 
         try:
