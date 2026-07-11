@@ -1,5 +1,7 @@
 # Portfolio Maker
 
+> 현재 공개 버전: `0.1.0`
+
 승인한 내 작업 자료를 바탕으로, **근거를 확인할 수 있는 커리어 프로필**과 **검토용 포트폴리오 초안**을 만드는 로컬 우선 도구입니다.
 
 Portfolio Maker는 원본 파일을 자동으로 업로드하거나 공개하지 않습니다. 먼저 후보를 확인하고, 사용자가 명시적으로 승인한 로컬 자료만 처리합니다. GitHub 활동도 발견해 검토할 수 있지만, 현재 버전에서는 포트폴리오 문장에 자동 반영하지 않습니다.
@@ -9,6 +11,8 @@ Portfolio Maker는 원본 파일을 자동으로 업로드하거나 공개하지
 - 로컬 파일과 GitHub 활동 후보 찾기
 - 처리할 로컬 자료를 직접 검토·승인하기
 - 승인된 자료에서 텍스트 스냅샷과 커리어 근거 저장하기
+- SQLite 데이터베이스와 journal/WAL/SHM sidecar를 하나의 작업 공간 상태로 안전하게 관리하기
+- 동시에 실행된 Portfolio Maker 프로세스 사이의 저장소 작업을 조율하기
 - 마스터 프로필을 JSON·Markdown으로 만들기
 - 승인 자료 목록을 바탕으로 검토용 포트폴리오 초안 골격 만들기
 
@@ -95,6 +99,7 @@ portfolio-maker draft-portfolio --workspace .
 - `excluded_repositories`에 넣은 저장소는 GitHub 탐색에서 제외합니다.
 - 공개 포트폴리오에는 비밀값, 토큰, 원본의 비공개 경로를 넣지 않아야 합니다.
 - `.portfolio-maker/`는 Git에 커밋하지 마세요.
+- `portfolio.db`와 journal/WAL/SHM sidecar는 하나의 관리 단위입니다. 개별 sidecar를 임의로 바꾸거나 삭제하지 마세요.
 
 기존 승인 파일을 새 예시로 바꾸려면 명시적 강제 옵션이 필요합니다.
 
@@ -104,7 +109,7 @@ portfolio-maker approve --workspace . --write-sample --force
 
 ## 현재 범위와 로드맵
 
-0.1.0에서는 로컬 자료 기반의 프로필 생성과 검토용 포트폴리오 초안 골격에 집중합니다. GitHub 활동의 산출물 반영, 회사·채용공고별 맞춤 작성, Google Drive 연동, 이력서·자기소개서·면접 자료, OCR·시맨틱 검색, MCP/app-server 인터페이스는 [GitHub Issues](https://github.com/koreaben777/portfolio-maker/issues)에서 관리합니다.
+0.1.0에서는 로컬 자료 기반의 프로필 생성과 검토용 포트폴리오 초안 골격에 집중합니다. 작업 이력은 사용자가 `.portfolio-maker/`를 직접 정리할 때까지 로컬에 남으며, 자동 보존·정리 기능은 아직 제공하지 않습니다. GitHub 활동의 산출물 반영, 회사·채용공고별 맞춤 작성, Google Drive 연동, 이력서·자기소개서·면접 자료, OCR, 시맨틱 검색, MCP/app-server 인터페이스는 [GitHub Issues](https://github.com/koreaben777/portfolio-maker/issues)에서 관리합니다.
 
 ## 버그와 제안
 
@@ -136,7 +141,7 @@ gh auth login
 
 ### 데이터베이스 복구
 
-CLI가 안전하지 않은 관리 데이터베이스 경로를 보고하면 먼저 `.portfolio-maker/`를 보존하거나 백업하세요. 보고된 `portfolio.db` 또는 SQLite sidecar 항목은 직접 확인한 뒤에만 제거하고, 그다음 명령을 다시 실행하세요. 데이터베이스 손상 메시지가 나오면 `portfolio.db`를 복구하거나 교체하기 전에 작업 공간 상태를 먼저 보존하세요.
+Portfolio Maker는 `portfolio.db`와 journal/WAL/SHM sidecar를 함께 검사하며, 협력하는 Portfolio Maker 프로세스 사이의 저장소 작업을 조율합니다. CLI가 안전하지 않은 관리 데이터베이스 경로를 보고하면 먼저 `.portfolio-maker/`를 보존하거나 백업하세요. 보고된 데이터베이스 패밀리 항목은 직접 확인한 뒤에만 정리하고, 그다음 명령을 다시 실행하세요. 데이터베이스 손상 메시지가 나오면 `portfolio.db`를 복구하거나 교체하기 전에 작업 공간 상태를 먼저 보존하세요.
 
 ### GitHub rate limit 또는 탐색 실패
 
