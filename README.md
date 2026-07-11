@@ -109,7 +109,7 @@ portfolio-maker approve --workspace . --write-sample --force
 
 ## 현재 범위와 로드맵
 
-0.1.0에서는 로컬 자료 기반의 프로필 생성과 검토용 포트폴리오 초안 골격에 집중합니다. 작업 이력은 사용자가 `.portfolio-maker/`를 직접 정리할 때까지 로컬에 남으며, 자동 보존·정리 기능은 아직 제공하지 않습니다. GitHub 활동의 산출물 반영, 회사·채용공고별 맞춤 작성, Google Drive 연동, 이력서·자기소개서·면접 자료, OCR, 시맨틱 검색, MCP/app-server 인터페이스는 [GitHub Issues](https://github.com/koreaben777/portfolio-maker/issues)에서 관리합니다.
+0.1.0에서는 로컬 자료 기반의 프로필 생성과 검토용 포트폴리오 초안 골격에 집중합니다. 작업 이력은 사용자가 `.portfolio-maker/`를 직접 정리할 때까지 로컬에 남으며, 자동 보존·정리 기능은 아직 제공하지 않습니다. GitHub 활동의 산출물 반영, 회사·채용공고별 맞춤 작성, Google Drive 연동, 이력서·자기소개서·면접 자료, OCR, 시맨틱 검색, 공개용 인터랙티브 HTML 포트폴리오, MCP/app-server 인터페이스는 [GitHub Issues](https://github.com/koreaben777/portfolio-maker/issues)에서 관리합니다.
 
 ## 버그와 제안
 
