@@ -482,6 +482,62 @@ def test_sqlite_repository_prevents_empty_late_journal_alias_after_connect(
     assert external.stat().st_size == 0
 
 
+def test_sqlite_repository_prevents_journal_alias_after_overlapping_read(
+    workspace,
+    tmp_path,
+    monkeypatch,
+):
+    paths = WorkspacePaths.from_root(workspace)
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    sidecar = paths.db_path.with_name("portfolio.db-journal")
+    external = tmp_path / "external-journal"
+    external.write_bytes(b"")
+    original_validate = repository._validate_database_family
+    overlapping_read_completed = False
+    injected = False
+    injection_blocked = False
+
+    def inject_after_write_validation(directory_descriptor, identity, stage):
+        nonlocal overlapping_read_completed, injected, injection_blocked
+        original_validate(directory_descriptor, identity, stage)
+        if stage != "after write transaction":
+            return
+        assert "sources" in SQLiteRepository(paths.db_path).table_names()
+        overlapping_read_completed = True
+        try:
+            sidecar.unlink()
+            os.link(external, sidecar)
+        except PermissionError:
+            injection_blocked = True
+        else:
+            injected = True
+
+    monkeypatch.setattr(repository, "_validate_database_family", inject_after_write_validation)
+
+    error: RepositoryError | None = None
+    try:
+        repository.upsert_source(
+            Source(
+                id=None,
+                type=SourceType.LOCAL_FILE,
+                uri="file:///overlapping-read.md",
+                display_name="overlapping-read.md",
+                owner=None,
+                status=SourceStatus.DISCOVERED,
+            )
+        )
+    except RepositoryError as caught:
+        error = caught
+
+    assert external.stat().st_size == 0
+    assert error is None
+    assert overlapping_read_completed is True
+    assert injection_blocked is True
+    assert injected is False
+    assert S_IMODE(paths.root.stat().st_mode) == 0o700
+
+
 @pytest.mark.parametrize("operation", ("read", "write"))
 def test_sqlite_repository_preserves_nonzero_user_version(workspace, operation):
     paths = WorkspacePaths.from_root(workspace)

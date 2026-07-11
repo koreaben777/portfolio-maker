@@ -5,6 +5,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 import os
 import sqlite3
+import threading
 from pathlib import Path
 from stat import S_ISDIR, S_ISREG
 
@@ -60,6 +61,8 @@ class RepositoryError(RuntimeError):
 
 
 _DATABASE_SIDECARS = ("-journal", "-wal", "-shm")
+_REPOSITORY_OPERATION_LOCK = threading.RLock()
+_REPOSITORY_OPERATION_STATE = threading.local()
 
 
 @dataclass(frozen=True)
@@ -74,34 +77,60 @@ class SQLiteRepository:
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
-        directory_descriptor, identity = self._open_database_family()
-        conn: sqlite3.Connection | None = None
-        directory_locked = False
-        try:
-            self._lock_database_directory(directory_descriptor)
-            directory_locked = True
-            conn = self._connect_validated(directory_descriptor, identity, read_only=False)
-            self._configure_write_journal(conn)
-            self._validate_database_family(directory_descriptor, identity, "after journal setup")
-            conn.execute("BEGIN IMMEDIATE")
-            self._validate_database_family(directory_descriptor, identity, "after write transaction")
-            yield conn
-            self._validate_database_family(directory_descriptor, identity, "before commit")
-            conn.commit()
-            self._validate_database_family(directory_descriptor, identity, "after commit")
-        except RepositoryError:
-            self._rollback(conn)
-            raise
-        except sqlite3.Error as error:
-            self._rollback(conn)
-            raise self._repository_error(error) from error
-        except OSError as error:
-            self._rollback(conn)
-            raise self._unsafe_path_error(self.db_path.name) from error
-        finally:
+        with self._database_operation() as (directory_descriptor, identity):
+            conn: sqlite3.Connection | None = None
             try:
+                conn = self._connect_validated(directory_descriptor, identity, read_only=False)
+                self._configure_write_journal(conn)
+                self._validate_database_family(directory_descriptor, identity, "after journal setup")
+                conn.execute("BEGIN IMMEDIATE")
+                self._validate_database_family(directory_descriptor, identity, "after write transaction")
+                yield conn
+                self._validate_database_family(directory_descriptor, identity, "before commit")
+                conn.commit()
+                self._validate_database_family(directory_descriptor, identity, "after commit")
+            except RepositoryError:
+                self._rollback(conn)
+                raise
+            except sqlite3.Error as error:
+                self._rollback(conn)
+                raise self._repository_error(error) from error
+            except OSError as error:
+                self._rollback(conn)
+                raise self._unsafe_path_error(self.db_path.name) from error
+            finally:
                 if conn is not None:
                     conn.close()
+
+    @contextmanager
+    def _read_connection(self) -> Iterator[sqlite3.Connection]:
+        with self._database_operation() as (directory_descriptor, identity):
+            conn: sqlite3.Connection | None = None
+            try:
+                conn = self._connect_validated(directory_descriptor, identity, read_only=True)
+                yield conn
+            except RepositoryError:
+                raise
+            except sqlite3.Error as error:
+                raise self._repository_error(error) from error
+            except OSError as error:
+                raise self._unsafe_path_error(self.db_path.name) from error
+            finally:
+                if conn is not None:
+                    conn.close()
+
+    @contextmanager
+    def _database_operation(self) -> Iterator[tuple[int, _DatabaseIdentity]]:
+        with self._repository_critical_section() as outermost:
+            directory_descriptor, identity = self._open_database_family(
+                ensure_directory=outermost
+            )
+            directory_locked = False
+            try:
+                if outermost:
+                    self._lock_database_directory(directory_descriptor)
+                    directory_locked = True
+                yield directory_descriptor, identity
             finally:
                 try:
                     if directory_locked:
@@ -110,35 +139,25 @@ class SQLiteRepository:
                     os.close(directory_descriptor)
 
     @contextmanager
-    def _read_connection(self) -> Iterator[sqlite3.Connection]:
-        directory_descriptor, identity = self._open_database_family()
-        conn: sqlite3.Connection | None = None
-        directory_locked = False
-        try:
-            self._lock_database_directory(directory_descriptor)
-            directory_locked = True
-            conn = self._connect_validated(directory_descriptor, identity, read_only=True)
-            yield conn
-        except RepositoryError:
-            raise
-        except sqlite3.Error as error:
-            raise self._repository_error(error) from error
-        except OSError as error:
-            raise self._unsafe_path_error(self.db_path.name) from error
-        finally:
+    def _repository_critical_section(self) -> Iterator[bool]:
+        key = str(self.db_path.parent.absolute())
+        with _REPOSITORY_OPERATION_LOCK:
+            depths = getattr(_REPOSITORY_OPERATION_STATE, "depths", {})
+            depth = depths.get(key, 0)
+            depths[key] = depth + 1
+            _REPOSITORY_OPERATION_STATE.depths = depths
             try:
-                if conn is not None:
-                    conn.close()
+                yield depth == 0
             finally:
-                try:
-                    if directory_locked:
-                        self._unlock_database_directory(directory_descriptor)
-                finally:
-                    os.close(directory_descriptor)
+                if depth:
+                    depths[key] = depth
+                else:
+                    del depths[key]
 
-    def _open_database_family(self) -> tuple[int, _DatabaseIdentity]:
+    def _open_database_family(self, *, ensure_directory: bool) -> tuple[int, _DatabaseIdentity]:
         try:
-            ensure_managed_directory(self.db_path.parent)
+            if ensure_directory:
+                ensure_managed_directory(self.db_path.parent)
             return self._prepare_database_family()
         except RepositoryError:
             raise
