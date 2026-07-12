@@ -485,6 +485,107 @@ def test_build_profile_excludes_legacy_github_activity_with_invalid_source_uri(
     assert activity_url not in paths.portfolio_draft_path.read_text(encoding="utf-8")
 
 
+def test_build_profile_retires_github_artifacts_when_activity_becomes_private(tmp_path):
+    workspace = tmp_path / "workspace"
+    paths = WorkspacePaths.from_root(workspace)
+    write_sample_approval(paths)
+    activity_url = "https://github.com/octo/demo/pull/1"
+    approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    approval["approved_github_activity_urls"] = [activity_url]
+    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    source_id = repository.upsert_source(
+        Source(None, SourceType.GITHUB_REPOSITORY, "https://github.com/octo/demo", "octo/demo", "octo", SourceStatus.DISCOVERED)
+    )
+    activity_id = repository.insert_github_activity(
+        GitHubActivity(None, source_id, "octo/demo", "pull_request", activity_url, "Safe title", "MERGED", "octo", "2026-01-01T00:00:00Z", None)
+    )
+
+    assert build_profile(BuildProfileRequest(workspace=workspace)).claim_count == 1
+    with repository._connection() as conn:
+        conn.execute("UPDATE github_activities SET is_private = 1 WHERE id = ?", (activity_id,))
+
+    result = build_profile(BuildProfileRequest(workspace=workspace))
+    draft_portfolio(DraftPortfolioRequest(workspace=workspace))
+
+    with repository._read_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT evidence_items.public_safe, career_claims.public_safe
+            FROM evidence_items
+            JOIN claim_evidence ON claim_evidence.evidence_id = evidence_items.id
+            JOIN career_claims ON career_claims.id = claim_evidence.claim_id
+            WHERE evidence_items.github_activity_id = ?
+            """,
+            (activity_id,),
+        ).fetchall()
+    assert result.claim_count == 0
+    assert [tuple(row) for row in rows] == [(0, 0)]
+    assert activity_url not in paths.portfolio_draft_path.read_text(encoding="utf-8")
+
+
+def test_build_profile_updates_github_claim_when_activity_metadata_changes(tmp_path):
+    workspace = tmp_path / "workspace"
+    paths = WorkspacePaths.from_root(workspace)
+    write_sample_approval(paths)
+    activity_url = "https://github.com/octo/demo/pull/1"
+    approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    approval["approved_github_activity_urls"] = [activity_url]
+    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    source_id = repository.upsert_source(
+        Source(None, SourceType.GITHUB_REPOSITORY, "https://github.com/octo/demo", "octo/demo", "octo", SourceStatus.DISCOVERED)
+    )
+    activity = GitHubActivity(None, source_id, "octo/demo", "pull_request", activity_url, "Title v1", "MERGED", "octo", "2026-01-01T00:00:00Z", None)
+    repository.insert_github_activity(activity)
+    assert build_profile(BuildProfileRequest(workspace=workspace)).claim_count == 1
+    repository.insert_github_activity(
+        GitHubActivity(None, source_id, "octo/demo", "pull_request", activity_url, "Title v2", "MERGED", "octo", "2026-01-01T00:00:00Z", None)
+    )
+
+    result = build_profile(BuildProfileRequest(workspace=workspace))
+
+    with repository._read_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT career_claims.text, career_claims.public_safe
+            FROM career_claims
+            JOIN claim_evidence ON claim_evidence.claim_id = career_claims.id
+            JOIN evidence_items ON evidence_items.id = claim_evidence.evidence_id
+            WHERE evidence_items.github_activity_id IS NOT NULL
+            ORDER BY career_claims.id
+            """
+        ).fetchall()
+    assert result.claim_count == 1
+    assert [tuple(row) for row in rows] == [("octo/demo: Title v2", 1)]
+
+
+def test_build_profile_excludes_legacy_github_activity_with_empty_normalized_title(tmp_path):
+    workspace = tmp_path / "workspace"
+    paths = WorkspacePaths.from_root(workspace)
+    write_sample_approval(paths)
+    activity_url = "https://github.com/octo/demo/pull/1"
+    approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    approval["approved_github_activity_urls"] = [activity_url]
+    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    source_id = repository.upsert_source(
+        Source(None, SourceType.GITHUB_REPOSITORY, "https://github.com/octo/demo", "octo/demo", "octo", SourceStatus.DISCOVERED)
+    )
+    repository.insert_github_activity(
+        GitHubActivity(None, source_id, "octo/demo", "pull_request", activity_url, " \n", "MERGED", "octo", "2026-01-01T00:00:00Z", None)
+    )
+
+    result = build_profile(BuildProfileRequest(workspace=workspace))
+    draft_portfolio(DraftPortfolioRequest(workspace=workspace))
+
+    assert result.claim_count == 0
+    assert activity_url not in paths.portfolio_draft_path.read_text(encoding="utf-8")
+
+
 def test_build_profile_excludes_ingested_source_after_approval_revoked(tmp_path):
     workspace, source_path, paths = _ingest_approved_source(tmp_path)
     approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))

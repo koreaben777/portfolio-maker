@@ -686,6 +686,68 @@ class SQLiteRepository:
             )
         return int(cursor.lastrowid)
 
+    def reconcile_github_artifact_safety(self) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                "UPDATE evidence_items SET public_safe = 0 "
+                "WHERE github_activity_id IS NOT NULL"
+            )
+            conn.execute(
+                """
+                UPDATE career_claims SET public_safe = 0
+                WHERE public_safe = 1 AND id IN (
+                    SELECT claim_evidence.claim_id
+                    FROM claim_evidence
+                    JOIN evidence_items
+                      ON evidence_items.id = claim_evidence.evidence_id
+                    WHERE evidence_items.github_activity_id IS NOT NULL
+                )
+                """
+            )
+
+    def upsert_github_activity_claim(
+        self,
+        evidence_id: int,
+        project_id: int,
+        text: str,
+    ) -> int:
+        with self._connection() as conn:
+            row = conn.execute(
+                """
+                SELECT career_claims.id
+                FROM career_claims
+                JOIN claim_evidence ON claim_evidence.claim_id = career_claims.id
+                WHERE claim_evidence.evidence_id = ?
+                ORDER BY career_claims.id
+                LIMIT 1
+                """,
+                (evidence_id,),
+            ).fetchone()
+            if row is None:
+                cursor = conn.execute(
+                    "INSERT INTO career_claims (project_id, text, public_safe) VALUES (?, ?, 1)",
+                    (project_id, text),
+                )
+                claim_id = int(cursor.lastrowid)
+                conn.execute(
+                    """
+                    INSERT INTO claim_evidence (claim_id, evidence_id, support_level)
+                    VALUES (?, ?, 'direct')
+                    """,
+                    (claim_id, evidence_id),
+                )
+                return claim_id
+            claim_id = self._required_int(row, "id")
+            conn.execute(
+                """
+                UPDATE career_claims
+                SET project_id = ?, text = ?, public_safe = 1
+                WHERE id = ?
+                """,
+                (project_id, text, claim_id),
+            )
+        return claim_id
+
     def link_claim_evidence(self, claim_id: int, evidence_id: int, support_level: str) -> None:
         with self._connection() as conn:
             conn.execute(

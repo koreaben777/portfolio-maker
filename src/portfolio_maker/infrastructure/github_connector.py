@@ -9,6 +9,8 @@ from datetime import datetime
 from typing import Any
 from urllib.parse import urlparse
 
+from portfolio_maker.infrastructure.presentation import normalize_label
+
 
 class GitHubDiscoveryError(RuntimeError):
     pass
@@ -116,7 +118,7 @@ def parse_pr_list(repo: str, payload: Any) -> list[GitHubActivityCandidate]:
             url=_required_activity_url(
                 item, "url", "pull request list", repo, "pull_request"
             ),
-            title=_required_string(item, "title", "pull request list"),
+            title=_required_normalized_title(item, "title", "pull request list"),
             state=_required_nonempty_string(item, "state", "pull request list"),
             author=_nested_optional_string(item, "author", "login", "pull request list"),
             created_at=_required_timestamp(item, "createdAt", "pull request list"),
@@ -132,7 +134,7 @@ def parse_issue_list(repo: str, payload: Any) -> list[GitHubActivityCandidate]:
             repo=repo,
             activity_type="issue",
             url=_required_activity_url(item, "url", "issue list", repo, "issue"),
-            title=_required_string(item, "title", "issue list"),
+            title=_required_normalized_title(item, "title", "issue list"),
             state=_required_nonempty_string(item, "state", "issue list"),
             author=_nested_optional_string(item, "author", "login", "issue list"),
             created_at=_required_timestamp(item, "createdAt", "issue list"),
@@ -168,6 +170,7 @@ def parse_commit_list(repo: str, payload: Any) -> list[GitHubActivityCandidate]:
 def parse_review_list(repo: str, payload: Any) -> list[GitHubActivityCandidate]:
     activities: list[GitHubActivityCandidate] = []
     for item in _list_payload(payload, "review comment list"):
+        body = _required_normalized_title(item, "body", "review comment list")
         activities.append(
             GitHubActivityCandidate(
                 repo=repo,
@@ -179,7 +182,7 @@ def parse_review_list(repo: str, payload: Any) -> list[GitHubActivityCandidate]:
                     repo,
                     "review_comment",
                 ),
-                title=f"Review comment: {_required_string(item, 'body', 'review comment list')}".splitlines()[0],
+                title=f"Review comment: {body}",
                 state="commented",
                 author=_nested_required_string(item, "user", "login", "review comment list"),
                 created_at=_required_timestamp(item, "created_at", "review comment list"),
@@ -203,7 +206,7 @@ def parse_workflow_run_list(repo: str, payload: Any) -> list[GitHubActivityCandi
                 url=_required_activity_url(
                     item, "html_url", "workflow run list", repo, "workflow_run"
                 ),
-                title=_required_string(item, "name", "workflow run list"),
+                title=_required_normalized_title(item, "name", "workflow run list"),
                 state=_required_one_of_strings(item, ("conclusion", "status"), "workflow run list"),
                 author=_nested_required_string(item, "actor", "login", "workflow run list"),
                 created_at=_required_timestamp(item, "created_at", "workflow run list"),
@@ -382,6 +385,13 @@ def _required_timestamp(item: dict[str, Any], key: str, label: str) -> str:
     return value
 
 
+def _required_normalized_title(item: dict[str, Any], key: str, label: str) -> str:
+    value = _required_string(item, key, label)
+    if not normalize_label(value):
+        raise GitHubDiscoveryError(f"GitHub {label} payload is invalid")
+    return value
+
+
 def _required_activity_url(
     item: dict[str, Any],
     key: str,
@@ -466,24 +476,8 @@ def is_public_github_activity_url(value: str) -> bool:
 
 
 def public_github_repository_name(value: str) -> str | None:
-    if any(
-        character.isspace() or unicodedata.category(character).startswith("C")
-        for character in value
-    ):
-        return None
-    try:
-        parsed = urlparse(value)
-    except ValueError:
-        return None
-    if (
-        parsed.scheme != "https"
-        or parsed.netloc != "github.com"
-        or parsed.params
-        or parsed.query
-        or parsed.fragment
-        or parsed.username is not None
-        or parsed.password is not None
-    ):
+    parsed = _trusted_public_github_url(value)
+    if parsed is None or parsed.fragment:
         return None
     match = _PUBLIC_REPOSITORY_PATH.fullmatch(parsed.path)
     if match is None:
@@ -495,23 +489,8 @@ def public_github_repository_name(value: str) -> str | None:
 
 
 def public_github_activity_identity(value: str) -> tuple[str, str] | None:
-    if any(
-        character.isspace() or unicodedata.category(character).startswith("C")
-        for character in value
-    ):
-        return None
-    try:
-        parsed = urlparse(value)
-    except ValueError:
-        return None
-    if (
-        parsed.scheme != "https"
-        or parsed.netloc != "github.com"
-        or parsed.params
-        or parsed.query
-        or parsed.username is not None
-        or parsed.password is not None
-    ):
+    parsed = _trusted_public_github_url(value)
+    if parsed is None:
         return None
     match = _PUBLIC_ACTIVITY_PATH.fullmatch(parsed.path)
     if match is None:
@@ -535,6 +514,28 @@ def public_github_activity_identity(value: str) -> tuple[str, str] | None:
     if match["kind"] is not None:
         return repository, {"commit": "commit", "issues": "issue", "pull": "pull_request"}[match["kind"]]
     return repository, "workflow_run"
+
+
+def _trusted_public_github_url(value: str):
+    if any(
+        character.isspace() or unicodedata.category(character).startswith("C")
+        for character in value
+    ):
+        return None
+    try:
+        parsed = urlparse(value)
+    except ValueError:
+        return None
+    if (
+        parsed.scheme != "https"
+        or parsed.netloc != "github.com"
+        or parsed.params
+        or parsed.query
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        return None
+    return parsed
 
 
 def public_github_activity_type(value: str) -> str | None:

@@ -32,6 +32,7 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
     )
     repository = SQLiteRepository(paths.db_path)
     repository.initialize()
+    repository.reconcile_github_artifact_safety()
     snapshots = repository.latest_snapshot_metadata_by_source_id()
     sources: list[Source] = []
     claims: list[dict[str, object]] = []
@@ -140,13 +141,15 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
             or (allowed_repositories and repository_name not in allowed_repositories)
         ):
             continue
+        title = normalize_label(mask_public_value(activity.title))
+        if not title:
+            continue
         activity_key = (repository_name, activity.activity_type, activity.url)
         if activity_key in seen_activities:
             continue
         seen_activities.add(activity_key)
         if source not in sources:
             sources.append(source)
-        title = normalize_label(mask_public_value(activity.title))
         author = normalize_label(mask_public_value(activity.author))
         state = normalize_label(activity.state)
         claim_text = f"{repository_name}: {title}"
@@ -160,8 +163,11 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
             content_hash=None,
             public_safe=True,
         )
-        claim_id = repository.upsert_career_claim(project_id, claim_text, public_safe=True)
-        repository.link_claim_evidence(claim_id, evidence_id, "direct")
+        claim_id = repository.upsert_github_activity_claim(
+            evidence_id,
+            project_id,
+            claim_text,
+        )
         evidence_ids.append(evidence_id)
         claim_ids.append(claim_id)
         claims.append(

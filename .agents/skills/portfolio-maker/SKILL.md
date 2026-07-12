@@ -33,7 +33,7 @@ portfolio-maker approve --workspace . --write-sample
 
 This creates the sample only when no approval file exists. Use `portfolio-maker approve --workspace . --write-sample --force` only to deliberately reset an existing approval file.
 
-4. Before discovery, edit only the GitHub visibility policy in `.portfolio-maker/reviews/source-approval.json`: `excluded_repositories`, `allowed_repositories` (canonical `owner/repo` values only), and `private_sources_allowed`. Keep `approved_github_activity_urls` empty until discovery has recorded exact public activity URLs.
+4. Before discovery, edit the policy fields in `.portfolio-maker/reviews/source-approval.json`: `excluded_repositories`, `allowed_repositories` (canonical `owner/repo` values only), `private_sources_allowed`, and `excluded_file_patterns` (case-insensitive filename globs). Keep `approved_github_activity_urls` empty until discovery has recorded exact public activity URLs.
 
 5. Run discovery:
 
