@@ -6,7 +6,6 @@ from pathlib import Path
 from portfolio_maker.application.build_profile import build_profile
 from portfolio_maker.application.models import (
     BuildProfileRequest,
-    BuildProfileResult,
     DraftPortfolioRequest,
     DraftPortfolioResult,
 )
@@ -56,8 +55,8 @@ def draft_portfolio(request: DraftPortfolioRequest) -> DraftPortfolioResult:
     if evidence_lines:
         content += "## GitHub Activity Evidence\n\n" + "\n".join(evidence_lines) + "\n"
     write_markdown(paths.portfolio_draft_path, content)
-    claim_ids = profile_result.claim_ids if isinstance(profile_result, BuildProfileResult) else ()
-    evidence_ids = profile_result.evidence_ids if isinstance(profile_result, BuildProfileResult) else ()
+    claim_ids = profile_result.claim_ids
+    evidence_ids = profile_result.evidence_ids
     repository = SQLiteRepository(paths.db_path)
     repository.initialize()
     repository.record_artifact(
@@ -111,7 +110,7 @@ def _github_evidence_lines(claims: list[object]) -> list[str]:
         lines.extend(
             [
                 f"- `{markdown_text(normalize_label(activity_type))}`: {markdown_text(mask_public_value(title))}",
-                f"  Evidence: {markdown_text(url)}",
+                f"  Evidence: {url}",
             ]
         )
     return lines

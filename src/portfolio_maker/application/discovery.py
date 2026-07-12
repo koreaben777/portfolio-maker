@@ -59,9 +59,10 @@ def discover_sources(request: DiscoverSourcesRequest) -> DiscoverSourcesResult:
                 allowed_repositories=tuple(allowed_repositories),
                 private_sources_allowed=private_sources_allowed,
             )
-            # A successful repository list is the current visibility authority.
-            # Activity endpoint failures stay fail-open only for local discovery.
-            repository.invalidate_github_activity_visibility()
+            # Only a complete GitHub discovery is a visibility authority. A
+            # failed endpoint leaves prior confirmation intact for retry.
+            if not github_statuses:
+                repository.invalidate_github_activity_visibility()
         except (GitHubDiscoveryError, FileNotFoundError) as error:
             github_statuses = [str(error) or "GitHub discovery failed"]
 

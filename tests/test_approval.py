@@ -143,6 +143,17 @@ def test_load_approval_reads_public_github_activity_urls(workspace):
     )
 
 
+def test_load_approval_accepts_known_safe_review_comment_url(workspace):
+    paths = WorkspacePaths.from_root(workspace)
+    paths.ensure()
+    url = "https://github.com/octo/demo/pull/1#discussion_r1"
+    paths.approval_path.write_text(
+        json.dumps({"approved_github_activity_urls": [url]}), encoding="utf-8"
+    )
+
+    assert load_approval(paths).approved_github_activity_urls == (url,)
+
+
 @pytest.mark.parametrize(
     "url",
     (
@@ -151,7 +162,11 @@ def test_load_approval_reads_public_github_activity_urls(workspace):
         "https://example.test/octo/demo/pull/1",
         "https://github.com/octo/demo/releases/tag/v1",
         "https://github.com/octo/demo/pull/1?token=synthetic",
-        "https://github.com/octo/demo/pull/1#discussion_r1",
+        "https://github.com/octo/demo/pull/1#discussion_rnot-a-number",
+        "https://user:placeholder@github.com/octo/demo/pull/1",
+        "\nhttps://github.com/octo/demo/pull/1",
+        "\thttps://github.com/octo/demo/pull/1",
+        "\u200bhttps://github.com/octo/demo/pull/1",
     ),
 )
 def test_load_approval_rejects_non_activity_github_urls(workspace, url):

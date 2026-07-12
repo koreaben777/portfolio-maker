@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import unicodedata
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
@@ -37,6 +38,7 @@ _PUBLIC_ACTIVITY_PATH = re.compile(
     r"(?:(?P<kind>commit|issues|pull)/(?P<identifier>[A-Za-z0-9._-]+)"
     r"|actions/runs/(?P<run_id>[A-Za-z0-9._-]+))$"
 )
+_SAFE_REVIEW_FRAGMENT = re.compile(r"^discussion_r\d+$")
 
 
 def parse_repo_list(payload: Any) -> list[GitHubRepositoryCandidate]:
@@ -307,7 +309,7 @@ def _required_one_of_strings(
 ) -> str:
     for key in keys:
         value = item.get(key)
-        if isinstance(value, str):
+        if isinstance(value, str) and value.strip():
             return value
     raise GitHubDiscoveryError(f"GitHub {label} payload is invalid")
 
@@ -329,6 +331,11 @@ def is_public_github_activity_url(value: str) -> bool:
 
 
 def public_github_activity_type(value: str) -> str | None:
+    if any(
+        character.isspace() or unicodedata.category(character).startswith("C")
+        for character in value
+    ):
+        return None
     try:
         parsed = urlparse(value)
     except ValueError:
@@ -338,7 +345,6 @@ def public_github_activity_type(value: str) -> str | None:
         or parsed.netloc != "github.com"
         or parsed.params
         or parsed.query
-        or parsed.fragment
         or parsed.username is not None
         or parsed.password is not None
     ):
@@ -349,6 +355,10 @@ def public_github_activity_type(value: str) -> str | None:
     try:
         canonical_repository_name(f"{match['owner']}/{match['repository']}")
     except ValueError:
+        return None
+    if parsed.fragment:
+        if match["kind"] == "pull" and _SAFE_REVIEW_FRAGMENT.fullmatch(parsed.fragment):
+            return "review_comment"
         return None
     if match["kind"] is not None:
         return {"commit": "commit", "issues": "issue", "pull": "pull_request"}[match["kind"]]

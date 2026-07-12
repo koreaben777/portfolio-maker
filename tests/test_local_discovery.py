@@ -8,7 +8,12 @@ import pytest
 from portfolio_maker.application.approval import write_sample_approval
 from portfolio_maker.application.build_profile import build_profile
 from portfolio_maker.application.discovery import discover_sources
-from portfolio_maker.application.models import BuildProfileRequest, DiscoverSourcesRequest
+from portfolio_maker.application.draft_portfolio import draft_portfolio
+from portfolio_maker.application.models import (
+    BuildProfileRequest,
+    DiscoverSourcesRequest,
+    DraftPortfolioRequest,
+)
 from portfolio_maker.domain.models import SourceStatus, SourceType
 from portfolio_maker.infrastructure.github_connector import (
     GitHubActivityCandidate,
@@ -394,6 +399,69 @@ def test_failed_github_rediscovery_preserves_existing_activity_visibility(worksp
 
     repository = SQLiteRepository(WorkspacePaths.from_root(workspace).db_path)
     assert repository.list_github_activities()[0].is_private is False
+
+
+def test_incomplete_github_rediscovery_preserves_existing_activity_visibility(workspace, tmp_path, monkeypatch):
+    activity = GitHubActivityCandidate(
+        repo="octo/demo",
+        activity_type="pull_request",
+        url="https://github.com/octo/demo/pull/1",
+        title="Observed once",
+        state="MERGED",
+        author="octo",
+        created_at="2026-01-01T00:00:00Z",
+        merged_at="2026-01-02T00:00:00Z",
+    )
+    repo = GitHubRepositoryCandidate("octo/demo", "https://github.com/octo/demo", False)
+    responses = [([repo], [activity], []), ([repo], [], ["GitHub workflow runs discovery failed"])]
+    monkeypatch.setattr(
+        "portfolio_maker.application.discovery.discover_github_candidates",
+        lambda **kwargs: responses.pop(0),
+    )
+    request = DiscoverSourcesRequest(workspace=workspace, home=tmp_path, include_github=True)
+    discover_sources(request)
+
+    discover_sources(request)
+
+    repository = SQLiteRepository(WorkspacePaths.from_root(workspace).db_path)
+    assert repository.list_github_activities()[0].is_private is False
+
+
+def test_discovery_review_comment_can_be_approved_and_rendered_as_evidence(workspace, tmp_path, monkeypatch):
+    url = "https://github.com/octo/demo/pull/1#discussion_r1"
+    monkeypatch.setattr(
+        "portfolio_maker.application.discovery.discover_github_candidates",
+        lambda **kwargs: (
+            [GitHubRepositoryCandidate("octo/demo", "https://github.com/octo/demo", False)],
+            [
+                GitHubActivityCandidate(
+                    repo="octo/demo",
+                    activity_type="review_comment",
+                    url=url,
+                    title="Review comment: Tighten checks",
+                    state="commented",
+                    author="octo",
+                    created_at="2026-01-01T00:00:00Z",
+                    merged_at=None,
+                )
+            ],
+            [],
+        ),
+    )
+
+    discover_sources(DiscoverSourcesRequest(workspace=workspace, home=tmp_path, include_github=True))
+    paths = WorkspacePaths.from_root(workspace)
+    write_sample_approval(paths)
+    approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    approval["approved_github_activity_urls"] = [url]
+    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+
+    draft_portfolio(DraftPortfolioRequest(workspace=workspace))
+
+    draft = paths.portfolio_draft_path.read_text(encoding="utf-8")
+    assert "review\\_comment" in draft
+    assert "Tighten checks" in draft
+    assert url in draft
 
 
 def test_discover_sources_uses_approval_forbidden_paths_on_rerun(workspace, tmp_path):

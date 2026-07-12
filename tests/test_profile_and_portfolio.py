@@ -7,6 +7,7 @@ from portfolio_maker.application.draft_portfolio import draft_portfolio
 from portfolio_maker.application.ingestion import ingest_sources
 from portfolio_maker.application.models import (
     BuildProfileRequest,
+    BuildProfileResult,
     DraftPortfolioRequest,
     IngestSourcesRequest,
 )
@@ -559,7 +560,11 @@ def test_draft_portfolio_masks_secret_shaped_display_names(tmp_path, monkeypatch
         json.dumps({"sources": [{"display_name": "sk-synthetic-file-token"}]}),
         encoding="utf-8",
     )
-    monkeypatch.setattr(draft_portfolio_module, "build_profile", lambda request: None)
+    monkeypatch.setattr(
+        draft_portfolio_module,
+        "build_profile",
+        lambda request: BuildProfileResult(paths.master_profile_json_path, paths.master_profile_md_path, 0),
+    )
 
     draft_portfolio_module.draft_portfolio(DraftPortfolioRequest(workspace=paths.workspace))
 
@@ -583,7 +588,11 @@ def test_draft_portfolio_masks_timestamped_password_export_display_name(tmp_path
         ),
         encoding="utf-8",
     )
-    monkeypatch.setattr(draft_portfolio_module, "build_profile", lambda request: None)
+    monkeypatch.setattr(
+        draft_portfolio_module,
+        "build_profile",
+        lambda request: BuildProfileResult(paths.master_profile_json_path, paths.master_profile_md_path, 0),
+    )
 
     draft_portfolio_module.draft_portfolio(DraftPortfolioRequest(workspace=paths.workspace))
 
@@ -601,7 +610,11 @@ def test_draft_portfolio_normalizes_control_characters_and_markdown_label(tmp_pa
         json.dumps({"sources": [{"display_name": "safe\n## Forged"}]}),
         encoding="utf-8",
     )
-    monkeypatch.setattr(draft_portfolio_module, "build_profile", lambda request: None)
+    monkeypatch.setattr(
+        draft_portfolio_module,
+        "build_profile",
+        lambda request: BuildProfileResult(paths.master_profile_json_path, paths.master_profile_md_path, 0),
+    )
 
     draft_portfolio_module.draft_portfolio(DraftPortfolioRequest(workspace=paths.workspace))
 

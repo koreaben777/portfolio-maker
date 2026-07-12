@@ -150,6 +150,29 @@ def test_review_and_workflow_parsers_reject_missing_stable_fields():
         parse_workflow_run_list("octo/demo", {})
 
 
+@pytest.mark.parametrize(
+    "conclusion,status",
+    (("", None), (None, ""), ("", ""), ("   ", "\t")),
+)
+def test_workflow_parser_rejects_blank_conclusion_and_status(conclusion, status):
+    with pytest.raises(GitHubDiscoveryError, match="workflow run list payload is invalid"):
+        parse_workflow_run_list(
+            "octo/demo",
+            {
+                "workflow_runs": [
+                    {
+                        "html_url": "https://github.com/octo/demo/actions/runs/1",
+                        "name": "CI",
+                        "conclusion": conclusion,
+                        "status": status,
+                        "actor": {"login": "octo"},
+                        "created_at": "2026-01-01T00:00:00Z",
+                    }
+                ]
+            },
+        )
+
+
 def test_discover_github_candidates_collects_repo_activities(monkeypatch):
     calls = []
 
@@ -319,6 +342,51 @@ def test_discover_github_candidates_keeps_early_endpoint_success_on_late_failure
     assert [activity.activity_type for activity in activities] == ["pull_request"]
     assert statuses == [
         "GitHub workflow runs discovery failed for octo/demo: synthetic endpoint failure"
+    ]
+
+
+def test_discover_github_candidates_isolates_blank_workflow_state(monkeypatch):
+    def fake_run_gh_json(args):
+        if args[:2] == ["repo", "list"]:
+            return [
+                {
+                    "nameWithOwner": "octo/demo",
+                    "url": "https://github.com/octo/demo",
+                    "isPrivate": False,
+                }
+            ]
+        if args[:2] in (["pr", "list"], ["issue", "list"]):
+            return []
+        if args == ["api", "repos/octo/demo/commits"]:
+            return []
+        if args == ["api", "repos/octo/demo/pulls/comments"]:
+            return []
+        if args == ["api", "repos/octo/demo/actions/runs"]:
+            return {
+                "workflow_runs": [
+                    {
+                        "html_url": "https://github.com/octo/demo/actions/runs/1",
+                        "name": "CI",
+                        "conclusion": "",
+                        "status": "",
+                        "actor": {"login": "octo"},
+                        "created_at": "2026-01-01T00:00:00Z",
+                    }
+                ]
+            }
+        raise AssertionError(args)
+
+    monkeypatch.setattr(
+        "portfolio_maker.infrastructure.github_connector.run_gh_json",
+        fake_run_gh_json,
+    )
+
+    _, activities, statuses = discover_github_candidates()
+
+    assert activities == []
+    assert statuses == [
+        "GitHub workflow runs discovery failed for octo/demo: "
+        "GitHub workflow run list payload is invalid"
     ]
 
 
