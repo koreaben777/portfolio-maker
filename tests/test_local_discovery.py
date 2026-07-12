@@ -427,6 +427,52 @@ def test_incomplete_github_rediscovery_preserves_existing_activity_visibility(wo
     assert repository.list_github_activities()[0].is_private is False
 
 
+def test_partial_rediscovery_hides_activity_from_repository_that_is_no_longer_public(
+    workspace,
+    tmp_path,
+    monkeypatch,
+):
+    activity = GitHubActivityCandidate(
+        repo="octo/demo",
+        activity_type="pull_request",
+        url="https://github.com/octo/demo/pull/1",
+        title="Previously public",
+        state="MERGED",
+        author="octo",
+        created_at="2026-01-01T00:00:00Z",
+        merged_at="2026-01-02T00:00:00Z",
+    )
+    public_repo = GitHubRepositoryCandidate("octo/demo", "https://github.com/octo/demo", False)
+    private_repo = GitHubRepositoryCandidate("octo/demo", "https://github.com/octo/demo", True)
+    responses = [
+        ([public_repo], [activity], []),
+        ([private_repo], [], ["GitHub workflow runs discovery failed for octo/other"]),
+    ]
+    monkeypatch.setattr(
+        "portfolio_maker.application.discovery.discover_github_candidates",
+        lambda **kwargs: responses.pop(0),
+    )
+    request = DiscoverSourcesRequest(workspace=workspace, home=tmp_path, include_github=True)
+    discover_sources(request)
+    paths = WorkspacePaths.from_root(workspace)
+    write_sample_approval(paths)
+    approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    approval["approved_github_activity_urls"] = [activity.url]
+    approval["private_sources_allowed"] = True
+    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+    assert build_profile(BuildProfileRequest(workspace=workspace)).claim_count == 1
+    draft_portfolio(DraftPortfolioRequest(workspace=workspace))
+    assert activity.url in paths.portfolio_draft_path.read_text(encoding="utf-8")
+
+    discover_sources(request)
+
+    repository = SQLiteRepository(paths.db_path)
+    assert repository.list_github_activities()[0].is_private is True
+    assert build_profile(BuildProfileRequest(workspace=workspace)).claim_count == 0
+    draft_portfolio(DraftPortfolioRequest(workspace=workspace))
+    assert activity.url not in paths.portfolio_draft_path.read_text(encoding="utf-8")
+
+
 def test_discovery_review_comment_can_be_approved_and_rendered_as_evidence(workspace, tmp_path, monkeypatch):
     url = "https://github.com/octo/demo/pull/1#discussion_r1"
     monkeypatch.setattr(

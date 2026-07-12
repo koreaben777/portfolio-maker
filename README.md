@@ -63,6 +63,10 @@ $portfolio-maker
 portfolio-maker approve --workspace . --write-sample
 ```
 
+탐색 전에는 `forbidden_paths`, `excluded_repositories`, `allowed_repositories`,
+`private_sources_allowed`, `excluded_file_patterns`만 검토합니다. 정확한 activity URL은
+아직 존재하지 않으므로 `approved_github_activity_urls`는 비워 둡니다.
+
 그다음 후보를 확인하고 승인 내용을 검토합니다.
 
 ```bash
@@ -74,7 +78,10 @@ portfolio-maker discover --workspace .
 .portfolio-maker/reviews/source-approval.json
 ```
 
-승인 파일을 검토·완성한 뒤 아래 순서로 실행합니다.
+discovery report의 public `GitHub Activities`에서 선택한 정확한 URL을
+`approved_github_activity_urls`에 복사한 뒤, 로컬 `approved_source_uris`를 함께
+검토·완성합니다. private, excluded, missing, stale activity는 승인하지 않습니다.
+그 다음 아래 순서로 실행합니다.
 
 ```bash
 portfolio-maker ingest --workspace .

@@ -539,6 +539,21 @@ class SQLiteRepository:
         with self._connection() as conn:
             conn.execute("UPDATE github_activities SET is_private = 1")
 
+    def invalidate_unconfirmed_github_activity_visibility(
+        self,
+        confirmed_repositories: tuple[str, ...],
+    ) -> None:
+        if not confirmed_repositories:
+            self.invalidate_github_activity_visibility()
+            return
+        placeholders = ", ".join("?" for _ in confirmed_repositories)
+        with self._connection() as conn:
+            conn.execute(
+                f"UPDATE github_activities SET is_private = 1 "
+                f"WHERE lower(repo) NOT IN ({placeholders})",
+                confirmed_repositories,
+            )
+
     def list_github_activities(self) -> list[GitHubActivity]:
         with self._read_connection() as conn:
             rows = conn.execute(

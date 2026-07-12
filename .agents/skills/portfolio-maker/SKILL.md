@@ -33,7 +33,7 @@ portfolio-maker approve --workspace . --write-sample
 
 This creates the sample only when no approval file exists. Use `portfolio-maker approve --workspace . --write-sample --force` only to deliberately reset an existing approval file.
 
-4. Edit `excluded_repositories`, `allowed_repositories` (canonical `owner/repo` values only), `private_sources_allowed`, and `approved_github_activity_urls` in `.portfolio-maker/reviews/source-approval.json` when GitHub visibility rules are needed. Private, excluded, missing, or stale activities remain artifact-ineligible.
+4. Before discovery, edit only the GitHub visibility policy in `.portfolio-maker/reviews/source-approval.json`: `excluded_repositories`, `allowed_repositories` (canonical `owner/repo` values only), and `private_sources_allowed`. Keep `approved_github_activity_urls` empty until discovery has recorded exact public activity URLs.
 
 5. Run discovery:
 
@@ -49,13 +49,15 @@ If the user supplied forbidden paths, pass one `--forbidden-path` argument per p
 .portfolio-maker/reviews/discovery-report.md
 ```
 
-7. Ask the user to complete local source approval:
+7. From the report's public `GitHub Activities` section, copy each selected exact URL into `approved_github_activity_urls`. Do not approve private, excluded, missing, or stale activities.
+
+8. Ask the user to complete local source approval:
 
 ```text
 .portfolio-maker/reviews/source-approval.json
 ```
 
-8. After approval only, run:
+9. After approval only, run:
 
 ```bash
 portfolio-maker ingest --workspace .
@@ -63,7 +65,7 @@ portfolio-maker build-profile --workspace .
 portfolio-maker draft-portfolio --workspace .
 ```
 
-9. Review generated artifacts:
+10. Review generated artifacts:
 
 ```text
 .portfolio-maker/artifacts/master-profile.json
@@ -71,7 +73,7 @@ portfolio-maker draft-portfolio --workspace .
 .portfolio-maker/artifacts/portfolio-draft.md
 ```
 
-10. Report:
+11. Report:
    - what was generated
    - which commands were run
    - whether public artifacts avoided secrets and private raw paths
