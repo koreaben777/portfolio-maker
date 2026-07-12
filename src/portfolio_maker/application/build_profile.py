@@ -12,6 +12,7 @@ from portfolio_maker.infrastructure.managed_files import remove_managed_file
 from portfolio_maker.infrastructure.presentation import markdown_text, normalize_label
 from portfolio_maker.infrastructure.github_connector import (
     canonical_repository_name,
+    is_valid_github_activity_state,
     is_valid_github_timestamp,
     public_github_activity_identity,
     public_github_repository_name,
@@ -121,7 +122,7 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
             or activity.source_id is None
             or activity.is_private
             or activity.url not in approved_activity_urls
-            or not activity.state.strip()
+            or not is_valid_github_activity_state(activity.activity_type, activity.state)
             or not is_valid_github_timestamp(activity.created_at)
             or public_github_activity_identity(activity.url)
             != (repository_name, activity.activity_type)
@@ -151,7 +152,7 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
         if source not in sources:
             sources.append(source)
         author = normalize_label(mask_public_value(activity.author))
-        state = normalize_label(activity.state)
+        state = normalize_label(mask_public_value(activity.state))
         claim_text = f"{repository_name}: {title}"
         project_id = repository.upsert_project(f"github:{repository_name}", public_safe=True)
         evidence_id = repository.upsert_evidence_item(

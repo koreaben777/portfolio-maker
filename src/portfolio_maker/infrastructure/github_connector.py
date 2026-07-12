@@ -61,6 +61,31 @@ _COMMIT_SHA = re.compile(r"^[0-9a-fA-F]{4,40}$")
 _GITHUB_TIMESTAMP = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$"
 )
+_ACTIVITY_STATES = {
+    "pull_request": frozenset({"open", "closed", "merged"}),
+    "issue": frozenset({"open", "closed"}),
+    "commit": frozenset({"committed"}),
+    "review_comment": frozenset({"commented"}),
+    "workflow_run": frozenset(
+        {
+            "action_required",
+            "cancelled",
+            "completed",
+            "failure",
+            "in_progress",
+            "neutral",
+            "pending",
+            "queued",
+            "requested",
+            "skipped",
+            "stale",
+            "startup_failure",
+            "success",
+            "timed_out",
+            "waiting",
+        }
+    ),
+}
 
 
 def parse_repo_list(payload: Any) -> list[GitHubRepositoryCandidate]:
@@ -119,7 +144,9 @@ def parse_pr_list(repo: str, payload: Any) -> list[GitHubActivityCandidate]:
                 item, "url", "pull request list", repo, "pull_request"
             ),
             title=_required_normalized_title(item, "title", "pull request list"),
-            state=_required_nonempty_string(item, "state", "pull request list"),
+            state=_required_activity_state(
+                item, "state", "pull request list", "pull_request"
+            ),
             author=_nested_optional_string(item, "author", "login", "pull request list"),
             created_at=_required_timestamp(item, "createdAt", "pull request list"),
             merged_at=_optional_string(item, "mergedAt", "pull request list"),
@@ -135,7 +162,7 @@ def parse_issue_list(repo: str, payload: Any) -> list[GitHubActivityCandidate]:
             activity_type="issue",
             url=_required_activity_url(item, "url", "issue list", repo, "issue"),
             title=_required_normalized_title(item, "title", "issue list"),
-            state=_required_nonempty_string(item, "state", "issue list"),
+            state=_required_activity_state(item, "state", "issue list", "issue"),
             author=_nested_optional_string(item, "author", "login", "issue list"),
             created_at=_required_timestamp(item, "createdAt", "issue list"),
             merged_at=None,
@@ -210,7 +237,13 @@ def parse_workflow_run_list(repo: str, payload: Any) -> list[GitHubActivityCandi
                     item, "html_url", "workflow run list", repo, "workflow_run"
                 ),
                 title=_required_normalized_title(item, "name", "workflow run list"),
-                state=_required_one_of_strings(item, ("conclusion", "status"), "workflow run list"),
+                state=_required_activity_state_value(
+                    _required_one_of_strings(
+                        item, ("conclusion", "status"), "workflow run list"
+                    ),
+                    "workflow run list",
+                    "workflow_run",
+                ),
                 author=_nested_required_string(item, "actor", "login", "workflow run list"),
                 created_at=_required_timestamp(item, "created_at", "workflow run list"),
                 merged_at=None,
@@ -388,6 +421,20 @@ def _required_timestamp(item: dict[str, Any], key: str, label: str) -> str:
     return value
 
 
+def _required_activity_state(
+    item: dict[str, Any], key: str, label: str, activity_type: str
+) -> str:
+    return _required_activity_state_value(
+        _required_nonempty_string(item, key, label), label, activity_type
+    )
+
+
+def _required_activity_state_value(value: str, label: str, activity_type: str) -> str:
+    if not is_valid_github_activity_state(activity_type, value):
+        raise GitHubDiscoveryError(f"GitHub {label} payload is invalid")
+    return value
+
+
 def _required_normalized_title(item: dict[str, Any], key: str, label: str) -> str:
     value = _required_string(item, key, label)
     if not normalize_label(value):
@@ -460,6 +507,10 @@ def is_valid_github_timestamp(value: str) -> bool:
     except ValueError:
         return False
     return True
+
+
+def is_valid_github_activity_state(activity_type: str, value: str) -> bool:
+    return normalize_label(value).casefold() in _ACTIVITY_STATES.get(activity_type, ())
 
 
 def canonical_repository_name(name: str) -> str:

@@ -133,6 +133,24 @@ def test_activity_parsers_reject_empty_state(parser):
         )
 
 
+def test_activity_parsers_reject_invalid_normalized_states():
+    with pytest.raises(GitHubDiscoveryError, match="pull request list payload is invalid"):
+        parse_pr_list(
+            "octo/demo",
+            [{"url": "https://github.com/octo/demo/pull/1", "title": "Title", "state": "Bearer synthetic.token", "createdAt": "2026-01-01T00:00:00Z", "author": None}],
+        )
+    with pytest.raises(GitHubDiscoveryError, match="issue list payload is invalid"):
+        parse_issue_list(
+            "octo/demo",
+            [{"url": "https://github.com/octo/demo/issues/1", "title": "Title", "state": "\u0000", "createdAt": "2026-01-01T00:00:00Z", "author": None}],
+        )
+    with pytest.raises(GitHubDiscoveryError, match="workflow run list payload is invalid"):
+        parse_workflow_run_list(
+            "octo/demo",
+            {"workflow_runs": [{"html_url": "https://github.com/octo/demo/actions/runs/1", "name": "CI", "conclusion": "Bearer synthetic.token", "actor": {"login": "octo"}, "created_at": "2026-01-01T00:00:00Z"}]},
+        )
+
+
 def test_parse_commit_review_and_workflow_run_lists():
     commits = parse_commit_list("octo/demo", load_fixture("gh_commit_list.json"))
     reviews = parse_review_list("octo/demo", load_fixture("gh_review_list.json"))
