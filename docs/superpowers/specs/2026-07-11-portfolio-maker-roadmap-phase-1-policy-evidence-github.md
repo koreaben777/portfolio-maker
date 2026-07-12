@@ -182,68 +182,98 @@ Stage C는 approval schema에 다음 optional 필드를 추가한다.
 - GitHub claim은 evidence URL과 stable identifier로 추적된다.
 - public artifact에 token, raw local path, private repo name, unescaped title이 나타나지 않는다.
 
-## 7. 후속 Stage — #3과 #11
+## 7. 후속 Stage — #11 일반형 HTML과 #3 회사별 맞춤 확장
 
-### 7.1 #3 회사/JD별 맞춤 포트폴리오
+### 7.1 #11 일반형 공개용 인터랙티브 HTML
 
-#3은 Stage B/C에서 생성한 evidence/claim graph를 읽어, 사용자가 준 회사/JD 요구와 근거의 대응을 검토 가능한 형태로 만든다. 역할·기술적 접근·결과 문장은 evidence가 없는 경우 생성하지 않거나 review-required로 남긴다.
+[#11](https://github.com/koreaben777/portfolio-maker/issues/11)을 이번 최우선 구현 대상으로 삼는다. 이 단계의 포트폴리오는 회사나 채용공고를 대상으로 하지 않는 사용자의 **기본 포트폴리오**다. 사용자가 자신의 작업과 근거를 확인하고, 방문자가 프로젝트와 역량을 이해할 수 있게 하는 것이 목적이다.
 
-### 7.2 #11 공개용 인터랙티브 HTML
+#11은 #4, #2, #1의 완료된 public-safe evidence/claim/artifact 계약을 입력으로 사용하며, #3을 선행 조건으로 요구하지 않는다. 결과는 검토용 Markdown을 대체하는 공개 표현 계층이지만, 근거 없는 문장이나 자동 회사별 서술을 생성하지 않는다.
 
-[#11](https://github.com/koreaben777/portfolio-maker/issues/11)은 #3 이후의 **renderer**다. 새 비즈니스 모델을 만들지 않고, public-safe claim/evidence/artifact manifest만 읽는다.
-
-목표 출력은 기본적으로 다음과 같다.
+목표 출력:
 
 ```text
+.portfolio-maker/artifacts/portfolio-public.json
 .portfolio-maker/artifacts/portfolio.html
+.portfolio-maker/artifacts/portfolio-assets/
 ```
+
+일반형 포트폴리오의 고정 정보 구조:
+
+- 소개와 기본 프로필
+- 선택 프로젝트
+- 기술·역량 요약
+- 근거 및 provenance
+- 공개 링크/연락 경로
+- 프로젝트 필터와 상세 보기
 
 요구 사항:
 
 - 외부 tracker, CDN, remote API 없이 브라우저에서 직접 열리는 정적 HTML
-- 프로젝트 카드, 필터/탐색, 근거 상세 보기, keyboard navigation, mobile layout
-- safe source label과 public GitHub URL만 provenance로 표시
+- 승인·정책 재검증을 통과한 public-safe claim/evidence만 사용
+- 프로젝트·기술·성과 표현은 evidence가 제공하는 범위를 넘지 않음
 - raw local path, snapshot path, `public_safe=false` data, secret-shaped text는 HTML/JS data에도 포함하지 않음
-- HTML/attribute/JavaScript context별 escaping과 CSP-friendly inline-free 또는 hashed asset strategy
-- automated output tests와 실제 브라우저 수동 검증
+- HTML/attribute/JavaScript context별 escaping
+- keyboard navigation, mobile layout, visible focus, 색 대비, reduced-motion 지원
+- 빈 manifest도 허위 콘텐츠 없이 설명 가능한 empty state로 렌더링
+- 회사/JD 입력, 맞춤 문장, 실시간 협업, 편집 UI, 분석/텔레메트리는 포함하지 않음
 
-### 7.3 #11에서의 emilkowalski/skills + @sites 연동 계획
+### 7.2 #11 구현의 emilkowalski/skills + @sites 연동
 
-두 도구는 같은 계층에서 경쟁하지 않고 역할을 나눠 사용한다.
+두 도구는 다음 경계로 하나의 vertical slice에 결합한다.
 
 | 계층 | 역할 | 금지 범위 |
 |---|---|---|
-| Portfolio Maker CLI/Python/SQLite | 승인, evidence/claim 검증, `portfolio.html`과 자산 생성의 기준 | Sites에 raw DB·원본 파일·비공개 snapshot 전달 |
-| 설치된 `emilkowalski/skills` | `emil-design-eng`, `review-animations` 등의 원칙으로 타이포그래피·간격·상태·모션·접근성 설계와 리뷰 수행 | 런타임 CDN/외부 API/생성 데이터 소스로 사용 |
-| Codex `@sites` | 공개 페이지 디자인 선택, 기존 HTML/정적 자산의 Sites 표면 빌드·검증, 필요 시 선택적 호스팅 | 근거 수집기·비즈니스 로직·자동 공개 승인 대체 |
+| Portfolio Maker CLI/Python/SQLite | 승인, evidence/claim 검증, `portfolio-public.json` 생성, canonical artifact 기록 | Sites에 raw DB·원본·private snapshot 전달 |
+| `web/portfolio` Sites 프로젝트 | manifest를 빌드 시점에 번들하고 일반형 UI·상호작용·정적 HTML을 생성 | runtime DB/API/fetch, 자체 claim 생성 |
+| 설치된 `emilkowalski/skills` | typography, spacing, state, motion, accessibility 설계·리뷰 기준 | runtime dependency, 외부 데이터 소스 |
+| Codex `@sites` | 정확히 3개 디자인 시안 선택, Sites build/preview, 검증 후 선택적 hosting | 근거 수집기, 비즈니스 로직, 자동 public 승인 |
+
+권장 데이터 흐름:
+
+```text
+승인된 evidence/claim graph
+  → Portfolio Maker public-safe manifest
+  → web/portfolio build-time data module
+  → 정적 HTML/자산
+  → .portfolio-maker/artifacts/portfolio.html
+  → (선택) private Sites deployment
+```
 
 구현 절차:
 
-1. #3 산출물을 포함한 public-safe manifest와 HTML 정보 구조를 로컬에서 확정한다. 이 단계에서 원본 경로, `.portfolio-maker/` 내부 파일, SQLite, 자격 증명은 Sites 입력에서 제외한다.
-2. 공개 대상과 방문자, 섹션, 탐색/필터, 근거 상세, 키보드·모바일·대비 요구를 포함한 디자인 brief를 만든다.
-3. `@sites` 디자인 흐름에서 비교 가능한 시안을 **정확히 3개** 순차 제시하고 하나를 선택한다. 설치된 `emilkowalski/skills`는 선택안의 motion/interaction review checklist로 적용하며 런타임 의존성으로 포함하지 않는다.
-4. 선택한 방향으로 정적 HTML 표면을 빌드하고 `npm run build`, 로컬 파일 직접 열기, Codex 브라우저의 키보드·모바일·접근성 수동 검증을 통과시킨다.
-5. 검증을 통과한 뒤에만 `sites-hosting`을 사용한다. 기본은 private 배포이며, public URL 배포는 별도 명시적 승인을 받은 경우에만 수행한다.
-6. Sites 배포가 있더라도 로컬 `.portfolio-maker/artifacts/portfolio.html`을 canonical artifact로 유지한다. Sites는 presentation/hosting 계층이며 Portfolio Maker의 승인·근거 모델을 대체하지 않는다.
+1. `portfolio-public.json` schema와 generic page information architecture를 먼저 고정한다.
+2. 방문자·섹션·필터·근거 상세·키보드·모바일·대비 요구를 포함한 design brief를 작성한다.
+3. `@sites` 디자인 흐름에서 정확히 3개 비교안을 순차 제시하고 하나를 선택한다.
+4. 선택안에 대해 `emilkowalski/skills`의 motion/interaction review를 기록한다.
+5. Sites 프로젝트는 manifest를 runtime fetch하지 않고 build-time module로 번들한다. 따라서 결과 HTML은 로컬 파일로 직접 열려야 한다.
+6. `npm run build`, output safety validator, 로컬 파일 확인, Codex Browser 수동 검증을 모두 통과시킨다.
+7. 검증 후에만 `sites-hosting`을 사용하며, private 배포를 기본으로 한다.
+8. Sites 배포와 관계없이 로컬 `portfolio.html`을 canonical artifact로 보존한다.
 
-완료 게이트:
+### 7.3 #3 회사/JD별 맞춤 포트폴리오 후속 확장
 
-- 디자인 선택 전에는 HTML 구현을 시작하지 않는다.
-- 세 시안의 차이와 선택 결과가 구현 brief에 기록된다.
-- 공개 산출물과 Sites 업로드 대상에 public-safe manifest만 존재한다.
-- 빌드 실패, 접근성 결함, escaping 실패, 직접 열기 실패가 있으면 호스팅하지 않는다.
-- private/public 배포 상태와 URL 공개 여부가 사용자의 명시적 선택과 일치한다.
+[#3](https://github.com/koreaben777/portfolio-maker/issues/3)은 #11이 생성한 동일한 public-safe manifest를 입력으로 받아 회사·JD별 우선순위, 표현, 섹션 구성을 추가하는 후속 단계다.
+
+#3은 일반형 포트폴리오 renderer와 안전성 경계를 대체하지 않는다.
+
+- 일반형 기본 포트폴리오는 항상 독립적으로 생성 가능해야 한다.
+- 회사/JD 입력이 없으면 일반형 콘텐츠만 사용한다.
+- 회사/JD 맞춤 문장은 근거가 없으면 생성하지 않거나 review-required로 남긴다.
+- #3 구현은 #11의 UI·manifest 계약을 확장하되, raw source와 runtime 외부 API를 새로 노출하지 않는다.
 
 ## 8. developer 작업 지시
 
-1. 현재 `origin/main`에서 작업을 시작하고 dirty/untracked 파일을 먼저 분리한다.
-2. #4에 대해 failing test를 작성하고 Stage A만 구현한다.
-3. #4 focused tests, 전체 test, `git diff --check`를 통과시킨다.
-4. 같은 방식으로 #2, 그다음 #1을 순서대로 진행한다.
-5. 각 stage가 끝날 때 README, sample approval, Issue의 현재 상태를 code behavior와 맞춘다.
-6. #3, #11 또는 다른 roadmap Issue는 구현하지 않는다. 필요한 model/renderer 확장은 Issue와 이 명세의 후속 stage로 남긴다.
-7. #11을 구현할 때에만 7.3의 emilkowalski/skills + @sites 흐름을 적용한다. #4 → #2 → #1 구현 중에는 Sites 초기화·디자인 선택·호스팅을 실행하지 않는다.
-8. 최종 보고에는 변경 파일, HEAD, 실행한 검증 명령, 결과, 남은 위험을 포함한다.
+1. 현재 `origin/main`과 구현 worktree를 확인하고, 완료된 #4/#2/#1 계약을 기준으로 작업한다.
+2. 이 구현에서는 #11 일반형 기본 포트폴리오와 `@sites` vertical slice를 최우선으로 진행한다.
+3. `portfolio-public.json` manifest 계약, Sites build-time data boundary, `portfolio-maker render-html` export 흐름을 먼저 focused test로 고정한다.
+4. `@sites` 디자인 picker에서 정확히 3개 시안을 순차 제시하고 사용자 선택 전에는 product UI를 편집하지 않는다.
+5. 선택안에 따라 `web/portfolio`를 구현하고, `emilkowalski/skills` review 기록을 남긴다.
+6. Python full suite, Sites build, static output validator, 로컬 파일 확인, Codex Browser 수동 검증을 통과시키기 전에는 hosting하지 않는다.
+7. private hosting이 기본이며, public URL 배포는 별도 명시적 승인이 있을 때만 수행한다.
+8. #3 회사/JD 맞춤 작성, Google Drive, OCR, semantic search, MCP/app-server, 외부 LLM API는 이번 구현에 포함하지 않는다.
+9. README, 이 명세, Issue #11, design/review 기록이 실제 구현 결과와 일치하는지 마지막에 확인한다.
+10. 최종 보고에는 변경 파일, commit/HEAD, 실행한 검증 명령, 로컬 artifact 경로, Sites 배포 상태, 남은 #3 확장 범위를 포함한다.
 
 ## 9. 명세 자체 점검
 
