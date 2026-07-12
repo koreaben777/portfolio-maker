@@ -10,7 +10,13 @@ import threading
 from pathlib import Path
 from stat import S_ISDIR, S_ISREG
 
-from portfolio_maker.domain.models import GitHubActivity, Source, SourceStatus, SourceType
+from portfolio_maker.domain.models import (
+    GitHubActivity,
+    PublicEvidenceRecord,
+    Source,
+    SourceStatus,
+    SourceType,
+)
 from portfolio_maker.infrastructure.github_connector import (
     canonical_public_github_activity_url,
     canonical_repository_name,
@@ -690,6 +696,92 @@ class SQLiteRepository:
                     )
                 )
             return activities
+        except (KeyError, TypeError, ValueError) as error:
+            raise self._semantic_error() from error
+
+    def list_public_evidence_records(self) -> list[PublicEvidenceRecord]:
+        with self._read_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    projects.id AS project_id,
+                    projects.name AS project_name,
+                    career_claims.id AS claim_id,
+                    career_claims.text AS claim_text,
+                    evidence_items.id AS evidence_id,
+                    evidence_items.stable_id AS evidence_stable_id,
+                    evidence_items.locator AS evidence_locator,
+                    sources.id AS source_id,
+                    sources.type AS source_type,
+                    sources.uri AS source_uri,
+                    sources.display_name AS source_display_name,
+                    sources.status AS source_status,
+                    github_activities.id AS activity_id,
+                    github_activities.repo AS activity_repo,
+                    github_activities.activity_type AS activity_type,
+                    github_activities.url AS activity_url,
+                    github_activities.title AS activity_title,
+                    github_activities.state AS activity_state,
+                    github_activities.state_field AS activity_state_field,
+                    github_activities.author AS activity_author,
+                    github_activities.created_at AS activity_created_at,
+                    github_activities.is_private AS activity_is_private
+                FROM projects
+                JOIN career_claims
+                  ON career_claims.project_id = projects.id
+                JOIN claim_evidence
+                  ON claim_evidence.claim_id = career_claims.id
+                JOIN evidence_items
+                  ON evidence_items.id = claim_evidence.evidence_id
+                LEFT JOIN github_activities
+                  ON github_activities.id = evidence_items.github_activity_id
+                LEFT JOIN sources
+                  ON sources.id = COALESCE(
+                      evidence_items.source_id,
+                      github_activities.source_id
+                  )
+                WHERE projects.public_safe = 1
+                  AND career_claims.public_safe = 1
+                  AND evidence_items.public_safe = 1
+                ORDER BY projects.id, career_claims.id, evidence_items.id
+                """
+            ).fetchall()
+        try:
+            records: list[PublicEvidenceRecord] = []
+            for row in rows:
+                activity_id = self._optional_int(row, "activity_id")
+                activity_is_private = (
+                    None
+                    if activity_id is None
+                    else self._required_boolean(row, "activity_is_private")
+                )
+                records.append(
+                    PublicEvidenceRecord(
+                        project_id=self._required_int(row, "project_id"),
+                        project_name=self._required_text(row, "project_name"),
+                        claim_id=self._required_int(row, "claim_id"),
+                        claim_text=self._required_text(row, "claim_text"),
+                        evidence_id=self._required_int(row, "evidence_id"),
+                        evidence_stable_id=self._required_text(row, "evidence_stable_id"),
+                        evidence_locator=self._required_text(row, "evidence_locator"),
+                        source_id=self._optional_int(row, "source_id"),
+                        source_type=self._optional_text(row, "source_type"),
+                        source_uri=self._optional_text(row, "source_uri"),
+                        source_display_name=self._optional_text(row, "source_display_name"),
+                        source_status=self._optional_text(row, "source_status"),
+                        activity_id=activity_id,
+                        activity_repo=self._optional_text(row, "activity_repo"),
+                        activity_type=self._optional_text(row, "activity_type"),
+                        activity_url=self._optional_text(row, "activity_url"),
+                        activity_title=self._optional_text(row, "activity_title"),
+                        activity_state=self._optional_text(row, "activity_state"),
+                        activity_state_field=self._optional_text(row, "activity_state_field"),
+                        activity_author=self._optional_text(row, "activity_author"),
+                        activity_created_at=self._optional_text(row, "activity_created_at"),
+                        activity_is_private=activity_is_private,
+                    )
+                )
+            return records
         except (KeyError, TypeError, ValueError) as error:
             raise self._semantic_error() from error
 

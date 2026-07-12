@@ -21,6 +21,8 @@ class WorkspacePaths:
     master_profile_json_path: Path
     master_profile_md_path: Path
     portfolio_draft_path: Path
+    portfolio_public_json_path: Path
+    portfolio_html_path: Path
 
     @classmethod
     def from_root(cls, workspace: Path) -> "WorkspacePaths":
@@ -44,6 +46,8 @@ class WorkspacePaths:
             master_profile_json_path=artifacts_dir / "master-profile.json",
             master_profile_md_path=artifacts_dir / "master-profile.md",
             portfolio_draft_path=artifacts_dir / "portfolio-draft.md",
+            portfolio_public_json_path=artifacts_dir / "portfolio-public.json",
+            portfolio_html_path=artifacts_dir / "portfolio.html",
         )
 
     def ensure(self) -> None:

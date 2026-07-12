@@ -65,6 +65,15 @@ def test_cli_ingest_missing_approval_exits_without_traceback(workspace, capsys):
     assert "Traceback" not in captured.err
 
 
+def test_cli_render_html_missing_sites_exits_without_traceback(workspace, capsys):
+    exit_code = main(["render-html", "--workspace", str(workspace)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "Sites project missing" in captured.err
+    assert "Traceback" not in captured.err
+
+
 def test_cli_ingest_malformed_approval_exits_without_traceback(workspace, capsys):
     approval_path = workspace / ".portfolio-maker" / "reviews" / "source-approval.json"
     approval_path.parent.mkdir(parents=True)

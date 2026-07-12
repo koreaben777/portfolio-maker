@@ -3,7 +3,10 @@
 날짜: 2026-07-11
 상태: 현재 Phase 1 정책 및 runtime 계약
 대상 Issue: #4 → #2 → #1
-후속 렌더링: #3 → #11 (`@sites` 선택적 presentation/hosting)
+현재 구현 slice: #4 → #2 → #1 → #11 일반형 renderer
+후속 확장: #3 회사/JD별 맞춤 생성 (`@sites`는 presentation/hosting 계층)
+
+2026-07-13 정렬 메모: #4, #2, #1 기준선과 일반형 #11 renderer가 현재 worktree에 구현되어 있다. #3 맞춤 생성은 아직 deferred이며, 이 문서의 #11 규칙은 아래 current implementation slice를 기준으로 읽는다.
 
 ## 1. 목적과 범위
 
@@ -26,7 +29,7 @@ Portfolio Maker 0.1.0은 승인된 로컬 파일에서 근거 기반 master prof
 - 이력서·자기소개서·면접 자료 (#7)
 - Google Drive, OCR, 시맨틱 검색 (#6, #8, #10)
 - MCP/app-server (#9)
-- 공개용 인터랙티브 HTML 렌더러 (#11)
+- 회사/JD별 맞춤 문장 renderer 확장 (#3)
 - 외부 LLM API, hosted backend, 계정, 자동 게시
 
 ## 2. 공통 불변식
@@ -51,11 +54,11 @@ Portfolio Maker 0.1.0은 승인된 로컬 파일에서 근거 기반 master prof
   ↓
 #1 명시적으로 승인된 공개 GitHub 활동 반영
   ↓
-#3 회사/JD별 맞춤 포트폴리오
-  ↓
-#11 공개용 인터랙티브 HTML 포트폴리오
+#11 일반형 public-safe HTML renderer
       ├─ emilkowalski/skills: 디자인·모션 검토 기준
       └─ @sites: 디자인 선택·빌드 검증·선택적 호스팅
+  ↓
+#3 회사/JD별 맞춤 포트폴리오
 ```
 
 각 Issue의 focused test와 전체 `pytest`가 통과하기 전에는 다음 Issue의 runtime 동작을 구현하지 않는다. 문서·샘플 approval·README는 해당 Issue와 같은 변경 단위로 갱신한다.
@@ -182,15 +185,15 @@ Stage C는 approval schema에 다음 optional 필드를 추가한다.
 - GitHub claim은 evidence URL과 stable identifier로 추적된다.
 - public artifact에 token, raw local path, private repo name, unescaped title이 나타나지 않는다.
 
-## 7. 후속 Stage — #3과 #11
+## 7. #11 현재 구현과 #3 후속 Stage
 
 ### 7.1 #3 회사/JD별 맞춤 포트폴리오
 
 #3은 Stage B/C에서 생성한 evidence/claim graph를 읽어, 사용자가 준 회사/JD 요구와 근거의 대응을 검토 가능한 형태로 만든다. 역할·기술적 접근·결과 문장은 evidence가 없는 경우 생성하지 않거나 review-required로 남긴다.
 
-### 7.2 #11 공개용 인터랙티브 HTML
+### 7.2 #11 공개용 인터랙티브 HTML (현재 일반형 구현)
 
-[#11](https://github.com/koreaben777/portfolio-maker/issues/11)은 #3 이후의 **renderer**다. 새 비즈니스 모델을 만들지 않고, public-safe claim/evidence/artifact manifest만 읽는다.
+[#11](https://github.com/koreaben777/portfolio-maker/issues/11)은 Portfolio Maker가 만든 public-safe claim/evidence/artifact manifest를 정적 HTML로 표시하는 **renderer**다. 현재 일반형 구현은 #3 회사/JD 맞춤 서술을 포함하지 않으며, 새 비즈니스 모델을 만들지 않고 manifest만 읽는다.
 
 목표 출력은 기본적으로 다음과 같다.
 
@@ -201,7 +204,7 @@ Stage C는 approval schema에 다음 optional 필드를 추가한다.
 요구 사항:
 
 - 외부 tracker, CDN, remote API 없이 브라우저에서 직접 열리는 정적 HTML
-- 프로젝트 카드, 필터/탐색, 근거 상세 보기, keyboard navigation, mobile layout
+- 프로젝트 목록, 필터/탐색, 근거 상세 보기, 프로젝트별 timeline, keyboard navigation, mobile layout
 - safe source label과 public GitHub URL만 provenance로 표시
 - raw local path, snapshot path, `public_safe=false` data, secret-shaped text는 HTML/JS data에도 포함하지 않음
 - HTML/attribute/JavaScript context별 escaping과 CSP-friendly inline-free 또는 hashed asset strategy
@@ -219,12 +222,12 @@ Stage C는 approval schema에 다음 optional 필드를 추가한다.
 
 구현 절차:
 
-1. #3 산출물을 포함한 public-safe manifest와 HTML 정보 구조를 로컬에서 확정한다. 이 단계에서 원본 경로, `.portfolio-maker/` 내부 파일, SQLite, 자격 증명은 Sites 입력에서 제외한다.
+1. public-safe manifest와 HTML 정보 구조를 로컬에서 확정한다. 현재 일반형 구현은 #3 산출물 없이도 verified evidence를 표시할 수 있으며, 원본 경로, `.portfolio-maker/` 내부 파일, SQLite, 자격 증명은 Sites 입력에서 제외한다.
 2. 공개 대상과 방문자, 섹션, 탐색/필터, 근거 상세, 키보드·모바일·대비 요구를 포함한 디자인 brief를 만든다.
 3. `@sites` 디자인 흐름에서 비교 가능한 시안을 **정확히 3개** 순차 제시하고 하나를 선택한다. 설치된 `emilkowalski/skills`는 선택안의 motion/interaction review checklist로 적용하며 런타임 의존성으로 포함하지 않는다.
 4. 선택한 방향으로 정적 HTML 표면을 빌드하고 `npm run build`, 로컬 파일 직접 열기, Codex 브라우저의 키보드·모바일·접근성 수동 검증을 통과시킨다.
 5. 검증을 통과한 뒤에만 `sites-hosting`을 사용한다. 기본은 private 배포이며, public URL 배포는 별도 명시적 승인을 받은 경우에만 수행한다.
-6. Sites 배포가 있더라도 로컬 `.portfolio-maker/artifacts/portfolio.html`을 canonical artifact로 유지한다. Sites는 presentation/hosting 계층이며 Portfolio Maker의 승인·근거 모델을 대체하지 않는다.
+6. Sites 배포가 있더라도 로컬 `.portfolio-maker/artifacts/portfolio.html`을 canonical artifact로 유지한다. 현재 구현은 hosting을 실행하지 않았으며, Sites는 presentation/hosting 계층으로만 남고 Portfolio Maker의 승인·근거 모델을 대체하지 않는다.
 
 완료 게이트:
 
@@ -241,7 +244,7 @@ Stage C는 approval schema에 다음 optional 필드를 추가한다.
 3. #4 focused tests, 전체 test, `git diff --check`를 통과시킨다.
 4. 같은 방식으로 #2, 그다음 #1을 순서대로 진행한다.
 5. 각 stage가 끝날 때 README, sample approval, Issue의 현재 상태를 code behavior와 맞춘다.
-6. #3, #11 또는 다른 roadmap Issue는 구현하지 않는다. 필요한 model/renderer 확장은 Issue와 이 명세의 후속 stage로 남긴다.
+6. #3 회사/JD 문장 생성 또는 다른 roadmap Issue는 구현하지 않는다. 현재 #11 renderer는 일반형 public-safe evidence/timeline 표면에 한정한다.
 7. #11을 구현할 때에만 7.3의 emilkowalski/skills + @sites 흐름을 적용한다. #4 → #2 → #1 구현 중에는 Sites 초기화·디자인 선택·호스팅을 실행하지 않는다.
 8. 최종 보고에는 변경 파일, HEAD, 실행한 검증 명령, 결과, 남은 위험을 포함한다.
 

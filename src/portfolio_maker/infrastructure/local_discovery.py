@@ -46,6 +46,8 @@ def discover_local_candidates(
         home_resolved = home.resolve(strict=False)
     except (OSError, RuntimeError) as error:
         raise DiscoveryRootError(f"Discovery root cannot be resolved: {home}") from error
+    if not home_resolved.exists() and home.is_symlink():
+        raise DiscoveryRootError(f"Discovery root cannot be resolved: {home}")
     if not home_resolved.exists():
         raise DiscoveryRootError(f"Discovery root does not exist: {home}")
     if not home_resolved.is_dir():
@@ -96,6 +98,9 @@ def discover_local_candidates(
         for filename in files:
             path = Path(root) / filename
             try:
+                if path.is_symlink() and not path.exists():
+                    skipped.append(SkippedPath(path.absolute(), "skipped_unresolvable"))
+                    continue
                 resolved = path.resolve()
                 classification = policy.classify_path(resolved)
                 if classification != "candidate":

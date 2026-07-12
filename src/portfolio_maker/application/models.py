@@ -62,3 +62,30 @@ class DraftPortfolioRequest:
 class DraftPortfolioResult:
     markdown_path: Path
     project_count: int
+
+
+@dataclass(frozen=True)
+class PublicPortfolioRequest:
+    workspace: Path
+
+
+@dataclass(frozen=True)
+class PublicPortfolioResult:
+    manifest_path: Path
+    project_count: int
+    claim_count: int
+    evidence_count: int
+    claim_ids: tuple[int, ...] = ()
+    evidence_ids: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
+class RenderHtmlRequest:
+    workspace: Path
+
+
+@dataclass(frozen=True)
+class RenderHtmlResult:
+    manifest_path: Path
+    html_path: Path
+    dist_path: Path

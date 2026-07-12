@@ -11,11 +11,13 @@ from portfolio_maker.application.build_profile import build_profile
 from portfolio_maker.application.discovery import discover_sources
 from portfolio_maker.application.draft_portfolio import ProfileFormatError, draft_portfolio
 from portfolio_maker.application.ingestion import ingest_sources
+from portfolio_maker.application.render_html import HtmlRenderError, render_html
 from portfolio_maker.application.models import (
     BuildProfileRequest,
     DiscoverSourcesRequest,
     DraftPortfolioRequest,
     IngestSourcesRequest,
+    RenderHtmlRequest,
 )
 from portfolio_maker.infrastructure.github_connector import GitHubDiscoveryError
 from portfolio_maker.infrastructure.local_discovery import DiscoveryRootError
@@ -47,6 +49,9 @@ def build_parser() -> argparse.ArgumentParser:
     draft = subparsers.add_parser("draft-portfolio")
     draft.add_argument("--workspace", type=Path, default=Path("."))
 
+    render = subparsers.add_parser("render-html")
+    render.add_argument("--workspace", type=Path, default=Path("."))
+
     run_mvp = subparsers.add_parser("run-mvp")
     run_mvp.add_argument("--workspace", type=Path, default=Path("."))
     run_mvp.add_argument("--home", type=Path, default=Path.home())
@@ -64,6 +69,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         ApprovalFormatError,
         DiscoveryRootError,
         GitHubDiscoveryError,
+        HtmlRenderError,
         ProfileFormatError,
         RepositoryError,
         json.JSONDecodeError,
@@ -112,6 +118,12 @@ def _main(argv: Sequence[str] | None = None) -> int:
         result = draft_portfolio(DraftPortfolioRequest(workspace=args.workspace))
         print(f"Portfolio draft: {result.markdown_path}")
         print(f"Projects: {result.project_count}")
+        return 0
+
+    if args.command == "render-html":
+        result = render_html(RenderHtmlRequest(workspace=args.workspace))
+        print(f"Public manifest: {result.manifest_path}")
+        print(f"Portfolio HTML: {result.html_path}")
         return 0
 
     if args.command == "run-mvp":

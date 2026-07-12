@@ -9,7 +9,7 @@ Use this skill to run the Portfolio Maker MVP safely from Codex app.
 
 GitHub repositories and activities are discovery metadata by default. Only exact URLs in `approved_github_activity_urls` can enter profile or draft artifacts, and then only for a currently confirmed public repository that passes `allowed_repositories` and `excluded_repositories` revalidation. GitHub activity appears as reviewable evidence, never as an automatic project narrative.
 
-The generated portfolio draft is a review-required portfolio skeleton. It lists approved sources but leaves role, technical approach, and outcome as placeholders; evidence-rendered portfolio writing is deferred.
+The generated portfolio draft is a review-required portfolio skeleton. Narrative role, technical approach, and outcome writing remains deferred; the static HTML surface renders only verified public claims, evidence, and their project timelines.
 
 ## Safety Rules
 
@@ -71,6 +71,7 @@ After discovery succeeds, review the report and reapprove the exact public activ
 portfolio-maker ingest --workspace .
 portfolio-maker build-profile --workspace .
 portfolio-maker draft-portfolio --workspace .
+portfolio-maker render-html --workspace .
 ```
 
 11. Review generated artifacts:
@@ -79,6 +80,8 @@ portfolio-maker draft-portfolio --workspace .
 .portfolio-maker/artifacts/master-profile.json
 .portfolio-maker/artifacts/master-profile.md
 .portfolio-maker/artifacts/portfolio-draft.md
+.portfolio-maker/artifacts/portfolio-public.json
+.portfolio-maker/artifacts/portfolio.html
 ```
 
 12. Report:
