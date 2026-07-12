@@ -142,7 +142,7 @@ Commits:
 Implemented:
 
 - `src/portfolio_maker/infrastructure/sqlite_repository.py`
-- Historical pre-reduction schema included deferred evidence, project, claim, and artifact tables. Current 0.1.0 creates only `sources`, `source_snapshots`, and `github_activities`; the other tables are deferred.
+- Historical handoff state: the pre-reduction schema discussion described deferred evidence, project, claim, and artifact tables. That statement is superseded and is not the current runtime contract; see the [current Phase 1 policy/runtime contract](../specs/2026-07-11-portfolio-maker-roadmap-phase-1-policy-evidence-github.md).
 - `SQLiteRepository.connect()`, `initialize()`, `table_names()`, `upsert_source()`, `list_sources()`, and `update_source_status()`.
 - Deterministic connection closing via private `_connection()`.
 - SQLite FK enforcement via `PRAGMA foreign_keys = ON`.

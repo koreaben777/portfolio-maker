@@ -259,6 +259,31 @@ def test_workflow_parser_rejects_control_suffix_before_normalization():
         )
 
 
+@pytest.mark.parametrize(
+    ("parser", "label", "url"),
+    (
+        (parse_pr_list, "pull request list", "https://github.com/octo/demo/pull/1"),
+        (parse_issue_list, "issue list", "https://github.com/octo/demo/issues/1"),
+    ),
+)
+def test_non_workflow_parsers_reject_control_suffix_before_normalization(
+    parser, label, url
+):
+    with pytest.raises(GitHubDiscoveryError, match=f"{label} payload is invalid"):
+        parser(
+            "octo/demo",
+            [
+                {
+                    "url": url,
+                    "title": "Title",
+                    "state": "OPEN" + chr(0),
+                    "createdAt": "2026-01-01T00:00:00Z",
+                    "author": None,
+                }
+            ],
+        )
+
+
 def test_parse_commit_review_and_workflow_run_lists():
     commits = parse_commit_list("octo/demo", load_fixture("gh_commit_list.json"))
     reviews = parse_review_list("octo/demo", load_fixture("gh_review_list.json"))

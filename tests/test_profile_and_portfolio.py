@@ -15,7 +15,11 @@ from portfolio_maker.application.models import (
 )
 from portfolio_maker.domain.models import GitHubActivity, Source, SourceStatus, SourceType
 from portfolio_maker.infrastructure.extractors import extract_text
-from portfolio_maker.infrastructure.github_connector import parse_workflow_run_list
+from portfolio_maker.infrastructure.github_connector import (
+    parse_issue_list,
+    parse_pr_list,
+    parse_workflow_run_list,
+)
 from portfolio_maker.infrastructure.sqlite_repository import SQLiteRepository
 from portfolio_maker.workspace import WorkspacePaths
 
@@ -373,6 +377,67 @@ def test_build_profile_masks_bearer_workflow_author_from_parser_to_artifact(tmp_
     assert profile["claims"][0]["author"] == "[REDACTED]"
 
 
+@pytest.mark.parametrize(
+    ("parser", "activity_type", "activity_url"),
+    (
+        (parse_pr_list, "pull_request", "https://github.com/octo/demo/pull/1"),
+        (parse_issue_list, "issue", "https://github.com/octo/demo/issues/1"),
+    ),
+)
+def test_build_profile_excludes_persisted_non_workflow_control_state(
+    tmp_path, parser, activity_type, activity_url
+):
+    workspace = tmp_path / "workspace"
+    paths = WorkspacePaths.from_root(workspace)
+    write_sample_approval(paths)
+    approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    approval["approved_github_activity_urls"] = [activity_url]
+    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+    parser(
+        "octo/demo",
+        [
+            {
+                "url": activity_url,
+                "title": "Title",
+                "state": "OPEN",
+                "createdAt": "2026-01-01T00:00:00Z",
+                "author": None,
+            }
+        ],
+    )
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    source_id = repository.upsert_source(
+        Source(
+            None,
+            SourceType.GITHUB_REPOSITORY,
+            "https://github.com/octo/demo",
+            "octo/demo",
+            "octo",
+            SourceStatus.DISCOVERED,
+        )
+    )
+    with repository._connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO github_activities
+                (source_id, repo, activity_type, url, title, state, author, created_at, is_private)
+            VALUES (?, 'octo/demo', ?, ?, 'Title', ?, 'octo', ?, 0)
+            """,
+            (
+                source_id,
+                activity_type,
+                activity_url,
+                "OPEN" + chr(0),
+                "2026-01-01T00:00:00Z",
+            ),
+        )
+
+    result = build_profile(BuildProfileRequest(workspace=workspace))
+    draft_portfolio(DraftPortfolioRequest(workspace=workspace))
+
+    assert result.claim_count == 0
+    assert activity_url not in paths.portfolio_draft_path.read_text(encoding="utf-8")
 def test_draft_portfolio_renders_approved_github_activity_as_evidence_with_provenance(tmp_path):
     workspace = tmp_path / "workspace"
     paths = WorkspacePaths.from_root(workspace)

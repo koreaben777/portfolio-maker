@@ -535,7 +535,7 @@ def is_valid_github_timestamp(value: str) -> bool:
 def is_valid_github_activity_state(
     activity_type: str, value: str, state_field: str | None = None
 ) -> bool:
-    if activity_type == "workflow_run" and _contains_unicode_control(value):
+    if _contains_unicode_control(value):
         return False
     normalized = normalize_label(value).casefold()
     if activity_type == "workflow_run":
