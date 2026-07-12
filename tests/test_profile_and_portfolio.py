@@ -16,8 +16,6 @@ from portfolio_maker.application.models import (
 from portfolio_maker.domain.models import GitHubActivity, Source, SourceStatus, SourceType
 from portfolio_maker.infrastructure.extractors import extract_text
 from portfolio_maker.infrastructure.github_connector import (
-    parse_issue_list,
-    parse_pr_list,
     parse_workflow_run_list,
 )
 from portfolio_maker.infrastructure.sqlite_repository import SQLiteRepository
@@ -378,14 +376,14 @@ def test_build_profile_masks_bearer_workflow_author_from_parser_to_artifact(tmp_
 
 
 @pytest.mark.parametrize(
-    ("parser", "activity_type", "activity_url"),
+    ("activity_type", "activity_url", "state_field"),
     (
-        (parse_pr_list, "pull_request", "https://github.com/octo/demo/pull/1"),
-        (parse_issue_list, "issue", "https://github.com/octo/demo/issues/1"),
+        ("pull_request", "https://github.com/octo/demo/pull/1", "status"),
+        ("issue", "https://github.com/octo/demo/issues/1", "conclusion"),
     ),
 )
 def test_build_profile_excludes_persisted_non_workflow_control_state(
-    tmp_path, parser, activity_type, activity_url
+    tmp_path, activity_type, activity_url, state_field
 ):
     workspace = tmp_path / "workspace"
     paths = WorkspacePaths.from_root(workspace)
@@ -393,18 +391,6 @@ def test_build_profile_excludes_persisted_non_workflow_control_state(
     approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
     approval["approved_github_activity_urls"] = [activity_url]
     paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
-    parser(
-        "octo/demo",
-        [
-            {
-                "url": activity_url,
-                "title": "Title",
-                "state": "OPEN",
-                "createdAt": "2026-01-01T00:00:00Z",
-                "author": None,
-            }
-        ],
-    )
     repository = SQLiteRepository(paths.db_path)
     repository.initialize()
     source_id = repository.upsert_source(
@@ -421,8 +407,8 @@ def test_build_profile_excludes_persisted_non_workflow_control_state(
         conn.execute(
             """
             INSERT INTO github_activities
-                (source_id, repo, activity_type, url, title, state, author, created_at, is_private)
-            VALUES (?, 'octo/demo', ?, ?, 'Title', ?, 'octo', ?, 0)
+                (source_id, repo, activity_type, url, title, state, author, created_at, is_private, state_field)
+            VALUES (?, 'octo/demo', ?, ?, 'Title', ?, 'octo', ?, 0, ?)
             """,
             (
                 source_id,
@@ -430,7 +416,49 @@ def test_build_profile_excludes_persisted_non_workflow_control_state(
                 activity_url,
                 "OPEN" + chr(0),
                 "2026-01-01T00:00:00Z",
+                state_field,
             ),
+        )
+
+    result = build_profile(BuildProfileRequest(workspace=workspace))
+    draft_portfolio(DraftPortfolioRequest(workspace=workspace))
+
+    assert result.claim_count == 0
+    assert activity_url not in paths.portfolio_draft_path.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("field", ("title", "author"))
+def test_build_profile_excludes_persisted_activity_control_metadata(tmp_path, field):
+    workspace = tmp_path / "workspace"
+    paths = WorkspacePaths.from_root(workspace)
+    write_sample_approval(paths)
+    activity_url = "https://github.com/octo/demo/pull/1"
+    approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    approval["approved_github_activity_urls"] = [activity_url]
+    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    source_id = repository.upsert_source(
+        Source(
+            None,
+            SourceType.GITHUB_REPOSITORY,
+            "https://github.com/octo/demo",
+            "octo/demo",
+            "octo",
+            SourceStatus.DISCOVERED,
+        )
+    )
+    control_value = "Bearer" + chr(0) + "example-token-value"
+    title = control_value if field == "title" else "Safe title"
+    author = control_value if field == "author" else "octo"
+    with repository._connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO github_activities
+                (source_id, repo, activity_type, url, title, state, author, created_at, is_private)
+            VALUES (?, 'octo/demo', 'pull_request', ?, ?, 'OPEN', ?, ?, 0)
+            """,
+            (source_id, activity_url, title, author, "2026-01-01T00:00:00Z"),
         )
 
     result = build_profile(BuildProfileRequest(workspace=workspace))
@@ -509,9 +537,8 @@ def test_build_profile_skips_malformed_or_case_duplicate_github_activity_rows(tm
     result = build_profile(BuildProfileRequest(workspace=workspace))
     profile = json.loads(result.json_path.read_text(encoding="utf-8"))
 
-    assert result.claim_count == 1
-    assert "OPENAI_API_KEY=synthetic" not in profile["claims"][0]["text"]
-    assert "\n" not in profile["claims"][0]["author"]
+    assert result.claim_count == 0
+    assert profile["claims"] == []
 
 
 @pytest.mark.parametrize("created_at", ("", "not-a-timestamp"))

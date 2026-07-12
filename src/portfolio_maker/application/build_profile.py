@@ -12,6 +12,7 @@ from portfolio_maker.infrastructure.managed_files import remove_managed_file
 from portfolio_maker.infrastructure.presentation import markdown_text, normalize_label
 from portfolio_maker.infrastructure.github_connector import (
     canonical_repository_name,
+    contains_unicode_control,
     is_valid_github_activity_state,
     is_valid_github_timestamp,
     public_github_activity_identity,
@@ -123,6 +124,8 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
             or activity.source_id is None
             or activity.is_private
             or activity.url not in approved_activity_urls
+            or contains_unicode_control(activity.title)
+            or contains_unicode_control(activity.author)
             or not is_valid_github_activity_state(
                 activity.activity_type, activity.state, activity.state_field
             )

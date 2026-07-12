@@ -284,6 +284,74 @@ def test_non_workflow_parsers_reject_control_suffix_before_normalization(
         )
 
 
+@pytest.mark.parametrize(
+    ("parser", "url"),
+    (
+        (parse_pr_list, "https://github.com/octo/demo/pull/1"),
+        (parse_issue_list, "https://github.com/octo/demo/issues/1"),
+    ),
+)
+def test_activity_parsers_reject_control_in_title(parser, url):
+    with pytest.raises(GitHubDiscoveryError, match="payload is invalid"):
+        parser(
+            "octo/demo",
+            [
+                {
+                    "url": url,
+                    "title": "Bearer" + chr(0) + "example-token-value",
+                    "state": "OPEN",
+                    "createdAt": "2026-01-01T00:00:00Z",
+                    "author": None,
+                }
+            ],
+        )
+
+
+@pytest.mark.parametrize(
+    ("parser", "url"),
+    (
+        (parse_pr_list, "https://github.com/octo/demo/pull/1"),
+        (parse_issue_list, "https://github.com/octo/demo/issues/1"),
+    ),
+)
+def test_activity_parsers_reject_control_in_author(parser, url):
+    with pytest.raises(GitHubDiscoveryError, match="payload is invalid"):
+        parser(
+            "octo/demo",
+            [
+                {
+                    "url": url,
+                    "title": "Title",
+                    "state": "OPEN",
+                    "createdAt": "2026-01-01T00:00:00Z",
+                    "author": {"login": "Bearer" + chr(0) + "author-token-value"},
+                }
+            ],
+        )
+
+
+@pytest.mark.parametrize("field", ("title", "author"))
+def test_commit_parser_rejects_control_in_title_or_author(field):
+    message = "Title" + chr(0) if field == "title" else "Title"
+    author_name = "author" + chr(0) if field == "author" else "author"
+    with pytest.raises(GitHubDiscoveryError, match="commit list payload is invalid"):
+        parse_commit_list(
+            "octo/demo",
+            [
+                {
+                    "html_url": "https://github.com/octo/demo/commit/abc123",
+                    "commit": {
+                        "message": message,
+                        "author": {
+                            "name": author_name,
+                            "date": "2026-01-01T00:00:00Z",
+                        },
+                    },
+                }
+            ],
+        )
+
+
 def test_parse_commit_review_and_workflow_run_lists():
     commits = parse_commit_list("octo/demo", load_fixture("gh_commit_list.json"))
     reviews = parse_review_list("octo/demo", load_fixture("gh_review_list.json"))

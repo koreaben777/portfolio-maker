@@ -176,7 +176,10 @@ def parse_commit_list(repo: str, payload: Any) -> list[GitHubActivityCandidate]:
         commit = _object(item.get("commit") or {}, "commit list")
         author = _object(commit.get("author") or {}, "commit list")
         message = _required_string(commit, "message", "commit list")
-        subject = normalize_label(message.splitlines()[0] if message else "")
+        raw_subject = message.splitlines()[0] if message else ""
+        if contains_unicode_control(raw_subject):
+            raise GitHubDiscoveryError("GitHub commit list payload is invalid")
+        subject = normalize_label(raw_subject)
         if not subject:
             raise GitHubDiscoveryError("GitHub commit list payload is invalid")
         activities.append(
@@ -436,7 +439,7 @@ def _required_workflow_state(
     if "status" not in item or not isinstance(item["status"], str):
         raise GitHubDiscoveryError(f"GitHub {label} payload is invalid")
     status = item["status"]
-    if _contains_unicode_control(status):
+    if contains_unicode_control(status):
         raise GitHubDiscoveryError(f"GitHub {label} payload is invalid")
     normalized_status = normalize_label(status).casefold()
     if not status.strip() or normalized_status not in _WORKFLOW_STATUS_STATES:
@@ -451,7 +454,7 @@ def _required_workflow_state(
     if (
         not isinstance(conclusion, str)
         or not conclusion.strip()
-        or _contains_unicode_control(conclusion)
+        or contains_unicode_control(conclusion)
         or normalize_label(conclusion).casefold() not in _WORKFLOW_CONCLUSION_STATES
     ):
         raise GitHubDiscoveryError(f"GitHub {label} payload is invalid")
@@ -460,7 +463,7 @@ def _required_workflow_state(
 
 def _required_normalized_title(item: dict[str, Any], key: str, label: str) -> str:
     value = _required_string(item, key, label)
-    if not normalize_label(value):
+    if contains_unicode_control(value) or not normalize_label(value):
         raise GitHubDiscoveryError(f"GitHub {label} payload is invalid")
     return value
 
@@ -488,6 +491,8 @@ def _optional_string(item: dict[str, Any], key: str, label: str) -> str | None:
         return None
     if not isinstance(value, str):
         raise GitHubDiscoveryError(f"GitHub {label} payload is invalid")
+    if contains_unicode_control(value):
+        raise GitHubDiscoveryError(f"GitHub {label} payload is invalid")
     return value
 
 
@@ -502,6 +507,8 @@ def _nested_optional_string(
         return ""
     if not isinstance(nested, str):
         raise GitHubDiscoveryError(f"GitHub {label} payload is invalid")
+    if contains_unicode_control(nested):
+        raise GitHubDiscoveryError(f"GitHub {label} payload is invalid")
     return nested
 
 
@@ -509,7 +516,10 @@ def _nested_required_string(
     item: dict[str, Any], key: str, nested_key: str, label: str
 ) -> str:
     value = _object(item.get(key), label)
-    return _required_string(value, nested_key, label)
+    nested = _required_string(value, nested_key, label)
+    if contains_unicode_control(nested):
+        raise GitHubDiscoveryError(f"GitHub {label} payload is invalid")
+    return nested
 
 
 def _required_one_of_strings(
@@ -535,7 +545,7 @@ def is_valid_github_timestamp(value: str) -> bool:
 def is_valid_github_activity_state(
     activity_type: str, value: str, state_field: str | None = None
 ) -> bool:
-    if _contains_unicode_control(value):
+    if contains_unicode_control(value):
         return False
     normalized = normalize_label(value).casefold()
     if activity_type == "workflow_run":
@@ -544,10 +554,12 @@ def is_valid_github_activity_state(
         if state_field == "status":
             return normalized in _WORKFLOW_NON_COMPLETED_STATUS_STATES
         return False
+    if state_field is not None:
+        return False
     return normalized in _ACTIVITY_STATES.get(activity_type, ())
 
 
-def _contains_unicode_control(value: str) -> bool:
+def contains_unicode_control(value: str) -> bool:
     return any(unicodedata.category(character).startswith("C") for character in value)
 
 
