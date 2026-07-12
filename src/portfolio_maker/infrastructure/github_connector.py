@@ -123,7 +123,7 @@ def parse_commit_list(repo: str, payload: Any) -> list[GitHubActivityCandidate]:
                 title=message.splitlines()[0] if message else "",
                 state="committed",
                 author=_optional_string(author, "name", "commit list") or "",
-                created_at=_optional_string(author, "date", "commit list") or "",
+                created_at=_required_timestamp(author, "date", "commit list"),
                 merged_at=None,
             )
         )

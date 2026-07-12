@@ -150,49 +150,32 @@ def test_review_and_workflow_parsers_reject_missing_stable_fields():
         parse_workflow_run_list("octo/demo", {})
 
 
-def test_activity_parsers_reject_blank_required_timestamps():
+@pytest.mark.parametrize("timestamp", ("", "not-a-timestamp"))
+def test_activity_parsers_reject_invalid_required_timestamps(timestamp):
     with pytest.raises(GitHubDiscoveryError, match="pull request list payload is invalid"):
         parse_pr_list(
             "octo/demo",
-            [{"url": "https://github.com/octo/demo/pull/1", "title": "Title", "state": "OPEN", "createdAt": "", "author": None}],
+            [{"url": "https://github.com/octo/demo/pull/1", "title": "Title", "state": "OPEN", "createdAt": timestamp, "author": None}],
         )
     with pytest.raises(GitHubDiscoveryError, match="issue list payload is invalid"):
         parse_issue_list(
             "octo/demo",
-            [{"url": "https://github.com/octo/demo/issues/1", "title": "Title", "state": "OPEN", "createdAt": "", "author": None}],
+            [{"url": "https://github.com/octo/demo/issues/1", "title": "Title", "state": "OPEN", "createdAt": timestamp, "author": None}],
+        )
+    with pytest.raises(GitHubDiscoveryError, match="commit list payload is invalid"):
+        parse_commit_list(
+            "octo/demo",
+            [{"html_url": "https://github.com/octo/demo/commit/abc123", "commit": {"message": "Commit", "author": {"date": timestamp}}}],
         )
     with pytest.raises(GitHubDiscoveryError, match="review comment list payload is invalid"):
         parse_review_list(
             "octo/demo",
-            [{"html_url": "https://github.com/octo/demo/pull/1#discussion_r1", "body": "Review", "user": {"login": "octo"}, "created_at": ""}],
+            [{"html_url": "https://github.com/octo/demo/pull/1#discussion_r1", "body": "Review", "user": {"login": "octo"}, "created_at": timestamp}],
         )
     with pytest.raises(GitHubDiscoveryError, match="workflow run list payload is invalid"):
         parse_workflow_run_list(
             "octo/demo",
-            {"workflow_runs": [{"html_url": "https://github.com/octo/demo/actions/runs/1", "name": "CI", "conclusion": "success", "actor": {"login": "octo"}, "created_at": ""}]},
-        )
-
-
-def test_activity_parsers_reject_malformed_required_timestamps():
-    with pytest.raises(GitHubDiscoveryError, match="pull request list payload is invalid"):
-        parse_pr_list(
-            "octo/demo",
-            [{"url": "https://github.com/octo/demo/pull/1", "title": "Title", "state": "OPEN", "createdAt": "not-a-timestamp", "author": None}],
-        )
-    with pytest.raises(GitHubDiscoveryError, match="issue list payload is invalid"):
-        parse_issue_list(
-            "octo/demo",
-            [{"url": "https://github.com/octo/demo/issues/1", "title": "Title", "state": "OPEN", "createdAt": "not-a-timestamp", "author": None}],
-        )
-    with pytest.raises(GitHubDiscoveryError, match="review comment list payload is invalid"):
-        parse_review_list(
-            "octo/demo",
-            [{"html_url": "https://github.com/octo/demo/pull/1#discussion_r1", "body": "Review", "user": {"login": "octo"}, "created_at": "not-a-timestamp"}],
-        )
-    with pytest.raises(GitHubDiscoveryError, match="workflow run list payload is invalid"):
-        parse_workflow_run_list(
-            "octo/demo",
-            {"workflow_runs": [{"html_url": "https://github.com/octo/demo/actions/runs/1", "name": "CI", "conclusion": "success", "actor": {"login": "octo"}, "created_at": "not-a-timestamp"}]},
+            {"workflow_runs": [{"html_url": "https://github.com/octo/demo/actions/runs/1", "name": "CI", "conclusion": "success", "actor": {"login": "octo"}, "created_at": timestamp}]},
         )
 
 
@@ -479,7 +462,10 @@ def test_parse_commit_list_handles_empty_commit_message():
         [
             {
                 "html_url": "https://github.com/octo/demo/commit/synthetic",
-                "commit": {"message": "", "author": {}},
+                "commit": {
+                    "message": "",
+                    "author": {"date": "2026-01-01T00:00:00Z"},
+                },
             }
         ],
     )

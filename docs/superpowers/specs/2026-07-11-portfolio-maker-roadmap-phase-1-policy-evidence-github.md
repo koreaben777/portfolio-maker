@@ -1,13 +1,13 @@
 # Portfolio Maker 로드맵 Phase 1 구현 명세
 
 날짜: 2026-07-11
-상태: developer 구현 준비 완료
+상태: 현재 Phase 1 정책 및 runtime 계약
 대상 Issue: #4 → #2 → #1
 후속 렌더링: #3 → #11 (`@sites` 선택적 presentation/hosting)
 
 ## 1. 목적과 범위
 
-Portfolio Maker 0.1.0은 승인된 로컬 파일에서 근거 기반 master profile과 검토용 Markdown 포트폴리오 골격을 생성한다. GitHub 활동은 discovery-only이며, 현재 저장소는 `sources`, `source_snapshots`, `github_activities`만 runtime에 사용한다.
+Portfolio Maker 0.1.0은 승인된 로컬 파일에서 근거 기반 master profile과 검토용 Markdown 포트폴리오 골격을 생성한다. GitHub repository와 activity는 기본적으로 discovery metadata다. 다만 policy 재검증을 통과한 confirmed public repository의 activity 중 `approved_github_activity_urls`에 정확히 있는 URL만 profile과 portfolio draft의 public-safe evidence로 사용할 수 있다. 이는 자동 project narrative를 만들지 않는다.
 
 이번 Phase 1의 목적은 다음 두 가지다.
 

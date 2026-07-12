@@ -1,9 +1,9 @@
 # Portfolio Maker Architecture Design
 
 Date: 2026-07-09
-Status: Approved historical architecture; implemented 0.1.0 MVP uses GitHub discovery only
+Status: Approved historical architecture; pre-Phase-1 GitHub wording is superseded by the current Phase 1 policy contract
 
-This document records the approved architecture design and its implemented 0.1.0 MVP boundary.
+This document records the approved architecture design and its pre-Phase-1 0.1.0 baseline. Its GitHub discovery-only statements are historical baseline wording, not the current runtime. The [current Phase 1 policy and evidence contract](2026-07-11-portfolio-maker-roadmap-phase-1-policy-evidence-github.md) is authoritative: GitHub is discovery metadata by default, and only an exact explicitly approved activity URL from a confirmed public repository that passes policy revalidation may enter profile or portfolio draft as public-safe evidence. It never creates an automatic project narrative.
 
 ## Planning Summary
 
@@ -19,7 +19,7 @@ The initial product form was narrowed from a general local app into a Codex-nati
   2. Generate an evidence-based master profile and a review-required portfolio skeleton; defer evidence-rendered portfolio drafts.
   3. Add company-specific strategy and tailored job materials later.
 - Initial data sources are **local files and GitHub**. Google Drive is explicitly deferred.
-- GitHub scope includes repositories, commits, pull requests, issues, reviews, and Actions activity as discovery metadata; it does not enter snapshots, profiles, or portfolio drafts in the 0.1.0 MVP.
+- In the pre-Phase-1 baseline, GitHub scope includes repositories, commits, pull requests, issues, reviews, and Actions activity as discovery metadata; it does not enter snapshots, profiles, or portfolio drafts.
 - Local discovery may scan the home directory for candidates, but users must be able to mark forbidden folders.
 - Ingestion cannot proceed until the user reviews and approves discovered sources.
 - Storage is **SQLite-centered**, with a minimal file-based raw snapshot store for extracted text and metadata that should not be normalized into the database.
@@ -72,7 +72,7 @@ The repository does not initially provide:
 2. Discover local file and GitHub source candidates.
 3. Let the user exclude forbidden folders and repositories; source-class exclusion is deferred until company-specific generation.
 4. Block body ingestion until source approval is explicit.
-5. Ingest approved local files into SQLite and minimal snapshots; retain GitHub repositories and activities only as discovery metadata.
+5. In the pre-Phase-1 baseline, ingest approved local files into SQLite and minimal snapshots; retain GitHub repositories and activities only as discovery metadata.
 6. Create an evidence-based master profile in JSON and Markdown.
 7. Create a public portfolio draft in Markdown.
 8. Keep public artifacts free of secrets, tokens, and private raw paths.
@@ -243,7 +243,7 @@ GitHub discovery:
 - includes commits, pull requests, issues, reviews, and Actions activity
 - marks public and private repository visibility
 - defers organization-resource marking and direct-user-activity prioritization until a later discovery upgrade
-- stores repositories and activities as discovery metadata only; it does not ingest GitHub bodies or use GitHub activity in current artifacts
+- in the pre-Phase-1 baseline, stores repositories and activities as discovery metadata only; it does not ingest GitHub bodies or use GitHub activity in artifacts
 
 Output:
 
@@ -272,7 +272,7 @@ Repository allowlists and excluded file patterns are deferred and not implemente
 
 Ingestion must fail closed when approval is missing.
 
-In 0.1.0, GitHub approval settings control discovery visibility only. They do not authorize GitHub artifact input.
+In the pre-Phase-1 baseline, GitHub approval settings control discovery visibility only. They do not authorize GitHub artifact input.
 
 ### 3. Ingestion
 
@@ -292,7 +292,7 @@ It does not copy original files into the project store.
 
 ### 4. Synthesis
 
-The 0.1.0 synthesis stage builds a master profile from the latest approved local snapshots whose original source still exists and has the same current hash. Missing, changed, policy-blocked, or unavailable snapshots are excluded until re-ingestion. It lists one `project_evidence` claim per remaining source. GitHub activity is not artifact input until the later company-specific generation phase.
+The pre-Phase-1 synthesis stage builds a master profile from the latest approved local snapshots whose original source still exists and has the same current hash. Missing, changed, policy-blocked, or unavailable snapshots are excluded until re-ingestion. It lists one `project_evidence` claim per remaining source. GitHub activity is not artifact input until the later company-specific generation phase.
 
 Detailed project summaries, skill inventories, role analyses, and confidence-scored claims are deferred with company-specific generation.
 
@@ -376,7 +376,7 @@ github_activities
 ## Evidence Rules
 
 1. Current profile claims are derived from approved local snapshots.
-2. GitHub URLs and activities remain discovery-report metadata in the 0.1.0 MVP.
+2. In the pre-Phase-1 baseline, GitHub URLs and activities remain discovery-report metadata.
 3. Public artifacts must not expose private raw paths or sensitive content.
 4. If an ingested local source disappears or its hash changes, mark it stale and require re-ingestion before generating artifacts.
 
@@ -422,7 +422,7 @@ Rules:
 - distinguish public and private repositories; organization classification is deferred
 - show private repositories only when explicitly allowed
 - report GitHub rate-limit and per-repository failures without discarding unrelated discovery results
-- do not use GitHub repositories or activities as profile or portfolio input in the 0.1.0 MVP
+- in the pre-Phase-1 baseline, do not use GitHub repositories or activities as profile or portfolio input
 
 ### Approval Gate
 
