@@ -173,6 +173,29 @@ def test_activity_parsers_reject_blank_required_timestamps():
         )
 
 
+def test_activity_parsers_reject_malformed_required_timestamps():
+    with pytest.raises(GitHubDiscoveryError, match="pull request list payload is invalid"):
+        parse_pr_list(
+            "octo/demo",
+            [{"url": "https://github.com/octo/demo/pull/1", "title": "Title", "state": "OPEN", "createdAt": "not-a-timestamp", "author": None}],
+        )
+    with pytest.raises(GitHubDiscoveryError, match="issue list payload is invalid"):
+        parse_issue_list(
+            "octo/demo",
+            [{"url": "https://github.com/octo/demo/issues/1", "title": "Title", "state": "OPEN", "createdAt": "not-a-timestamp", "author": None}],
+        )
+    with pytest.raises(GitHubDiscoveryError, match="review comment list payload is invalid"):
+        parse_review_list(
+            "octo/demo",
+            [{"html_url": "https://github.com/octo/demo/pull/1#discussion_r1", "body": "Review", "user": {"login": "octo"}, "created_at": "not-a-timestamp"}],
+        )
+    with pytest.raises(GitHubDiscoveryError, match="workflow run list payload is invalid"):
+        parse_workflow_run_list(
+            "octo/demo",
+            {"workflow_runs": [{"html_url": "https://github.com/octo/demo/actions/runs/1", "name": "CI", "conclusion": "success", "actor": {"login": "octo"}, "created_at": "not-a-timestamp"}]},
+        )
+
+
 @pytest.mark.parametrize(
     "conclusion,status",
     (("", None), (None, ""), ("", ""), ("   ", "\t")),
@@ -221,7 +244,9 @@ def test_discover_github_candidates_collects_repo_activities(monkeypatch):
     )
 
     result = discover_github_candidates()
-    repos, activities, statuses = result
+    repos = result.repositories
+    activities = result.activities
+    statuses = result.statuses
 
     assert len(repos) == 1
     assert len(activities) == 5
@@ -233,12 +258,12 @@ def test_discover_github_candidates_collects_repo_activities(monkeypatch):
         "review_comment",
         "workflow_run",
     ]
-    assert {(outcome.repository, outcome.activity_type, outcome.succeeded) for outcome in result.endpoint_outcomes} == {
-        ("octo/demo", "pull_request", True),
-        ("octo/demo", "commit", True),
-        ("octo/demo", "issue", True),
-        ("octo/demo", "review_comment", True),
-        ("octo/demo", "workflow_run", True),
+    assert set(result.completed_endpoints) == {
+        ("octo/demo", "pull_request"),
+        ("octo/demo", "commit"),
+        ("octo/demo", "issue"),
+        ("octo/demo", "review_comment"),
+        ("octo/demo", "workflow_run"),
     }
 
 
@@ -282,10 +307,13 @@ def test_discover_github_candidates_filters_repos_before_activity_calls(monkeypa
         fake_run_gh_json,
     )
 
-    repos, activities, statuses = discover_github_candidates(
+    result = discover_github_candidates(
         excluded_repositories=("OCTO/EXCLUDED",),
         private_sources_allowed=False,
     )
+    repos = result.repositories
+    activities = result.activities
+    statuses = result.statuses
 
     assert [repo.name_with_owner for repo in repos] == ["octo/public"]
     assert activities == []
@@ -329,7 +357,9 @@ def test_discover_github_candidates_keeps_partial_results_when_repo_activity_fai
     )
 
     result = discover_github_candidates()
-    repos, activities, statuses = result
+    repos = result.repositories
+    activities = result.activities
+    statuses = result.statuses
 
     assert [repo.name_with_owner for repo in repos] == ["octo/ok", "octo/flaky"]
     assert [activity.repo for activity in activities] == ["octo/ok"]
@@ -340,17 +370,12 @@ def test_discover_github_candidates_keeps_partial_results_when_repo_activity_fai
         "GitHub review comments discovery failed for octo/flaky: rate limited",
         "GitHub workflow runs discovery failed for octo/flaky: rate limited",
     ]
-    assert {(outcome.repository, outcome.activity_type, outcome.succeeded) for outcome in result.endpoint_outcomes} == {
-        ("octo/ok", "pull_request", True),
-        ("octo/ok", "commit", True),
-        ("octo/ok", "issue", True),
-        ("octo/ok", "review_comment", True),
-        ("octo/ok", "workflow_run", True),
-        ("octo/flaky", "pull_request", False),
-        ("octo/flaky", "commit", False),
-        ("octo/flaky", "issue", False),
-        ("octo/flaky", "review_comment", False),
-        ("octo/flaky", "workflow_run", False),
+    assert set(result.completed_endpoints) == {
+        ("octo/ok", "pull_request"),
+        ("octo/ok", "commit"),
+        ("octo/ok", "issue"),
+        ("octo/ok", "review_comment"),
+        ("octo/ok", "workflow_run"),
     }
 
 
@@ -381,7 +406,9 @@ def test_discover_github_candidates_keeps_early_endpoint_success_on_late_failure
         fake_run_gh_json,
     )
 
-    _, activities, statuses = discover_github_candidates()
+    result = discover_github_candidates()
+    activities = result.activities
+    statuses = result.statuses
 
     assert [activity.activity_type for activity in activities] == ["pull_request"]
     assert statuses == [
@@ -425,7 +452,9 @@ def test_discover_github_candidates_isolates_blank_workflow_state(monkeypatch):
         fake_run_gh_json,
     )
 
-    _, activities, statuses = discover_github_candidates()
+    result = discover_github_candidates()
+    activities = result.activities
+    statuses = result.statuses
 
     assert activities == []
     assert statuses == [
@@ -495,7 +524,10 @@ def test_discover_github_candidates_isolates_commit_without_stable_url(monkeypat
         fake_run_gh_json,
     )
 
-    repos, activities, statuses = discover_github_candidates()
+    result = discover_github_candidates()
+    repos = result.repositories
+    activities = result.activities
+    statuses = result.statuses
 
     assert [repo.name_with_owner for repo in repos] == ["octo/demo"]
     assert activities == []

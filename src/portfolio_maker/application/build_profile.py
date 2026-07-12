@@ -12,6 +12,7 @@ from portfolio_maker.infrastructure.managed_files import remove_managed_file
 from portfolio_maker.infrastructure.presentation import markdown_text, normalize_label
 from portfolio_maker.infrastructure.github_connector import (
     canonical_repository_name,
+    is_valid_github_timestamp,
     public_github_activity_type,
 )
 from portfolio_maker.infrastructure.sqlite_repository import SQLiteRepository
@@ -115,7 +116,7 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
             or activity.is_private
             or activity.url not in approved_activity_urls
             or not activity.state.strip()
-            or not activity.created_at.strip()
+            or not is_valid_github_timestamp(activity.created_at)
             or public_github_activity_type(activity.url) != activity.activity_type
         ):
             continue

@@ -5,6 +5,7 @@ import re
 import subprocess
 import unicodedata
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 from urllib.parse import urlparse
 
@@ -33,23 +34,11 @@ class GitHubActivityCandidate:
 
 
 @dataclass(frozen=True)
-class GitHubEndpointOutcome:
-    repository: str
-    activity_type: str
-    succeeded: bool
-
-
-@dataclass(frozen=True)
 class GitHubDiscoveryResult:
     repositories: list[GitHubRepositoryCandidate]
     activities: list[GitHubActivityCandidate]
     statuses: list[str]
-    endpoint_outcomes: tuple[GitHubEndpointOutcome, ...]
-
-    def __iter__(self):
-        yield self.repositories
-        yield self.activities
-        yield self.statuses
+    completed_endpoints: tuple[tuple[str, str], ...]
 
 
 _PUBLIC_ACTIVITY_PATH = re.compile(
@@ -59,6 +48,9 @@ _PUBLIC_ACTIVITY_PATH = re.compile(
     r"|actions/runs/(?P<run_id>[A-Za-z0-9._-]+))$"
 )
 _SAFE_REVIEW_FRAGMENT = re.compile(r"^discussion_r\d+$")
+_GITHUB_TIMESTAMP = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$"
+)
 
 
 def parse_repo_list(payload: Any) -> list[GitHubRepositoryCandidate]:
@@ -94,7 +86,7 @@ def parse_pr_list(repo: str, payload: Any) -> list[GitHubActivityCandidate]:
             title=_required_string(item, "title", "pull request list"),
             state=_required_nonempty_string(item, "state", "pull request list"),
             author=_nested_optional_string(item, "author", "login", "pull request list"),
-            created_at=_required_nonempty_string(item, "createdAt", "pull request list"),
+            created_at=_required_timestamp(item, "createdAt", "pull request list"),
             merged_at=_optional_string(item, "mergedAt", "pull request list"),
         )
         for item in _list_payload(payload, "pull request list")
@@ -110,7 +102,7 @@ def parse_issue_list(repo: str, payload: Any) -> list[GitHubActivityCandidate]:
             title=_required_string(item, "title", "issue list"),
             state=_required_nonempty_string(item, "state", "issue list"),
             author=_nested_optional_string(item, "author", "login", "issue list"),
-            created_at=_required_nonempty_string(item, "createdAt", "issue list"),
+            created_at=_required_timestamp(item, "createdAt", "issue list"),
             merged_at=None,
         )
         for item in _list_payload(payload, "issue list")
@@ -149,7 +141,7 @@ def parse_review_list(repo: str, payload: Any) -> list[GitHubActivityCandidate]:
                 title=f"Review comment: {_required_string(item, 'body', 'review comment list')}".splitlines()[0],
                 state="commented",
                 author=_nested_required_string(item, "user", "login", "review comment list"),
-                created_at=_required_nonempty_string(item, "created_at", "review comment list"),
+                created_at=_required_timestamp(item, "created_at", "review comment list"),
                 merged_at=None,
             )
         )
@@ -171,7 +163,7 @@ def parse_workflow_run_list(repo: str, payload: Any) -> list[GitHubActivityCandi
                 title=_required_string(item, "name", "workflow run list"),
                 state=_required_one_of_strings(item, ("conclusion", "status"), "workflow run list"),
                 author=_nested_required_string(item, "actor", "login", "workflow run list"),
-                created_at=_required_nonempty_string(item, "created_at", "workflow run list"),
+                created_at=_required_timestamp(item, "created_at", "workflow run list"),
                 merged_at=None,
             )
         )
@@ -219,7 +211,7 @@ def discover_github_candidates(
     ]
     activities: list[GitHubActivityCandidate] = []
     statuses: list[str] = []
-    endpoint_outcomes: list[GitHubEndpointOutcome] = []
+    completed_endpoints: list[tuple[str, str]] = []
     endpoints = (
         (
             "pull requests",
@@ -264,17 +256,12 @@ def discover_github_candidates(
             args = [part.format(repo=repo.name_with_owner) for part in args_template]
             try:
                 activities.extend(parser(repo.name_with_owner, run_gh_json(args)))
-                endpoint_outcomes.append(
-                    GitHubEndpointOutcome(repo.name_with_owner, activity_type, True)
-                )
+                completed_endpoints.append((repo.name_with_owner, activity_type))
             except GitHubDiscoveryError as error:
-                endpoint_outcomes.append(
-                    GitHubEndpointOutcome(repo.name_with_owner, activity_type, False)
-                )
                 statuses.append(
                     f"GitHub {label} discovery failed for {repo.name_with_owner}: {error}"
                 )
-    return GitHubDiscoveryResult(repos, activities, statuses, tuple(endpoint_outcomes))
+    return GitHubDiscoveryResult(repos, activities, statuses, tuple(completed_endpoints))
 
 
 def _list_payload(payload: Any, label: str) -> list[dict[str, Any]]:
@@ -299,6 +286,13 @@ def _required_string(item: dict[str, Any], key: str, label: str) -> str:
 def _required_nonempty_string(item: dict[str, Any], key: str, label: str) -> str:
     value = _required_string(item, key, label)
     if not value.strip():
+        raise GitHubDiscoveryError(f"GitHub {label} payload is invalid")
+    return value
+
+
+def _required_timestamp(item: dict[str, Any], key: str, label: str) -> str:
+    value = _required_nonempty_string(item, key, label)
+    if not is_valid_github_timestamp(value):
         raise GitHubDiscoveryError(f"GitHub {label} payload is invalid")
     return value
 
@@ -341,6 +335,16 @@ def _required_one_of_strings(
         if isinstance(value, str) and value.strip():
             return value
     raise GitHubDiscoveryError(f"GitHub {label} payload is invalid")
+
+
+def is_valid_github_timestamp(value: str) -> bool:
+    if _GITHUB_TIMESTAMP.fullmatch(value) is None:
+        return False
+    try:
+        datetime.fromisoformat(value[:-1] + "+00:00" if value.endswith("Z") else value)
+    except ValueError:
+        return False
+    return True
 
 
 def canonical_repository_name(name: str) -> str:

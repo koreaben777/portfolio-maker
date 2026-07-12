@@ -18,13 +18,26 @@ from portfolio_maker.domain.models import SourceStatus, SourceType
 from portfolio_maker.infrastructure.github_connector import (
     GitHubActivityCandidate,
     GitHubDiscoveryResult,
-    GitHubEndpointOutcome,
     GitHubRepositoryCandidate,
 )
 from portfolio_maker.infrastructure.local_discovery import discover_local_candidates
 from portfolio_maker.infrastructure.local_discovery import DiscoveryRootError
 from portfolio_maker.infrastructure.sqlite_repository import SQLiteRepository
 from portfolio_maker.workspace import WorkspacePaths
+
+
+def github_discovery_result(
+    repositories: list[GitHubRepositoryCandidate],
+    activities: list[GitHubActivityCandidate],
+    statuses: list[str] | None = None,
+    completed_endpoints: tuple[tuple[str, str], ...] = (),
+) -> GitHubDiscoveryResult:
+    return GitHubDiscoveryResult(
+        repositories,
+        activities,
+        statuses if statuses is not None else [],
+        completed_endpoints,
+    )
 
 
 def test_discover_local_candidates_finds_readme_and_skips_forbidden_and_policy_paths(tmp_path):
@@ -256,7 +269,7 @@ def test_discover_sources_includes_github_candidates(workspace, tmp_path, monkey
             "allowed_repositories": (),
             "private_sources_allowed": False,
         }
-        return (
+        return github_discovery_result(
             [
                 GitHubRepositoryCandidate(
                     name_with_owner="octo/demo",
@@ -350,7 +363,10 @@ def test_successful_github_rediscovery_invalidates_disappeared_activities(worksp
         merged_at="2026-01-02T00:00:00Z",
     )
     repo = GitHubRepositoryCandidate("octo/demo", "https://github.com/octo/demo", False)
-    responses = [([repo], [activity], []), ([repo], [], [])]
+    responses = [
+        github_discovery_result([repo], [activity]),
+        github_discovery_result([repo], []),
+    ]
 
     monkeypatch.setattr(
         "portfolio_maker.application.discovery.discover_github_candidates",
@@ -388,7 +404,7 @@ def test_failed_github_rediscovery_preserves_existing_activity_visibility(worksp
     repo = GitHubRepositoryCandidate("octo/demo", "https://github.com/octo/demo", False)
     monkeypatch.setattr(
         "portfolio_maker.application.discovery.discover_github_candidates",
-        lambda **kwargs: ([repo], [activity], []),
+        lambda **kwargs: github_discovery_result([repo], [activity]),
     )
     request = DiscoverSourcesRequest(workspace=workspace, home=tmp_path, include_github=True)
     discover_sources(request)
@@ -415,7 +431,12 @@ def test_incomplete_github_rediscovery_preserves_existing_activity_visibility(wo
         merged_at="2026-01-02T00:00:00Z",
     )
     repo = GitHubRepositoryCandidate("octo/demo", "https://github.com/octo/demo", False)
-    responses = [([repo], [activity], []), ([repo], [], ["GitHub workflow runs discovery failed"])]
+    responses = [
+        github_discovery_result([repo], [activity]),
+        github_discovery_result(
+            [repo], [], ["GitHub workflow runs discovery failed"]
+        ),
+    ]
     monkeypatch.setattr(
         "portfolio_maker.application.discovery.discover_github_candidates",
         lambda **kwargs: responses.pop(0),
@@ -500,15 +521,12 @@ def test_partial_rediscovery_revokes_successfully_empty_pr_endpoint(
     demo = GitHubRepositoryCandidate("octo/demo", "https://github.com/octo/demo", False)
     other = GitHubRepositoryCandidate("octo/other", "https://github.com/octo/other", False)
     responses = [
-        GitHubDiscoveryResult([demo], [activity], [], ()),
-        GitHubDiscoveryResult(
+        github_discovery_result([demo], [activity]),
+        github_discovery_result(
             [demo, other],
             [],
             [f"GitHub workflow runs discovery failed for {failure_repository}"],
-            (
-                GitHubEndpointOutcome("octo/demo", "pull_request", True),
-                GitHubEndpointOutcome(failure_repository, "workflow_run", False),
-            ),
+            (("octo/demo", "pull_request"),),
         ),
     ]
     monkeypatch.setattr(
@@ -535,7 +553,7 @@ def test_discovery_review_comment_can_be_approved_and_rendered_as_evidence(works
     url = "https://github.com/octo/demo/pull/1#discussion_r1"
     monkeypatch.setattr(
         "portfolio_maker.application.discovery.discover_github_candidates",
-        lambda **kwargs: (
+        lambda **kwargs: github_discovery_result(
             [GitHubRepositoryCandidate("octo/demo", "https://github.com/octo/demo", False)],
             [
                 GitHubActivityCandidate(
@@ -626,7 +644,7 @@ def test_discover_sources_filters_private_and_excluded_github_repos(workspace, t
             "allowed_repositories": (),
             "private_sources_allowed": False,
         }
-        return (
+        return github_discovery_result(
             [
                 GitHubRepositoryCandidate(
                     name_with_owner="octo/public",

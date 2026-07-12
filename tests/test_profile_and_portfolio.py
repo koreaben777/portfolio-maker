@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 import portfolio_maker.application.draft_portfolio as draft_portfolio_module
 from portfolio_maker.application.approval import write_sample_approval
 from portfolio_maker.application.build_profile import build_profile
@@ -387,7 +389,8 @@ def test_build_profile_skips_malformed_or_case_duplicate_github_activity_rows(tm
     assert "\n" not in profile["claims"][0]["author"]
 
 
-def test_build_profile_excludes_legacy_github_activity_with_blank_timestamp(tmp_path):
+@pytest.mark.parametrize("created_at", ("", "not-a-timestamp"))
+def test_build_profile_excludes_legacy_github_activity_with_invalid_timestamp(tmp_path, created_at):
     workspace = tmp_path / "workspace"
     paths = WorkspacePaths.from_root(workspace)
     write_sample_approval(paths)
@@ -405,9 +408,9 @@ def test_build_profile_excludes_legacy_github_activity_with_blank_timestamp(tmp_
             """
             INSERT INTO github_activities
                 (source_id, repo, activity_type, url, title, state, author, created_at, is_private)
-            VALUES (?, 'octo/demo', 'pull_request', ?, 'Legacy row', 'MERGED', 'octo', '', 0)
+            VALUES (?, 'octo/demo', 'pull_request', ?, 'Legacy row', 'MERGED', 'octo', ?, 0)
             """,
-            (source_id, activity_url),
+            (source_id, activity_url, created_at),
         )
 
     result = build_profile(BuildProfileRequest(workspace=workspace))
