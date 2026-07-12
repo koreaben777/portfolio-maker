@@ -327,6 +327,41 @@ def test_discover_sources_includes_github_candidates(workspace, tmp_path, monkey
     assert "Add RAG \\#\\# Forged" in report
 
 
+def test_discover_sources_persists_and_hydrates_workflow_state_provenance(
+    workspace, tmp_path, monkeypatch
+):
+    repo = GitHubRepositoryCandidate(
+        name_with_owner="octo/demo",
+        url="https://github.com/octo/demo",
+        is_private=False,
+    )
+    activity = GitHubActivityCandidate(
+        repo="octo/demo",
+        activity_type="workflow_run",
+        url="https://github.com/octo/demo/actions/runs/1",
+        title="CI",
+        state="queued",
+        author="octo",
+        created_at="2026-01-01T00:00:00Z",
+        merged_at=None,
+        state_field="status",
+    )
+    monkeypatch.setattr(
+        "portfolio_maker.application.discovery.discover_github_candidates",
+        lambda **kwargs: github_discovery_result([repo], [activity]),
+    )
+
+    discover_sources(
+        DiscoverSourcesRequest(workspace=workspace, home=tmp_path, include_github=True)
+    )
+
+    repository = SQLiteRepository(WorkspacePaths.from_root(workspace).db_path)
+    hydrated = repository.list_github_activities()
+    assert len(hydrated) == 1
+    assert hydrated[0].state == "queued"
+    assert hydrated[0].state_field == "status"
+
+
 def test_discover_sources_keeps_local_report_when_github_fails(workspace, tmp_path, monkeypatch):
     readme = tmp_path / "README.md"
     readme.write_text("# Demo\n", encoding="utf-8")

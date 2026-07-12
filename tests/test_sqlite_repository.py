@@ -128,7 +128,48 @@ def test_sqlite_repository_initialize_creates_required_schema_columns(workspace)
 
     assert {"discovered_at", "approved_at"} <= column_names(repository, "sources")
     assert {"extracted_at"} <= column_names(repository, "source_snapshots")
-    assert {"repo", "activity_type", "url"} <= column_names(repository, "github_activities")
+    assert {"repo", "activity_type", "url", "state_field"} <= column_names(
+        repository, "github_activities"
+    )
+
+
+def test_sqlite_repository_migrates_legacy_workflow_rows_without_provenance(workspace):
+    paths = WorkspacePaths.from_root(workspace)
+    paths.ensure()
+    with sqlite3.connect(paths.db_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE github_activities (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_id INTEGER,
+                repo TEXT NOT NULL,
+                activity_type TEXT NOT NULL,
+                url TEXT NOT NULL,
+                title TEXT NOT NULL,
+                state TEXT NOT NULL,
+                author TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                merged_at TEXT,
+                is_private INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(repo, activity_type, url)
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO github_activities
+                (repo, activity_type, url, title, state, author, created_at)
+            VALUES ('octo/demo', 'workflow_run',
+                    'https://github.com/octo/demo/actions/runs/1',
+                    'CI', 'queued', 'octo', '2026-01-01T00:00:00Z')
+            """
+        )
+
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+
+    assert "state_field" in column_names(repository, "github_activities")
+    assert repository.list_github_activities()[0].state_field is None
 
 
 def test_sqlite_repository_upsert_source_lists_inserted_source(workspace):
@@ -287,6 +328,28 @@ def test_sqlite_repository_upserts_github_activity_by_repo_type_and_url(workspac
         rows = conn.execute("SELECT id, title FROM github_activities").fetchall()
     assert second_id == first_id
     assert [(row["id"], row["title"]) for row in rows] == [(first_id, "Updated title")]
+
+
+def test_sqlite_repository_requires_workflow_state_provenance(workspace):
+    paths = WorkspacePaths.from_root(workspace)
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+
+    with pytest.raises(RepositoryError, match="state or provenance is invalid"):
+        repository.insert_github_activity(
+            GitHubActivity(
+                id=None,
+                source_id=None,
+                repo="octo/demo",
+                activity_type="workflow_run",
+                url="https://github.com/octo/demo/actions/runs/1",
+                title="CI",
+                state="queued",
+                author="octo",
+                created_at="2026-01-01T00:00:00Z",
+                merged_at=None,
+            )
+        )
 
 
 def test_sqlite_repository_creates_private_unlinked_database_and_upgrades_permissions(workspace):

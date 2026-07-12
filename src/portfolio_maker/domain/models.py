@@ -41,3 +41,4 @@ class GitHubActivity:
     created_at: str
     merged_at: str | None
     is_private: bool = False
+    state_field: str | None = None

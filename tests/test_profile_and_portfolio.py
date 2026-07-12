@@ -609,9 +609,15 @@ def test_build_profile_excludes_legacy_github_activity_with_invalid_state(tmp_pa
     source_id = repository.upsert_source(
         Source(None, SourceType.GITHUB_REPOSITORY, "https://github.com/octo/demo", "octo/demo", "octo", SourceStatus.DISCOVERED)
     )
-    repository.insert_github_activity(
-        GitHubActivity(None, source_id, "octo/demo", "pull_request", activity_url, "Safe title", state, "octo", "2026-01-01T00:00:00Z", None)
-    )
+    with repository._connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO github_activities
+                (source_id, repo, activity_type, url, title, state, author, created_at, is_private)
+            VALUES (?, 'octo/demo', 'pull_request', ?, 'Safe title', ?, 'octo', ?, 0)
+            """,
+            (source_id, activity_url, state, "2026-01-01T00:00:00Z"),
+        )
 
     result = build_profile(BuildProfileRequest(workspace=workspace))
     draft_portfolio(DraftPortfolioRequest(workspace=workspace))
@@ -687,7 +693,45 @@ def test_build_profile_excludes_legacy_workflow_activity_with_unsupported_state(
             SourceStatus.DISCOVERED,
         )
     )
-    repository.insert_github_activity(
+    with repository._connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO github_activities
+                (source_id, repo, activity_type, url, title, state, author, created_at, is_private)
+            VALUES (?, 'octo/demo', 'workflow_run', ?, 'CI', 'unsupported', 'octo', ?, 0)
+            """,
+            (source_id, activity_url, "2026-01-01T00:00:00Z"),
+        )
+
+    result = build_profile(BuildProfileRequest(workspace=workspace))
+
+    assert result.claim_count == 0
+    assert activity_url not in result.markdown_path.read_text(encoding="utf-8")
+
+
+def test_build_profile_accepts_persisted_workflow_provenance_but_rejects_ambiguous_legacy(
+    tmp_path,
+):
+    workspace = tmp_path / "workspace"
+    paths = WorkspacePaths.from_root(workspace)
+    write_sample_approval(paths)
+    activity_url = "https://github.com/octo/demo/actions/runs/1"
+    approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    approval["approved_github_activity_urls"] = [activity_url]
+    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    source_id = repository.upsert_source(
+        Source(
+            None,
+            SourceType.GITHUB_REPOSITORY,
+            "https://github.com/octo/demo",
+            "octo/demo",
+            "octo",
+            SourceStatus.DISCOVERED,
+        )
+    )
+    activity_id = repository.insert_github_activity(
         GitHubActivity(
             None,
             source_id,
@@ -695,17 +739,28 @@ def test_build_profile_excludes_legacy_workflow_activity_with_unsupported_state(
             "workflow_run",
             activity_url,
             "CI",
-            "unsupported",
+            "queued",
             "octo",
             "2026-01-01T00:00:00Z",
             None,
+            state_field="status",
         )
     )
 
+    assert repository.list_github_activities()[0].state_field == "status"
+    assert build_profile(BuildProfileRequest(workspace=workspace)).claim_count == 1
+
+    with repository._connection() as conn:
+        conn.execute(
+            "UPDATE github_activities SET state_field = NULL WHERE id = ?",
+            (activity_id,),
+        )
+
     result = build_profile(BuildProfileRequest(workspace=workspace))
+    draft_portfolio(DraftPortfolioRequest(workspace=workspace))
 
     assert result.claim_count == 0
-    assert activity_url not in result.markdown_path.read_text(encoding="utf-8")
+    assert activity_url not in paths.portfolio_draft_path.read_text(encoding="utf-8")
 
 
 def test_build_profile_excludes_ingested_source_after_approval_revoked(tmp_path):

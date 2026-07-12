@@ -83,7 +83,6 @@ _ACTIVITY_STATES = {
     "issue": frozenset({"open", "closed"}),
     "commit": frozenset({"committed"}),
     "review_comment": frozenset({"commented"}),
-    "workflow_run": _WORKFLOW_CONCLUSION_STATES | _WORKFLOW_STATUS_STATES,
 }
 
 
@@ -433,28 +432,26 @@ def _required_activity_state_value(value: str, label: str, activity_type: str) -
 def _required_workflow_state(
     item: dict[str, Any], label: str
 ) -> tuple[str, str]:
-    conclusion = item.get("conclusion")
-    if conclusion is not None:
-        if not isinstance(conclusion, str):
-            raise GitHubDiscoveryError(f"GitHub {label} payload is invalid")
-        if conclusion.strip():
-            if normalize_label(conclusion).casefold() not in _WORKFLOW_CONCLUSION_STATES:
-                raise GitHubDiscoveryError(f"GitHub {label} payload is invalid")
-            status = item.get("status")
-            if status is not None and status != "":
-                if (
-                    not isinstance(status, str)
-                    or normalize_label(status).casefold() != "completed"
-                ):
-                    raise GitHubDiscoveryError(f"GitHub {label} payload is invalid")
-            return conclusion, "conclusion"
+    if "status" not in item or not isinstance(item["status"], str):
+        raise GitHubDiscoveryError(f"GitHub {label} payload is invalid")
+    status = item["status"]
+    normalized_status = normalize_label(status).casefold()
+    if not status.strip() or normalized_status not in _WORKFLOW_STATUS_STATES:
+        raise GitHubDiscoveryError(f"GitHub {label} payload is invalid")
 
-    status = item.get("status")
-    if isinstance(status, str) and status.strip():
-        if normalize_label(status).casefold() not in _WORKFLOW_STATUS_STATES:
+    if normalized_status != "completed":
+        if "conclusion" not in item or item["conclusion"] is not None:
             raise GitHubDiscoveryError(f"GitHub {label} payload is invalid")
         return status, "status"
-    raise GitHubDiscoveryError(f"GitHub {label} payload is invalid")
+
+    conclusion = item.get("conclusion")
+    if (
+        not isinstance(conclusion, str)
+        or not conclusion.strip()
+        or normalize_label(conclusion).casefold() not in _WORKFLOW_CONCLUSION_STATES
+    ):
+        raise GitHubDiscoveryError(f"GitHub {label} payload is invalid")
+    return conclusion, "conclusion"
 
 
 def _required_normalized_title(item: dict[str, Any], key: str, label: str) -> str:
@@ -531,8 +528,17 @@ def is_valid_github_timestamp(value: str) -> bool:
     return True
 
 
-def is_valid_github_activity_state(activity_type: str, value: str) -> bool:
-    return normalize_label(value).casefold() in _ACTIVITY_STATES.get(activity_type, ())
+def is_valid_github_activity_state(
+    activity_type: str, value: str, state_field: str | None = None
+) -> bool:
+    normalized = normalize_label(value).casefold()
+    if activity_type == "workflow_run":
+        if state_field == "conclusion":
+            return normalized in _WORKFLOW_CONCLUSION_STATES
+        if state_field == "status":
+            return normalized in _WORKFLOW_STATUS_STATES
+        return False
+    return normalized in _ACTIVITY_STATES.get(activity_type, ())
 
 
 def canonical_repository_name(name: str) -> str:

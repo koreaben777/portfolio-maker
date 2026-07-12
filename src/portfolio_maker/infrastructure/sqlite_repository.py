@@ -11,7 +11,10 @@ from pathlib import Path
 from stat import S_ISDIR, S_ISREG
 
 from portfolio_maker.domain.models import GitHubActivity, Source, SourceStatus, SourceType
-from portfolio_maker.infrastructure.github_connector import canonical_repository_name
+from portfolio_maker.infrastructure.github_connector import (
+    canonical_repository_name,
+    is_valid_github_activity_state,
+)
 from portfolio_maker.infrastructure.managed_files import (
     ensure_managed_directory,
     open_managed_directory,
@@ -53,6 +56,7 @@ CREATE TABLE IF NOT EXISTS github_activities (
     created_at TEXT NOT NULL,
     merged_at TEXT,
     is_private INTEGER NOT NULL DEFAULT 0 CHECK(is_private IN (0, 1)),
+    state_field TEXT CHECK(state_field IS NULL OR state_field IN ('conclusion', 'status')),
     UNIQUE(repo, activity_type, url)
 );
 
@@ -439,6 +443,7 @@ class SQLiteRepository:
                 if statement.strip():
                     conn.execute(statement)
             self._ensure_github_activity_visibility_column(conn)
+            self._ensure_github_activity_state_field_column(conn)
 
     @staticmethod
     def _ensure_github_activity_visibility_column(conn: sqlite3.Connection) -> None:
@@ -451,6 +456,19 @@ class SQLiteRepository:
             conn.execute(
                 "ALTER TABLE github_activities "
                 "ADD COLUMN is_private INTEGER NOT NULL DEFAULT 1 CHECK(is_private IN (0, 1))"
+            )
+
+    @staticmethod
+    def _ensure_github_activity_state_field_column(conn: sqlite3.Connection) -> None:
+        columns = {
+            SQLiteRepository._required_text(row, "name")
+            for row in conn.execute("PRAGMA table_info(github_activities)").fetchall()
+        }
+        if "state_field" not in columns:
+            conn.execute(
+                "ALTER TABLE github_activities "
+                "ADD COLUMN state_field TEXT "
+                "CHECK(state_field IS NULL OR state_field IN ('conclusion', 'status'))"
             )
 
     def table_names(self) -> set[str]:
@@ -494,6 +512,10 @@ class SQLiteRepository:
     def insert_github_activity(self, activity: GitHubActivity) -> int:
         if not activity.state.strip():
             raise RepositoryError("GitHub activity state must be non-empty")
+        if not is_valid_github_activity_state(
+            activity.activity_type, activity.state, activity.state_field
+        ):
+            raise RepositoryError("GitHub activity state or provenance is invalid")
         try:
             repository_name = canonical_repository_name(activity.repo)
         except ValueError as error:
@@ -502,8 +524,8 @@ class SQLiteRepository:
             conn.execute(
                 """
                 INSERT INTO github_activities
-                    (source_id, repo, activity_type, url, title, state, author, created_at, merged_at, is_private)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (source_id, repo, activity_type, url, title, state, author, created_at, merged_at, is_private, state_field)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(repo, activity_type, url) DO UPDATE SET
                     source_id = excluded.source_id,
                     title = excluded.title,
@@ -511,7 +533,8 @@ class SQLiteRepository:
                     author = excluded.author,
                     created_at = excluded.created_at,
                     merged_at = excluded.merged_at,
-                    is_private = excluded.is_private
+                    is_private = excluded.is_private,
+                    state_field = excluded.state_field
                 """,
                 (
                     activity.source_id,
@@ -524,6 +547,7 @@ class SQLiteRepository:
                     activity.created_at,
                     activity.merged_at,
                     int(activity.is_private),
+                    activity.state_field,
                 ),
             )
             row = conn.execute(
@@ -591,7 +615,7 @@ class SQLiteRepository:
             rows = conn.execute(
                 """
                 SELECT id, source_id, repo, activity_type, url, title, state, author,
-                       created_at, merged_at, is_private
+                       created_at, merged_at, is_private, state_field
                 FROM github_activities
                 ORDER BY id
                 """
@@ -610,6 +634,7 @@ class SQLiteRepository:
                     created_at=self._required_text(row, "created_at"),
                     merged_at=self._optional_text(row, "merged_at"),
                     is_private=bool(self._required_boolean(row, "is_private")),
+                    state_field=self._optional_text(row, "state_field"),
                 )
                 for row in rows
             ]

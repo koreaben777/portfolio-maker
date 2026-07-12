@@ -123,7 +123,9 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
             or activity.source_id is None
             or activity.is_private
             or activity.url not in approved_activity_urls
-            or not is_valid_github_activity_state(activity.activity_type, activity.state)
+            or not is_valid_github_activity_state(
+                activity.activity_type, activity.state, activity.state_field
+            )
             or not is_valid_github_timestamp(activity.created_at)
             or public_github_activity_identity(activity.url)
             != (repository_name, activity.activity_type)

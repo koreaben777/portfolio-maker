@@ -119,6 +119,7 @@ def discover_sources(request: DiscoverSourcesRequest) -> DiscoverSourcesResult:
                     created_at=activity.created_at,
                     merged_at=activity.merged_at,
                     is_private=repo_visibility.get(repository_name, True),
+                    state_field=activity.state_field,
                 )
             )
 
