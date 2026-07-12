@@ -82,7 +82,9 @@ def parse_pr_list(repo: str, payload: Any) -> list[GitHubActivityCandidate]:
         GitHubActivityCandidate(
             repo=repo,
             activity_type="pull_request",
-            url=_required_string(item, "url", "pull request list"),
+            url=_required_activity_url(
+                item, "url", "pull request list", repo, "pull_request"
+            ),
             title=_required_string(item, "title", "pull request list"),
             state=_required_nonempty_string(item, "state", "pull request list"),
             author=_nested_optional_string(item, "author", "login", "pull request list"),
@@ -98,7 +100,7 @@ def parse_issue_list(repo: str, payload: Any) -> list[GitHubActivityCandidate]:
         GitHubActivityCandidate(
             repo=repo,
             activity_type="issue",
-            url=_required_string(item, "url", "issue list"),
+            url=_required_activity_url(item, "url", "issue list", repo, "issue"),
             title=_required_string(item, "title", "issue list"),
             state=_required_nonempty_string(item, "state", "issue list"),
             author=_nested_optional_string(item, "author", "login", "issue list"),
@@ -119,7 +121,9 @@ def parse_commit_list(repo: str, payload: Any) -> list[GitHubActivityCandidate]:
             GitHubActivityCandidate(
                 repo=repo,
                 activity_type="commit",
-                url=_required_nonempty_string(item, "html_url", "commit list"),
+                url=_required_activity_url(
+                    item, "html_url", "commit list", repo, "commit"
+                ),
                 title=message.splitlines()[0] if message else "",
                 state="committed",
                 author=_optional_string(author, "name", "commit list") or "",
@@ -137,7 +141,13 @@ def parse_review_list(repo: str, payload: Any) -> list[GitHubActivityCandidate]:
             GitHubActivityCandidate(
                 repo=repo,
                 activity_type="review_comment",
-                url=_required_string(item, "html_url", "review comment list"),
+                url=_required_activity_url(
+                    item,
+                    "html_url",
+                    "review comment list",
+                    repo,
+                    "review_comment",
+                ),
                 title=f"Review comment: {_required_string(item, 'body', 'review comment list')}".splitlines()[0],
                 state="commented",
                 author=_nested_required_string(item, "user", "login", "review comment list"),
@@ -159,7 +169,9 @@ def parse_workflow_run_list(repo: str, payload: Any) -> list[GitHubActivityCandi
             GitHubActivityCandidate(
                 repo=repo,
                 activity_type="workflow_run",
-                url=_required_string(item, "html_url", "workflow run list"),
+                url=_required_activity_url(
+                    item, "html_url", "workflow run list", repo, "workflow_run"
+                ),
                 title=_required_string(item, "name", "workflow run list"),
                 state=_required_one_of_strings(item, ("conclusion", "status"), "workflow run list"),
                 author=_nested_required_string(item, "actor", "login", "workflow run list"),
@@ -229,8 +241,9 @@ def discover_github_candidates(
                 "--limit",
                 "100",
             ],
+            100,
         ),
-        ("commits", "commit", parse_commit_list, ["api", "repos/{repo}/commits"]),
+        ("commits", "commit", parse_commit_list, ["api", "repos/{repo}/commits"], 30),
         (
             "issues",
             "issue",
@@ -247,16 +260,36 @@ def discover_github_candidates(
                 "--limit",
                 "100",
             ],
+            100,
         ),
-        ("review comments", "review_comment", parse_review_list, ["api", "repos/{repo}/pulls/comments"]),
-        ("workflow runs", "workflow_run", parse_workflow_run_list, ["api", "repos/{repo}/actions/runs"]),
+        (
+            "review comments",
+            "review_comment",
+            parse_review_list,
+            ["api", "repos/{repo}/pulls/comments"],
+            30,
+        ),
+        (
+            "workflow runs",
+            "workflow_run",
+            parse_workflow_run_list,
+            ["api", "repos/{repo}/actions/runs"],
+            30,
+        ),
     )
     for repo in repos:
-        for label, activity_type, parser, args_template in endpoints:
+        for label, activity_type, parser, args_template, page_limit in endpoints:
             args = [part.format(repo=repo.name_with_owner) for part in args_template]
             try:
-                activities.extend(parser(repo.name_with_owner, run_gh_json(args)))
-                completed_endpoints.append((repo.name_with_owner, activity_type))
+                parsed_activities = parser(repo.name_with_owner, run_gh_json(args))
+                activities.extend(parsed_activities)
+                if len(parsed_activities) >= page_limit:
+                    statuses.append(
+                        f"GitHub {label} discovery incomplete for {repo.name_with_owner}: "
+                        f"result reached the {page_limit}-item limit"
+                    )
+                else:
+                    completed_endpoints.append((repo.name_with_owner, activity_type))
             except GitHubDiscoveryError as error:
                 statuses.append(
                     f"GitHub {label} discovery failed for {repo.name_with_owner}: {error}"
@@ -293,6 +326,23 @@ def _required_nonempty_string(item: dict[str, Any], key: str, label: str) -> str
 def _required_timestamp(item: dict[str, Any], key: str, label: str) -> str:
     value = _required_nonempty_string(item, key, label)
     if not is_valid_github_timestamp(value):
+        raise GitHubDiscoveryError(f"GitHub {label} payload is invalid")
+    return value
+
+
+def _required_activity_url(
+    item: dict[str, Any],
+    key: str,
+    label: str,
+    repository: str,
+    activity_type: str,
+) -> str:
+    value = _required_nonempty_string(item, key, label)
+    try:
+        canonical_repository = canonical_repository_name(repository)
+    except ValueError as error:
+        raise GitHubDiscoveryError(f"GitHub {label} payload is invalid") from error
+    if public_github_activity_identity(value) != (canonical_repository, activity_type):
         raise GitHubDiscoveryError(f"GitHub {label} payload is invalid")
     return value
 
@@ -360,10 +410,10 @@ def canonical_repository_name(name: str) -> str:
 
 
 def is_public_github_activity_url(value: str) -> bool:
-    return public_github_activity_type(value) is not None
+    return public_github_activity_identity(value) is not None
 
 
-def public_github_activity_type(value: str) -> str | None:
+def public_github_activity_identity(value: str) -> tuple[str, str] | None:
     if any(
         character.isspace() or unicodedata.category(character).startswith("C")
         for character in value
@@ -386,16 +436,21 @@ def public_github_activity_type(value: str) -> str | None:
     if match is None:
         return None
     try:
-        canonical_repository_name(f"{match['owner']}/{match['repository']}")
+        repository = canonical_repository_name(f"{match['owner']}/{match['repository']}")
     except ValueError:
         return None
     if parsed.fragment:
         if match["kind"] == "pull" and _SAFE_REVIEW_FRAGMENT.fullmatch(parsed.fragment):
-            return "review_comment"
+            return repository, "review_comment"
         return None
     if match["kind"] is not None:
-        return {"commit": "commit", "issues": "issue", "pull": "pull_request"}[match["kind"]]
-    return "workflow_run"
+        return repository, {"commit": "commit", "issues": "issue", "pull": "pull_request"}[match["kind"]]
+    return repository, "workflow_run"
+
+
+def public_github_activity_type(value: str) -> str | None:
+    identity = public_github_activity_identity(value)
+    return identity[1] if identity is not None else None
 
 
 def _is_canonical_repository_component(value: str, allow_dots: bool) -> bool:

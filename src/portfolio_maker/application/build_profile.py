@@ -13,7 +13,7 @@ from portfolio_maker.infrastructure.presentation import markdown_text, normalize
 from portfolio_maker.infrastructure.github_connector import (
     canonical_repository_name,
     is_valid_github_timestamp,
-    public_github_activity_type,
+    public_github_activity_identity,
 )
 from portfolio_maker.infrastructure.sqlite_repository import SQLiteRepository
 from portfolio_maker.infrastructure.snapshots import load_valid_local_snapshot
@@ -110,6 +110,10 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
     excluded_repositories = set(approval.excluded_repositories)
     seen_activities: set[tuple[str, str, str]] = set()
     for activity in repository.list_github_activities():
+        try:
+            repository_name = canonical_repository_name(activity.repo)
+        except ValueError:
+            continue
         if (
             activity.id is None
             or activity.source_id is None
@@ -117,12 +121,9 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
             or activity.url not in approved_activity_urls
             or not activity.state.strip()
             or not is_valid_github_timestamp(activity.created_at)
-            or public_github_activity_type(activity.url) != activity.activity_type
+            or public_github_activity_identity(activity.url)
+            != (repository_name, activity.activity_type)
         ):
-            continue
-        try:
-            repository_name = canonical_repository_name(activity.repo)
-        except ValueError:
             continue
         source = source_by_id.get(activity.source_id)
         if (

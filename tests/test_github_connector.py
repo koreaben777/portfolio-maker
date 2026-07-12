@@ -180,6 +180,18 @@ def test_activity_parsers_reject_invalid_required_timestamps(timestamp):
 
 
 @pytest.mark.parametrize(
+    "url",
+    ("not-a-url", "https://github.com/octo/other/pull/1"),
+)
+def test_activity_parsers_reject_invalid_or_cross_repository_urls(url):
+    with pytest.raises(GitHubDiscoveryError, match="pull request list payload is invalid"):
+        parse_pr_list(
+            "octo/demo",
+            [{"url": url, "title": "Title", "state": "OPEN", "createdAt": "2026-01-01T00:00:00Z", "author": None}],
+        )
+
+
+@pytest.mark.parametrize(
     "conclusion,status",
     (("", None), (None, ""), ("", ""), ("   ", "\t")),
 )
@@ -321,7 +333,16 @@ def test_discover_github_candidates_keeps_partial_results_when_repo_activity_fai
                 },
             ]
         if args[:2] == ["pr", "list"] and args[3] == "octo/ok":
-            return load_fixture("gh_pr_list.json")
+            return [
+                {
+                    "url": "https://github.com/octo/ok/pull/1",
+                    "title": "Observed pull request",
+                    "state": "OPEN",
+                    "createdAt": "2026-01-01T00:00:00Z",
+                    "mergedAt": None,
+                    "author": None,
+                }
+            ]
         if "octo/flaky" in " ".join(args):
             raise GitHubDiscoveryError("rate limited")
         if args[:2] in (["pr", "list"], ["issue", "list"]):

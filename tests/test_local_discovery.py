@@ -550,10 +550,20 @@ def test_partial_rediscovery_revokes_successfully_empty_pr_endpoint(
     assert activity.url not in paths.portfolio_draft_path.read_text(encoding="utf-8")
 
 
-def test_partial_rediscovery_preserves_commit_when_timestamp_is_invalid(
+@pytest.mark.parametrize(
+    ("rediscovered_url", "rediscovered_timestamp"),
+    (
+        ("https://github.com/octo/demo/commit/abc123", "not-a-timestamp"),
+        ("not-a-url", "2026-01-02T00:00:00Z"),
+        ("https://github.com/octo/other/commit/abc123", "2026-01-02T00:00:00Z"),
+    ),
+)
+def test_partial_rediscovery_preserves_commit_when_payload_is_invalid(
     workspace,
     tmp_path,
     monkeypatch,
+    rediscovered_url,
+    rediscovered_timestamp,
 ):
     activity = GitHubActivityCandidate(
         repo="octo/demo",
@@ -572,7 +582,7 @@ def test_partial_rediscovery_preserves_commit_when_timestamp_is_invalid(
         if args[:2] == ["repo", "list"]:
             return [{"nameWithOwner": "octo/demo", "url": repo.url, "isPrivate": False}]
         if args == ["api", "repos/octo/demo/commits"]:
-            return [{"html_url": activity.url, "commit": {"message": "Invalid", "author": {"date": "not-a-timestamp"}}}]
+            return [{"html_url": rediscovered_url, "commit": {"message": "Invalid", "author": {"date": rediscovered_timestamp}}}]
         if args[:2] in (["pr", "list"], ["issue", "list"]):
             return []
         if args == ["api", "repos/octo/demo/pulls/comments"]:
@@ -610,6 +620,86 @@ def test_partial_rediscovery_preserves_commit_when_timestamp_is_invalid(
 
     assert ("octo/demo", "commit") not in rediscovery_results[0].completed_endpoints
     assert "GitHub commits discovery failed for octo/demo" in rediscovery_results[0].statuses[0]
+    repository = SQLiteRepository(paths.db_path)
+    assert repository.list_github_activities()[0].is_private is False
+    assert build_profile(BuildProfileRequest(workspace=workspace)).claim_count == 1
+    draft_portfolio(DraftPortfolioRequest(workspace=workspace))
+    assert activity.url in paths.portfolio_draft_path.read_text(encoding="utf-8")
+
+
+def test_partial_rediscovery_preserves_page_two_pull_request_evidence(
+    workspace,
+    tmp_path,
+    monkeypatch,
+):
+    activity = GitHubActivityCandidate(
+        repo="octo/demo",
+        activity_type="pull_request",
+        url="https://github.com/octo/demo/pull/1",
+        title="Older approved pull request",
+        state="MERGED",
+        author="octo",
+        created_at="2026-01-01T00:00:00Z",
+        merged_at="2026-01-02T00:00:00Z",
+    )
+    repo = GitHubRepositoryCandidate("octo/demo", "https://github.com/octo/demo", False)
+    rediscovery_results = []
+    first_page = [
+        {
+            "url": f"https://github.com/octo/demo/pull/{index}",
+            "title": f"New pull request {index}",
+            "state": "OPEN",
+            "createdAt": "2026-02-01T00:00:00Z",
+            "mergedAt": None,
+            "author": None,
+        }
+        for index in range(2, 102)
+    ]
+
+    def fake_run_gh_json(args):
+        if args[:2] == ["repo", "list"]:
+            return [{"nameWithOwner": "octo/demo", "url": repo.url, "isPrivate": False}]
+        if args[:2] == ["pr", "list"]:
+            return first_page
+        if args[:2] == ["issue", "list"]:
+            return []
+        if args == ["api", "repos/octo/demo/commits"]:
+            return []
+        if args == ["api", "repos/octo/demo/pulls/comments"]:
+            return []
+        if args == ["api", "repos/octo/demo/actions/runs"]:
+            return {"workflow_runs": []}
+        raise AssertionError(args)
+
+    monkeypatch.setattr(github_connector, "run_gh_json", fake_run_gh_json)
+    calls = 0
+
+    def fake_discover_github_candidates(**kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return github_discovery_result([repo], [activity])
+        result = github_connector.discover_github_candidates(**kwargs)
+        rediscovery_results.append(result)
+        return result
+
+    monkeypatch.setattr(
+        "portfolio_maker.application.discovery.discover_github_candidates",
+        fake_discover_github_candidates,
+    )
+    request = DiscoverSourcesRequest(workspace=workspace, home=tmp_path, include_github=True)
+    discover_sources(request)
+    paths = WorkspacePaths.from_root(workspace)
+    write_sample_approval(paths)
+    approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    approval["approved_github_activity_urls"] = [activity.url]
+    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+    assert build_profile(BuildProfileRequest(workspace=workspace)).claim_count == 1
+
+    discover_sources(request)
+
+    assert ("octo/demo", "pull_request") not in rediscovery_results[0].completed_endpoints
+    assert "GitHub pull requests discovery incomplete for octo/demo" in rediscovery_results[0].statuses[0]
     repository = SQLiteRepository(paths.db_path)
     assert repository.list_github_activities()[0].is_private is False
     assert build_profile(BuildProfileRequest(workspace=workspace)).claim_count == 1

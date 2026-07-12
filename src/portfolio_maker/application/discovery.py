@@ -148,7 +148,7 @@ def _render_report(
     lines = [
         "# Discovery Report",
         "",
-        "> MVP limits: local discovery records at most 500 candidates. GitHub repository, pull request, and issue commands request at most 100 items; GitHub API endpoints are not paginated, so results may be incomplete.",
+        "> MVP limits: local discovery records at most 500 candidates. GitHub activity endpoints are not paginated, so results may be incomplete; an endpoint that reaches its request cap is marked incomplete and does not revoke prior activity visibility.",
         "",
         "## Local candidates",
     ]
