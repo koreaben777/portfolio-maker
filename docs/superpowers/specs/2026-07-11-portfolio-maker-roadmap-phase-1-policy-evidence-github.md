@@ -3,7 +3,7 @@
 날짜: 2026-07-11
 상태: developer 구현 준비 완료
 대상 Issue: #4 → #2 → #1
-후속 렌더링: #3 → #11
+후속 렌더링: #3 → #11 (`@sites` 선택적 presentation/hosting)
 
 ## 1. 목적과 범위
 
@@ -54,6 +54,8 @@ Portfolio Maker 0.1.0은 승인된 로컬 파일에서 근거 기반 master prof
 #3 회사/JD별 맞춤 포트폴리오
   ↓
 #11 공개용 인터랙티브 HTML 포트폴리오
+      ├─ emilkowalski/skills: 디자인·모션 검토 기준
+      └─ @sites: 디자인 선택·빌드 검증·선택적 호스팅
 ```
 
 각 Issue의 focused test와 전체 `pytest`가 통과하기 전에는 다음 Issue의 runtime 동작을 구현하지 않는다. 문서·샘플 approval·README는 해당 Issue와 같은 변경 단위로 갱신한다.
@@ -204,6 +206,33 @@ Stage C는 approval schema에 다음 optional 필드를 추가한다.
 - HTML/attribute/JavaScript context별 escaping과 CSP-friendly inline-free 또는 hashed asset strategy
 - automated output tests와 실제 브라우저 수동 검증
 
+### 7.3 #11에서의 emilkowalski/skills + @sites 연동 계획
+
+두 도구는 같은 계층에서 경쟁하지 않고 역할을 나눠 사용한다.
+
+| 계층 | 역할 | 금지 범위 |
+|---|---|---|
+| Portfolio Maker CLI/Python/SQLite | 승인, evidence/claim 검증, `portfolio.html`과 자산 생성의 기준 | Sites에 raw DB·원본 파일·비공개 snapshot 전달 |
+| 설치된 `emilkowalski/skills` | `emil-design-eng`, `review-animations` 등의 원칙으로 타이포그래피·간격·상태·모션·접근성 설계와 리뷰 수행 | 런타임 CDN/외부 API/생성 데이터 소스로 사용 |
+| Codex `@sites` | 공개 페이지 디자인 선택, 기존 HTML/정적 자산의 Sites 표면 빌드·검증, 필요 시 선택적 호스팅 | 근거 수집기·비즈니스 로직·자동 공개 승인 대체 |
+
+구현 절차:
+
+1. #3 산출물을 포함한 public-safe manifest와 HTML 정보 구조를 로컬에서 확정한다. 이 단계에서 원본 경로, `.portfolio-maker/` 내부 파일, SQLite, 자격 증명은 Sites 입력에서 제외한다.
+2. 공개 대상과 방문자, 섹션, 탐색/필터, 근거 상세, 키보드·모바일·대비 요구를 포함한 디자인 brief를 만든다.
+3. `@sites` 디자인 흐름에서 비교 가능한 시안을 **정확히 3개** 순차 제시하고 하나를 선택한다. 설치된 `emilkowalski/skills`는 선택안의 motion/interaction review checklist로 적용하며 런타임 의존성으로 포함하지 않는다.
+4. 선택한 방향으로 정적 HTML 표면을 빌드하고 `npm run build`, 로컬 파일 직접 열기, Codex 브라우저의 키보드·모바일·접근성 수동 검증을 통과시킨다.
+5. 검증을 통과한 뒤에만 `sites-hosting`을 사용한다. 기본은 private 배포이며, public URL 배포는 별도 명시적 승인을 받은 경우에만 수행한다.
+6. Sites 배포가 있더라도 로컬 `.portfolio-maker/artifacts/portfolio.html`을 canonical artifact로 유지한다. Sites는 presentation/hosting 계층이며 Portfolio Maker의 승인·근거 모델을 대체하지 않는다.
+
+완료 게이트:
+
+- 디자인 선택 전에는 HTML 구현을 시작하지 않는다.
+- 세 시안의 차이와 선택 결과가 구현 brief에 기록된다.
+- 공개 산출물과 Sites 업로드 대상에 public-safe manifest만 존재한다.
+- 빌드 실패, 접근성 결함, escaping 실패, 직접 열기 실패가 있으면 호스팅하지 않는다.
+- private/public 배포 상태와 URL 공개 여부가 사용자의 명시적 선택과 일치한다.
+
 ## 8. developer 작업 지시
 
 1. 현재 `origin/main`에서 작업을 시작하고 dirty/untracked 파일을 먼저 분리한다.
@@ -212,7 +241,8 @@ Stage C는 approval schema에 다음 optional 필드를 추가한다.
 4. 같은 방식으로 #2, 그다음 #1을 순서대로 진행한다.
 5. 각 stage가 끝날 때 README, sample approval, Issue의 현재 상태를 code behavior와 맞춘다.
 6. #3, #11 또는 다른 roadmap Issue는 구현하지 않는다. 필요한 model/renderer 확장은 Issue와 이 명세의 후속 stage로 남긴다.
-7. 최종 보고에는 변경 파일, HEAD, 실행한 검증 명령, 결과, 남은 위험을 포함한다.
+7. #11을 구현할 때에만 7.3의 emilkowalski/skills + @sites 흐름을 적용한다. #4 → #2 → #1 구현 중에는 Sites 초기화·디자인 선택·호스팅을 실행하지 않는다.
+8. 최종 보고에는 변경 파일, HEAD, 실행한 검증 명령, 결과, 남은 위험을 포함한다.
 
 ## 9. 명세 자체 점검
 
@@ -220,4 +250,5 @@ Stage C는 approval schema에 다음 optional 필드를 추가한다.
 - #2가 #1과 #11에 필요한 근거 추적 모델을 제공한다.
 - #1은 explicit activity approval과 public/private 경계를 분리한다.
 - #11은 public-safe data만 렌더링하며 #3 이전 구현 범위에 섞이지 않는다.
+- #11은 emilkowalski/skills를 설계·리뷰 기준으로, @sites를 presentation/hosting 표면으로 사용하되 evidence authority를 대체하지 않는다.
 - 현재 0.1.0의 local-first, approval-first, GitHub fail-open, review-required portfolio 경계를 유지한다.
