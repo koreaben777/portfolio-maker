@@ -436,6 +436,8 @@ def _required_workflow_state(
     if "status" not in item or not isinstance(item["status"], str):
         raise GitHubDiscoveryError(f"GitHub {label} payload is invalid")
     status = item["status"]
+    if _contains_unicode_control(status):
+        raise GitHubDiscoveryError(f"GitHub {label} payload is invalid")
     normalized_status = normalize_label(status).casefold()
     if not status.strip() or normalized_status not in _WORKFLOW_STATUS_STATES:
         raise GitHubDiscoveryError(f"GitHub {label} payload is invalid")
@@ -449,6 +451,7 @@ def _required_workflow_state(
     if (
         not isinstance(conclusion, str)
         or not conclusion.strip()
+        or _contains_unicode_control(conclusion)
         or normalize_label(conclusion).casefold() not in _WORKFLOW_CONCLUSION_STATES
     ):
         raise GitHubDiscoveryError(f"GitHub {label} payload is invalid")
@@ -532,6 +535,8 @@ def is_valid_github_timestamp(value: str) -> bool:
 def is_valid_github_activity_state(
     activity_type: str, value: str, state_field: str | None = None
 ) -> bool:
+    if activity_type == "workflow_run" and _contains_unicode_control(value):
+        return False
     normalized = normalize_label(value).casefold()
     if activity_type == "workflow_run":
         if state_field == "conclusion":
@@ -540,6 +545,10 @@ def is_valid_github_activity_state(
             return normalized in _WORKFLOW_NON_COMPLETED_STATUS_STATES
         return False
     return normalized in _ACTIVITY_STATES.get(activity_type, ())
+
+
+def _contains_unicode_control(value: str) -> bool:
+    return any(unicodedata.category(character).startswith("C") for character in value)
 
 
 def canonical_repository_name(name: str) -> str:

@@ -240,6 +240,25 @@ def test_workflow_parser_accepts_only_compatible_nonblank_pairs():
             )
 
 
+def test_workflow_parser_rejects_control_suffix_before_normalization():
+    with pytest.raises(GitHubDiscoveryError, match="workflow run list payload is invalid"):
+        parse_workflow_run_list(
+            "octo/demo",
+            {
+                "workflow_runs": [
+                    {
+                        "html_url": "https://github.com/octo/demo/actions/runs/1",
+                        "name": "CI",
+                        "conclusion": None,
+                        "status": "queued\u0000",
+                        "actor": {"login": "octo"},
+                        "created_at": "2026-01-01T00:00:00Z",
+                    }
+                ]
+            },
+        )
+
+
 def test_parse_commit_review_and_workflow_run_lists():
     commits = parse_commit_list("octo/demo", load_fixture("gh_commit_list.json"))
     reviews = parse_review_list("octo/demo", load_fixture("gh_review_list.json"))

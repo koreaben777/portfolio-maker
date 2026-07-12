@@ -15,6 +15,7 @@ from portfolio_maker.application.models import (
 )
 from portfolio_maker.domain.models import GitHubActivity, Source, SourceStatus, SourceType
 from portfolio_maker.infrastructure.extractors import extract_text
+from portfolio_maker.infrastructure.github_connector import parse_workflow_run_list
 from portfolio_maker.infrastructure.sqlite_repository import SQLiteRepository
 from portfolio_maker.workspace import WorkspacePaths
 
@@ -311,6 +312,65 @@ def test_build_profile_traces_approved_github_claim_to_evidence(tmp_path):
             """
         ).fetchone()
     assert tuple(row) == (activity_id, activity_url, 1, "direct", 1)
+
+
+def test_build_profile_masks_bearer_workflow_author_from_parser_to_artifact(tmp_path):
+    workspace = tmp_path / "workspace"
+    paths = WorkspacePaths.from_root(workspace)
+    write_sample_approval(paths)
+    activity_url = "https://github.com/octo/demo/actions/runs/1"
+    approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    approval["approved_github_activity_urls"] = [activity_url]
+    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+    candidate = parse_workflow_run_list(
+        "octo/demo",
+        {
+            "workflow_runs": [
+                {
+                    "html_url": activity_url,
+                    "name": "CI",
+                    "conclusion": "success",
+                    "status": "completed",
+                    "actor": {"login": "Bearer author-sentinel"},
+                    "created_at": "2026-01-01T00:00:00Z",
+                }
+            ]
+        },
+    )[0]
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    source_id = repository.upsert_source(
+        Source(
+            None,
+            SourceType.GITHUB_REPOSITORY,
+            "https://github.com/octo/demo",
+            "octo/demo",
+            "octo",
+            SourceStatus.DISCOVERED,
+        )
+    )
+    repository.insert_github_activity(
+        GitHubActivity(
+            None,
+            source_id,
+            candidate.repo,
+            candidate.activity_type,
+            candidate.url,
+            candidate.title,
+            candidate.state,
+            candidate.author,
+            candidate.created_at,
+            candidate.merged_at,
+            state_field=candidate.state_field,
+        )
+    )
+
+    result = build_profile(BuildProfileRequest(workspace=workspace))
+    profile = json.loads(result.json_path.read_text(encoding="utf-8"))
+
+    assert result.claim_count == 1
+    assert "Bearer author-sentinel" not in json.dumps(profile)
+    assert profile["claims"][0]["author"] == "[REDACTED]"
 
 
 def test_draft_portfolio_renders_approved_github_activity_as_evidence_with_provenance(tmp_path):
@@ -760,6 +820,19 @@ def test_build_profile_accepts_persisted_workflow_provenance_but_rejects_ambiguo
     draft_portfolio(DraftPortfolioRequest(workspace=workspace))
 
     assert completed_result.claim_count == 0
+    assert activity_url not in paths.portfolio_draft_path.read_text(encoding="utf-8")
+
+    control_state = "queued" + chr(0)
+    with repository._connection() as conn:
+        conn.execute(
+            "UPDATE github_activities SET state = ? WHERE id = ?",
+            (control_state, activity_id),
+        )
+
+    control_result = build_profile(BuildProfileRequest(workspace=workspace))
+    draft_portfolio(DraftPortfolioRequest(workspace=workspace))
+
+    assert control_result.claim_count == 0
     assert activity_url not in paths.portfolio_draft_path.read_text(encoding="utf-8")
 
     with repository._connection() as conn:

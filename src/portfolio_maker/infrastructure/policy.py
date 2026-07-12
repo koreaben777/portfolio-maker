@@ -54,6 +54,7 @@ SECRET_PATTERNS = [
         re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"),
         "literal",
     ),
+    (re.compile(r"(?i)\bBearer\s+[^\s,;]+"), "literal"),
     (re.compile(r"(?im)(Authorization\s*:\s*Bearer\s+)[^\s,;]+"), "bare_key_value"),
     (re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b"), "literal"),
     (re.compile(r"github_pat_[A-Za-z0-9_]{20,}"), "literal"),
