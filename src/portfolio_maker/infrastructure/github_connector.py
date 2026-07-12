@@ -32,6 +32,26 @@ class GitHubActivityCandidate:
     merged_at: str | None
 
 
+@dataclass(frozen=True)
+class GitHubEndpointOutcome:
+    repository: str
+    activity_type: str
+    succeeded: bool
+
+
+@dataclass(frozen=True)
+class GitHubDiscoveryResult:
+    repositories: list[GitHubRepositoryCandidate]
+    activities: list[GitHubActivityCandidate]
+    statuses: list[str]
+    endpoint_outcomes: tuple[GitHubEndpointOutcome, ...]
+
+    def __iter__(self):
+        yield self.repositories
+        yield self.activities
+        yield self.statuses
+
+
 _PUBLIC_ACTIVITY_PATH = re.compile(
     r"^/(?P<owner>[A-Za-z0-9][A-Za-z0-9_-]*)/"
     r"(?P<repository>[A-Za-z0-9][A-Za-z0-9_.-]*)/"
@@ -74,7 +94,7 @@ def parse_pr_list(repo: str, payload: Any) -> list[GitHubActivityCandidate]:
             title=_required_string(item, "title", "pull request list"),
             state=_required_nonempty_string(item, "state", "pull request list"),
             author=_nested_optional_string(item, "author", "login", "pull request list"),
-            created_at=_required_string(item, "createdAt", "pull request list"),
+            created_at=_required_nonempty_string(item, "createdAt", "pull request list"),
             merged_at=_optional_string(item, "mergedAt", "pull request list"),
         )
         for item in _list_payload(payload, "pull request list")
@@ -90,7 +110,7 @@ def parse_issue_list(repo: str, payload: Any) -> list[GitHubActivityCandidate]:
             title=_required_string(item, "title", "issue list"),
             state=_required_nonempty_string(item, "state", "issue list"),
             author=_nested_optional_string(item, "author", "login", "issue list"),
-            created_at=_required_string(item, "createdAt", "issue list"),
+            created_at=_required_nonempty_string(item, "createdAt", "issue list"),
             merged_at=None,
         )
         for item in _list_payload(payload, "issue list")
@@ -129,7 +149,7 @@ def parse_review_list(repo: str, payload: Any) -> list[GitHubActivityCandidate]:
                 title=f"Review comment: {_required_string(item, 'body', 'review comment list')}".splitlines()[0],
                 state="commented",
                 author=_nested_required_string(item, "user", "login", "review comment list"),
-                created_at=_required_string(item, "created_at", "review comment list"),
+                created_at=_required_nonempty_string(item, "created_at", "review comment list"),
                 merged_at=None,
             )
         )
@@ -151,7 +171,7 @@ def parse_workflow_run_list(repo: str, payload: Any) -> list[GitHubActivityCandi
                 title=_required_string(item, "name", "workflow run list"),
                 state=_required_one_of_strings(item, ("conclusion", "status"), "workflow run list"),
                 author=_nested_required_string(item, "actor", "login", "workflow run list"),
-                created_at=_required_string(item, "created_at", "workflow run list"),
+                created_at=_required_nonempty_string(item, "created_at", "workflow run list"),
                 merged_at=None,
             )
         )
@@ -175,7 +195,7 @@ def discover_github_candidates(
     excluded_repositories: tuple[str, ...] = (),
     allowed_repositories: tuple[str, ...] = (),
     private_sources_allowed: bool = False,
-) -> tuple[list[GitHubRepositoryCandidate], list[GitHubActivityCandidate], list[str]]:
+) -> GitHubDiscoveryResult:
     repos = parse_repo_list(
         run_gh_json(
             [
@@ -199,9 +219,11 @@ def discover_github_candidates(
     ]
     activities: list[GitHubActivityCandidate] = []
     statuses: list[str] = []
+    endpoint_outcomes: list[GitHubEndpointOutcome] = []
     endpoints = (
         (
             "pull requests",
+            "pull_request",
             parse_pr_list,
             [
                 "pr",
@@ -216,9 +238,10 @@ def discover_github_candidates(
                 "100",
             ],
         ),
-        ("commits", parse_commit_list, ["api", "repos/{repo}/commits"]),
+        ("commits", "commit", parse_commit_list, ["api", "repos/{repo}/commits"]),
         (
             "issues",
+            "issue",
             parse_issue_list,
             [
                 "issue",
@@ -233,19 +256,25 @@ def discover_github_candidates(
                 "100",
             ],
         ),
-        ("review comments", parse_review_list, ["api", "repos/{repo}/pulls/comments"]),
-        ("workflow runs", parse_workflow_run_list, ["api", "repos/{repo}/actions/runs"]),
+        ("review comments", "review_comment", parse_review_list, ["api", "repos/{repo}/pulls/comments"]),
+        ("workflow runs", "workflow_run", parse_workflow_run_list, ["api", "repos/{repo}/actions/runs"]),
     )
     for repo in repos:
-        for label, parser, args_template in endpoints:
+        for label, activity_type, parser, args_template in endpoints:
             args = [part.format(repo=repo.name_with_owner) for part in args_template]
             try:
                 activities.extend(parser(repo.name_with_owner, run_gh_json(args)))
+                endpoint_outcomes.append(
+                    GitHubEndpointOutcome(repo.name_with_owner, activity_type, True)
+                )
             except GitHubDiscoveryError as error:
+                endpoint_outcomes.append(
+                    GitHubEndpointOutcome(repo.name_with_owner, activity_type, False)
+                )
                 statuses.append(
                     f"GitHub {label} discovery failed for {repo.name_with_owner}: {error}"
                 )
-    return repos, activities, statuses
+    return GitHubDiscoveryResult(repos, activities, statuses, tuple(endpoint_outcomes))
 
 
 def _list_payload(payload: Any, label: str) -> list[dict[str, Any]]:

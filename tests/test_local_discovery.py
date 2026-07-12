@@ -17,6 +17,8 @@ from portfolio_maker.application.models import (
 from portfolio_maker.domain.models import SourceStatus, SourceType
 from portfolio_maker.infrastructure.github_connector import (
     GitHubActivityCandidate,
+    GitHubDiscoveryResult,
+    GitHubEndpointOutcome,
     GitHubRepositoryCandidate,
 )
 from portfolio_maker.infrastructure.local_discovery import discover_local_candidates
@@ -445,8 +447,13 @@ def test_partial_rediscovery_hides_activity_from_repository_that_is_no_longer_pu
     public_repo = GitHubRepositoryCandidate("octo/demo", "https://github.com/octo/demo", False)
     private_repo = GitHubRepositoryCandidate("octo/demo", "https://github.com/octo/demo", True)
     responses = [
-        ([public_repo], [activity], []),
-        ([private_repo], [], ["GitHub workflow runs discovery failed for octo/other"]),
+        GitHubDiscoveryResult([public_repo], [activity], [], ()),
+        GitHubDiscoveryResult(
+            [private_repo],
+            [],
+            ["GitHub workflow runs discovery failed for octo/other"],
+            (),
+        ),
     ]
     monkeypatch.setattr(
         "portfolio_maker.application.discovery.discover_github_candidates",
@@ -468,6 +475,57 @@ def test_partial_rediscovery_hides_activity_from_repository_that_is_no_longer_pu
 
     repository = SQLiteRepository(paths.db_path)
     assert repository.list_github_activities()[0].is_private is True
+    assert build_profile(BuildProfileRequest(workspace=workspace)).claim_count == 0
+    draft_portfolio(DraftPortfolioRequest(workspace=workspace))
+    assert activity.url not in paths.portfolio_draft_path.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("failure_repository", ("octo/other", "octo/demo"))
+def test_partial_rediscovery_revokes_successfully_empty_pr_endpoint(
+    workspace,
+    tmp_path,
+    monkeypatch,
+    failure_repository,
+):
+    activity = GitHubActivityCandidate(
+        repo="octo/demo",
+        activity_type="pull_request",
+        url="https://github.com/octo/demo/pull/1",
+        title="Previously public",
+        state="MERGED",
+        author="octo",
+        created_at="2026-01-01T00:00:00Z",
+        merged_at="2026-01-02T00:00:00Z",
+    )
+    demo = GitHubRepositoryCandidate("octo/demo", "https://github.com/octo/demo", False)
+    other = GitHubRepositoryCandidate("octo/other", "https://github.com/octo/other", False)
+    responses = [
+        GitHubDiscoveryResult([demo], [activity], [], ()),
+        GitHubDiscoveryResult(
+            [demo, other],
+            [],
+            [f"GitHub workflow runs discovery failed for {failure_repository}"],
+            (
+                GitHubEndpointOutcome("octo/demo", "pull_request", True),
+                GitHubEndpointOutcome(failure_repository, "workflow_run", False),
+            ),
+        ),
+    ]
+    monkeypatch.setattr(
+        "portfolio_maker.application.discovery.discover_github_candidates",
+        lambda **kwargs: responses.pop(0),
+    )
+    request = DiscoverSourcesRequest(workspace=workspace, home=tmp_path, include_github=True)
+    discover_sources(request)
+    paths = WorkspacePaths.from_root(workspace)
+    write_sample_approval(paths)
+    approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    approval["approved_github_activity_urls"] = [activity.url]
+    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+    assert build_profile(BuildProfileRequest(workspace=workspace)).claim_count == 1
+
+    discover_sources(request)
+
     assert build_profile(BuildProfileRequest(workspace=workspace)).claim_count == 0
     draft_portfolio(DraftPortfolioRequest(workspace=workspace))
     assert activity.url not in paths.portfolio_draft_path.read_text(encoding="utf-8")

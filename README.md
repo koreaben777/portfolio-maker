@@ -78,7 +78,8 @@ portfolio-maker discover --workspace .
 .portfolio-maker/reviews/source-approval.json
 ```
 
-discovery report의 public `GitHub Activities`에서 선택한 정확한 URL을
+discovery report의 `GitHub Activities`에서 URL을 고르기 전에, 대응하는
+`GitHub Repositories` 항목이 `(public)`으로 표시되는지 확인합니다. 선택한 정확한 URL을
 `approved_github_activity_urls`에 복사한 뒤, 로컬 `approved_source_uris`를 함께
 검토·완성합니다. private, excluded, missing, stale activity는 승인하지 않습니다.
 그 다음 아래 순서로 실행합니다.

@@ -49,7 +49,7 @@ If the user supplied forbidden paths, pass one `--forbidden-path` argument per p
 .portfolio-maker/reviews/discovery-report.md
 ```
 
-7. From the report's public `GitHub Activities` section, copy each selected exact URL into `approved_github_activity_urls`. Do not approve private, excluded, missing, or stale activities.
+7. In `GitHub Activities`, find each candidate URL only after confirming its matching entry in `GitHub Repositories` is marked `(public)`. Copy the selected exact URL into `approved_github_activity_urls`. Do not approve private, excluded, missing, or stale activities.
 
 8. Ask the user to complete local source approval:
 

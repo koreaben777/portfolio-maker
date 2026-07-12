@@ -115,6 +115,7 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
             or activity.is_private
             or activity.url not in approved_activity_urls
             or not activity.state.strip()
+            or not activity.created_at.strip()
             or public_github_activity_type(activity.url) != activity.activity_type
         ):
             continue

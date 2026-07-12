@@ -5,6 +5,7 @@ from portfolio_maker.application.models import DiscoverSourcesRequest, DiscoverS
 from portfolio_maker.domain.models import GitHubActivity, Source, SourceStatus, SourceType
 from portfolio_maker.infrastructure.github_connector import (
     GitHubDiscoveryError,
+    GitHubDiscoveryResult,
     GitHubActivityCandidate,
     GitHubRepositoryCandidate,
     canonical_repository_name,
@@ -54,19 +55,31 @@ def discover_sources(request: DiscoverSourcesRequest) -> DiscoverSourcesResult:
         allowed_repositories = approval.allowed_repositories if approval else ()
         private_sources_allowed = approval.private_sources_allowed if approval else False
         try:
-            github_repos, github_activities, github_statuses = discover_github_candidates(
+            discovery_result = discover_github_candidates(
                 excluded_repositories=tuple(excluded_repositories),
                 allowed_repositories=tuple(allowed_repositories),
                 private_sources_allowed=private_sources_allowed,
             )
+            github_repos, github_activities, github_statuses = discovery_result
             # Only a complete GitHub discovery is a visibility authority. A
             # failed endpoint leaves confirmed public repositories intact for retry.
             if not github_statuses:
                 repository.invalidate_github_activity_visibility()
             else:
-                repository.invalidate_unconfirmed_github_activity_visibility(
-                    tuple(repo.name_with_owner for repo in github_repos if not repo.is_private)
+                confirmed_repositories = tuple(
+                    repo.name_with_owner for repo in github_repos if not repo.is_private
                 )
+                repository.invalidate_unconfirmed_github_activity_visibility(
+                    confirmed_repositories
+                )
+                if isinstance(discovery_result, GitHubDiscoveryResult):
+                    repository.invalidate_github_activity_visibility_for_endpoints(
+                        tuple(
+                            (outcome.repository, outcome.activity_type)
+                            for outcome in discovery_result.endpoint_outcomes
+                            if outcome.succeeded and outcome.repository in confirmed_repositories
+                        )
+                    )
         except (GitHubDiscoveryError, FileNotFoundError) as error:
             github_statuses = [str(error) or "GitHub discovery failed"]
 
