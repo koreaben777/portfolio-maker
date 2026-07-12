@@ -1,5 +1,7 @@
 # Portfolio Maker 0.1.0 Final Review Report
 
+> **Historical baseline note:** This report records the pre-Phase-1 0.1.0 final review. Its GitHub discovery-only and three-table schema statements describe that historical snapshot, not the current runtime. The [current Phase 1 policy and evidence contract](../superpowers/specs/2026-07-11-portfolio-maker-roadmap-phase-1-policy-evidence-github.md) is authoritative.
+
 Date: 2026-07-11
 Version: `0.1.0`
 Final review status: PASS

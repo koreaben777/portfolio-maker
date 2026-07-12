@@ -14,6 +14,7 @@ from portfolio_maker.infrastructure.github_connector import (
     parse_repo_list,
     parse_review_list,
     parse_workflow_run_list,
+    public_github_activity_identity,
 )
 
 
@@ -58,6 +59,17 @@ def test_parse_repo_list_canonicalizes_and_deduplicates_case_equivalent_reposito
     ]
 
 
+def test_parse_repo_list_treats_a_private_duplicate_as_private():
+    repos = parse_repo_list(
+        [
+            {"nameWithOwner": "Octo/Demo", "url": "https://github.com/Octo/Demo", "isPrivate": False},
+            {"nameWithOwner": "octo/demo", "url": "https://github.com/octo/demo", "isPrivate": True},
+        ]
+    )
+
+    assert repos[0].is_private is True
+
+
 @pytest.mark.parametrize("repository", ("../repo", "owner/..", "_owner/repo", "-owner/repo"))
 def test_parse_repo_list_rejects_noncanonical_repository_name(repository):
     with pytest.raises(GitHubDiscoveryError, match="repository list payload is invalid"):
@@ -69,6 +81,21 @@ def test_parse_repo_list_rejects_noncanonical_repository_name(repository):
                     "isPrivate": False,
                 }
             ]
+        )
+
+
+@pytest.mark.parametrize(
+    "url",
+    (
+        "not-a-url",
+        "https://github.com/octo/other",
+        "https://github.com/octo/demo/pull/1",
+    ),
+)
+def test_parse_repo_list_rejects_url_not_bound_to_repository_name(url):
+    with pytest.raises(GitHubDiscoveryError, match="repository list payload is invalid"):
+        parse_repo_list(
+            [{"nameWithOwner": "octo/demo", "url": url, "isPrivate": False}]
         )
 
 
@@ -192,6 +219,28 @@ def test_activity_parsers_reject_invalid_or_cross_repository_urls(url):
 
 
 @pytest.mark.parametrize(
+    "url",
+    (
+        "https://github.com/octo/demo/pull/not-a-pr",
+        "https://github.com/octo/demo/issues/not-an-issue",
+        "https://github.com/octo/demo/commit/not-a-sha",
+        "https://github.com/octo/demo/actions/runs/not-a-run",
+        "https://github.com/octo/demo/pull/not-a-pr#discussion_r1",
+    ),
+)
+def test_public_github_activity_identity_rejects_invalid_type_specific_identifiers(url):
+    assert public_github_activity_identity(url) is None
+
+
+def test_parse_pr_list_rejects_invalid_numeric_identifier():
+    with pytest.raises(GitHubDiscoveryError, match="pull request list payload is invalid"):
+        parse_pr_list(
+            "octo/demo",
+            [{"url": "https://github.com/octo/demo/pull/not-a-pr", "title": "Title", "state": "OPEN", "createdAt": "2026-01-01T00:00:00Z", "author": None}],
+        )
+
+
+@pytest.mark.parametrize(
     "conclusion,status",
     (("", None), (None, ""), ("", ""), ("   ", "\t")),
 )
@@ -260,6 +309,46 @@ def test_discover_github_candidates_collects_repo_activities(monkeypatch):
         ("octo/demo", "review_comment"),
         ("octo/demo", "workflow_run"),
     }
+    assert result.repositories_complete is True
+
+
+def test_discover_github_candidates_marks_repository_cap_incomplete(monkeypatch):
+    repository_list = [
+        {"nameWithOwner": "Octo/Demo", "url": "https://github.com/Octo/Demo", "isPrivate": False}
+    ] + [
+        {
+            "nameWithOwner": "octo/demo",
+            "url": "https://github.com/octo/demo",
+            "isPrivate": False,
+        }
+        for index in range(1, 100)
+    ]
+
+    def fake_run_gh_json(args):
+        if args[:2] == ["repo", "list"]:
+            return repository_list
+        if args[:2] in (["pr", "list"], ["issue", "list"]):
+            return []
+        if args == ["api", "repos/octo/demo/commits"]:
+            return []
+        if args == ["api", "repos/octo/demo/pulls/comments"]:
+            return []
+        if args == ["api", "repos/octo/demo/actions/runs"]:
+            return {"workflow_runs": []}
+        raise AssertionError(args)
+
+    monkeypatch.setattr(
+        "portfolio_maker.infrastructure.github_connector.run_gh_json",
+        fake_run_gh_json,
+    )
+
+    result = discover_github_candidates()
+
+    assert [repo.name_with_owner for repo in result.repositories] == ["octo/demo"]
+    assert result.repositories_complete is False
+    assert result.statuses[0] == (
+        "GitHub repository list discovery incomplete: result reached the 100-item limit"
+    )
 
 
 def test_discover_github_candidates_filters_repos_before_activity_calls(monkeypatch):
@@ -482,7 +571,7 @@ def test_parse_commit_list_handles_empty_commit_message():
         "octo/demo",
         [
             {
-                "html_url": "https://github.com/octo/demo/commit/synthetic",
+                "html_url": "https://github.com/octo/demo/commit/abcdef1",
                 "commit": {
                     "message": "",
                     "author": {"date": "2026-01-01T00:00:00Z"},

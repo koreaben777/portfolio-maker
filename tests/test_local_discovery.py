@@ -32,12 +32,14 @@ def github_discovery_result(
     activities: list[GitHubActivityCandidate],
     statuses: list[str] | None = None,
     completed_endpoints: tuple[tuple[str, str], ...] = (),
+    repositories_complete: bool = True,
 ) -> GitHubDiscoveryResult:
     return GitHubDiscoveryResult(
         repositories,
         activities,
         statuses if statuses is not None else [],
         completed_endpoints,
+        repositories_complete,
     )
 
 
@@ -352,6 +354,31 @@ def test_discover_sources_keeps_local_report_when_github_fails(workspace, tmp_pa
     assert "GitHub discovery failed" in report
 
 
+def test_discovery_report_labels_incomplete_github_status_without_failure_prefix(
+    workspace,
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "portfolio_maker.application.discovery.discover_github_candidates",
+        lambda **kwargs: github_discovery_result(
+            [],
+            [],
+            ["GitHub repository list discovery incomplete: result reached the 100-item limit"],
+            (),
+            False,
+        ),
+    )
+
+    result = discover_sources(
+        DiscoverSourcesRequest(workspace=workspace, home=tmp_path, include_github=True)
+    )
+
+    report = result.report_path.read_text(encoding="utf-8")
+    assert "GitHub discovery incomplete: GitHub repository list discovery incomplete" in report
+    assert "GitHub discovery failed: GitHub repository list discovery incomplete" not in report
+
+
 def test_successful_github_rediscovery_invalidates_disappeared_activities(workspace, tmp_path, monkeypatch):
     activity = GitHubActivityCandidate(
         repo="octo/demo",
@@ -556,6 +583,7 @@ def test_partial_rediscovery_revokes_successfully_empty_pr_endpoint(
         ("https://github.com/octo/demo/commit/abc123", "not-a-timestamp"),
         ("not-a-url", "2026-01-02T00:00:00Z"),
         ("https://github.com/octo/other/commit/abc123", "2026-01-02T00:00:00Z"),
+        ("https://github.com/octo/demo/commit/not-a-sha", "2026-01-02T00:00:00Z"),
     ),
 )
 def test_partial_rediscovery_preserves_commit_when_payload_is_invalid(
@@ -705,6 +733,155 @@ def test_partial_rediscovery_preserves_page_two_pull_request_evidence(
     assert build_profile(BuildProfileRequest(workspace=workspace)).claim_count == 1
     draft_portfolio(DraftPortfolioRequest(workspace=workspace))
     assert activity.url in paths.portfolio_draft_path.read_text(encoding="utf-8")
+
+
+def test_repository_cap_preserves_unreturned_public_activity_evidence(
+    workspace,
+    tmp_path,
+    monkeypatch,
+):
+    activity = GitHubActivityCandidate(
+        repo="octo/old",
+        activity_type="pull_request",
+        url="https://github.com/octo/old/pull/1",
+        title="Previously approved pull request",
+        state="MERGED",
+        author="octo",
+        created_at="2026-01-01T00:00:00Z",
+        merged_at="2026-01-02T00:00:00Z",
+    )
+    old_repo = GitHubRepositoryCandidate("octo/old", "https://github.com/octo/old", False)
+    capped_repositories = [
+        {"nameWithOwner": "Octo/Demo", "url": "https://github.com/Octo/Demo", "isPrivate": False}
+    ] + [
+        {
+            "nameWithOwner": "octo/demo",
+            "url": "https://github.com/octo/demo",
+            "isPrivate": False,
+        }
+        for index in range(1, 100)
+    ]
+    rediscovery_results = []
+
+    def fake_run_gh_json(args):
+        if args[:2] == ["repo", "list"]:
+            return capped_repositories
+        if args[:2] in (["pr", "list"], ["issue", "list"]):
+            return []
+        if args == ["api", "repos/octo/demo/commits"]:
+            return []
+        if args == ["api", "repos/octo/demo/pulls/comments"]:
+            return []
+        if args == ["api", "repos/octo/demo/actions/runs"]:
+            return {"workflow_runs": []}
+        raise AssertionError(args)
+
+    monkeypatch.setattr(github_connector, "run_gh_json", fake_run_gh_json)
+    calls = 0
+
+    def fake_discover_github_candidates(**kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return github_discovery_result([old_repo], [activity])
+        result = github_connector.discover_github_candidates(**kwargs)
+        rediscovery_results.append(result)
+        return result
+
+    monkeypatch.setattr(
+        "portfolio_maker.application.discovery.discover_github_candidates",
+        fake_discover_github_candidates,
+    )
+    request = DiscoverSourcesRequest(workspace=workspace, home=tmp_path, include_github=True)
+    discover_sources(request)
+    paths = WorkspacePaths.from_root(workspace)
+    write_sample_approval(paths)
+    approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    approval["approved_github_activity_urls"] = [activity.url]
+    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+    assert build_profile(BuildProfileRequest(workspace=workspace)).claim_count == 1
+
+    discover_sources(request)
+
+    assert rediscovery_results[0].repositories_complete is False
+    repository = SQLiteRepository(paths.db_path)
+    assert repository.list_github_activities()[0].is_private is False
+    assert build_profile(BuildProfileRequest(workspace=workspace)).claim_count == 1
+    draft_portfolio(DraftPortfolioRequest(workspace=workspace))
+    assert activity.url in paths.portfolio_draft_path.read_text(encoding="utf-8")
+
+
+def test_capped_repository_list_revokes_observed_private_activity(
+    workspace,
+    tmp_path,
+    monkeypatch,
+):
+    activity = GitHubActivityCandidate(
+        repo="octo/old",
+        activity_type="pull_request",
+        url="https://github.com/octo/old/pull/1",
+        title="Previously approved pull request",
+        state="MERGED",
+        author="octo",
+        created_at="2026-01-01T00:00:00Z",
+        merged_at="2026-01-02T00:00:00Z",
+    )
+    old_repo = GitHubRepositoryCandidate("octo/old", "https://github.com/octo/old", False)
+    capped_repositories = [
+        {"nameWithOwner": "octo/old", "url": "https://github.com/octo/old", "isPrivate": True},
+        {"nameWithOwner": "octo/demo", "url": "https://github.com/octo/demo", "isPrivate": False},
+    ] + [
+        {
+            "nameWithOwner": f"octo/private{index}",
+            "url": f"https://github.com/octo/private{index}",
+            "isPrivate": True,
+        }
+        for index in range(1, 99)
+    ]
+
+    def fake_run_gh_json(args):
+        if args[:2] == ["repo", "list"]:
+            return capped_repositories
+        if args[:2] in (["pr", "list"], ["issue", "list"]):
+            return []
+        if args == ["api", "repos/octo/demo/commits"]:
+            return []
+        if args == ["api", "repos/octo/demo/pulls/comments"]:
+            return []
+        if args == ["api", "repos/octo/demo/actions/runs"]:
+            return {"workflow_runs": []}
+        raise AssertionError(args)
+
+    monkeypatch.setattr(github_connector, "run_gh_json", fake_run_gh_json)
+    calls = 0
+
+    def fake_discover_github_candidates(**kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return github_discovery_result([old_repo], [activity])
+        return github_connector.discover_github_candidates(**kwargs)
+
+    monkeypatch.setattr(
+        "portfolio_maker.application.discovery.discover_github_candidates",
+        fake_discover_github_candidates,
+    )
+    request = DiscoverSourcesRequest(workspace=workspace, home=tmp_path, include_github=True)
+    discover_sources(request)
+    paths = WorkspacePaths.from_root(workspace)
+    write_sample_approval(paths)
+    approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    approval["approved_github_activity_urls"] = [activity.url]
+    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+    assert build_profile(BuildProfileRequest(workspace=workspace)).claim_count == 1
+
+    discover_sources(request)
+
+    repository = SQLiteRepository(paths.db_path)
+    assert repository.list_github_activities()[0].is_private is True
+    assert build_profile(BuildProfileRequest(workspace=workspace)).claim_count == 0
+    draft_portfolio(DraftPortfolioRequest(workspace=workspace))
+    assert activity.url not in paths.portfolio_draft_path.read_text(encoding="utf-8")
 
 
 def test_discovery_review_comment_can_be_approved_and_rendered_as_evidence(workspace, tmp_path, monkeypatch):

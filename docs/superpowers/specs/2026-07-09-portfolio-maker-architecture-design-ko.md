@@ -202,7 +202,7 @@ Application use case는 재사용 가능한 engine boundary입니다.
 
 ### Domain Layer
 
-구현된 0.1.0 domain은 MVP runtime에서 사용하는 개념만 유지합니다.
+pre-Phase-1 기준선 domain은 해당 MVP runtime에서 사용하는 개념만 유지합니다.
 
 - `Source`: 승인된 로컬 파일 또는 발견된 GitHub repository record
 - `GitHubActivity`: repository/activity discovery 메타데이터
@@ -375,7 +375,7 @@ github_activities
 
 ## 근거 규칙
 
-1. 현재 profile claim은 승인된 로컬 snapshot에서 생성합니다.
+1. pre-Phase-1 기준선에서 profile claim은 승인된 로컬 snapshot에서 생성합니다.
 2. pre-Phase-1 기준선에서는 GitHub URL과 activity가 discovery report metadata로만 남습니다.
 3. Public artifact는 private raw path나 sensitive content를 노출하면 안 됩니다.
 4. ingest된 로컬 source가 사라지거나 hash가 바뀌면 stale로 표시하고, artifact 생성 전 재-ingestion을 요구합니다.

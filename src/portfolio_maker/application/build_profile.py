@@ -14,6 +14,7 @@ from portfolio_maker.infrastructure.github_connector import (
     canonical_repository_name,
     is_valid_github_timestamp,
     public_github_activity_identity,
+    public_github_repository_name,
 )
 from portfolio_maker.infrastructure.sqlite_repository import SQLiteRepository
 from portfolio_maker.infrastructure.snapshots import load_valid_local_snapshot
@@ -129,6 +130,7 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
         if (
             source is None
             or source.type != SourceType.GITHUB_REPOSITORY
+            or public_github_repository_name(source.uri) != repository_name
             or source.status in {
                 SourceStatus.SKIPPED_POLICY,
                 SourceStatus.EXTRACT_FAILED,

@@ -2,13 +2,15 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Historical baseline note:** This plan records the pre-Phase-1 implementation sequence. Its discovery-only GitHub and deferred normalized-schema statements are historical, not the current runtime contract. The [current Phase 1 policy and evidence contract](../specs/2026-07-11-portfolio-maker-roadmap-phase-1-policy-evidence-github.md) is authoritative.
+
 **Goal:** Codex app에서 호출 가능한 CLI 기반 MVP를 만들어 로컬 파일과 GitHub 활동 후보를 발견하고, 승인된 로컬 source만 ingest한 뒤 근거 기반 master profile과 승인 source를 나열한 검토용 portfolio skeleton을 생성한다. GitHub 활동은 이 MVP에서 discovery-only이며, artifact 입력은 후속 회사별 맞춤 생성 단계로 남긴다.
 
 **Architecture:** MVP는 Codex Skill + CLI adapter + reusable application use cases 구조로 구현한다. 핵심 로직은 CLI나 Codex thread에 의존하지 않는 Python package에 두고, 저장소는 SQLite와 최소 snapshot file store를 사용한다. 향후 Codex app-server나 MCP adapter가 같은 use case를 재사용할 수 있도록 request/result dataclass와 structured progress event를 사용한다.
 
 **Tech Stack:** Python 3.11+, standard library `argparse`, `dataclasses`, `json`, `sqlite3`, `pathlib`, `subprocess`; test runner `pytest`; packaging via `pyproject.toml`.
 
-> **Historical implementation note:** The checklist and code snippets below record the original implementation sequence. The implemented 0.1.0 contract is defined by the README, architecture specs, and runtime: only `sources`, `source_snapshots`, and `github_activities` are created. Snippets for `evidence_items`, `projects`, `career_claims`, `claim_evidence`, and `artifacts` are deferred design, not current implementation work.
+> **Historical implementation note:** The checklist and code snippets below record the original pre-Phase-1 implementation sequence. Its three-table runtime and deferred `evidence_items`, `projects`, `career_claims`, `claim_evidence`, and `artifacts` statements are historical baseline design, not current implementation work. See the current Phase 1 policy contract above.
 
 ---
 

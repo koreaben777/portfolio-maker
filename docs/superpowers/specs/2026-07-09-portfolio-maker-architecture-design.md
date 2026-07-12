@@ -202,7 +202,7 @@ These rules are what keep the system open to a future Codex app-server companion
 
 ### Domain Layer
 
-The implemented 0.1.0 domain keeps only the concepts used by the MVP runtime:
+The pre-Phase-1 baseline domain keeps only the concepts used by that MVP runtime:
 
 - `Source`: an approved local file or discovered GitHub repository record
 - `GitHubActivity`: repository/activity discovery metadata
@@ -375,7 +375,7 @@ github_activities
 
 ## Evidence Rules
 
-1. Current profile claims are derived from approved local snapshots.
+1. In the pre-Phase-1 baseline, profile claims are derived from approved local snapshots.
 2. In the pre-Phase-1 baseline, GitHub URLs and activities remain discovery-report metadata.
 3. Public artifacts must not expose private raw paths or sensitive content.
 4. If an ingested local source disappears or its hash changes, mark it stale and require re-ingestion before generating artifacts.

@@ -62,17 +62,21 @@ def discover_sources(request: DiscoverSourcesRequest) -> DiscoverSourcesResult:
             github_repos = discovery_result.repositories
             github_activities = discovery_result.activities
             github_statuses = discovery_result.statuses
+            repository.invalidate_github_activity_visibility_for_repositories(
+                discovery_result.observed_private_repositories
+            )
             # Only a complete GitHub discovery is a visibility authority. A
             # failed endpoint leaves confirmed public repositories intact for retry.
-            if not github_statuses:
+            if discovery_result.repositories_complete and not github_statuses:
                 repository.invalidate_github_activity_visibility()
             else:
                 confirmed_repositories = tuple(
                     repo.name_with_owner for repo in github_repos if not repo.is_private
                 )
-                repository.invalidate_unconfirmed_github_activity_visibility(
-                    confirmed_repositories
-                )
+                if discovery_result.repositories_complete:
+                    repository.invalidate_unconfirmed_github_activity_visibility(
+                        confirmed_repositories
+                    )
                 repository.invalidate_github_activity_visibility_for_endpoints(
                     tuple(
                         endpoint
@@ -148,7 +152,7 @@ def _render_report(
     lines = [
         "# Discovery Report",
         "",
-        "> MVP limits: local discovery records at most 500 candidates. GitHub activity endpoints are not paginated, so results may be incomplete; an endpoint that reaches its request cap is marked incomplete and does not revoke prior activity visibility.",
+        "> MVP limits: local discovery records at most 500 candidates. GitHub repository and activity endpoints are not paginated, so results may be incomplete. A capped repository list preserves unobserved repository visibility; a capped activity endpoint preserves prior activity visibility.",
         "",
         "## Local candidates",
     ]
@@ -172,7 +176,12 @@ def _render_report(
     if github_statuses:
         lines.extend(["", "## GitHub Status"])
         for status in github_statuses:
-            lines.append(f"- GitHub discovery failed: {markdown_text(status)}")
+            label = (
+                "GitHub discovery incomplete"
+                if " discovery incomplete" in status
+                else "GitHub discovery failed"
+            )
+            lines.append(f"- {label}: {markdown_text(status)}")
     lines.extend(["", "## Skipped"])
     for item in skipped:
         path = "[redacted]" if item.reason in {"forbidden", "skipped_policy"} else item.path

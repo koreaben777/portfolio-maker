@@ -554,6 +554,20 @@ class SQLiteRepository:
                 confirmed_repositories,
             )
 
+    def invalidate_github_activity_visibility_for_repositories(
+        self,
+        repositories: tuple[str, ...],
+    ) -> None:
+        if not repositories:
+            return
+        placeholders = ", ".join("?" for _ in repositories)
+        with self._connection() as conn:
+            conn.execute(
+                f"UPDATE github_activities SET is_private = 1 "
+                f"WHERE lower(repo) IN ({placeholders})",
+                repositories,
+            )
+
     def invalidate_github_activity_visibility_for_endpoints(
         self,
         completed_endpoints: tuple[tuple[str, str], ...],

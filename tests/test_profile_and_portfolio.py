@@ -450,6 +450,41 @@ def test_build_profile_excludes_legacy_github_activity_with_cross_repository_url
     assert activity_url not in paths.portfolio_draft_path.read_text(encoding="utf-8")
 
 
+@pytest.mark.parametrize(
+    "source_uri",
+    (
+        "not-a-url",
+        "https://github.com/octo/other",
+        "https://github.com/octo/demo/pull/1",
+    ),
+)
+def test_build_profile_excludes_legacy_github_activity_with_invalid_source_uri(
+    tmp_path,
+    source_uri,
+):
+    workspace = tmp_path / "workspace"
+    paths = WorkspacePaths.from_root(workspace)
+    write_sample_approval(paths)
+    activity_url = "https://github.com/octo/demo/pull/1"
+    approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    approval["approved_github_activity_urls"] = [activity_url]
+    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    source_id = repository.upsert_source(
+        Source(None, SourceType.GITHUB_REPOSITORY, source_uri, "octo/demo", "octo", SourceStatus.DISCOVERED)
+    )
+    repository.insert_github_activity(
+        GitHubActivity(None, source_id, "octo/demo", "pull_request", activity_url, "Legacy row", "MERGED", "octo", "2026-01-01T00:00:00Z", None)
+    )
+
+    result = build_profile(BuildProfileRequest(workspace=workspace))
+    draft_portfolio(DraftPortfolioRequest(workspace=workspace))
+
+    assert result.claim_count == 0
+    assert activity_url not in paths.portfolio_draft_path.read_text(encoding="utf-8")
+
+
 def test_build_profile_excludes_ingested_source_after_approval_revoked(tmp_path):
     workspace, source_path, paths = _ingest_approved_source(tmp_path)
     approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))

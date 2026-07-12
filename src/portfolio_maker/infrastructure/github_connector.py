@@ -39,6 +39,8 @@ class GitHubDiscoveryResult:
     activities: list[GitHubActivityCandidate]
     statuses: list[str]
     completed_endpoints: tuple[tuple[str, str], ...]
+    repositories_complete: bool = True
+    observed_private_repositories: tuple[str, ...] = ()
 
 
 _PUBLIC_ACTIVITY_PATH = re.compile(
@@ -48,32 +50,61 @@ _PUBLIC_ACTIVITY_PATH = re.compile(
     r"|actions/runs/(?P<run_id>[A-Za-z0-9._-]+))$"
 )
 _SAFE_REVIEW_FRAGMENT = re.compile(r"^discussion_r\d+$")
+_PUBLIC_REPOSITORY_PATH = re.compile(
+    r"^/(?P<owner>[A-Za-z0-9][A-Za-z0-9_-]*)/"
+    r"(?P<repository>[A-Za-z0-9][A-Za-z0-9_.-]*)$"
+)
+_NUMERIC_GITHUB_IDENTIFIER = re.compile(r"^[1-9]\d*$")
+_COMMIT_SHA = re.compile(r"^[0-9a-fA-F]{4,40}$")
 _GITHUB_TIMESTAMP = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$"
 )
 
 
 def parse_repo_list(payload: Any) -> list[GitHubRepositoryCandidate]:
-    repos: dict[str, GitHubRepositoryCandidate] = {}
+    return _deduplicate_repository_candidates(_parse_repository_candidates(payload))
+
+
+def _parse_repository_candidates(payload: Any) -> list[GitHubRepositoryCandidate]:
+    candidates: list[GitHubRepositoryCandidate] = []
     for item in _list_payload(payload, "repository list"):
-        is_private = item.get("isPrivate")
-        if "isPrivate" not in item or not isinstance(is_private, bool):
-            raise GitHubDiscoveryError("GitHub repository list payload is invalid")
-        name_with_owner = _required_string(item, "nameWithOwner", "repository list")
-        try:
-            canonical_name = canonical_repository_name(name_with_owner)
-        except ValueError as error:
-            raise GitHubDiscoveryError(
-                "GitHub repository list payload is invalid"
-            ) from error
-        repos.setdefault(
-            canonical_name,
-            GitHubRepositoryCandidate(
-                name_with_owner=canonical_name,
-                url=_required_string(item, "url", "repository list"),
-                is_private=is_private,
-            ),
-        )
+        candidates.append(_parse_repository_candidate(item))
+    return candidates
+
+
+def _parse_repository_candidate(item: dict[str, Any]) -> GitHubRepositoryCandidate:
+    is_private = item.get("isPrivate")
+    if "isPrivate" not in item or not isinstance(is_private, bool):
+        raise GitHubDiscoveryError("GitHub repository list payload is invalid")
+    name_with_owner = _required_string(item, "nameWithOwner", "repository list")
+    try:
+        canonical_name = canonical_repository_name(name_with_owner)
+    except ValueError as error:
+        raise GitHubDiscoveryError("GitHub repository list payload is invalid") from error
+    url = _required_string(item, "url", "repository list")
+    if public_github_repository_name(url) != canonical_name:
+        raise GitHubDiscoveryError("GitHub repository list payload is invalid")
+    return GitHubRepositoryCandidate(
+        name_with_owner=canonical_name,
+        url=url,
+        is_private=is_private,
+    )
+
+
+def _deduplicate_repository_candidates(
+    candidates: list[GitHubRepositoryCandidate],
+) -> list[GitHubRepositoryCandidate]:
+    repos: dict[str, GitHubRepositoryCandidate] = {}
+    for candidate in candidates:
+        existing = repos.get(candidate.name_with_owner)
+        if existing is None:
+            repos[candidate.name_with_owner] = candidate
+        elif candidate.is_private and not existing.is_private:
+            repos[candidate.name_with_owner] = GitHubRepositoryCandidate(
+                name_with_owner=existing.name_with_owner,
+                url=existing.url,
+                is_private=True,
+            )
     return list(repos.values())
 
 
@@ -200,29 +231,43 @@ def discover_github_candidates(
     allowed_repositories: tuple[str, ...] = (),
     private_sources_allowed: bool = False,
 ) -> GitHubDiscoveryResult:
-    repos = parse_repo_list(
-        run_gh_json(
-            [
-                "repo",
-                "list",
-                "--json",
-                "nameWithOwner,url,isPrivate",
-                "--limit",
-                "100",
-            ]
+    repository_payload = run_gh_json(
+        [
+            "repo",
+            "list",
+            "--json",
+            "nameWithOwner,url,isPrivate",
+            "--limit",
+            "100",
+        ]
+    )
+    raw_repositories = _parse_repository_candidates(repository_payload)
+    discovered_repositories = _deduplicate_repository_candidates(raw_repositories)
+    repositories_complete = len(raw_repositories) < 100
+    observed_private_repositories = tuple(
+        sorted(
+            {
+                repository.name_with_owner
+                for repository in raw_repositories
+                if repository.is_private
+            }
         )
     )
     excluded = {canonical_repository_name(name) for name in excluded_repositories}
     allowed = {canonical_repository_name(name) for name in allowed_repositories}
     repos = [
         repo
-        for repo in repos
+        for repo in discovered_repositories
         if canonical_repository_name(repo.name_with_owner) not in excluded
         and (not allowed or canonical_repository_name(repo.name_with_owner) in allowed)
         and (private_sources_allowed or not repo.is_private)
     ]
     activities: list[GitHubActivityCandidate] = []
     statuses: list[str] = []
+    if not repositories_complete:
+        statuses.append(
+            "GitHub repository list discovery incomplete: result reached the 100-item limit"
+        )
     completed_endpoints: list[tuple[str, str]] = []
     endpoints = (
         (
@@ -294,7 +339,14 @@ def discover_github_candidates(
                 statuses.append(
                     f"GitHub {label} discovery failed for {repo.name_with_owner}: {error}"
                 )
-    return GitHubDiscoveryResult(repos, activities, statuses, tuple(completed_endpoints))
+    return GitHubDiscoveryResult(
+        repos,
+        activities,
+        statuses,
+        tuple(completed_endpoints),
+        repositories_complete,
+        observed_private_repositories,
+    )
 
 
 def _list_payload(payload: Any, label: str) -> list[dict[str, Any]]:
@@ -413,6 +465,35 @@ def is_public_github_activity_url(value: str) -> bool:
     return public_github_activity_identity(value) is not None
 
 
+def public_github_repository_name(value: str) -> str | None:
+    if any(
+        character.isspace() or unicodedata.category(character).startswith("C")
+        for character in value
+    ):
+        return None
+    try:
+        parsed = urlparse(value)
+    except ValueError:
+        return None
+    if (
+        parsed.scheme != "https"
+        or parsed.netloc != "github.com"
+        or parsed.params
+        or parsed.query
+        or parsed.fragment
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        return None
+    match = _PUBLIC_REPOSITORY_PATH.fullmatch(parsed.path)
+    if match is None:
+        return None
+    try:
+        return canonical_repository_name(f"{match['owner']}/{match['repository']}")
+    except ValueError:
+        return None
+
+
 def public_github_activity_identity(value: str) -> tuple[str, str] | None:
     if any(
         character.isspace() or unicodedata.category(character).startswith("C")
@@ -438,6 +519,14 @@ def public_github_activity_identity(value: str) -> tuple[str, str] | None:
     try:
         repository = canonical_repository_name(f"{match['owner']}/{match['repository']}")
     except ValueError:
+        return None
+    if match["kind"] == "commit":
+        if _COMMIT_SHA.fullmatch(match["identifier"]) is None:
+            return None
+    elif match["kind"] in {"issues", "pull"}:
+        if _NUMERIC_GITHUB_IDENTIFIER.fullmatch(match["identifier"]) is None:
+            return None
+    elif _NUMERIC_GITHUB_IDENTIFIER.fullmatch(match["run_id"]) is None:
         return None
     if parsed.fragment:
         if match["kind"] == "pull" and _SAFE_REVIEW_FRAGMENT.fullmatch(parsed.fragment):
