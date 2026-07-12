@@ -186,7 +186,7 @@ Stage C는 approval schema에 다음 optional 필드를 추가한다.
 
 ### 7.1 #11 일반형 공개용 인터랙티브 HTML
 
-[#11](https://github.com/koreaben777/portfolio-maker/issues/11)을 이번 최우선 구현 대상으로 삼는다. 이 단계의 포트폴리오는 회사나 채용공고를 대상으로 하지 않는 사용자의 **기본 포트폴리오**다. 사용자가 자신의 작업과 근거를 확인하고, 방문자가 프로젝트와 역량을 이해할 수 있게 하는 것이 목적이다.
+[#11](https://github.com/koreaben777/portfolio-maker/issues/11)을 이번 최우선 구현 대상으로 삼는다. 구현 세부 단계는 [일반형 인터랙티브 HTML + @sites 구현 계획](https://github.com/koreaben777/portfolio-maker/blob/main/docs/superpowers/plans/2026-07-13-portfolio-maker-general-interactive-html-sites.md)에 기록한다. 이 단계의 포트폴리오는 회사나 채용공고를 대상으로 하지 않는 사용자의 **기본 포트폴리오**다. 사용자가 자신의 작업과 근거를 확인하고, 방문자가 프로젝트와 역량을 이해할 수 있게 하는 것이 목적이다.
 
 #11은 #4, #2, #1의 완료된 public-safe evidence/claim/artifact 계약을 입력으로 사용하며, #3을 선행 조건으로 요구하지 않는다. 결과는 검토용 Markdown을 대체하는 공개 표현 계층이지만, 근거 없는 문장이나 자동 회사별 서술을 생성하지 않는다.
 
