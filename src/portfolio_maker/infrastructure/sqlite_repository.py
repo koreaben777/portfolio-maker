@@ -538,31 +538,37 @@ class SQLiteRepository:
                 int(activity.is_private),
                 activity.state_field,
             )
-            canonical_row = conn.execute(
+            candidate_rows = conn.execute(
                 """
-                SELECT id FROM github_activities
-                WHERE repo = ? AND activity_type = ? AND url = ?
+                SELECT id, url FROM github_activities
+                WHERE repo = ? AND activity_type = ? AND url = ? COLLATE NOCASE
+                ORDER BY id
                 """,
                 (repository_name, activity.activity_type, activity_url),
-            ).fetchone()
-            legacy_row = None
-            if canonical_row is None:
-                for candidate in conn.execute(
-                    """
-                    SELECT id, url FROM github_activities
-                    WHERE repo = ? AND activity_type = ?
-                    ORDER BY id
-                    """,
-                    (repository_name, activity.activity_type),
-                ).fetchall():
-                    raw_url = candidate["url"]
-                    if (
-                        isinstance(raw_url, str)
-                        and canonical_public_github_activity_url(raw_url) == activity_url
-                    ):
-                        legacy_row = candidate
-                        break
-            if legacy_row is not None:
+            ).fetchall()
+            canonical_rows = [
+                candidate
+                for candidate in candidate_rows
+                if isinstance(candidate["url"], str)
+                and canonical_public_github_activity_url(candidate["url"]) == activity_url
+            ]
+            if canonical_rows:
+                survivor_id = canonical_rows[0]["id"]
+                duplicate_ids = tuple(
+                    candidate["id"]
+                    for candidate in canonical_rows[1:]
+                )
+                if duplicate_ids:
+                    placeholders = ", ".join("?" for _ in duplicate_ids)
+                    conn.execute(
+                        f"UPDATE evidence_items SET github_activity_id = ? "
+                        f"WHERE github_activity_id IN ({placeholders})",
+                        (survivor_id, *duplicate_ids),
+                    )
+                    conn.execute(
+                        f"DELETE FROM github_activities WHERE id IN ({placeholders})",
+                        duplicate_ids,
+                    )
                 conn.execute(
                     """
                     UPDATE github_activities SET
@@ -571,7 +577,7 @@ class SQLiteRepository:
                         merged_at = ?, is_private = ?, state_field = ?
                     WHERE id = ?
                     """,
-                    (*values, legacy_row["id"]),
+                    (*values, survivor_id),
                 )
             else:
                 conn.execute(

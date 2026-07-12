@@ -156,14 +156,6 @@ def mask_public_value(value: str) -> str:
     return mask_secrets(value)
 
 
-def is_secret_shaped_public_value(value: str) -> bool:
-    detection_value = _remove_invisible_combining_marks(value)
-    return bool(
-        mask_secrets(value) != value
-        or mask_secrets(detection_value) != detection_value
-    )
-
-
 def contains_hidden_secret_shaped_public_value(value: str) -> bool:
     detection_value = _remove_invisible_combining_marks(value)
     return detection_value != value and mask_secrets(detection_value) != detection_value

@@ -9,6 +9,7 @@ from stat import S_IMODE
 import pytest
 
 from portfolio_maker.domain.models import GitHubActivity, Source, SourceStatus, SourceType
+import portfolio_maker.infrastructure.sqlite_repository as sqlite_repository_module
 from portfolio_maker.infrastructure.sqlite_repository import RepositoryError, SQLiteRepository
 from portfolio_maker.workspace import WorkspacePaths
 
@@ -328,6 +329,64 @@ def test_sqlite_repository_upserts_github_activity_by_repo_type_and_url(workspac
         rows = conn.execute("SELECT id, title FROM github_activities").fetchall()
     assert second_id == first_id
     assert [(row["id"], row["title"]) for row in rows] == [(first_id, "Updated title")]
+
+
+def test_sqlite_repository_legacy_alias_lookup_does_not_scan_unrelated_rows(
+    workspace, monkeypatch
+):
+    paths = WorkspacePaths.from_root(workspace)
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    with repository._connection() as conn:
+        for activity_number in range(10, 110):
+            conn.execute(
+                """
+                INSERT INTO github_activities
+                    (repo, activity_type, url, title, state, author, created_at, is_private)
+                VALUES ('octo/demo', 'issue', ?, 'Old title', 'OPEN', 'octo', ?, 0)
+                """,
+                (
+                    f"https://github.com/octo/demo/issues/{activity_number}",
+                    "2026-01-01T00:00:00Z",
+                ),
+            )
+        conn.execute(
+            """
+            INSERT INTO github_activities
+                (repo, activity_type, url, title, state, author, created_at, is_private)
+            VALUES ('octo/demo', 'issue', ?, 'Legacy alias', 'OPEN', 'octo', ?, 0)
+            """,
+            ("https://github.com/Octo/Demo/issues/1", "2026-01-01T00:00:00Z"),
+        )
+
+    original_canonicalizer = sqlite_repository_module.canonical_public_github_activity_url
+    canonicalizer_calls = []
+
+    def tracked_canonicalizer(value):
+        canonicalizer_calls.append(value)
+        return original_canonicalizer(value)
+
+    monkeypatch.setattr(
+        sqlite_repository_module,
+        "canonical_public_github_activity_url",
+        tracked_canonicalizer,
+    )
+    repository.insert_github_activity(
+        GitHubActivity(
+            None,
+            None,
+            "octo/demo",
+            "issue",
+            "https://github.com/octo/demo/issues/1",
+            "Current title",
+            "OPEN",
+            "octo",
+            "2026-01-02T00:00:00Z",
+            None,
+        )
+    )
+
+    assert len(canonicalizer_calls) <= 2
 
 
 def test_sqlite_repository_requires_workflow_state_provenance(workspace):

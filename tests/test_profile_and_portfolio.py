@@ -542,6 +542,28 @@ def test_build_profile_canonicalizes_legacy_case_variant_activity_url(tmp_path):
                 (raw_activity_url,),
             ).fetchone()["id"]
         )
+        conn.execute(
+            """
+            INSERT INTO github_activities
+                (source_id, repo, activity_type, url, title, state, author, created_at, is_private)
+            VALUES (?, 'octo/demo', 'pull_request', ?, 'Stale canonical title', 'MERGED', 'octo', ?, 0)
+            """,
+            (source_id, canonical_activity_url, "2026-01-01T00:00:00Z"),
+        )
+        canonical_id = int(
+            conn.execute(
+                "SELECT id FROM github_activities WHERE url = ?",
+                (canonical_activity_url,),
+            ).fetchone()["id"]
+        )
+        conn.execute(
+            """
+            INSERT INTO evidence_items
+                (source_id, github_activity_id, locator, stable_id, public_safe)
+            VALUES (?, ?, ?, 'legacy-alias-evidence', 1)
+            """,
+            (source_id, canonical_id, canonical_activity_url),
+        )
 
     rediscovered_id = repository.insert_github_activity(
         GitHubActivity(
@@ -566,12 +588,25 @@ def test_build_profile_canonicalizes_legacy_case_variant_activity_url(tmp_path):
 
     with repository._read_connection() as conn:
         rows = conn.execute(
-            "SELECT id, url, title FROM github_activities WHERE repo = 'octo/demo'"
+            "SELECT id, url, title, source_id FROM github_activities WHERE repo = 'octo/demo'"
         ).fetchall()
-    assert [(row["id"], row["url"], row["title"]) for row in rows] == [
-        (legacy_id, canonical_activity_url, "Current title")
+        evidence_rows = conn.execute(
+            "SELECT github_activity_id FROM evidence_items WHERE stable_id = 'legacy-alias-evidence'"
+        ).fetchall()
+    assert len(rows) == 1
+    survivor_id = rows[0]["id"]
+    assert (rows[0]["url"], rows[0]["title"], rows[0]["source_id"]) == (
+        canonical_activity_url,
+        "Current title",
+        source_id,
+    )
+    assert survivor_id in {legacy_id, canonical_id}
+    assert [row["github_activity_id"] for row in evidence_rows] == [survivor_id]
+    assert [(row["id"], row["url"]) for row in rows] == [
+        (survivor_id, canonical_activity_url)
     ]
     assert first.claim_count == result.claim_count == 1
+    assert len(result.evidence_ids) == 1
     assert profile["claims"][0]["evidence_uri"] == canonical_activity_url
     assert profile["claims"][0]["title"] == "Current title"
     draft = paths.portfolio_draft_path.read_text(encoding="utf-8")

@@ -6,7 +6,6 @@ from portfolio_maker.infrastructure.policy import (
     DEFAULT_EXCLUDED_NAMES,
     FilePolicy,
     contains_hidden_secret_shaped_public_value,
-    is_secret_shaped_public_value,
     mask_secrets,
 )
 
@@ -192,15 +191,10 @@ def test_secret_masking_redacts_bearer_private_key_and_token_prefixes():
     assert "sk-synthetic-token" not in masked
 
 
-def test_secret_shape_detection_checks_invisible_combining_marks_without_sanitizing_text():
-    assert is_secret_shaped_public_value("Bearer synthetic-token") is True
-    assert is_secret_shaped_public_value("Bearer\u034f token") is True
-    assert is_secret_shaped_public_value("국제화 제목") is False
-
-
 @pytest.mark.parametrize(
     "hidden_value",
     (
+        "Bearer\u034f token",
         "sk\u180f-" + "synthetic-token",
         "github_pat\u180f_" + "synthetictoken123456",
         "ghp\u180f_" + "synthetictoken123456",
@@ -208,8 +202,8 @@ def test_secret_shape_detection_checks_invisible_combining_marks_without_sanitiz
 )
 def test_hidden_secret_detection_reuses_mask_policy(hidden_value):
     detection_value = hidden_value.replace("\u180f", "")
+    detection_value = detection_value.replace("\u034f", "")
 
     assert mask_secrets(detection_value) != detection_value
-    assert is_secret_shaped_public_value(hidden_value) is True
     assert contains_hidden_secret_shaped_public_value(hidden_value) is True
     assert contains_hidden_secret_shaped_public_value("Bearer synthetic-token") is False
