@@ -7,8 +7,9 @@ import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunsplit
 
+from portfolio_maker.infrastructure.policy import contains_hidden_secret_shaped_public_value
 from portfolio_maker.infrastructure.presentation import normalize_label
 
 
@@ -177,7 +178,10 @@ def parse_commit_list(repo: str, payload: Any) -> list[GitHubActivityCandidate]:
         author = _object(commit.get("author") or {}, "commit list")
         message = _required_string(commit, "message", "commit list")
         raw_subject = message.splitlines()[0] if message else ""
-        if contains_unicode_control(raw_subject):
+        if (
+            contains_unicode_control(raw_subject)
+            or contains_hidden_secret_shaped_public_value(raw_subject)
+        ):
             raise GitHubDiscoveryError("GitHub commit list payload is invalid")
         subject = normalize_label(raw_subject)
         if not subject:
@@ -463,7 +467,11 @@ def _required_workflow_state(
 
 def _required_normalized_title(item: dict[str, Any], key: str, label: str) -> str:
     value = _required_string(item, key, label)
-    if contains_unicode_control(value) or not normalize_label(value):
+    if (
+        contains_unicode_control(value)
+        or contains_hidden_secret_shaped_public_value(value)
+        or not normalize_label(value)
+    ):
         raise GitHubDiscoveryError(f"GitHub {label} payload is invalid")
     return value
 
@@ -491,7 +499,10 @@ def _optional_string(item: dict[str, Any], key: str, label: str) -> str | None:
         return None
     if not isinstance(value, str):
         raise GitHubDiscoveryError(f"GitHub {label} payload is invalid")
-    if contains_unicode_control(value):
+    if (
+        contains_unicode_control(value)
+        or contains_hidden_secret_shaped_public_value(value)
+    ):
         raise GitHubDiscoveryError(f"GitHub {label} payload is invalid")
     return value
 
@@ -507,7 +518,10 @@ def _nested_optional_string(
         return ""
     if not isinstance(nested, str):
         raise GitHubDiscoveryError(f"GitHub {label} payload is invalid")
-    if contains_unicode_control(nested):
+    if (
+        contains_unicode_control(nested)
+        or contains_hidden_secret_shaped_public_value(nested)
+    ):
         raise GitHubDiscoveryError(f"GitHub {label} payload is invalid")
     return nested
 
@@ -517,7 +531,10 @@ def _nested_required_string(
 ) -> str:
     value = _object(item.get(key), label)
     nested = _required_string(value, nested_key, label)
-    if contains_unicode_control(nested):
+    if (
+        contains_unicode_control(nested)
+        or contains_hidden_secret_shaped_public_value(nested)
+    ):
         raise GitHubDiscoveryError(f"GitHub {label} payload is invalid")
     return nested
 
@@ -618,6 +635,22 @@ def public_github_activity_identity(value: str) -> tuple[str, str] | None:
     if match["kind"] is not None:
         return repository, {"commit": "commit", "issues": "issue", "pull": "pull_request"}[match["kind"]]
     return repository, "workflow_run"
+
+
+def canonical_public_github_activity_url(value: str) -> str | None:
+    parsed = _trusted_public_github_url(value)
+    identity = public_github_activity_identity(value)
+    if parsed is None or identity is None:
+        return None
+    match = _PUBLIC_ACTIVITY_PATH.fullmatch(parsed.path)
+    if match is None:
+        return None
+    repository, _ = identity
+    if match["kind"] is None:
+        path = f"/{repository}/actions/runs/{match['run_id']}"
+    else:
+        path = f"/{repository}/{match['kind']}/{match['identifier']}"
+    return urlunsplit(("https", "github.com", path, "", parsed.fragment))
 
 
 def _trusted_public_github_url(value: str):

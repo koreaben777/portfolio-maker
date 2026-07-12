@@ -75,6 +75,13 @@ SECRET_PATTERNS = [
         "bare_key_value",
     ),
 ]
+_BEARER_SECRET_PATTERN = re.compile(r"(?i)\bBearer\s+[^\s,;]+")
+_INVISIBLE_COMBINING_MARKS = (
+    frozenset({"\u034f"})
+    | frozenset(chr(code) for code in range(0x180B, 0x180F))
+    | frozenset(chr(code) for code in range(0xFE00, 0xFE10))
+    | frozenset(chr(code) for code in range(0xE0100, 0xE01F0))
+)
 DEFAULT_EXCLUDED_NAMES_CASEFOLD = {name.casefold() for name in DEFAULT_EXCLUDED_NAMES}
 SENSITIVE_FILE_NAMES_CASEFOLD = {name.casefold() for name in SENSITIVE_FILE_NAMES}
 PASSWORD_MANAGER_EXPORT_FILENAME = re.compile(
@@ -148,3 +155,24 @@ def mask_public_value(value: str) -> str:
     if is_sensitive_filename(value):
         return "[REDACTED]"
     return mask_secrets(value)
+
+
+def is_secret_shaped_public_value(value: str) -> bool:
+    detection_value = _remove_invisible_combining_marks(value)
+    return bool(
+        _BEARER_SECRET_PATTERN.search(value)
+        or _BEARER_SECRET_PATTERN.search(detection_value)
+    )
+
+
+def contains_hidden_secret_shaped_public_value(value: str) -> bool:
+    detection_value = _remove_invisible_combining_marks(value)
+    return detection_value != value and is_secret_shaped_public_value(value)
+
+
+def _remove_invisible_combining_marks(value: str) -> str:
+    return "".join(
+        character
+        for character in value
+        if character not in _INVISIBLE_COMBINING_MARKS
+    )

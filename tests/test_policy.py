@@ -3,6 +3,7 @@ from pathlib import Path
 from portfolio_maker.infrastructure.policy import (
     DEFAULT_EXCLUDED_NAMES,
     FilePolicy,
+    is_secret_shaped_public_value,
     mask_secrets,
 )
 
@@ -186,3 +187,9 @@ def test_secret_masking_redacts_bearer_private_key_and_token_prefixes():
     assert "synthetic-bearer-token" not in masked
     assert "synthetic-private-key-material" not in masked
     assert "sk-synthetic-token" not in masked
+
+
+def test_secret_shape_detection_checks_invisible_combining_marks_without_sanitizing_text():
+    assert is_secret_shaped_public_value("Bearer synthetic-token") is True
+    assert is_secret_shaped_public_value("Bearer\u034f token") is True
+    assert is_secret_shaped_public_value("국제화 제목") is False

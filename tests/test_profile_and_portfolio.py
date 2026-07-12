@@ -51,6 +51,28 @@ def _ingest_approved_source(tmp_path):
     return workspace, source_path, paths
 
 
+def _setup_approved_github_activity(tmp_path, activity_url):
+    workspace = tmp_path / "workspace"
+    paths = WorkspacePaths.from_root(workspace)
+    write_sample_approval(paths)
+    approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    approval["approved_github_activity_urls"] = [activity_url]
+    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    source_id = repository.upsert_source(
+        Source(
+            None,
+            SourceType.GITHUB_REPOSITORY,
+            "https://github.com/octo/demo",
+            "octo/demo",
+            "octo",
+            SourceStatus.DISCOVERED,
+        )
+    )
+    return workspace, paths, repository, source_id
+
+
 def test_build_profile_treats_github_sources_as_discovery_only_in_mvp(tmp_path):
     workspace = tmp_path / "workspace"
     paths = WorkspacePaths.from_root(workspace)
@@ -385,23 +407,8 @@ def test_build_profile_masks_bearer_workflow_author_from_parser_to_artifact(tmp_
 def test_build_profile_excludes_persisted_non_workflow_control_state(
     tmp_path, activity_type, activity_url, state_field
 ):
-    workspace = tmp_path / "workspace"
-    paths = WorkspacePaths.from_root(workspace)
-    write_sample_approval(paths)
-    approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
-    approval["approved_github_activity_urls"] = [activity_url]
-    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
-    repository = SQLiteRepository(paths.db_path)
-    repository.initialize()
-    source_id = repository.upsert_source(
-        Source(
-            None,
-            SourceType.GITHUB_REPOSITORY,
-            "https://github.com/octo/demo",
-            "octo/demo",
-            "octo",
-            SourceStatus.DISCOVERED,
-        )
+    workspace, paths, repository, source_id = _setup_approved_github_activity(
+        tmp_path, activity_url
     )
     with repository._connection() as conn:
         conn.execute(
@@ -414,7 +421,7 @@ def test_build_profile_excludes_persisted_non_workflow_control_state(
                 source_id,
                 activity_type,
                 activity_url,
-                "OPEN" + chr(0),
+                "OPEN",
                 "2026-01-01T00:00:00Z",
                 state_field,
             ),
@@ -427,30 +434,22 @@ def test_build_profile_excludes_persisted_non_workflow_control_state(
     assert activity_url not in paths.portfolio_draft_path.read_text(encoding="utf-8")
 
 
-@pytest.mark.parametrize("field", ("title", "author"))
-def test_build_profile_excludes_persisted_activity_control_metadata(tmp_path, field):
-    workspace = tmp_path / "workspace"
-    paths = WorkspacePaths.from_root(workspace)
-    write_sample_approval(paths)
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("title", "Bearer" + chr(0) + "example-token-value"),
+        ("author", "Bearer" + chr(0) + "example-token-value"),
+        ("title", "Bearer\u034f token"),
+        ("author", "Bearer\u034f token"),
+    ),
+)
+def test_build_profile_excludes_persisted_activity_secret_metadata(tmp_path, field, value):
     activity_url = "https://github.com/octo/demo/pull/1"
-    approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
-    approval["approved_github_activity_urls"] = [activity_url]
-    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
-    repository = SQLiteRepository(paths.db_path)
-    repository.initialize()
-    source_id = repository.upsert_source(
-        Source(
-            None,
-            SourceType.GITHUB_REPOSITORY,
-            "https://github.com/octo/demo",
-            "octo/demo",
-            "octo",
-            SourceStatus.DISCOVERED,
-        )
+    workspace, paths, repository, source_id = _setup_approved_github_activity(
+        tmp_path, activity_url
     )
-    control_value = "Bearer" + chr(0) + "example-token-value"
-    title = control_value if field == "title" else "Safe title"
-    author = control_value if field == "author" else "octo"
+    title = value if field == "title" else "Safe title"
+    author = value if field == "author" else "octo"
     with repository._connection() as conn:
         conn.execute(
             """
@@ -466,6 +465,82 @@ def test_build_profile_excludes_persisted_activity_control_metadata(tmp_path, fi
 
     assert result.claim_count == 0
     assert activity_url not in paths.portfolio_draft_path.read_text(encoding="utf-8")
+
+
+def test_build_profile_canonicalizes_case_variant_activity_urls_across_builds(tmp_path):
+    raw_activity_url = "https://github.com/Octo/Demo/pull/1"
+    canonical_activity_url = "https://github.com/octo/demo/pull/1"
+    workspace, paths, repository, source_id = _setup_approved_github_activity(
+        tmp_path, raw_activity_url
+    )
+    approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    approval["approved_github_activity_urls"] = [canonical_activity_url]
+    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+    activity_id = repository.insert_github_activity(
+        GitHubActivity(
+            None,
+            source_id,
+            "Octo/Demo",
+            "pull_request",
+            raw_activity_url,
+            "Safe title",
+            "MERGED",
+            "octo",
+            "2026-01-01T00:00:00Z",
+            None,
+        )
+    )
+
+    first = build_profile(BuildProfileRequest(workspace=workspace))
+    second = build_profile(BuildProfileRequest(workspace=workspace))
+    draft_portfolio(DraftPortfolioRequest(workspace=workspace))
+    profile = json.loads(second.json_path.read_text(encoding="utf-8"))
+
+    with repository._read_connection() as conn:
+        rows = conn.execute(
+            "SELECT id, url FROM github_activities WHERE repo = 'octo/demo'"
+        ).fetchall()
+    assert first.claim_count == second.claim_count == 1
+    assert [(row["id"], row["url"]) for row in rows] == [
+        (activity_id, canonical_activity_url)
+    ]
+    assert profile["claims"][0]["evidence_uri"] == canonical_activity_url
+    assert paths.portfolio_draft_path.read_text(encoding="utf-8").count(
+        canonical_activity_url
+    ) == 1
+
+
+def test_build_profile_canonicalizes_legacy_case_variant_activity_url(tmp_path):
+    raw_activity_url = "https://github.com/Octo/Demo/pull/1"
+    canonical_activity_url = "https://github.com/octo/demo/pull/1"
+    workspace, paths, repository, source_id = _setup_approved_github_activity(
+        tmp_path, raw_activity_url
+    )
+    approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    approval["approved_github_activity_urls"] = [canonical_activity_url]
+    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+    with repository._connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO github_activities
+                (source_id, repo, activity_type, url, title, state, author, created_at, is_private)
+            VALUES (?, 'octo/demo', 'pull_request', ?, 'Legacy title', 'MERGED', 'octo', ?, 0)
+            """,
+            (source_id, raw_activity_url, "2026-01-01T00:00:00Z"),
+        )
+
+    result = build_profile(BuildProfileRequest(workspace=workspace))
+    draft_portfolio(DraftPortfolioRequest(workspace=workspace))
+    profile = json.loads(result.json_path.read_text(encoding="utf-8"))
+
+    assert repository.list_github_activities()[0].url == canonical_activity_url
+    assert result.claim_count == 1
+    assert profile["claims"][0]["evidence_uri"] == canonical_activity_url
+    assert paths.portfolio_draft_path.read_text(encoding="utf-8").count(
+        canonical_activity_url
+    ) == 1
+
+
 def test_draft_portfolio_renders_approved_github_activity_as_evidence_with_provenance(tmp_path):
     workspace = tmp_path / "workspace"
     paths = WorkspacePaths.from_root(workspace)

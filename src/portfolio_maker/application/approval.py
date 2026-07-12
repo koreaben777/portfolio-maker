@@ -7,8 +7,8 @@ from typing import Any
 import unicodedata
 
 from portfolio_maker.infrastructure.github_connector import (
+    canonical_public_github_activity_url,
     canonical_repository_name,
-    is_public_github_activity_url,
 )
 from portfolio_maker.infrastructure.managed_files import read_managed_bytes, write_managed_text
 from portfolio_maker.workspace import WorkspacePaths
@@ -115,7 +115,11 @@ def load_approval(paths: WorkspacePaths) -> SourceApproval:
     ):
         raise ApprovalFormatError("excluded_file_patterns entries must be safe filenames globs")
     approved_github_activity_urls = _string_list(payload, "approved_github_activity_urls")
-    if any(not is_public_github_activity_url(url) for url in approved_github_activity_urls):
+    canonical_approved_urls = tuple(
+        canonical_public_github_activity_url(url)
+        for url in approved_github_activity_urls
+    )
+    if any(url is None for url in canonical_approved_urls):
         raise ApprovalFormatError(
             "approved_github_activity_urls entries must be public GitHub activity URLs"
         )
@@ -127,7 +131,9 @@ def load_approval(paths: WorkspacePaths) -> SourceApproval:
         private_sources_allowed=private_sources_allowed,
         allowed_repositories=allowed_repositories,
         excluded_file_patterns=excluded_file_patterns,
-        approved_github_activity_urls=approved_github_activity_urls,
+        approved_github_activity_urls=tuple(
+            url for url in canonical_approved_urls if url is not None
+        ),
     )
 
 

@@ -352,6 +352,41 @@ def test_commit_parser_rejects_control_in_title_or_author(field):
         )
 
 
+def test_activity_parser_rejects_hidden_bearer_title():
+    with pytest.raises(GitHubDiscoveryError, match="pull request list payload is invalid"):
+        parse_pr_list(
+            "octo/demo",
+            [
+                {
+                    "url": "https://github.com/octo/demo/pull/1",
+                    "title": "Bearer\u034f token",
+                    "state": "OPEN",
+                    "createdAt": "2026-01-01T00:00:00Z",
+                    "author": None,
+                }
+            ],
+        )
+
+
+def test_workflow_parser_rejects_hidden_bearer_author():
+    with pytest.raises(GitHubDiscoveryError, match="workflow run list payload is invalid"):
+        parse_workflow_run_list(
+            "octo/demo",
+            {
+                "workflow_runs": [
+                    {
+                        "html_url": "https://github.com/octo/demo/actions/runs/1",
+                        "name": "CI",
+                        "conclusion": "success",
+                        "status": "completed",
+                        "actor": {"login": "Bearer\u034f token"},
+                        "created_at": "2026-01-01T00:00:00Z",
+                    }
+                ]
+            },
+        )
+
+
 def test_parse_commit_review_and_workflow_run_lists():
     commits = parse_commit_list("octo/demo", load_fixture("gh_commit_list.json"))
     reviews = parse_review_list("octo/demo", load_fixture("gh_review_list.json"))

@@ -12,6 +12,7 @@ from stat import S_ISDIR, S_ISREG
 
 from portfolio_maker.domain.models import GitHubActivity, Source, SourceStatus, SourceType
 from portfolio_maker.infrastructure.github_connector import (
+    canonical_public_github_activity_url,
     canonical_repository_name,
     is_valid_github_activity_state,
 )
@@ -520,6 +521,9 @@ class SQLiteRepository:
             repository_name = canonical_repository_name(activity.repo)
         except ValueError as error:
             raise RepositoryError("GitHub activity repository is invalid") from error
+        activity_url = canonical_public_github_activity_url(activity.url)
+        if activity_url is None:
+            raise RepositoryError("GitHub activity URL is invalid")
         with self._connection() as conn:
             conn.execute(
                 """
@@ -540,7 +544,7 @@ class SQLiteRepository:
                     activity.source_id,
                     repository_name,
                     activity.activity_type,
-                    activity.url,
+                    activity_url,
                     activity.title,
                     activity.state,
                     activity.author,
@@ -555,7 +559,7 @@ class SQLiteRepository:
                 SELECT id FROM github_activities
                 WHERE repo = ? AND activity_type = ? AND url = ?
                 """,
-                (repository_name, activity.activity_type, activity.url),
+                (repository_name, activity.activity_type, activity_url),
             ).fetchone()
         return int(row["id"])
 
@@ -621,23 +625,26 @@ class SQLiteRepository:
                 """
             ).fetchall()
         try:
-            return [
-                GitHubActivity(
-                    id=self._required_int(row, "id"),
-                    source_id=self._optional_int(row, "source_id"),
-                    repo=self._required_text(row, "repo"),
-                    activity_type=self._required_text(row, "activity_type"),
-                    url=self._required_text(row, "url"),
-                    title=self._required_text(row, "title"),
-                    state=self._required_text(row, "state"),
-                    author=self._required_text(row, "author"),
-                    created_at=self._required_text(row, "created_at"),
-                    merged_at=self._optional_text(row, "merged_at"),
-                    is_private=bool(self._required_boolean(row, "is_private")),
-                    state_field=self._optional_text(row, "state_field"),
+            activities: list[GitHubActivity] = []
+            for row in rows:
+                raw_url = self._required_text(row, "url")
+                activities.append(
+                    GitHubActivity(
+                        id=self._required_int(row, "id"),
+                        source_id=self._optional_int(row, "source_id"),
+                        repo=self._required_text(row, "repo"),
+                        activity_type=self._required_text(row, "activity_type"),
+                        url=canonical_public_github_activity_url(raw_url) or raw_url,
+                        title=self._required_text(row, "title"),
+                        state=self._required_text(row, "state"),
+                        author=self._required_text(row, "author"),
+                        created_at=self._required_text(row, "created_at"),
+                        merged_at=self._optional_text(row, "merged_at"),
+                        is_private=bool(self._required_boolean(row, "is_private")),
+                        state_field=self._optional_text(row, "state_field"),
+                    )
                 )
-                for row in rows
-            ]
+            return activities
         except (KeyError, TypeError, ValueError) as error:
             raise self._semantic_error() from error
 

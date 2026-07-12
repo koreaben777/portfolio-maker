@@ -7,16 +7,22 @@ from portfolio_maker.application.models import BuildProfileRequest, BuildProfile
 from portfolio_maker.domain.models import Source, SourceStatus, SourceType
 from portfolio_maker.infrastructure.artifacts import write_json, write_markdown
 from portfolio_maker.infrastructure.extractors import extract_approved_text
-from portfolio_maker.infrastructure.policy import FilePolicy, SourcePathPolicyError, mask_public_value
 from portfolio_maker.infrastructure.managed_files import remove_managed_file
 from portfolio_maker.infrastructure.presentation import markdown_text, normalize_label
 from portfolio_maker.infrastructure.github_connector import (
+    canonical_public_github_activity_url,
     canonical_repository_name,
     contains_unicode_control,
     is_valid_github_activity_state,
     is_valid_github_timestamp,
     public_github_activity_identity,
     public_github_repository_name,
+)
+from portfolio_maker.infrastructure.policy import (
+    FilePolicy,
+    SourcePathPolicyError,
+    contains_hidden_secret_shaped_public_value,
+    mask_public_value,
 )
 from portfolio_maker.infrastructure.sqlite_repository import SQLiteRepository
 from portfolio_maker.infrastructure.snapshots import load_valid_local_snapshot
@@ -115,6 +121,9 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
     excluded_repositories = set(approval.excluded_repositories)
     seen_activities: set[tuple[str, str, str]] = set()
     for activity in repository.list_github_activities():
+        canonical_activity_url = canonical_public_github_activity_url(activity.url)
+        if canonical_activity_url is None:
+            continue
         try:
             repository_name = canonical_repository_name(activity.repo)
         except ValueError:
@@ -123,14 +132,16 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
             activity.id is None
             or activity.source_id is None
             or activity.is_private
-            or activity.url not in approved_activity_urls
+            or canonical_activity_url not in approved_activity_urls
             or contains_unicode_control(activity.title)
             or contains_unicode_control(activity.author)
+            or contains_hidden_secret_shaped_public_value(activity.title)
+            or contains_hidden_secret_shaped_public_value(activity.author)
             or not is_valid_github_activity_state(
                 activity.activity_type, activity.state, activity.state_field
             )
             or not is_valid_github_timestamp(activity.created_at)
-            or public_github_activity_identity(activity.url)
+            or public_github_activity_identity(canonical_activity_url)
             != (repository_name, activity.activity_type)
         ):
             continue
@@ -151,7 +162,11 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
         title = normalize_label(mask_public_value(activity.title))
         if not title:
             continue
-        activity_key = (repository_name, activity.activity_type, activity.url)
+        activity_key = (
+            repository_name,
+            activity.activity_type,
+            canonical_activity_url,
+        )
         if activity_key in seen_activities:
             continue
         seen_activities.add(activity_key)
@@ -166,7 +181,7 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
             source_id=source.id,
             snapshot_id=None,
             github_activity_id=activity.id,
-            locator=activity.url,
+            locator=canonical_activity_url,
             stable_id=f"github-activity:{activity.id}",
             content_hash=None,
             public_safe=True,
@@ -184,7 +199,7 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
                 "text": claim_text,
                 "confidence": "high",
                 "public_safe": True,
-                "evidence_uri": activity.url,
+                "evidence_uri": canonical_activity_url,
                 "evidence_snapshot": None,
                 "activity_type": activity.activity_type,
                 "title": title,
