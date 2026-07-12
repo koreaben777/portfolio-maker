@@ -33,7 +33,7 @@ portfolio-maker approve --workspace . --write-sample
 
 This creates the sample only when no approval file exists. Use `portfolio-maker approve --workspace . --write-sample --force` only to deliberately reset an existing approval file.
 
-4. Before discovery, edit the policy fields in `.portfolio-maker/reviews/source-approval.json`: `excluded_repositories`, `allowed_repositories` (canonical `owner/repo` values only), `private_sources_allowed`, and `excluded_file_patterns` (case-insensitive filename globs). Keep `approved_github_activity_urls` empty until discovery has recorded exact public activity URLs.
+4. Before discovery, persist the policy fields in `.portfolio-maker/reviews/source-approval.json`: `forbidden_paths` (required for ingest/profile/draft revalidation), `excluded_repositories`, `allowed_repositories` (canonical `owner/repo` values only), `private_sources_allowed`, and `excluded_file_patterns` (case-insensitive filename globs). Keep `approved_github_activity_urls` empty until discovery has recorded exact public activity URLs.
 
 5. Run discovery:
 
@@ -41,7 +41,7 @@ This creates the sample only when no approval file exists. Use `portfolio-maker 
 portfolio-maker discover --workspace .
 ```
 
-If the user supplied forbidden paths, pass one `--forbidden-path` argument per path.
+`--forbidden-path` applies only to this discovery run; persist paths in `forbidden_paths` before ingest, profile, or draft generation.
 
 6. Ask the user to review:
 

@@ -150,6 +150,9 @@ def parse_commit_list(repo: str, payload: Any) -> list[GitHubActivityCandidate]:
         commit = _object(item.get("commit") or {}, "commit list")
         author = _object(commit.get("author") or {}, "commit list")
         message = _required_string(commit, "message", "commit list")
+        subject = normalize_label(message.splitlines()[0] if message else "")
+        if not subject:
+            raise GitHubDiscoveryError("GitHub commit list payload is invalid")
         activities.append(
             GitHubActivityCandidate(
                 repo=repo,
@@ -157,7 +160,7 @@ def parse_commit_list(repo: str, payload: Any) -> list[GitHubActivityCandidate]:
                 url=_required_activity_url(
                     item, "html_url", "commit list", repo, "commit"
                 ),
-                title=message.splitlines()[0] if message else "",
+                title=subject,
                 state="committed",
                 author=_optional_string(author, "name", "commit list") or "",
                 created_at=_required_timestamp(author, "date", "commit list"),

@@ -495,6 +495,7 @@ def test_build_profile_retires_github_artifacts_when_activity_becomes_private(tm
     paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
     repository = SQLiteRepository(paths.db_path)
     repository.initialize()
+    repository.upsert_project("local:sentinel", public_safe=True)
     source_id = repository.upsert_source(
         Source(None, SourceType.GITHUB_REPOSITORY, "https://github.com/octo/demo", "octo/demo", "octo", SourceStatus.DISCOVERED)
     )
@@ -520,8 +521,16 @@ def test_build_profile_retires_github_artifacts_when_activity_becomes_private(tm
             """,
             (activity_id,),
         ).fetchall()
+        project = conn.execute(
+            "SELECT public_safe FROM projects WHERE name = 'github:octo/demo'"
+        ).fetchone()
+        local_project = conn.execute(
+            "SELECT public_safe FROM projects WHERE name = 'local:sentinel'"
+        ).fetchone()
     assert result.claim_count == 0
     assert [tuple(row) for row in rows] == [(0, 0)]
+    assert project["public_safe"] == 0
+    assert local_project["public_safe"] == 1
     assert activity_url not in paths.portfolio_draft_path.read_text(encoding="utf-8")
 
 

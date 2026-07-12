@@ -689,6 +689,10 @@ class SQLiteRepository:
     def reconcile_github_artifact_safety(self) -> None:
         with self._connection() as conn:
             conn.execute(
+                "UPDATE projects SET public_safe = 0 "
+                "WHERE public_safe = 1 AND name LIKE 'github:%'"
+            )
+            conn.execute(
                 "UPDATE evidence_items SET public_safe = 0 "
                 "WHERE github_activity_id IS NOT NULL"
             )

@@ -589,21 +589,37 @@ def test_discover_github_candidates_rejects_malformed_repository_payload(monkeyp
         discover_github_candidates()
 
 
-def test_parse_commit_list_handles_empty_commit_message():
+def test_parse_commit_list_normalizes_commit_subject():
     activities = parse_commit_list(
         "octo/demo",
         [
             {
                 "html_url": "https://github.com/octo/demo/commit/abcdef1",
                 "commit": {
-                    "message": "",
+                        "message": "  Implement subject  \n\nBody text",
                     "author": {"date": "2026-01-01T00:00:00Z"},
                 },
             }
         ],
     )
 
-    assert activities[0].title == ""
+    assert activities[0].title == "Implement subject"
+
+
+def test_parse_commit_list_rejects_whitespace_only_subject():
+    with pytest.raises(GitHubDiscoveryError, match="commit list payload is invalid"):
+        parse_commit_list(
+            "octo/demo",
+            [
+                {
+                    "html_url": "https://github.com/octo/demo/commit/abcdef1",
+                    "commit": {
+                        "message": " \nBody text",
+                        "author": {"date": "2026-01-01T00:00:00Z"},
+                    },
+                }
+            ],
+        )
 
 
 @pytest.mark.parametrize("html_url", (None, ""))
