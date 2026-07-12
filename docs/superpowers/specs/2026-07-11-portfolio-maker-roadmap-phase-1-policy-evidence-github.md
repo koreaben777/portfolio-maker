@@ -54,7 +54,7 @@ Portfolio Maker 0.1.0은 승인된 로컬 파일에서 근거 기반 master prof
 #11 일반형 인터랙티브 HTML + @sites    이번 최우선 구현
   ↓
 #3 회사/JD별 맞춤 포트폴리오           후속 확장
-``` 
+```
 
 #11에서는 `emilkowalski/skills`를 디자인·모션 review 기준으로, `@sites`를 디자인 선택·빌드 검증·선택적 hosting 표면으로 사용한다.
 
