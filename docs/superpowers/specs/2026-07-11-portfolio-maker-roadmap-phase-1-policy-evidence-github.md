@@ -3,7 +3,7 @@
 날짜: 2026-07-11
 상태: 현재 Phase 1 정책 및 runtime 계약
 대상 Issue: #4 → #2 → #1
-후속 렌더링: #3 → #11 (`@sites` 선택적 presentation/hosting)
+후속 렌더링: #11 일반형 HTML + `@sites` → #3 회사별 맞춤 확장
 
 ## 1. 목적과 범위
 
@@ -20,7 +20,7 @@ Portfolio Maker 0.1.0은 승인된 로컬 파일에서 근거 기반 master prof
 - [#2 근거·주장·산출물 정규화 스키마 도입](https://github.com/koreaben777/portfolio-maker/issues/2)
 - [#1 GitHub 활동을 프로필·포트폴리오 근거로 반영](https://github.com/koreaben777/portfolio-maker/issues/1)
 
-다음은 **이번 구현 범위 밖**이다.
+다음은 **현재 Phase 1 runtime 구현 범위 밖**이다.
 
 - 회사/JD별 맞춤 문장 생성 (#3)
 - 이력서·자기소개서·면접 자료 (#7)
@@ -45,18 +45,18 @@ Portfolio Maker 0.1.0은 승인된 로컬 파일에서 근거 기반 master prof
 ## 3. 구현 순서와 완료 게이트
 
 ```text
-#4 세밀한 승인 정책
+#4 세밀한 승인 정책                 완료
   ↓
-#2 근거·주장·산출물 모델
+#2 근거·주장·산출물 모델              완료
   ↓
-#1 명시적으로 승인된 공개 GitHub 활동 반영
+#1 명시적으로 승인된 공개 GitHub 활동  완료
   ↓
-#3 회사/JD별 맞춤 포트폴리오
+#11 일반형 인터랙티브 HTML + @sites    이번 최우선 구현
   ↓
-#11 공개용 인터랙티브 HTML 포트폴리오
-      ├─ emilkowalski/skills: 디자인·모션 검토 기준
-      └─ @sites: 디자인 선택·빌드 검증·선택적 호스팅
-```
+#3 회사/JD별 맞춤 포트폴리오           후속 확장
+``` 
+
+#11에서는 `emilkowalski/skills`를 디자인·모션 review 기준으로, `@sites`를 디자인 선택·빌드 검증·선택적 hosting 표면으로 사용한다.
 
 각 Issue의 focused test와 전체 `pytest`가 통과하기 전에는 다음 Issue의 runtime 동작을 구현하지 않는다. 문서·샘플 approval·README는 해당 Issue와 같은 변경 단위로 갱신한다.
 
