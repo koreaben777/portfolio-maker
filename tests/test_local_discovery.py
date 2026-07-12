@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
 
+from portfolio_maker.application.approval import write_sample_approval
+from portfolio_maker.application.build_profile import build_profile
 from portfolio_maker.application.discovery import discover_sources
-from portfolio_maker.application.models import DiscoverSourcesRequest
+from portfolio_maker.application.models import BuildProfileRequest, DiscoverSourcesRequest
 from portfolio_maker.domain.models import SourceStatus, SourceType
 from portfolio_maker.infrastructure.github_connector import (
     GitHubActivityCandidate,
@@ -326,6 +329,71 @@ def test_discover_sources_keeps_local_report_when_github_fails(workspace, tmp_pa
     assert result.discovered_count == 1
     assert "README.md" in report
     assert "GitHub discovery failed" in report
+
+
+def test_successful_github_rediscovery_invalidates_disappeared_activities(workspace, tmp_path, monkeypatch):
+    activity = GitHubActivityCandidate(
+        repo="octo/demo",
+        activity_type="pull_request",
+        url="https://github.com/octo/demo/pull/1",
+        title="Observed once",
+        state="MERGED",
+        author="octo",
+        created_at="2026-01-01T00:00:00Z",
+        merged_at="2026-01-02T00:00:00Z",
+    )
+    repo = GitHubRepositoryCandidate("octo/demo", "https://github.com/octo/demo", False)
+    responses = [([repo], [activity], []), ([repo], [], [])]
+
+    monkeypatch.setattr(
+        "portfolio_maker.application.discovery.discover_github_candidates",
+        lambda **kwargs: responses.pop(0),
+    )
+
+    request = DiscoverSourcesRequest(workspace=workspace, home=tmp_path, include_github=True)
+    discover_sources(request)
+    repository = SQLiteRepository(WorkspacePaths.from_root(workspace).db_path)
+    assert repository.list_github_activities()[0].is_private is False
+    paths = WorkspacePaths.from_root(workspace)
+    write_sample_approval(paths)
+    approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    approval["approved_github_activity_urls"] = [activity.url]
+    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+    assert build_profile(BuildProfileRequest(workspace=workspace)).claim_count == 1
+
+    discover_sources(request)
+
+    assert repository.list_github_activities()[0].is_private is True
+    assert build_profile(BuildProfileRequest(workspace=workspace)).claim_count == 0
+
+
+def test_failed_github_rediscovery_preserves_existing_activity_visibility(workspace, tmp_path, monkeypatch):
+    activity = GitHubActivityCandidate(
+        repo="octo/demo",
+        activity_type="pull_request",
+        url="https://github.com/octo/demo/pull/1",
+        title="Observed once",
+        state="MERGED",
+        author="octo",
+        created_at="2026-01-01T00:00:00Z",
+        merged_at="2026-01-02T00:00:00Z",
+    )
+    repo = GitHubRepositoryCandidate("octo/demo", "https://github.com/octo/demo", False)
+    monkeypatch.setattr(
+        "portfolio_maker.application.discovery.discover_github_candidates",
+        lambda **kwargs: ([repo], [activity], []),
+    )
+    request = DiscoverSourcesRequest(workspace=workspace, home=tmp_path, include_github=True)
+    discover_sources(request)
+    monkeypatch.setattr(
+        "portfolio_maker.application.discovery.discover_github_candidates",
+        lambda **kwargs: (_ for _ in ()).throw(FileNotFoundError("gh")),
+    )
+
+    discover_sources(request)
+
+    repository = SQLiteRepository(WorkspacePaths.from_root(workspace).db_path)
+    assert repository.list_github_activities()[0].is_private is False
 
 
 def test_discover_sources_uses_approval_forbidden_paths_on_rerun(workspace, tmp_path):

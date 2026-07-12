@@ -11,6 +11,7 @@ from pathlib import Path
 from stat import S_ISDIR, S_ISREG
 
 from portfolio_maker.domain.models import GitHubActivity, Source, SourceStatus, SourceType
+from portfolio_maker.infrastructure.github_connector import canonical_repository_name
 from portfolio_maker.infrastructure.managed_files import (
     ensure_managed_directory,
     open_managed_directory,
@@ -491,6 +492,12 @@ class SQLiteRepository:
         return int(row["id"])
 
     def insert_github_activity(self, activity: GitHubActivity) -> int:
+        if not activity.state.strip():
+            raise RepositoryError("GitHub activity state must be non-empty")
+        try:
+            repository_name = canonical_repository_name(activity.repo)
+        except ValueError as error:
+            raise RepositoryError("GitHub activity repository is invalid") from error
         with self._connection() as conn:
             conn.execute(
                 """
@@ -508,7 +515,7 @@ class SQLiteRepository:
                 """,
                 (
                     activity.source_id,
-                    activity.repo,
+                    repository_name,
                     activity.activity_type,
                     activity.url,
                     activity.title,
@@ -524,9 +531,13 @@ class SQLiteRepository:
                 SELECT id FROM github_activities
                 WHERE repo = ? AND activity_type = ? AND url = ?
                 """,
-                (activity.repo, activity.activity_type, activity.url),
+                (repository_name, activity.activity_type, activity.url),
             ).fetchone()
         return int(row["id"])
+
+    def invalidate_github_activity_visibility(self) -> None:
+        with self._connection() as conn:
+            conn.execute("UPDATE github_activities SET is_private = 1")
 
     def list_github_activities(self) -> list[GitHubActivity]:
         with self._read_connection() as conn:
@@ -598,21 +609,33 @@ class SQLiteRepository:
             ).fetchone()
         return self._required_int(row, "id")
 
-    def upsert_career_claim(self, text: str, public_safe: bool) -> int:
+    def upsert_project(self, name: str, public_safe: bool) -> int:
+        with self._connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO projects (name, public_safe) VALUES (?, ?)
+                ON CONFLICT(name) DO UPDATE SET public_safe = excluded.public_safe
+                """,
+                (name, int(public_safe)),
+            )
+            row = conn.execute("SELECT id FROM projects WHERE name = ?", (name,)).fetchone()
+        return self._required_int(row, "id")
+
+    def upsert_career_claim(self, project_id: int, text: str, public_safe: bool) -> int:
         with self._connection() as conn:
             row = conn.execute(
                 """
                 SELECT id FROM career_claims
-                WHERE project_id IS NULL AND text = ? AND public_safe = ?
+                WHERE project_id = ? AND text = ? AND public_safe = ?
                 ORDER BY id LIMIT 1
                 """,
-                (text, int(public_safe)),
+                (project_id, text, int(public_safe)),
             ).fetchone()
             if row is not None:
                 return self._required_int(row, "id")
             cursor = conn.execute(
-                "INSERT INTO career_claims (text, public_safe) VALUES (?, ?)",
-                (text, int(public_safe)),
+                "INSERT INTO career_claims (project_id, text, public_safe) VALUES (?, ?, ?)",
+                (project_id, text, int(public_safe)),
             )
         return int(cursor.lastrowid)
 
@@ -626,13 +649,12 @@ class SQLiteRepository:
                 (claim_id, evidence_id, support_level),
             )
 
-    def record_artifact(self, kind: str, version: int, input_manifest: str) -> int:
+    def record_artifact(self, kind: str, version: int, input_manifest: str) -> None:
         with self._connection() as conn:
-            cursor = conn.execute(
+            conn.execute(
                 "INSERT INTO artifacts (kind, version, input_manifest) VALUES (?, ?, ?)",
                 (kind, version, input_manifest),
             )
-        return int(cursor.lastrowid)
 
     def insert_source_snapshot(
         self,

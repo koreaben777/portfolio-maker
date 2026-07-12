@@ -4,9 +4,12 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+import unicodedata
 
-from portfolio_maker.infrastructure.github_connector import canonical_repository_name
+from portfolio_maker.infrastructure.github_connector import (
+    canonical_repository_name,
+    is_public_github_activity_url,
+)
 from portfolio_maker.infrastructure.managed_files import read_managed_bytes, write_managed_text
 from portfolio_maker.workspace import WorkspacePaths
 
@@ -107,12 +110,12 @@ def load_approval(paths: WorkspacePaths) -> SourceApproval:
         not pattern
         or "/" in pattern
         or "\\" in pattern
-        or any(character.isspace() and character not in {" ", "\t"} for character in pattern)
+        or any(unicodedata.category(character).startswith("C") for character in pattern)
         for pattern in excluded_file_patterns
     ):
         raise ApprovalFormatError("excluded_file_patterns entries must be safe filenames globs")
     approved_github_activity_urls = _string_list(payload, "approved_github_activity_urls")
-    if any(not _is_public_github_activity_url(url) for url in approved_github_activity_urls):
+    if any(not is_public_github_activity_url(url) for url in approved_github_activity_urls):
         raise ApprovalFormatError(
             "approved_github_activity_urls entries must be public GitHub activity URLs"
         )
@@ -143,17 +146,3 @@ def _string_list(payload: dict[str, Any], key: str) -> tuple[str, ...]:
     if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
         raise ApprovalFormatError(f"{key} must be a list of strings")
     return tuple(value)
-
-
-def _is_public_github_activity_url(value: str) -> bool:
-    parsed = urlparse(value)
-    if parsed.scheme != "https" or parsed.netloc != "github.com":
-        return False
-    parts = [part for part in parsed.path.split("/") if part]
-    if len(parts) < 4 or parts[2] not in {"actions", "commit", "issues", "pull"}:
-        return False
-    try:
-        canonical_repository_name("/".join(parts[:2]))
-    except ValueError:
-        return False
-    return True

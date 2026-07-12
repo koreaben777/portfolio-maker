@@ -7,6 +7,7 @@ from portfolio_maker.infrastructure.github_connector import (
     GitHubDiscoveryError,
     GitHubActivityCandidate,
     GitHubRepositoryCandidate,
+    canonical_repository_name,
     discover_github_candidates,
 )
 from portfolio_maker.infrastructure.artifacts import write_markdown
@@ -58,6 +59,9 @@ def discover_sources(request: DiscoverSourcesRequest) -> DiscoverSourcesResult:
                 allowed_repositories=tuple(allowed_repositories),
                 private_sources_allowed=private_sources_allowed,
             )
+            # A successful repository list is the current visibility authority.
+            # Activity endpoint failures stay fail-open only for local discovery.
+            repository.invalidate_github_activity_visibility()
         except (GitHubDiscoveryError, FileNotFoundError) as error:
             github_statuses = [str(error) or "GitHub discovery failed"]
 
@@ -76,11 +80,15 @@ def discover_sources(request: DiscoverSourcesRequest) -> DiscoverSourcesResult:
             )
             repo_visibility[repo.name_with_owner] = repo.is_private
         for activity in github_activities:
+            try:
+                repository_name = canonical_repository_name(activity.repo)
+            except ValueError:
+                continue
             repository.insert_github_activity(
                 GitHubActivity(
                     id=None,
-                    source_id=repo_source_ids.get(activity.repo),
-                    repo=activity.repo,
+                    source_id=repo_source_ids.get(repository_name),
+                    repo=repository_name,
                     activity_type=activity.activity_type,
                     url=activity.url,
                     title=activity.title,
@@ -88,7 +96,7 @@ def discover_sources(request: DiscoverSourcesRequest) -> DiscoverSourcesResult:
                     author=activity.author,
                     created_at=activity.created_at,
                     merged_at=activity.merged_at,
-                    is_private=repo_visibility.get(activity.repo, True),
+                    is_private=repo_visibility.get(repository_name, True),
                 )
             )
 

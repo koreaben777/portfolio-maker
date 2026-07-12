@@ -4,7 +4,7 @@
 
 승인한 내 작업 자료를 바탕으로, **근거를 확인할 수 있는 커리어 프로필**과 **검토용 포트폴리오 초안**을 만드는 로컬 우선 도구입니다.
 
-Portfolio Maker는 원본 파일을 자동으로 업로드하거나 공개하지 않습니다. 먼저 후보를 확인하고, 사용자가 명시적으로 승인한 로컬 자료만 처리합니다. 공개 GitHub 활동도 `approved_github_activity_urls`에서 URL 단위로 명시 승인한 항목만 profile의 검토 근거로 반영합니다.
+Portfolio Maker는 원본 파일을 자동으로 업로드하거나 공개하지 않습니다. 먼저 후보를 확인하고, 사용자가 명시적으로 승인한 로컬 자료만 처리합니다. 공개 GitHub 활동도 `approved_github_activity_urls`에서 URL 단위로 명시 승인한 항목만 profile과 portfolio draft의 검토 근거로 반영하며, 자동 프로젝트 서술은 만들지 않습니다.
 
 ## 지금 할 수 있는 일
 

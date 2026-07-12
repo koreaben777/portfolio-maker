@@ -49,6 +49,8 @@ class BuildProfileResult:
     json_path: Path
     markdown_path: Path
     claim_count: int
+    claim_ids: tuple[int, ...] = ()
+    evidence_ids: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)

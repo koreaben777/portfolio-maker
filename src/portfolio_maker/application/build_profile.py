@@ -7,10 +7,14 @@ from portfolio_maker.application.models import BuildProfileRequest, BuildProfile
 from portfolio_maker.domain.models import Source, SourceStatus, SourceType
 from portfolio_maker.infrastructure.artifacts import write_json, write_markdown
 from portfolio_maker.infrastructure.extractors import extract_approved_text
-from portfolio_maker.infrastructure.policy import FilePolicy, SourcePathPolicyError
+from portfolio_maker.infrastructure.policy import FilePolicy, SourcePathPolicyError, mask_public_value
 from portfolio_maker.infrastructure.managed_files import remove_managed_file
 from portfolio_maker.infrastructure.presentation import markdown_text, normalize_label
-from portfolio_maker.infrastructure.github_connector import canonical_repository_name
+from portfolio_maker.infrastructure.github_connector import (
+    canonical_repository_name,
+    is_public_github_activity_url,
+    public_github_activity_type,
+)
 from portfolio_maker.infrastructure.sqlite_repository import SQLiteRepository
 from portfolio_maker.infrastructure.snapshots import load_valid_local_snapshot
 from portfolio_maker.workspace import WorkspacePaths
@@ -74,6 +78,7 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
             continue
         evidence = normalize_label(evidence)
         claim_text = f"{display_name}: {evidence}"
+        project_id = repository.upsert_project(f"local:{source.id}", public_safe=False)
         evidence_id = repository.upsert_evidence_item(
             source_id=source.id,
             snapshot_id=snapshot_metadata[0],
@@ -83,7 +88,7 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
             content_hash=snapshot_metadata[2],
             public_safe=False,
         )
-        claim_id = repository.upsert_career_claim(claim_text, public_safe=False)
+        claim_id = repository.upsert_career_claim(project_id, claim_text, public_safe=False)
         repository.link_claim_evidence(claim_id, evidence_id, "direct")
         evidence_ids.append(evidence_id)
         claim_ids.append(claim_id)
@@ -103,12 +108,16 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
     approved_activity_urls = set(approval.approved_github_activity_urls)
     allowed_repositories = set(approval.allowed_repositories)
     excluded_repositories = set(approval.excluded_repositories)
+    seen_activities: set[tuple[str, str, str]] = set()
     for activity in repository.list_github_activities():
         if (
             activity.id is None
             or activity.source_id is None
             or activity.is_private
             or activity.url not in approved_activity_urls
+            or not activity.state.strip()
+            or not is_public_github_activity_url(activity.url)
+            or public_github_activity_type(activity.url) != activity.activity_type
         ):
             continue
         try:
@@ -128,10 +137,17 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
             or (allowed_repositories and repository_name not in allowed_repositories)
         ):
             continue
+        activity_key = (repository_name, activity.activity_type, activity.url)
+        if activity_key in seen_activities:
+            continue
+        seen_activities.add(activity_key)
         if source not in sources:
             sources.append(source)
-        title = normalize_label(activity.title)
+        title = normalize_label(mask_public_value(activity.title))
+        author = normalize_label(mask_public_value(activity.author))
+        state = normalize_label(activity.state)
         claim_text = f"{repository_name}: {title}"
+        project_id = repository.upsert_project(f"github:{repository_name}", public_safe=True)
         evidence_id = repository.upsert_evidence_item(
             source_id=source.id,
             snapshot_id=None,
@@ -141,7 +157,7 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
             content_hash=None,
             public_safe=True,
         )
-        claim_id = repository.upsert_career_claim(claim_text, public_safe=True)
+        claim_id = repository.upsert_career_claim(project_id, claim_text, public_safe=True)
         repository.link_claim_evidence(claim_id, evidence_id, "direct")
         evidence_ids.append(evidence_id)
         claim_ids.append(claim_id)
@@ -154,9 +170,10 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
                 "evidence_uri": activity.url,
                 "evidence_snapshot": None,
                 "activity_type": activity.activity_type,
-                "author": normalize_label(activity.author),
+                "title": title,
+                "author": author,
                 "created_at": activity.created_at,
-                "state": activity.state,
+                "state": state,
             }
         )
 
@@ -211,6 +228,8 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
         json_path=paths.master_profile_json_path,
         markdown_path=paths.master_profile_md_path,
         claim_count=len(claims),
+        claim_ids=tuple(claim_ids),
+        evidence_ids=tuple(evidence_ids),
     )
 
 

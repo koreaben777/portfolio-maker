@@ -1,13 +1,13 @@
 ---
 name: portfolio-maker
-description: Use when generating a local evidence-based career profile or portfolio draft from approved local files in this repository. GitHub activity is discovery-only in this MVP.
+description: Use when generating a local evidence-based career profile or portfolio draft from approved local files and explicitly approved public GitHub activities in this repository.
 ---
 
 # Portfolio Maker Workflow
 
 Use this skill to run the Portfolio Maker MVP safely from Codex app.
 
-GitHub repositories and activities can be discovered for review, but this MVP does not ingest them into profile or portfolio artifacts.
+GitHub repositories and activities are discovery metadata by default. Only exact URLs in `approved_github_activity_urls` can enter profile or draft artifacts, and then only for a currently confirmed public repository that passes `allowed_repositories` and `excluded_repositories` revalidation. GitHub activity appears as reviewable evidence, never as an automatic project narrative.
 
 The generated portfolio draft is a review-required portfolio skeleton. It lists approved sources but leaves role, technical approach, and outcome as placeholders; evidence-rendered portfolio writing is deferred.
 
@@ -33,7 +33,7 @@ portfolio-maker approve --workspace . --write-sample
 
 This creates the sample only when no approval file exists. Use `portfolio-maker approve --workspace . --write-sample --force` only to deliberately reset an existing approval file.
 
-4. Edit `excluded_repositories` (canonical `owner/repo` values only) and `private_sources_allowed` in `.portfolio-maker/reviews/source-approval.json` when GitHub visibility rules are needed.
+4. Edit `excluded_repositories`, `allowed_repositories` (canonical `owner/repo` values only), `private_sources_allowed`, and `approved_github_activity_urls` in `.portfolio-maker/reviews/source-approval.json` when GitHub visibility rules are needed. Private, excluded, missing, or stale activities remain artifact-ineligible.
 
 5. Run discovery:
 

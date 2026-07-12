@@ -78,6 +78,22 @@ def test_cli_ingest_malformed_approval_exits_without_traceback(workspace, capsys
     assert "Traceback" not in captured.err
 
 
+def test_cli_profile_rejects_github_approval_url_with_query_without_traceback(workspace, capsys):
+    approval_path = workspace / ".portfolio-maker" / "reviews" / "source-approval.json"
+    approval_path.parent.mkdir(parents=True)
+    approval_path.write_text(
+        '{"approved_github_activity_urls": ["https://github.com/octo/demo/pull/1?token=synthetic"]}',
+        encoding="utf-8",
+    )
+
+    exit_code = main(["build-profile", "--workspace", str(workspace)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "approved_github_activity_urls" in captured.err
+    assert "Traceback" not in captured.err
+
+
 def test_cli_ingest_non_object_approval_exits_without_traceback(workspace, capsys):
     approval_path = workspace / ".portfolio-maker" / "reviews" / "source-approval.json"
     approval_path.parent.mkdir(parents=True)

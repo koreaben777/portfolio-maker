@@ -310,6 +310,82 @@ def test_build_profile_traces_approved_github_claim_to_evidence(tmp_path):
     assert tuple(row) == (activity_id, activity_url, 1, "direct", 1)
 
 
+def test_draft_portfolio_renders_approved_github_activity_as_evidence_with_provenance(tmp_path):
+    workspace = tmp_path / "workspace"
+    paths = WorkspacePaths.from_root(workspace)
+    write_sample_approval(paths)
+    approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    activity_url = "https://github.com/octo/demo/pull/1"
+    approval["approved_github_activity_urls"] = [activity_url]
+    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    source_id = repository.upsert_source(
+        Source(None, SourceType.GITHUB_REPOSITORY, "https://github.com/octo/demo", "octo/demo", "octo", SourceStatus.DISCOVERED)
+    )
+    repository.insert_github_activity(
+        GitHubActivity(None, source_id, "octo/demo", "pull_request", activity_url, "Safe title", "MERGED", "octo", "2026-01-01T00:00:00Z", None)
+    )
+
+    result = draft_portfolio(DraftPortfolioRequest(workspace=workspace))
+
+    draft = paths.portfolio_draft_path.read_text(encoding="utf-8")
+    with repository._read_connection() as conn:
+        artifact = conn.execute(
+            "SELECT input_manifest FROM artifacts WHERE kind = 'portfolio_draft' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        master_artifact = conn.execute(
+            "SELECT input_manifest FROM artifacts WHERE kind = 'master_profile' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        project_id = conn.execute("SELECT project_id FROM career_claims").fetchone()[0]
+    assert result.project_count == 0
+    assert "## GitHub Activity Evidence" in draft
+    assert "Safe title" in draft
+    assert activity_url in draft
+    assert "Role: Evidence review required" not in draft
+    assert json.loads(artifact["input_manifest"])["claim_ids"]
+    assert json.loads(artifact["input_manifest"])["evidence_ids"]
+    assert artifact["input_manifest"] == master_artifact["input_manifest"]
+    assert project_id is not None
+
+
+def test_build_profile_skips_malformed_or_case_duplicate_github_activity_rows(tmp_path):
+    workspace = tmp_path / "workspace"
+    paths = WorkspacePaths.from_root(workspace)
+    write_sample_approval(paths)
+    approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    activity_url = "https://github.com/octo/demo/pull/1"
+    approval["approved_github_activity_urls"] = [activity_url]
+    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    source_id = repository.upsert_source(
+        Source(None, SourceType.GITHUB_REPOSITORY, "https://github.com/octo/demo", "octo/demo", "octo", SourceStatus.DISCOVERED)
+    )
+    with repository._connection() as conn:
+        for repo, activity_type, state in (
+            ("octo/demo", "pull_request", "MERGED"),
+            ("Octo/Demo", "pull_request", "MERGED"),
+            ("octo/demo", "issue", "MERGED"),
+            ("octo/demo", "workflow_run", ""),
+        ):
+            conn.execute(
+                """
+                INSERT INTO github_activities
+                    (source_id, repo, activity_type, url, title, state, author, created_at, is_private)
+                VALUES (?, ?, ?, ?, 'OPENAI_API_KEY=synthetic', ?, 'author\nname', '2026-01-01T00:00:00Z', 0)
+                """,
+                    (source_id, repo, activity_type, activity_url, state),
+            )
+
+    result = build_profile(BuildProfileRequest(workspace=workspace))
+    profile = json.loads(result.json_path.read_text(encoding="utf-8"))
+
+    assert result.claim_count == 1
+    assert "OPENAI_API_KEY=synthetic" not in profile["claims"][0]["text"]
+    assert "\n" not in profile["claims"][0]["author"]
+
+
 def test_build_profile_excludes_ingested_source_after_approval_revoked(tmp_path):
     workspace, source_path, paths = _ingest_approved_source(tmp_path)
     approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))

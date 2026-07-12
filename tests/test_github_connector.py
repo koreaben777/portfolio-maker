@@ -41,6 +41,23 @@ def test_parse_repo_list_requires_boolean_privacy_field():
         )
 
 
+def test_parse_repo_list_canonicalizes_and_deduplicates_case_equivalent_repositories():
+    repos = parse_repo_list(
+        [
+            {"nameWithOwner": "Octo/Demo", "url": "https://github.com/Octo/Demo", "isPrivate": False},
+            {"nameWithOwner": "octo/demo", "url": "https://github.com/octo/demo", "isPrivate": False},
+        ]
+    )
+
+    assert repos == [
+        GitHubRepositoryCandidate(
+            name_with_owner="octo/demo",
+            url="https://github.com/Octo/Demo",
+            is_private=False,
+        )
+    ]
+
+
 @pytest.mark.parametrize("repository", ("../repo", "owner/..", "_owner/repo", "-owner/repo"))
 def test_parse_repo_list_rejects_noncanonical_repository_name(repository):
     with pytest.raises(GitHubDiscoveryError, match="repository list payload is invalid"):
@@ -78,6 +95,15 @@ def test_parse_pr_and_issue_lists():
         merged_at="2026-01-02T00:00:00Z",
     )
     assert issues[0].activity_type == "issue"
+
+
+@pytest.mark.parametrize("parser", (parse_pr_list, parse_issue_list))
+def test_activity_parsers_reject_empty_state(parser):
+    with pytest.raises(GitHubDiscoveryError, match="payload is invalid"):
+        parser(
+            "octo/demo",
+            [{"url": "https://github.com/octo/demo/pull/1", "title": "Title", "state": "", "createdAt": "2026-01-01T00:00:00Z", "author": None}],
+        )
 
 
 def test_parse_commit_review_and_workflow_run_lists():

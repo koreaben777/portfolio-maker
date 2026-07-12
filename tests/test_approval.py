@@ -150,6 +150,8 @@ def test_load_approval_reads_public_github_activity_urls(workspace):
         "http://github.com/octo/demo/pull/1",
         "https://example.test/octo/demo/pull/1",
         "https://github.com/octo/demo/releases/tag/v1",
+        "https://github.com/octo/demo/pull/1?token=synthetic",
+        "https://github.com/octo/demo/pull/1#discussion_r1",
     ),
 )
 def test_load_approval_rejects_non_activity_github_urls(workspace, url):
@@ -163,7 +165,9 @@ def test_load_approval_rejects_non_activity_github_urls(workspace, url):
         load_approval(paths)
 
 
-@pytest.mark.parametrize("pattern", ("", "nested/file.md", r"nested\\file.md", "bad\npattern"))
+@pytest.mark.parametrize(
+    "pattern", ("", "nested/file.md", r"nested\\file.md", "bad\npattern", "bad\x00pattern", "bad\u200bpattern")
+)
 def test_load_approval_rejects_unsafe_filename_pattern(workspace, pattern):
     paths = WorkspacePaths.from_root(workspace)
     paths.ensure()

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlparse
 
 
 class GitHubDiscoveryError(RuntimeError):
@@ -29,27 +31,36 @@ class GitHubActivityCandidate:
     merged_at: str | None
 
 
+_PUBLIC_ACTIVITY_PATH = re.compile(
+    r"^/(?P<owner>[A-Za-z0-9][A-Za-z0-9_-]*)/"
+    r"(?P<repository>[A-Za-z0-9][A-Za-z0-9_.-]*)/"
+    r"(?:(?P<kind>commit|issues|pull)/(?P<identifier>[A-Za-z0-9._-]+)"
+    r"|actions/runs/(?P<run_id>[A-Za-z0-9._-]+))$"
+)
+
+
 def parse_repo_list(payload: Any) -> list[GitHubRepositoryCandidate]:
-    repos: list[GitHubRepositoryCandidate] = []
+    repos: dict[str, GitHubRepositoryCandidate] = {}
     for item in _list_payload(payload, "repository list"):
         is_private = item.get("isPrivate")
         if "isPrivate" not in item or not isinstance(is_private, bool):
             raise GitHubDiscoveryError("GitHub repository list payload is invalid")
         name_with_owner = _required_string(item, "nameWithOwner", "repository list")
         try:
-            canonical_repository_name(name_with_owner)
+            canonical_name = canonical_repository_name(name_with_owner)
         except ValueError as error:
             raise GitHubDiscoveryError(
                 "GitHub repository list payload is invalid"
             ) from error
-        repos.append(
+        repos.setdefault(
+            canonical_name,
             GitHubRepositoryCandidate(
-                name_with_owner=name_with_owner,
+                name_with_owner=canonical_name,
                 url=_required_string(item, "url", "repository list"),
                 is_private=is_private,
-            )
+            ),
         )
-    return repos
+    return list(repos.values())
 
 
 def parse_pr_list(repo: str, payload: Any) -> list[GitHubActivityCandidate]:
@@ -59,7 +70,7 @@ def parse_pr_list(repo: str, payload: Any) -> list[GitHubActivityCandidate]:
             activity_type="pull_request",
             url=_required_string(item, "url", "pull request list"),
             title=_required_string(item, "title", "pull request list"),
-            state=_required_string(item, "state", "pull request list"),
+            state=_required_nonempty_string(item, "state", "pull request list"),
             author=_nested_optional_string(item, "author", "login", "pull request list"),
             created_at=_required_string(item, "createdAt", "pull request list"),
             merged_at=_optional_string(item, "mergedAt", "pull request list"),
@@ -75,7 +86,7 @@ def parse_issue_list(repo: str, payload: Any) -> list[GitHubActivityCandidate]:
             activity_type="issue",
             url=_required_string(item, "url", "issue list"),
             title=_required_string(item, "title", "issue list"),
-            state=_required_string(item, "state", "issue list"),
+            state=_required_nonempty_string(item, "state", "issue list"),
             author=_nested_optional_string(item, "author", "login", "issue list"),
             created_at=_required_string(item, "createdAt", "issue list"),
             merged_at=None,
@@ -311,6 +322,37 @@ def canonical_repository_name(name: str) -> str:
     ):
         raise ValueError("repository name must use canonical owner/repo form")
     return f"{owner.casefold()}/{repository.casefold()}"
+
+
+def is_public_github_activity_url(value: str) -> bool:
+    return public_github_activity_type(value) is not None
+
+
+def public_github_activity_type(value: str) -> str | None:
+    try:
+        parsed = urlparse(value)
+    except ValueError:
+        return None
+    if (
+        parsed.scheme != "https"
+        or parsed.netloc != "github.com"
+        or parsed.params
+        or parsed.query
+        or parsed.fragment
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        return None
+    match = _PUBLIC_ACTIVITY_PATH.fullmatch(parsed.path)
+    if match is None:
+        return None
+    try:
+        canonical_repository_name(f"{match['owner']}/{match['repository']}")
+    except ValueError:
+        return None
+    if match["kind"] is not None:
+        return {"commit": "commit", "issues": "issue", "pull": "pull_request"}[match["kind"]]
+    return "workflow_run"
 
 
 def _is_canonical_repository_component(value: str, allow_dots: bool) -> bool:
