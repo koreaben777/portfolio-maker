@@ -39,6 +39,7 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
     claims: list[dict[str, object]] = []
     evidence_ids: list[int] = []
     claim_ids: list[int] = []
+    github_source_repositories: dict[int, str] = {}
     source_by_id = {source.id: source for source in repository.list_sources() if source.id is not None}
 
     for source in repository.list_sources(status=SourceStatus.INGESTED):
@@ -151,6 +152,7 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
         seen_activities.add(activity_key)
         if source not in sources:
             sources.append(source)
+        github_source_repositories[source.id] = repository_name
         author = normalize_label(mask_public_value(activity.author))
         state = normalize_label(mask_public_value(activity.state))
         claim_text = f"{repository_name}: {title}"
@@ -190,24 +192,20 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
     payload = {
         "version": 1,
         "sources": [
-            {
-                "id": source.id,
-                "type": source.type.value,
-                "uri": source.uri,
-                "display_name": normalize_label(source.display_name),
-                "owner": source.owner,
-                "status": source.status.value,
-            }
+            _public_source_payload(source, github_source_repositories)
             for source in sources
         ],
         "claims": claims,
     }
 
     write_json(paths.master_profile_json_path, payload)
-    source_lines = [
-        f"- {markdown_text(source.display_name)} ({markdown_text(source.type.value)})"
-        for source in sources
-    ]
+    source_lines = []
+    for source in sources:
+        source_payload = _public_source_payload(source, github_source_repositories)
+        source_lines.append(
+            f"- {markdown_text(str(source_payload['display_name']))} "
+            f"({markdown_text(str(source_payload['type']))})"
+        )
     claim_lines = [
         f"- {markdown_text(str(claim['text']))} ({markdown_text(str(claim['confidence']))})"
         f"\n  Evidence: {markdown_text(str(claim['evidence_uri']))}"
@@ -253,3 +251,27 @@ def _snapshot_evidence(display_name: str, text: str) -> str | None:
         if line != display_name:
             return line
     return lines[0] if lines else None
+
+
+def _public_source_payload(
+    source: Source, github_source_repositories: dict[int, str]
+) -> dict[str, object]:
+    repository_name = (
+        github_source_repositories.get(source.id)
+        if source.type == SourceType.GITHUB_REPOSITORY
+        else None
+    )
+    if repository_name is not None:
+        owner = repository_name.split("/", 1)[0]
+        display_name = repository_name
+    else:
+        owner = source.owner
+        display_name = normalize_label(source.display_name)
+    return {
+        "id": source.id,
+        "type": source.type.value,
+        "uri": source.uri,
+        "display_name": display_name,
+        "owner": owner,
+        "status": source.status.value,
+    }

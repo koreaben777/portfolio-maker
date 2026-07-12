@@ -620,6 +620,94 @@ def test_build_profile_excludes_legacy_github_activity_with_invalid_state(tmp_pa
     assert activity_url not in paths.portfolio_draft_path.read_text(encoding="utf-8")
 
 
+def test_build_profile_derives_legacy_github_source_metadata_from_repository(tmp_path):
+    workspace = tmp_path / "workspace"
+    paths = WorkspacePaths.from_root(workspace)
+    write_sample_approval(paths)
+    activity_url = "https://github.com/octo/demo/pull/1"
+    approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    approval["approved_github_activity_urls"] = [activity_url]
+    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    source_id = repository.upsert_source(
+        Source(
+            None,
+            SourceType.GITHUB_REPOSITORY,
+            "https://github.com/octo/demo",
+            "Bearer legacy-display",
+            "Bearer legacy-owner",
+            SourceStatus.DISCOVERED,
+        )
+    )
+    repository.insert_github_activity(
+        GitHubActivity(
+            None,
+            source_id,
+            "octo/demo",
+            "pull_request",
+            activity_url,
+            "Safe title",
+            "MERGED",
+            "octo",
+            "2026-01-01T00:00:00Z",
+            None,
+        )
+    )
+
+    result = build_profile(BuildProfileRequest(workspace=workspace))
+    payload = json.loads(result.json_path.read_text(encoding="utf-8"))
+    profile_source = payload["sources"][0]
+    markdown = result.markdown_path.read_text(encoding="utf-8")
+
+    assert profile_source["display_name"] == "octo/demo"
+    assert profile_source["owner"] == "octo"
+    assert "Bearer legacy-display" not in json.dumps(payload)
+    assert "Bearer legacy-owner" not in json.dumps(payload)
+    assert "Bearer legacy-display" not in markdown
+
+
+def test_build_profile_excludes_legacy_workflow_activity_with_unsupported_state(tmp_path):
+    workspace = tmp_path / "workspace"
+    paths = WorkspacePaths.from_root(workspace)
+    write_sample_approval(paths)
+    activity_url = "https://github.com/octo/demo/actions/runs/1"
+    approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    approval["approved_github_activity_urls"] = [activity_url]
+    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    source_id = repository.upsert_source(
+        Source(
+            None,
+            SourceType.GITHUB_REPOSITORY,
+            "https://github.com/octo/demo",
+            "octo/demo",
+            "octo",
+            SourceStatus.DISCOVERED,
+        )
+    )
+    repository.insert_github_activity(
+        GitHubActivity(
+            None,
+            source_id,
+            "octo/demo",
+            "workflow_run",
+            activity_url,
+            "CI",
+            "unsupported",
+            "octo",
+            "2026-01-01T00:00:00Z",
+            None,
+        )
+    )
+
+    result = build_profile(BuildProfileRequest(workspace=workspace))
+
+    assert result.claim_count == 0
+    assert activity_url not in result.markdown_path.read_text(encoding="utf-8")
+
+
 def test_build_profile_excludes_ingested_source_after_approval_revoked(tmp_path):
     workspace, source_path, paths = _ingest_approved_source(tmp_path)
     approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))

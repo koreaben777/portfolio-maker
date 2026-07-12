@@ -151,6 +151,50 @@ def test_activity_parsers_reject_invalid_normalized_states():
         )
 
 
+@pytest.mark.parametrize(
+    ("conclusion", "status"),
+    (("queued", "completed"), ("success", "queued"), ("unsupported", "completed")),
+)
+def test_workflow_parser_rejects_state_values_from_wrong_field(conclusion, status):
+    with pytest.raises(GitHubDiscoveryError, match="workflow run list payload is invalid"):
+        parse_workflow_run_list(
+            "octo/demo",
+            {
+                "workflow_runs": [
+                    {
+                        "html_url": "https://github.com/octo/demo/actions/runs/1",
+                        "name": "CI",
+                        "conclusion": conclusion,
+                        "status": status,
+                        "actor": {"login": "octo"},
+                        "created_at": "2026-01-01T00:00:00Z",
+                    }
+                ]
+            },
+        )
+
+
+def test_workflow_parser_preserves_state_field_provenance():
+    activities = parse_workflow_run_list(
+        "octo/demo",
+        {
+            "workflow_runs": [
+                {
+                    "html_url": "https://github.com/octo/demo/actions/runs/1",
+                    "name": "CI",
+                    "conclusion": None,
+                    "status": "queued",
+                    "actor": {"login": "octo"},
+                    "created_at": "2026-01-01T00:00:00Z",
+                }
+            ]
+        },
+    )
+
+    assert activities[0].state == "queued"
+    assert activities[0].state_field == "status"
+
+
 def test_parse_commit_review_and_workflow_run_lists():
     commits = parse_commit_list("octo/demo", load_fixture("gh_commit_list.json"))
     reviews = parse_review_list("octo/demo", load_fixture("gh_review_list.json"))
@@ -185,6 +229,7 @@ def test_parse_commit_review_and_workflow_run_lists():
         author="octo",
         created_at="2026-01-05T00:00:00Z",
         merged_at=None,
+        state_field="conclusion",
     )
 
 

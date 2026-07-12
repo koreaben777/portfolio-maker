@@ -33,6 +33,7 @@ class GitHubActivityCandidate:
     author: str
     created_at: str
     merged_at: str | None
+    state_field: str | None = None
 
 
 @dataclass(frozen=True)
@@ -61,30 +62,28 @@ _COMMIT_SHA = re.compile(r"^[0-9a-fA-F]{4,40}$")
 _GITHUB_TIMESTAMP = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$"
 )
+_WORKFLOW_CONCLUSION_STATES = frozenset(
+    {
+        "action_required",
+        "cancelled",
+        "failure",
+        "neutral",
+        "skipped",
+        "stale",
+        "startup_failure",
+        "success",
+        "timed_out",
+    }
+)
+_WORKFLOW_STATUS_STATES = frozenset(
+    {"completed", "in_progress", "pending", "queued", "requested", "waiting"}
+)
 _ACTIVITY_STATES = {
     "pull_request": frozenset({"open", "closed", "merged"}),
     "issue": frozenset({"open", "closed"}),
     "commit": frozenset({"committed"}),
     "review_comment": frozenset({"commented"}),
-    "workflow_run": frozenset(
-        {
-            "action_required",
-            "cancelled",
-            "completed",
-            "failure",
-            "in_progress",
-            "neutral",
-            "pending",
-            "queued",
-            "requested",
-            "skipped",
-            "stale",
-            "startup_failure",
-            "success",
-            "timed_out",
-            "waiting",
-        }
-    ),
+    "workflow_run": _WORKFLOW_CONCLUSION_STATES | _WORKFLOW_STATUS_STATES,
 }
 
 
@@ -229,6 +228,7 @@ def parse_workflow_run_list(repo: str, payload: Any) -> list[GitHubActivityCandi
         raise GitHubDiscoveryError("GitHub workflow run list payload is invalid")
     activities: list[GitHubActivityCandidate] = []
     for item in _list_payload(runs, "workflow run list"):
+        state, state_field = _required_workflow_state(item, "workflow run list")
         activities.append(
             GitHubActivityCandidate(
                 repo=repo,
@@ -237,16 +237,11 @@ def parse_workflow_run_list(repo: str, payload: Any) -> list[GitHubActivityCandi
                     item, "html_url", "workflow run list", repo, "workflow_run"
                 ),
                 title=_required_normalized_title(item, "name", "workflow run list"),
-                state=_required_activity_state_value(
-                    _required_one_of_strings(
-                        item, ("conclusion", "status"), "workflow run list"
-                    ),
-                    "workflow run list",
-                    "workflow_run",
-                ),
+                state=state,
                 author=_nested_required_string(item, "actor", "login", "workflow run list"),
                 created_at=_required_timestamp(item, "created_at", "workflow run list"),
                 merged_at=None,
+                state_field=state_field,
             )
         )
     return activities
@@ -433,6 +428,33 @@ def _required_activity_state_value(value: str, label: str, activity_type: str) -
     if not is_valid_github_activity_state(activity_type, value):
         raise GitHubDiscoveryError(f"GitHub {label} payload is invalid")
     return value
+
+
+def _required_workflow_state(
+    item: dict[str, Any], label: str
+) -> tuple[str, str]:
+    conclusion = item.get("conclusion")
+    if conclusion is not None:
+        if not isinstance(conclusion, str):
+            raise GitHubDiscoveryError(f"GitHub {label} payload is invalid")
+        if conclusion.strip():
+            if normalize_label(conclusion).casefold() not in _WORKFLOW_CONCLUSION_STATES:
+                raise GitHubDiscoveryError(f"GitHub {label} payload is invalid")
+            status = item.get("status")
+            if status is not None and status != "":
+                if (
+                    not isinstance(status, str)
+                    or normalize_label(status).casefold() != "completed"
+                ):
+                    raise GitHubDiscoveryError(f"GitHub {label} payload is invalid")
+            return conclusion, "conclusion"
+
+    status = item.get("status")
+    if isinstance(status, str) and status.strip():
+        if normalize_label(status).casefold() not in _WORKFLOW_STATUS_STATES:
+            raise GitHubDiscoveryError(f"GitHub {label} payload is invalid")
+        return status, "status"
+    raise GitHubDiscoveryError(f"GitHub {label} payload is invalid")
 
 
 def _required_normalized_title(item: dict[str, Any], key: str, label: str) -> str:
