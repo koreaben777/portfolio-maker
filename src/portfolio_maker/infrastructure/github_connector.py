@@ -78,6 +78,7 @@ _WORKFLOW_CONCLUSION_STATES = frozenset(
 _WORKFLOW_STATUS_STATES = frozenset(
     {"completed", "in_progress", "pending", "queued", "requested", "waiting"}
 )
+_WORKFLOW_NON_COMPLETED_STATUS_STATES = _WORKFLOW_STATUS_STATES - {"completed"}
 _ACTIVITY_STATES = {
     "pull_request": frozenset({"open", "closed", "merged"}),
     "issue": frozenset({"open", "closed"}),
@@ -536,7 +537,7 @@ def is_valid_github_activity_state(
         if state_field == "conclusion":
             return normalized in _WORKFLOW_CONCLUSION_STATES
         if state_field == "status":
-            return normalized in _WORKFLOW_STATUS_STATES
+            return normalized in _WORKFLOW_NON_COMPLETED_STATUS_STATES
         return False
     return normalized in _ACTIVITY_STATES.get(activity_type, ())
 

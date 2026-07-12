@@ -82,6 +82,11 @@ discovery report의 `GitHub Activities`에서 URL을 고르기 전에, 대응하
 `GitHub Repositories` 항목이 `(public)`으로 표시되는지 확인합니다. 선택한 정확한 URL을
 `approved_github_activity_urls`에 복사한 뒤, 로컬 `approved_source_uris`를 함께
 검토·완성합니다. private, excluded, missing, stale activity는 승인하지 않습니다.
+
+기존 workspace에서 provenance가 없는 legacy workflow activity는 안전을 위해 profile과
+portfolio draft의 입력에서 제외됩니다. 이를 복구하려면 `portfolio-maker discover
+--workspace .`가 성공하도록 다시 실행한 뒤 discovery report에서 해당 공개 activity의
+정확한 URL을 확인하고, 필요한 경우 그 URL만 다시 승인 파일에 넣어 재승인합니다.
 그 다음 아래 순서로 실행합니다.
 
 ```bash

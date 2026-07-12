@@ -752,6 +752,18 @@ def test_build_profile_accepts_persisted_workflow_provenance_but_rejects_ambiguo
 
     with repository._connection() as conn:
         conn.execute(
+            "UPDATE github_activities SET state = 'completed' WHERE id = ?",
+            (activity_id,),
+        )
+
+    completed_result = build_profile(BuildProfileRequest(workspace=workspace))
+    draft_portfolio(DraftPortfolioRequest(workspace=workspace))
+
+    assert completed_result.claim_count == 0
+    assert activity_url not in paths.portfolio_draft_path.read_text(encoding="utf-8")
+
+    with repository._connection() as conn:
+        conn.execute(
             "UPDATE github_activities SET state_field = NULL WHERE id = ?",
             (activity_id,),
         )

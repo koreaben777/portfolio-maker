@@ -51,13 +51,21 @@ portfolio-maker discover --workspace .
 
 7. In `GitHub Activities`, find each candidate URL only after confirming its matching entry in `GitHub Repositories` is marked `(public)`. Copy the selected exact URL into `approved_github_activity_urls`. Do not approve private, excluded, missing, or stale activities.
 
-8. Ask the user to complete local source approval:
+8. Legacy workflow activities without persisted provenance remain ineligible for profile and portfolio artifacts. Recover them by completing a successful rediscovery:
+
+```bash
+portfolio-maker discover --workspace .
+```
+
+After discovery succeeds, review the report and reapprove the exact public activity URL in `approved_github_activity_urls` if it is still needed.
+
+9. Ask the user to complete local source approval:
 
 ```text
 .portfolio-maker/reviews/source-approval.json
 ```
 
-9. After approval only, run:
+10. After approval only, run:
 
 ```bash
 portfolio-maker ingest --workspace .
@@ -65,7 +73,7 @@ portfolio-maker build-profile --workspace .
 portfolio-maker draft-portfolio --workspace .
 ```
 
-10. Review generated artifacts:
+11. Review generated artifacts:
 
 ```text
 .portfolio-maker/artifacts/master-profile.json
@@ -73,7 +81,7 @@ portfolio-maker draft-portfolio --workspace .
 .portfolio-maker/artifacts/portfolio-draft.md
 ```
 
-11. Report:
+12. Report:
    - what was generated
    - which commands were run
    - whether public artifacts avoided secrets and private raw paths

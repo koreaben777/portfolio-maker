@@ -162,6 +162,7 @@ Stage C는 approval schema에 다음 optional 필드를 추가한다.
 - `excluded_repositories`는 언제나 우선한다.
 - private repository activity는 이번 Stage에서 public artifact 입력으로 허용하지 않는다.
 - approval에 없는 activity, malformed URL, state가 확인되지 않는 activity는 discovery metadata로만 남긴다.
+- provenance가 없는 legacy workflow activity는 profile/portfolio artifact 입력에서 제외한다. 복구하려면 `portfolio-maker discover --workspace .`를 성공시킨 뒤 discovery report에서 해당 공개 activity의 정확한 URL을 확인하고, 필요한 경우 그 URL만 `approved_github_activity_urls`에 다시 넣어 재승인한다.
 
 ### 6.2 처리 규칙
 
