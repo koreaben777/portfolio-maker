@@ -75,10 +75,9 @@ SECRET_PATTERNS = [
         "bare_key_value",
     ),
 ]
-_BEARER_SECRET_PATTERN = re.compile(r"(?i)\bBearer\s+[^\s,;]+")
 _INVISIBLE_COMBINING_MARKS = (
     frozenset({"\u034f"})
-    | frozenset(chr(code) for code in range(0x180B, 0x180F))
+    | frozenset(chr(code) for code in range(0x180B, 0x1810))
     | frozenset(chr(code) for code in range(0xFE00, 0xFE10))
     | frozenset(chr(code) for code in range(0xE0100, 0xE01F0))
 )
@@ -160,14 +159,14 @@ def mask_public_value(value: str) -> str:
 def is_secret_shaped_public_value(value: str) -> bool:
     detection_value = _remove_invisible_combining_marks(value)
     return bool(
-        _BEARER_SECRET_PATTERN.search(value)
-        or _BEARER_SECRET_PATTERN.search(detection_value)
+        mask_secrets(value) != value
+        or mask_secrets(detection_value) != detection_value
     )
 
 
 def contains_hidden_secret_shaped_public_value(value: str) -> bool:
     detection_value = _remove_invisible_combining_marks(value)
-    return detection_value != value and is_secret_shaped_public_value(value)
+    return detection_value != value and mask_secrets(detection_value) != detection_value
 
 
 def _remove_invisible_combining_marks(value: str) -> str:

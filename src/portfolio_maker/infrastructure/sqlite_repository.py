@@ -525,35 +525,72 @@ class SQLiteRepository:
         if activity_url is None:
             raise RepositoryError("GitHub activity URL is invalid")
         with self._connection() as conn:
-            conn.execute(
-                """
-                INSERT INTO github_activities
-                    (source_id, repo, activity_type, url, title, state, author, created_at, merged_at, is_private, state_field)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(repo, activity_type, url) DO UPDATE SET
-                    source_id = excluded.source_id,
-                    title = excluded.title,
-                    state = excluded.state,
-                    author = excluded.author,
-                    created_at = excluded.created_at,
-                    merged_at = excluded.merged_at,
-                    is_private = excluded.is_private,
-                    state_field = excluded.state_field
-                """,
-                (
-                    activity.source_id,
-                    repository_name,
-                    activity.activity_type,
-                    activity_url,
-                    activity.title,
-                    activity.state,
-                    activity.author,
-                    activity.created_at,
-                    activity.merged_at,
-                    int(activity.is_private),
-                    activity.state_field,
-                ),
+            values = (
+                activity.source_id,
+                repository_name,
+                activity.activity_type,
+                activity_url,
+                activity.title,
+                activity.state,
+                activity.author,
+                activity.created_at,
+                activity.merged_at,
+                int(activity.is_private),
+                activity.state_field,
             )
+            canonical_row = conn.execute(
+                """
+                SELECT id FROM github_activities
+                WHERE repo = ? AND activity_type = ? AND url = ?
+                """,
+                (repository_name, activity.activity_type, activity_url),
+            ).fetchone()
+            legacy_row = None
+            if canonical_row is None:
+                for candidate in conn.execute(
+                    """
+                    SELECT id, url FROM github_activities
+                    WHERE repo = ? AND activity_type = ?
+                    ORDER BY id
+                    """,
+                    (repository_name, activity.activity_type),
+                ).fetchall():
+                    raw_url = candidate["url"]
+                    if (
+                        isinstance(raw_url, str)
+                        and canonical_public_github_activity_url(raw_url) == activity_url
+                    ):
+                        legacy_row = candidate
+                        break
+            if legacy_row is not None:
+                conn.execute(
+                    """
+                    UPDATE github_activities SET
+                        source_id = ?, repo = ?, activity_type = ?, url = ?,
+                        title = ?, state = ?, author = ?, created_at = ?,
+                        merged_at = ?, is_private = ?, state_field = ?
+                    WHERE id = ?
+                    """,
+                    (*values, legacy_row["id"]),
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO github_activities
+                        (source_id, repo, activity_type, url, title, state, author, created_at, merged_at, is_private, state_field)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(repo, activity_type, url) DO UPDATE SET
+                        source_id = excluded.source_id,
+                        title = excluded.title,
+                        state = excluded.state,
+                        author = excluded.author,
+                        created_at = excluded.created_at,
+                        merged_at = excluded.merged_at,
+                        is_private = excluded.is_private,
+                        state_field = excluded.state_field
+                    """,
+                    values,
+                )
             row = conn.execute(
                 """
                 SELECT id FROM github_activities

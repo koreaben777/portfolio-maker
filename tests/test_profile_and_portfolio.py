@@ -441,6 +441,14 @@ def test_build_profile_excludes_persisted_non_workflow_control_state(
         ("author", "Bearer" + chr(0) + "example-token-value"),
         ("title", "Bearer\u034f token"),
         ("author", "Bearer\u034f token"),
+        ("title", "Bearer\u180f token"),
+        ("author", "Bearer\u180f token"),
+        ("title", "sk\u180f-" + "synthetic-token"),
+        ("author", "sk\u180f-" + "synthetic-token"),
+        ("title", "github_pat\u180f_" + "synthetictoken123456"),
+        ("author", "github_pat\u180f_" + "synthetictoken123456"),
+        ("title", "ghp\u180f_" + "synthetictoken123456"),
+        ("author", "ghp\u180f_" + "synthetictoken123456"),
     ),
 )
 def test_build_profile_excludes_persisted_activity_secret_metadata(tmp_path, field, value):
@@ -528,17 +536,48 @@ def test_build_profile_canonicalizes_legacy_case_variant_activity_url(tmp_path):
             """,
             (source_id, raw_activity_url, "2026-01-01T00:00:00Z"),
         )
+        legacy_id = int(
+            conn.execute(
+                "SELECT id FROM github_activities WHERE url = ?",
+                (raw_activity_url,),
+            ).fetchone()["id"]
+        )
 
+    rediscovered_id = repository.insert_github_activity(
+        GitHubActivity(
+            None,
+            source_id,
+            "Octo/Demo",
+            "pull_request",
+            canonical_activity_url,
+            "Current title",
+            "MERGED",
+            "current-author",
+            "2026-01-02T00:00:00Z",
+            None,
+        )
+    )
+    assert rediscovered_id == legacy_id
+
+    first = build_profile(BuildProfileRequest(workspace=workspace))
     result = build_profile(BuildProfileRequest(workspace=workspace))
     draft_portfolio(DraftPortfolioRequest(workspace=workspace))
     profile = json.loads(result.json_path.read_text(encoding="utf-8"))
 
-    assert repository.list_github_activities()[0].url == canonical_activity_url
-    assert result.claim_count == 1
+    with repository._read_connection() as conn:
+        rows = conn.execute(
+            "SELECT id, url, title FROM github_activities WHERE repo = 'octo/demo'"
+        ).fetchall()
+    assert [(row["id"], row["url"], row["title"]) for row in rows] == [
+        (legacy_id, canonical_activity_url, "Current title")
+    ]
+    assert first.claim_count == result.claim_count == 1
     assert profile["claims"][0]["evidence_uri"] == canonical_activity_url
-    assert paths.portfolio_draft_path.read_text(encoding="utf-8").count(
-        canonical_activity_url
-    ) == 1
+    assert profile["claims"][0]["title"] == "Current title"
+    draft = paths.portfolio_draft_path.read_text(encoding="utf-8")
+    assert "Current title" in draft
+    assert "Legacy title" not in draft
+    assert draft.count(canonical_activity_url) == 1
 
 
 def test_draft_portfolio_renders_approved_github_activity_as_evidence_with_provenance(tmp_path):

@@ -23,6 +23,15 @@ def load_fixture(name: str):
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+_HIDDEN_SECRET_VALUES = (
+    "Bearer\u034f token",
+    "Bearer\u180f token",
+    "sk\u180f-" + "synthetic-token",
+    "github_pat\u180f_" + "synthetictoken123456",
+    "ghp\u180f_" + "synthetictoken123456",
+)
+
+
 def test_parse_repo_list():
     repos = parse_repo_list(load_fixture("gh_repo_list.json"))
 
@@ -352,14 +361,15 @@ def test_commit_parser_rejects_control_in_title_or_author(field):
         )
 
 
-def test_activity_parser_rejects_hidden_bearer_title():
+@pytest.mark.parametrize("hidden_value", _HIDDEN_SECRET_VALUES)
+def test_activity_parser_rejects_hidden_secret_title(hidden_value):
     with pytest.raises(GitHubDiscoveryError, match="pull request list payload is invalid"):
         parse_pr_list(
             "octo/demo",
             [
                 {
                     "url": "https://github.com/octo/demo/pull/1",
-                    "title": "Bearer\u034f token",
+                    "title": hidden_value,
                     "state": "OPEN",
                     "createdAt": "2026-01-01T00:00:00Z",
                     "author": None,
@@ -368,7 +378,8 @@ def test_activity_parser_rejects_hidden_bearer_title():
         )
 
 
-def test_workflow_parser_rejects_hidden_bearer_author():
+@pytest.mark.parametrize("hidden_value", _HIDDEN_SECRET_VALUES)
+def test_workflow_parser_rejects_hidden_secret_author(hidden_value):
     with pytest.raises(GitHubDiscoveryError, match="workflow run list payload is invalid"):
         parse_workflow_run_list(
             "octo/demo",
@@ -379,7 +390,7 @@ def test_workflow_parser_rejects_hidden_bearer_author():
                         "name": "CI",
                         "conclusion": "success",
                         "status": "completed",
-                        "actor": {"login": "Bearer\u034f token"},
+                        "actor": {"login": hidden_value},
                         "created_at": "2026-01-01T00:00:00Z",
                     }
                 ]
