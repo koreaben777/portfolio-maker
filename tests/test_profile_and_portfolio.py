@@ -532,7 +532,7 @@ def test_build_profile_canonicalizes_legacy_case_variant_activity_url(tmp_path):
             """
             INSERT INTO github_activities
                 (source_id, repo, activity_type, url, title, state, author, created_at, is_private)
-            VALUES (?, 'octo/demo', 'pull_request', ?, 'Legacy title', 'MERGED', 'octo', ?, 0)
+            VALUES (?, 'Octo/Demo', 'pull_request', ?, 'Legacy title', 'MERGED', 'octo', ?, 0)
             """,
             (source_id, raw_activity_url, "2026-01-01T00:00:00Z"),
         )
@@ -546,7 +546,7 @@ def test_build_profile_canonicalizes_legacy_case_variant_activity_url(tmp_path):
             """
             INSERT INTO github_activities
                 (source_id, repo, activity_type, url, title, state, author, created_at, is_private)
-            VALUES (?, 'octo/demo', 'pull_request', ?, 'Stale canonical title', 'MERGED', 'octo', ?, 0)
+            VALUES (?, 'OCTO/DEMO', 'pull_request', ?, 'Stale canonical title', 'MERGED', 'octo', ?, 0)
             """,
             (source_id, canonical_activity_url, "2026-01-01T00:00:00Z"),
         )
@@ -556,7 +556,7 @@ def test_build_profile_canonicalizes_legacy_case_variant_activity_url(tmp_path):
                 (canonical_activity_url,),
             ).fetchone()["id"]
         )
-        conn.execute(
+        evidence_cursor = conn.execute(
             """
             INSERT INTO evidence_items
                 (source_id, github_activity_id, locator, stable_id, public_safe)
@@ -564,6 +564,14 @@ def test_build_profile_canonicalizes_legacy_case_variant_activity_url(tmp_path):
             """,
             (source_id, canonical_id, canonical_activity_url),
         )
+        evidence_id = int(evidence_cursor.lastrowid)
+
+    project_id = repository.upsert_project("github:octo/demo", public_safe=True)
+    claim_id = repository.upsert_github_activity_claim(
+        evidence_id,
+        project_id,
+        "Stale canonical title",
+    )
 
     rediscovered_id = repository.insert_github_activity(
         GitHubActivity(
@@ -588,20 +596,32 @@ def test_build_profile_canonicalizes_legacy_case_variant_activity_url(tmp_path):
 
     with repository._read_connection() as conn:
         rows = conn.execute(
-            "SELECT id, url, title, source_id FROM github_activities WHERE repo = 'octo/demo'"
+            "SELECT id, repo, url, title, source_id FROM github_activities "
+            "WHERE lower(repo) = 'octo/demo'"
         ).fetchall()
         evidence_rows = conn.execute(
-            "SELECT github_activity_id FROM evidence_items WHERE stable_id = 'legacy-alias-evidence'"
+            "SELECT github_activity_id FROM evidence_items"
+        ).fetchall()
+        claim_evidence_rows = conn.execute(
+            """
+            SELECT evidence_items.github_activity_id
+            FROM claim_evidence
+            JOIN evidence_items ON evidence_items.id = claim_evidence.evidence_id
+            WHERE claim_evidence.claim_id = ?
+            """,
+            (claim_id,),
         ).fetchall()
     assert len(rows) == 1
     survivor_id = rows[0]["id"]
-    assert (rows[0]["url"], rows[0]["title"], rows[0]["source_id"]) == (
+    assert (rows[0]["repo"], rows[0]["url"], rows[0]["title"], rows[0]["source_id"]) == (
+        "octo/demo",
         canonical_activity_url,
         "Current title",
         source_id,
     )
     assert survivor_id in {legacy_id, canonical_id}
-    assert [row["github_activity_id"] for row in evidence_rows] == [survivor_id]
+    assert {row["github_activity_id"] for row in evidence_rows} == {survivor_id}
+    assert [row["github_activity_id"] for row in claim_evidence_rows] == [survivor_id]
     assert [(row["id"], row["url"]) for row in rows] == [
         (survivor_id, canonical_activity_url)
     ]

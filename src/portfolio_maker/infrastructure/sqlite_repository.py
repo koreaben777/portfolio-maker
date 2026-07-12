@@ -541,7 +541,9 @@ class SQLiteRepository:
             candidate_rows = conn.execute(
                 """
                 SELECT id, url FROM github_activities
-                WHERE repo = ? AND activity_type = ? AND url = ? COLLATE NOCASE
+                WHERE repo COLLATE NOCASE = ?
+                  AND activity_type = ?
+                  AND url COLLATE NOCASE = ?
                 ORDER BY id
                 """,
                 (repository_name, activity.activity_type, activity_url),
