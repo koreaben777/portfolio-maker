@@ -160,13 +160,15 @@ restricted: local, direct transfer, private Sites
 open_public: explicit revalidation and optional public Sites deployment
 ~~~
 
-공통 `EvidenceSelectionResult.input_manifest()`가 각 `artifacts.input_manifest`에 다음을 기록한다.
+명시적 artifact policy가 있는 #12 경로에서는 공통 `EvidenceSelectionResult.input_manifest()`가 각 `artifacts.input_manifest`에 다음을 기록한다.
 
 - `artifact_kind`와 `delivery_scope`
 - 활성 artifact policy와 source approval 입력을 함께 반영한 결정론적 selection-input `policy_hash` (artifact policy 파일만의 hash가 아님)
 - 포함된 source/evidence/claim ID와 하위 호환용 `source_ids`/`evidence_ids`/`claim_ids` 별칭
 - 포함되지 않은 evidence의 `excluded_decisions` (ID와 reason)
 - 선택 결과의 origin별 합계인 `origin_counts`
+
+`artifact-approval.json`이 없는 legacy workspace의 `master_profile`과 `portfolio_draft` record는 기존 ID-only `claim_ids`/`evidence_ids` manifest 형식을 유지한다.
 
 `portfolio_html` artifact record에는 위 manifest에 더해 HTML 전용 in-memory payload의 결정론적 JSON bytes에서 계산한 `manifest_sha256`을 기록한다.
 
