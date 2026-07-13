@@ -13,7 +13,11 @@ from portfolio_maker.domain.models import Source, SourceStatus, SourceType
 from portfolio_maker.infrastructure.artifacts import write_json, write_markdown
 from portfolio_maker.infrastructure.extractors import extract_approved_text
 from portfolio_maker.infrastructure.managed_files import remove_managed_file
-from portfolio_maker.infrastructure.presentation import markdown_text, normalize_label
+from portfolio_maker.infrastructure.presentation import (
+    markdown_text,
+    normalize_label,
+    safe_local_public_label,
+)
 from portfolio_maker.infrastructure.policy import (
     FilePolicy,
     SourcePathPolicyError,
@@ -88,7 +92,7 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
         if snapshot is None:
             repository.update_source_status(source.id, SourceStatus.STALE_SOURCE)
             continue
-        display_name = normalize_label(source.display_name)
+        display_name = safe_local_public_label(mask_public_value(source.display_name))
         evidence = _snapshot_evidence(display_name, str(snapshot["text"]))
         if evidence is None:
             continue
@@ -118,8 +122,8 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
                 "public_safe": False,
                 "claim_id": claim_id,
                 "evidence_id": evidence_id,
-                "evidence_uri": source.uri,
-                "evidence_snapshot": str(snapshot_path),
+                "evidence_uri": f"local-evidence:{evidence_id}",
+                "evidence_snapshot": f"local-snapshot:{snapshot_metadata[0]}",
             }
         )
 
@@ -299,6 +303,17 @@ def _public_source_payload(
     if repository_name is not None:
         owner = repository_name.split("/", 1)[0]
         display_name = repository_name
+    elif source.type == SourceType.LOCAL_FILE:
+        return {
+            "id": source.id,
+            "type": source.type.value,
+            "uri": f"local-source:{source.id}",
+            "display_name": safe_local_public_label(
+                mask_public_value(source.display_name)
+            ),
+            "owner": None,
+            "status": source.status.value,
+        }
     else:
         owner = source.owner
         display_name = normalize_label(source.display_name)

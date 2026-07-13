@@ -14,6 +14,7 @@ from portfolio_maker.application.models import (
 )
 from portfolio_maker.application.public_portfolio import (
     PublicPortfolioError,
+    build_public_portfolio_payload,
     build_public_portfolio,
 )
 from portfolio_maker.infrastructure.managed_files import remove_managed_file, write_managed_text
@@ -44,17 +45,16 @@ def render_html(request: RenderHtmlRequest) -> RenderHtmlResult:
         raise HtmlRenderError(f"Sites project missing: {site_dir}")
 
     try:
-        public_result = build_public_portfolio(
+        build_public_portfolio(
             PublicPortfolioRequest(workspace=request.workspace)
+        )
+        html_build = build_public_portfolio_payload(
+            PublicPortfolioRequest(workspace=request.workspace),
+            "portfolio_html",
         )
     except PublicPortfolioError as error:
         raise HtmlRenderError(str(error)) from error
-    try:
-        manifest = json.loads(paths.portfolio_public_json_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise HtmlRenderError("public portfolio manifest could not be read") from error
-    if not isinstance(manifest, dict):
-        raise HtmlRenderError("public portfolio manifest must be an object")
+    manifest = html_build.payload
 
     try:
         with tempfile.TemporaryDirectory(prefix="portfolio-maker-sites-") as temp_dir:
@@ -93,14 +93,13 @@ def render_html(request: RenderHtmlRequest) -> RenderHtmlResult:
         raise HtmlRenderError(str(error)) from error
 
     write_managed_text(paths.portfolio_html_path, html)
-    manifest_bytes = paths.portfolio_public_json_path.read_bytes()
     repository = SQLiteRepository(paths.db_path)
     repository.initialize()
     repository.record_artifact(
         "portfolio_html",
         1,
         json.dumps(
-            _html_input_manifest(manifest, public_result, manifest_bytes),
+            _html_input_manifest(html_build.selection, html_build.payload),
             sort_keys=True,
             separators=(",", ":"),
         ),
@@ -111,19 +110,13 @@ def render_html(request: RenderHtmlRequest) -> RenderHtmlResult:
     )
 
 
-def _html_input_manifest(
-    manifest: dict[str, object],
-    public_result,
-    manifest_bytes: bytes,
-) -> dict[str, object]:
-    selection = manifest.get("selection")
-    if isinstance(selection, dict):
-        result = dict(selection)
-        result["artifact_kind"] = "portfolio_html"
-        result["manifest_sha256"] = hashlib.sha256(manifest_bytes).hexdigest()
-        return result
-    return {
-        "claim_ids": list(public_result.claim_ids),
-        "evidence_ids": list(public_result.evidence_ids),
-        "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
-    }
+def _html_input_manifest(selection, payload: dict[str, object]) -> dict[str, object]:
+    input_manifest = selection.input_manifest("portfolio_html")
+    payload_bytes = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    input_manifest["manifest_sha256"] = hashlib.sha256(payload_bytes).hexdigest()
+    return input_manifest

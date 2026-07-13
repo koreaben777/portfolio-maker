@@ -1,10 +1,10 @@
 # Portfolio Maker 로드맵 Phase 1 구현 명세
 
 날짜: 2026-07-11
-상태: 현재 Phase 1 정책 및 runtime 계약
-대상 Issue: #4 → #2 → #1
-현재 구현 slice: #4 → #2 → #1 → #11 일반형 renderer
-후속 확장: #12 통합 근거 정책 → #3 회사/JD별 맞춤 생성 (`@sites`는 presentation/hosting 계층)
+상태: 현재 구현 slice는 #12 통합 근거 정책이며, 아래 #4 → #2 → #1 설명은 역사적 Phase 1 기준선이다.
+역사적 기준선 대상 Issue: #4 → #2 → #1
+현재 구현 slice: #12 통합 근거 정책 (일반형 #11 renderer 포함)
+후속 확장: #3 회사/JD별 맞춤 생성 (`@sites`는 presentation/hosting 계층)
 
 2026-07-13 정렬 메모: #4, #2, #1 기준선과 일반형 #11 renderer가 현재 worktree에 구현되어 있다. #3 맞춤 생성은 아직 deferred이며, 이 문서의 #11 규칙은 아래 current implementation slice를 기준으로 읽는다.
 

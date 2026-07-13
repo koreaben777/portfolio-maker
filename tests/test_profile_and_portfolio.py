@@ -151,7 +151,7 @@ def test_build_profile_and_draft_portfolio_from_ingested_source(tmp_path):
     assert profile["sources"][0] == {
         "id": source_id,
         "type": "local_file",
-        "uri": source_path.resolve().as_uri(),
+        "uri": f"local-source:{source_id}",
         "display_name": "Portfolio Maker",
         "owner": None,
         "status": "ingested",
@@ -162,8 +162,8 @@ def test_build_profile_and_draft_portfolio_from_ingested_source(tmp_path):
             "text": "Portfolio Maker: Built an approval-gated evidence pipeline.",
             "confidence": "medium",
             "public_safe": False,
-            "evidence_uri": source_path.resolve().as_uri(),
-            "evidence_snapshot": str(snapshot_path),
+            "evidence_uri": f"local-evidence:{profile_result.evidence_ids[0]}",
+            "evidence_snapshot": "local-snapshot:1",
         }
     ]
     profile_markdown = paths.master_profile_md_path.read_text(encoding="utf-8")

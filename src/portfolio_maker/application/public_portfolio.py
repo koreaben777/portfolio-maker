@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 
@@ -8,9 +9,11 @@ from portfolio_maker.application.artifact_approval import load_artifact_policy
 from portfolio_maker.application.build_profile import build_profile
 from portfolio_maker.application.evidence_selection import (
     EvidenceSelectionRequest,
+    EvidenceSelectionResult,
     EvidenceSelectionService,
 )
 from portfolio_maker.application.models import (
+    ArtifactKind,
     BuildProfileRequest,
     PublicPortfolioRequest,
     PublicPortfolioResult,
@@ -18,7 +21,7 @@ from portfolio_maker.application.models import (
 from portfolio_maker.domain.models import PublicEvidenceRecord
 from portfolio_maker.infrastructure.artifacts import write_json
 from portfolio_maker.infrastructure.policy import mask_public_value
-from portfolio_maker.infrastructure.presentation import normalize_label
+from portfolio_maker.infrastructure.presentation import normalize_label, safe_local_public_label
 from portfolio_maker.infrastructure.sqlite_repository import SQLiteRepository
 from portfolio_maker.workspace import WorkspacePaths
 
@@ -27,7 +30,48 @@ class PublicPortfolioError(ValueError):
     pass
 
 
+@dataclass(frozen=True)
+class PublicPortfolioBuild:
+    payload: dict[str, object]
+    selection: EvidenceSelectionResult
+    result: PublicPortfolioResult
+
+
 def build_public_portfolio(request: PublicPortfolioRequest) -> PublicPortfolioResult:
+    paths = WorkspacePaths.from_root(request.workspace)
+    build = build_public_portfolio_payload(request, "portfolio_public_manifest")
+    selection = build.selection
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+
+    write_json(paths.portfolio_public_json_path, build.payload)
+    repository.record_artifact(
+        "portfolio_public",
+        1,
+        json.dumps(
+            {
+                **selection.input_manifest("portfolio_public_manifest"),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+    )
+    return PublicPortfolioResult(
+        manifest_path=paths.portfolio_public_json_path,
+        project_count=build.result.project_count,
+        claim_count=build.result.claim_count,
+        evidence_count=build.result.evidence_count,
+        claim_ids=build.result.claim_ids,
+        evidence_ids=build.result.evidence_ids,
+    )
+
+
+def build_public_portfolio_payload(
+    request: PublicPortfolioRequest,
+    artifact_kind: ArtifactKind,
+) -> PublicPortfolioBuild:
+    if artifact_kind not in {"portfolio_public_manifest", "portfolio_html"}:
+        raise PublicPortfolioError("unsupported public portfolio artifact kind")
     paths = WorkspacePaths.from_root(request.workspace)
     paths.ensure()
     build_profile(
@@ -38,17 +82,33 @@ def build_public_portfolio(request: PublicPortfolioRequest) -> PublicPortfolioRe
     )
     repository = SQLiteRepository(paths.db_path)
     repository.initialize()
-    approval = load_approval(paths)
-    selection_service = EvidenceSelectionService()
-    selection = selection_service.select(
+    selection = EvidenceSelectionService().select(
         repository,
         EvidenceSelectionRequest(
-            artifact_kind="portfolio_public_manifest",
+            artifact_kind=artifact_kind,
             policy=load_artifact_policy(paths),
-            current_approval=approval,
+            current_approval=load_approval(paths),
+        ),
+    )
+    payload, claim_ids, evidence_ids = _assemble_payload(selection, artifact_kind)
+    return PublicPortfolioBuild(
+        payload=payload,
+        selection=selection,
+        result=PublicPortfolioResult(
+            manifest_path=paths.portfolio_public_json_path,
+            project_count=len(payload["projects"]),
+            claim_count=len(set(claim_ids)),
+            evidence_count=len(set(evidence_ids)),
+            claim_ids=tuple(sorted(set(claim_ids))),
+            evidence_ids=tuple(sorted(set(evidence_ids))),
         ),
     )
 
+
+def _assemble_payload(
+    selection: EvidenceSelectionResult,
+    artifact_kind: ArtifactKind,
+) -> tuple[dict[str, object], list[int], list[int]]:
     projects: dict[str, dict[str, object]] = {}
     claim_ids: list[int] = []
     evidence_ids: list[int] = []
@@ -108,7 +168,7 @@ def build_public_portfolio(request: PublicPortfolioRequest) -> PublicPortfolioRe
         "version": 1,
         "delivery_scope": selection.delivery_scope,
         "policy_hash": selection.policy_hash,
-        "selection": selection.input_manifest("portfolio_public_manifest"),
+        "selection": selection.input_manifest(artifact_kind),
         "generated_at": datetime.now(timezone.utc)
         .replace(microsecond=0)
         .isoformat()
@@ -118,31 +178,12 @@ def build_public_portfolio(request: PublicPortfolioRequest) -> PublicPortfolioRe
         "skills": [],
         "links": [],
     }
-    write_json(paths.portfolio_public_json_path, payload)
-    repository.record_artifact(
-        "portfolio_public",
-        1,
-        json.dumps(
-            {
-                **selection.input_manifest("portfolio_public_manifest"),
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        ),
-    )
-    return PublicPortfolioResult(
-        manifest_path=paths.portfolio_public_json_path,
-        project_count=len(projects),
-        claim_count=len(set(claim_ids)),
-        evidence_count=len(set(evidence_ids)),
-        claim_ids=tuple(sorted(set(claim_ids))),
-        evidence_ids=tuple(sorted(set(evidence_ids))),
-    )
+    return payload, claim_ids, evidence_ids
 
 
 def _public_record(record: PublicEvidenceRecord) -> dict[str, object] | None:
     if record.activity_id is None:
-        label = normalize_label(mask_public_value(record.source_display_name or ""))
+        label = safe_local_public_label(mask_public_value(record.source_display_name or ""))
         if not label:
             return None
         return {

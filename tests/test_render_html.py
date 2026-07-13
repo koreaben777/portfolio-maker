@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from pathlib import Path
 import sqlite3
 import subprocess
@@ -8,11 +9,20 @@ import subprocess
 import pytest
 
 from portfolio_maker.application.approval import write_sample_approval
+from portfolio_maker.application.artifact_approval import write_sample_artifact_policy
 from portfolio_maker.application.build_profile import build_profile
-from portfolio_maker.application.models import BuildProfileRequest, RenderHtmlRequest
+from portfolio_maker.application.draft_portfolio import draft_portfolio
+from portfolio_maker.application.models import (
+    BuildProfileRequest,
+    DraftPortfolioRequest,
+    PublicPortfolioRequest,
+    RenderHtmlRequest,
+)
+from portfolio_maker.application.public_portfolio import build_public_portfolio
 from portfolio_maker.application.render_html import HtmlRenderError, render_html
 import portfolio_maker.application.render_html as render_html_module
 from portfolio_maker.domain.models import GitHubActivity, Source, SourceStatus, SourceType
+from portfolio_maker.infrastructure.extractors import extract_text
 from portfolio_maker.infrastructure.sqlite_repository import SQLiteRepository
 from portfolio_maker.workspace import WorkspacePaths
 
@@ -112,6 +122,166 @@ def _setup_legacy_github_render_workspace(tmp_path: Path) -> tuple[Path, Workspa
         encoding="utf-8",
     )
     return workspace, paths
+
+
+def _setup_multi_origin_render_workspace(
+    tmp_path: Path,
+    *,
+    html_policy: dict[str, object] | None = None,
+    path_like_label: bool = False,
+    local_display_name: str | None = None,
+) -> tuple[Path, WorkspacePaths, Path, Path, str, str, str]:
+    workspace = tmp_path / "multi-origin"
+    paths = WorkspacePaths.from_root(workspace)
+    source_path = tmp_path / "local" / "notes.md"
+    source_path.parent.mkdir()
+    source_path.write_text(
+        "Local project\nApproved local evidence.\n",
+        encoding="utf-8",
+    )
+    local_uri = source_path.resolve().as_uri()
+    public_url = "https://github.com/octo/public/pull/1"
+    private_url = "https://github.com/octo/private/pull/2"
+    write_sample_approval(paths)
+    approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    approval.update(
+        {
+            "approved_source_uris": [local_uri],
+            "allowed_repositories": ["octo/public", "octo/private"],
+            "approved_github_activity_urls": [public_url],
+            "private_sources_allowed": True,
+            "approved_private_github_activity_urls": [private_url],
+        }
+    )
+    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+    write_sample_artifact_policy(paths)
+    if html_policy is not None:
+        artifact_policy = json.loads(
+            paths.artifact_approval_path.read_text(encoding="utf-8")
+        )
+        artifact_policy["artifacts"]["portfolio_html"] = html_policy
+        paths.artifact_approval_path.write_text(
+            json.dumps(artifact_policy), encoding="utf-8"
+        )
+
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    local_id = repository.upsert_source(
+        Source(
+            None,
+            SourceType.LOCAL_FILE,
+            local_uri,
+            local_display_name
+            or ("/synthetic/private/project" if path_like_label else "Local notes"),
+            None,
+            SourceStatus.INGESTED,
+        )
+    )
+    extracted = extract_text(source_path)
+    snapshot_path = paths.local_snapshots_dir / f"source-{local_id}-{extracted.content_hash}.json"
+    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+    snapshot_path.write_text(
+        json.dumps(
+            {
+                "source_id": local_id,
+                "source_uri": local_uri,
+                "display_name": source_path.name,
+                "content_hash": extracted.content_hash,
+                "extractor": extracted.extractor,
+                "extracted_at": "2026-07-13T00:00:00Z",
+                "text": "Local project\nApproved local evidence.\n",
+            }
+        ),
+        encoding="utf-8",
+    )
+    repository.insert_source_snapshot(
+        local_id, snapshot_path, extracted.content_hash, extracted.extractor
+    )
+    public_source_id = repository.upsert_source(
+        Source(
+            None,
+            SourceType.GITHUB_REPOSITORY,
+            "https://github.com/octo/public",
+            "octo/public",
+            "octo",
+            SourceStatus.DISCOVERED,
+            "public_github",
+            "public",
+        )
+    )
+    private_source_id = repository.upsert_source(
+        Source(
+            None,
+            SourceType.GITHUB_REPOSITORY,
+            "https://github.com/octo/private",
+            "octo/private",
+            "octo",
+            SourceStatus.DISCOVERED,
+            "private_github",
+            "private",
+        )
+    )
+    repository.insert_github_activity(
+        GitHubActivity(
+            None,
+            public_source_id,
+            "octo/public",
+            "pull_request",
+            public_url,
+            "Public activity",
+            "OPEN",
+            "octo",
+            "2026-01-01T00:00:00Z",
+            None,
+        )
+    )
+    repository.insert_github_activity(
+        GitHubActivity(
+            None,
+            private_source_id,
+            "octo/private",
+            "pull_request",
+            private_url,
+            "Private activity",
+            "MERGED",
+            "octo",
+            "2026-01-02T00:00:00Z",
+            None,
+            True,
+        )
+    )
+    generated = workspace / "web" / "portfolio" / "src" / "generated"
+    generated.mkdir(parents=True)
+    (generated / "portfolio-data.ts").write_text(
+        'export const portfolioData = { version: 1, projects: [] } as const;\n',
+        encoding="utf-8",
+    )
+    return (
+        workspace,
+        paths,
+        source_path,
+        snapshot_path,
+        local_uri,
+        public_url,
+        private_url,
+    )
+
+
+def _fake_build_with_generated_data(*args, **kwargs):
+    temp_site = Path(kwargs["cwd"])
+    dist = temp_site / "dist"
+    (dist / "assets").mkdir(parents=True)
+    generated = temp_site / "src" / "generated" / "portfolio-data.ts"
+    (dist / "index.html").write_text(
+        '<script type="module" src="./assets/main.js"></script>\n'
+        + "<!-- generated data -->\n"
+        + generated.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    (dist / "assets" / "main.js").write_text(
+        "document.body.dataset.ready = 'true';", encoding="utf-8"
+    )
+    return subprocess.CompletedProcess(args[0], 0)
 
 
 def test_render_html_success_publishes_without_mutating_template_or_draft(
@@ -225,3 +395,100 @@ def test_legacy_schema_approved_github_activity_reaches_profile_and_html(
     assert render_result.html_path.is_file()
     manifest = json.loads(paths.portfolio_public_json_path.read_text(encoding="utf-8"))
     assert manifest["projects"][0]["timeline"][0]["title"] == "Legacy approved activity"
+
+
+def test_render_html_uses_its_own_policy_without_overwriting_manifest_policy(
+    tmp_path,
+    monkeypatch,
+):
+    workspace, paths, _, _, local_uri, public_url, private_url = (
+        _setup_multi_origin_render_workspace(
+            tmp_path,
+            html_policy={
+                "delivery_scope": "open_public",
+                "include_local": False,
+                "include_public_github": True,
+                "include_private_github": False,
+            },
+        )
+    )
+    monkeypatch.setattr(
+        render_html_module.subprocess, "run", _fake_build_with_generated_data
+    )
+
+    render_html(RenderHtmlRequest(workspace=workspace))
+
+    public_manifest = json.loads(
+        paths.portfolio_public_json_path.read_text(encoding="utf-8")
+    )
+    html_text = paths.portfolio_html_path.read_text(encoding="utf-8")
+    with SQLiteRepository(paths.db_path)._read_connection() as connection:
+        records = connection.execute(
+            "SELECT kind, input_manifest FROM artifacts "
+            "WHERE kind IN ('portfolio_public', 'portfolio_html') ORDER BY id"
+        ).fetchall()
+        evidence_rows = connection.execute(
+            "SELECT evidence_items.id, github_activities.url "
+            "FROM evidence_items JOIN github_activities "
+            "ON github_activities.id = evidence_items.github_activity_id"
+        ).fetchall()
+    manifests = {row["kind"]: json.loads(row["input_manifest"]) for row in records}
+    activity_evidence = {row["url"]: row["id"] for row in evidence_rows}
+
+    assert public_manifest["delivery_scope"] == "restricted"
+    assert manifests["portfolio_public"]["delivery_scope"] == "restricted"
+    assert manifests["portfolio_html"]["artifact_kind"] == "portfolio_html"
+    assert manifests["portfolio_html"]["delivery_scope"] == "open_public"
+    assert len(manifests["portfolio_html"]["manifest_sha256"]) == 64
+    assert manifests["portfolio_html"]["manifest_sha256"] != hashlib.sha256(
+        paths.portfolio_public_json_path.read_bytes()
+    ).hexdigest()
+    assert manifests["portfolio_html"]["included_evidence_ids"] == [
+        activity_evidence[public_url]
+    ]
+    assert manifests["portfolio_html"]["policy_hash"]
+    assert "Public activity" in html_text
+    assert "Private activity" not in html_text
+    assert private_url not in html_text
+    assert local_uri not in html_text
+
+
+@pytest.mark.parametrize(
+    "persisted_label",
+    ("/synthetic/private/project", "sk-synthetic-local-token"),
+)
+def test_restricted_artifacts_hide_local_uri_snapshot_and_path_like_label(
+    tmp_path,
+    monkeypatch,
+    persisted_label,
+):
+    workspace, paths, source_path, snapshot_path, local_uri, _, private_url = (
+        _setup_multi_origin_render_workspace(
+            tmp_path, local_display_name=persisted_label
+        )
+    )
+    monkeypatch.setattr(
+        render_html_module.subprocess, "run", _fake_build_with_generated_data
+    )
+
+    build_profile(BuildProfileRequest(workspace=workspace))
+    draft_portfolio(DraftPortfolioRequest(workspace=workspace))
+    build_public_portfolio(PublicPortfolioRequest(workspace=workspace))
+    render_html(RenderHtmlRequest(workspace=workspace))
+
+    artifact_text = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in (
+            paths.master_profile_json_path,
+            paths.master_profile_md_path,
+            paths.portfolio_draft_path,
+            paths.portfolio_public_json_path,
+            paths.portfolio_html_path,
+        )
+    )
+    assert local_uri not in artifact_text
+    assert str(source_path) not in artifact_text
+    assert str(snapshot_path) not in artifact_text
+    assert persisted_label not in artifact_text
+    assert private_url not in artifact_text
+    assert "Approved local evidence" in artifact_text

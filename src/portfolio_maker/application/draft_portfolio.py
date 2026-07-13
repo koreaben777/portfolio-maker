@@ -17,7 +17,11 @@ from portfolio_maker.application.models import (
 )
 from portfolio_maker.infrastructure.artifacts import write_markdown
 from portfolio_maker.infrastructure.policy import mask_public_value
-from portfolio_maker.infrastructure.presentation import markdown_text, normalize_label
+from portfolio_maker.infrastructure.presentation import (
+    markdown_text,
+    normalize_label,
+    safe_local_public_label,
+)
 from portfolio_maker.infrastructure.github_connector import is_public_github_activity_url
 from portfolio_maker.infrastructure.sqlite_repository import SQLiteRepository
 from portfolio_maker.workspace import WorkspacePaths
@@ -61,7 +65,10 @@ def draft_portfolio(request: DraftPortfolioRequest) -> DraftPortfolioResult:
     sections = []
     for source in sources:
         masked_name = mask_public_value(str(source["display_name"]))
-        display_name = masked_name if masked_name == "[REDACTED]" else markdown_text(masked_name)
+        safe_name = safe_local_public_label(masked_name)
+        display_name = (
+            safe_name if safe_name == "[REDACTED]" else markdown_text(safe_name)
+        )
         sections.append(
             "\n".join(
                 [

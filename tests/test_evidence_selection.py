@@ -153,6 +153,39 @@ def test_restricted_selection_includes_approved_local_public_and_private_origins
     assert result.policy_hash
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("excluded_directories", ["/synthetic/excluded"]),
+        ("excluded_file_patterns", ["*.secret"]),
+    ),
+)
+def test_policy_hash_changes_when_source_exclusion_policy_changes(tmp_path, field, value):
+    paths, repository, _ = _fixture(tmp_path)
+    service = EvidenceSelectionService()
+    baseline = service.select(
+        repository,
+        EvidenceSelectionRequest(
+            artifact_kind="portfolio_html",
+            policy=load_artifact_policy(paths),
+            current_approval=load_approval(paths),
+        ),
+    )
+    approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    approval[field] = value
+    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+    changed = service.select(
+        repository,
+        EvidenceSelectionRequest(
+            artifact_kind="portfolio_html",
+            policy=load_artifact_policy(paths),
+            current_approval=load_approval(paths),
+        ),
+    )
+
+    assert changed.policy_hash != baseline.policy_hash
+
+
 def test_artifact_exclusion_removes_one_source_without_changing_pool(tmp_path):
     paths, repository, records = _fixture(tmp_path)
     payload = {

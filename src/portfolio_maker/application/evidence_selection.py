@@ -363,6 +363,12 @@ def _policy_hash(request: EvidenceSelectionRequest) -> str:
             "approved_private_github_activity_urls": sorted(
                 request.current_approval.approved_private_github_activity_urls
             ),
+            "excluded_directories": sorted(
+                str(path) for path in request.current_approval.excluded_directories
+            ),
+            "excluded_file_patterns": sorted(
+                request.current_approval.excluded_file_patterns
+            ),
         },
     }
     return hashlib.sha256(
