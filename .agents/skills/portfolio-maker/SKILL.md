@@ -17,7 +17,7 @@ The generated portfolio draft is a review-required portfolio skeleton. Narrative
 - Do not print secrets, tokens, private key material, or credential values.
 - Do not ask to inspect `.env`, private keys, password-manager exports, browser profiles, or forbidden folders.
 - Keep generated public artifacts free of private raw paths.
-- The HTML renderer requires Node.js LTS with npm. On a fresh checkout, run `cd web/portfolio` and `npm ci` once before the normal workspace command; do not install Vite globally or use an `npx` fallback.
+- The HTML renderer requires Node.js LTS with npm. On a fresh checkout, run `(cd web/portfolio && npm ci)` once before the normal workspace command; do not install Vite globally or use an `npx` fallback.
 
 ## Workflow
 
@@ -69,11 +69,10 @@ After discovery succeeds, review the report and reapprove the exact public activ
 10. On a fresh checkout, with Node.js LTS and npm available, install the Sites dependencies once:
 
 ```bash
-cd web/portfolio
-npm ci
+(cd web/portfolio && npm ci)
 ```
 
-Then, after approval, run:
+The following `portfolio-maker ... --workspace .` commands must run from the repository root:
 
 ```bash
 portfolio-maker ingest --workspace .
