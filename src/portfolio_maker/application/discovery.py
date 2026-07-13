@@ -121,6 +121,8 @@ def discover_sources(request: DiscoverSourcesRequest) -> DiscoverSourcesResult:
                     display_name=repo.name_with_owner,
                     owner=repo.name_with_owner.split("/", 1)[0],
                     status=SourceStatus.DISCOVERED,
+                    origin_type=("private_github" if repo.is_private else "public_github"),
+                    origin_visibility=("private" if repo.is_private else "public"),
                 )
             )
             repo_visibility[repo.name_with_owner] = repo.is_private

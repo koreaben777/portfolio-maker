@@ -3,25 +3,20 @@ from __future__ import annotations
 import json
 
 from portfolio_maker.application.approval import load_approval
+from portfolio_maker.application.artifact_approval import load_artifact_policy
+from portfolio_maker.application.evidence_selection import (
+    EvidenceSelectionRequest,
+    EvidenceSelectionService,
+)
 from portfolio_maker.application.models import BuildProfileRequest, BuildProfileResult
 from portfolio_maker.domain.models import Source, SourceStatus, SourceType
 from portfolio_maker.infrastructure.artifacts import write_json, write_markdown
 from portfolio_maker.infrastructure.extractors import extract_approved_text
 from portfolio_maker.infrastructure.managed_files import remove_managed_file
 from portfolio_maker.infrastructure.presentation import markdown_text, normalize_label
-from portfolio_maker.infrastructure.github_connector import (
-    canonical_public_github_activity_url,
-    canonical_repository_name,
-    contains_unicode_control,
-    is_valid_github_activity_state,
-    is_valid_github_timestamp,
-    public_github_activity_identity,
-    public_github_repository_name,
-)
 from portfolio_maker.infrastructure.policy import (
     FilePolicy,
     SourcePathPolicyError,
-    contains_hidden_secret_shaped_public_value,
     mask_public_value,
 )
 from portfolio_maker.infrastructure.sqlite_repository import SQLiteRepository
@@ -33,7 +28,13 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
     paths = WorkspacePaths.from_root(request.workspace)
     paths.ensure()
     approval = load_approval(paths)
-    approved_uris = set(approval.approved_source_uris)
+    artifact_policy = load_artifact_policy(paths)
+    selection_service = EvidenceSelectionService()
+    selection_request = EvidenceSelectionRequest(
+        artifact_kind="master_profile",
+        policy=artifact_policy,
+        current_approval=approval,
+    )
     policy = FilePolicy(
         forbidden_paths=approval.excluded_directories,
         excluded_file_patterns=approval.excluded_file_patterns,
@@ -50,7 +51,11 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
     source_by_id = {source.id: source for source in repository.list_sources() if source.id is not None}
 
     for source in repository.list_sources(status=SourceStatus.INGESTED):
-        if source.type != SourceType.LOCAL_FILE or source.uri not in approved_uris or source.id is None:
+        if (
+            source.type != SourceType.LOCAL_FILE
+            or source.id is None
+            or selection_service.decision_for_source(source, selection_request) is not None
+        ):
             continue
         try:
             source_path, extracted = extract_approved_text(source.uri, policy)
@@ -111,54 +116,26 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
                 "text": claim_text,
                 "confidence": "medium",
                 "public_safe": False,
+                "claim_id": claim_id,
+                "evidence_id": evidence_id,
                 "evidence_uri": source.uri,
                 "evidence_snapshot": str(snapshot_path),
             }
         )
 
-    approved_activity_urls = set(approval.approved_github_activity_urls)
-    allowed_repositories = set(approval.allowed_repositories)
-    excluded_repositories = set(approval.excluded_repositories)
     seen_activities: set[tuple[str, str, str]] = set()
     for activity in repository.list_github_activities():
-        canonical_activity_url = canonical_public_github_activity_url(activity.url)
-        if canonical_activity_url is None:
-            continue
-        try:
-            repository_name = canonical_repository_name(activity.repo)
-        except ValueError:
-            continue
-        if (
-            activity.id is None
-            or activity.source_id is None
-            or activity.is_private
-            or canonical_activity_url not in approved_activity_urls
-            or contains_unicode_control(activity.title)
-            or contains_unicode_control(activity.author)
-            or contains_hidden_secret_shaped_public_value(activity.title)
-            or contains_hidden_secret_shaped_public_value(activity.author)
-            or not is_valid_github_activity_state(
-                activity.activity_type, activity.state, activity.state_field
-            )
-            or not is_valid_github_timestamp(activity.created_at)
-            or public_github_activity_identity(canonical_activity_url)
-            != (repository_name, activity.activity_type)
-        ):
+        if activity.id is None or activity.source_id is None:
             continue
         source = source_by_id.get(activity.source_id)
-        if (
-            source is None
-            or source.type != SourceType.GITHUB_REPOSITORY
-            or public_github_repository_name(source.uri) != repository_name
-            or source.status in {
-                SourceStatus.SKIPPED_POLICY,
-                SourceStatus.EXTRACT_FAILED,
-                SourceStatus.STALE_SOURCE,
-            }
-            or repository_name in excluded_repositories
-            or (allowed_repositories and repository_name not in allowed_repositories)
-        ):
+        if source is None:
             continue
+        if selection_service.decision_for_activity(
+            activity, source, selection_request
+        ) is not None:
+            continue
+        canonical_activity_url = activity.url
+        repository_name = activity.repo.casefold()
         title = normalize_label(mask_public_value(activity.title))
         if not title:
             continue
@@ -175,7 +152,17 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
         github_source_repositories[source.id] = repository_name
         author = normalize_label(mask_public_value(activity.author))
         state = normalize_label(mask_public_value(activity.state))
-        claim_text = f"{repository_name}: {title}"
+        is_private = activity.is_private
+        evidence_uri = (
+            f"private-github-activity:{activity.id}"
+            if is_private
+            else canonical_activity_url
+        )
+        claim_text = (
+            f"Private GitHub activity: {title}"
+            if is_private
+            else f"{repository_name}: {title}"
+        )
         project_id = repository.upsert_project(f"github:{repository_name}", public_safe=True)
         evidence_id = repository.upsert_evidence_item(
             source_id=source.id,
@@ -199,15 +186,26 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
                 "text": claim_text,
                 "confidence": "high",
                 "public_safe": True,
-                "evidence_uri": canonical_activity_url,
+                "claim_id": claim_id,
+                "evidence_id": evidence_id,
+                "evidence_uri": evidence_uri,
                 "evidence_snapshot": None,
                 "activity_type": activity.activity_type,
                 "title": title,
                 "author": author,
                 "created_at": activity.created_at,
                 "state": state,
+                "origin_type": "private_github" if is_private else "public_github",
             }
         )
+
+    selection = selection_service.select(repository, selection_request)
+
+    if artifact_policy.legacy_compatibility:
+        for claim in claims:
+            claim.pop("claim_id", None)
+            claim.pop("evidence_id", None)
+            claim.pop("origin_type", None)
 
     payload = {
         "version": 1,
@@ -217,6 +215,9 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
         ],
         "claims": claims,
     }
+    if not artifact_policy.legacy_compatibility:
+        payload["delivery_scope"] = selection.delivery_scope
+        payload["policy_hash"] = selection.policy_hash
 
     write_json(paths.master_profile_json_path, payload)
     source_lines = []
@@ -246,7 +247,11 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
         "master_profile",
         1,
         json.dumps(
-            {"claim_ids": claim_ids, "evidence_ids": evidence_ids},
+            (
+                {"claim_ids": claim_ids, "evidence_ids": evidence_ids}
+                if artifact_policy.legacy_compatibility
+                else selection.input_manifest("master_profile")
+            ),
             sort_keys=True,
             separators=(",", ":"),
         ),
@@ -282,6 +287,15 @@ def _public_source_payload(
         if source.type == SourceType.GITHUB_REPOSITORY
         else None
     )
+    if source.type == SourceType.GITHUB_REPOSITORY and source.origin_visibility == "private":
+        return {
+            "id": source.id,
+            "type": "private_github",
+            "uri": f"private-github-source:{source.id}",
+            "display_name": "Private GitHub repository",
+            "owner": None,
+            "status": source.status.value,
+        }
     if repository_name is not None:
         owner = repository_name.split("/", 1)[0]
         display_name = repository_name

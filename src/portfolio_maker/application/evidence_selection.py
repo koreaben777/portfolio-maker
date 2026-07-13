@@ -10,12 +10,23 @@ from portfolio_maker.application.artifact_approval import (
     ArtifactPolicySet,
 )
 from portfolio_maker.application.models import ArtifactKind
-from portfolio_maker.domain.models import PublicEvidenceRecord
+from portfolio_maker.domain.models import (
+    GitHubActivity,
+    PublicEvidenceRecord,
+    Source,
+    SourceType,
+)
 from portfolio_maker.infrastructure.github_connector import (
     canonical_public_github_activity_url,
     canonical_repository_name,
+    contains_unicode_control,
+    is_valid_github_activity_state,
+    is_valid_github_timestamp,
+    public_github_activity_identity,
     public_github_repository_name,
 )
+from portfolio_maker.infrastructure.policy import contains_hidden_secret_shaped_public_value
+from portfolio_maker.infrastructure.presentation import normalize_label
 from portfolio_maker.infrastructure.sqlite_repository import SQLiteRepository
 
 
@@ -40,8 +51,119 @@ class EvidenceSelectionResult:
     policy_hash: str
     records: tuple[PublicEvidenceRecord, ...] = ()
 
+    def input_manifest(self, artifact_kind: ArtifactKind) -> dict[str, object]:
+        origin_counts: dict[str, int] = {}
+        for record in self.records:
+            origin = _record_origin(record)
+            origin_counts[origin] = origin_counts.get(origin, 0) + 1
+        return {
+            "artifact_kind": artifact_kind,
+            "delivery_scope": self.delivery_scope,
+            "policy_hash": self.policy_hash,
+            "included_source_ids": list(self.included_source_ids),
+            "included_evidence_ids": list(self.included_evidence_ids),
+            "included_claim_ids": list(self.included_claim_ids),
+            "source_ids": list(self.included_source_ids),
+            "evidence_ids": list(self.included_evidence_ids),
+            "claim_ids": list(self.included_claim_ids),
+            "excluded_decisions": list(self.excluded_decisions),
+            "origin_counts": origin_counts,
+        }
+
 
 class EvidenceSelectionService:
+    def decision_for_source(
+        self,
+        source: Source,
+        request: EvidenceSelectionRequest,
+    ) -> str | None:
+        visibility = source.origin_visibility or "private"
+        record = PublicEvidenceRecord(
+            project_id=0,
+            project_name="",
+            claim_id=0,
+            claim_text="",
+            evidence_id=0,
+            evidence_stable_id="",
+            evidence_locator=source.uri,
+            source_id=source.id,
+            source_type=source.type.value,
+            source_uri=source.uri,
+            source_display_name=source.display_name,
+            source_status=source.status.value,
+            activity_id=None,
+            activity_repo=None,
+            activity_type=None,
+            activity_url=None,
+            activity_title=None,
+            activity_state=None,
+            activity_state_field=None,
+            activity_author=None,
+            activity_created_at=None,
+            activity_is_private=None,
+            evidence_origin_type=source.origin_type or "local",
+            evidence_origin_visibility=visibility,
+            source_origin_type=source.origin_type or "local",
+            source_origin_visibility=visibility,
+        )
+        return self._exclusion_reason(
+            record,
+            "local",
+            request.policy.for_kind(request.artifact_kind),
+            request.current_approval,
+            request.policy.legacy_compatibility
+            and request.artifact_kind in {"portfolio_public_manifest", "portfolio_html"},
+        )
+
+    def decision_for_activity(
+        self,
+        activity: GitHubActivity,
+        source: Source,
+        request: EvidenceSelectionRequest,
+    ) -> str | None:
+        origin = "private_github" if activity.is_private else "public_github"
+        visibility = activity.origin_visibility or (
+            "private" if activity.is_private else "public"
+        )
+        record = PublicEvidenceRecord(
+            project_id=0,
+            project_name="",
+            claim_id=0,
+            claim_text="",
+            evidence_id=0,
+            evidence_stable_id="",
+            evidence_locator=activity.url,
+            source_id=source.id,
+            source_type=source.type.value,
+            source_uri=source.uri,
+            source_display_name=source.display_name,
+            source_status=source.status.value,
+            activity_id=activity.id,
+            activity_repo=activity.repo,
+            activity_type=activity.activity_type,
+            activity_url=activity.url,
+            activity_title=activity.title,
+            activity_state=activity.state,
+            activity_state_field=activity.state_field,
+            activity_author=activity.author,
+            activity_created_at=activity.created_at,
+            activity_is_private=activity.is_private,
+            evidence_origin_type=activity.origin_type or origin,
+            evidence_origin_visibility=visibility,
+            source_origin_type=source.origin_type or origin,
+            source_origin_visibility=source.origin_visibility or visibility,
+            activity_origin_type=activity.origin_type or origin,
+            activity_origin_visibility=visibility,
+        )
+        return self._exclusion_reason(
+            record,
+            origin,
+            request.policy.for_kind(request.artifact_kind),
+            request.current_approval,
+            request.policy.legacy_compatibility
+            and request.artifact_kind in {"portfolio_public_manifest", "portfolio_html"},
+        )
+
     def select(
         self,
         repository: SQLiteRepository,
@@ -129,6 +251,31 @@ class EvidenceSelectionService:
 
         if record.activity_repo is None or record.activity_url is None:
             return "missing_activity"
+        if not all(
+            isinstance(value, str) and value.strip()
+            for value in (
+                record.activity_title,
+                record.activity_author,
+                record.activity_state,
+                record.activity_created_at,
+            )
+        ):
+            return "invalid_activity_metadata"
+        if (
+            contains_unicode_control(record.activity_title)
+            or contains_unicode_control(record.activity_author)
+            or contains_unicode_control(record.activity_state)
+            or contains_hidden_secret_shaped_public_value(record.activity_title)
+            or contains_hidden_secret_shaped_public_value(record.activity_author)
+            or contains_hidden_secret_shaped_public_value(record.activity_state)
+            or not is_valid_github_activity_state(
+                record.activity_type or "",
+                record.activity_state,
+                record.activity_state_field,
+            )
+            or not is_valid_github_timestamp(record.activity_created_at)
+        ):
+            return "invalid_activity_metadata"
         try:
             repository_name = canonical_repository_name(record.activity_repo)
         except ValueError:
@@ -168,6 +315,11 @@ class EvidenceSelectionService:
             return "excluded_activity"
         if public_github_repository_name(record.source_uri) != repository_name:
             return "source_repository_mismatch"
+        if (
+            public_github_activity_identity(activity_url)
+            != (repository_name, record.activity_type)
+        ):
+            return "invalid_activity_url"
         return None
 
 

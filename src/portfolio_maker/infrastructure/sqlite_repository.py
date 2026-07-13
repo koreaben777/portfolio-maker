@@ -735,6 +735,15 @@ class SQLiteRepository:
             )
             if {"origin_type", "origin_visibility"} <= columns:
                 values = (*values, origin_type, origin_visibility)
+                if activity.source_id is not None:
+                    conn.execute(
+                        """
+                        UPDATE sources
+                        SET origin_type = ?, origin_visibility = ?
+                        WHERE id = ? AND type = 'github_repository'
+                        """,
+                        (origin_type, origin_visibility, activity.source_id),
+                    )
             candidate_rows = conn.execute(
                 """
                 SELECT id, url FROM github_activities

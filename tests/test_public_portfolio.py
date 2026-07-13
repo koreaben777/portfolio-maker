@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
+import subprocess
 
 from portfolio_maker.application.approval import write_sample_approval
-from portfolio_maker.application.models import PublicPortfolioRequest
+from portfolio_maker.application.models import PublicPortfolioRequest, RenderHtmlRequest
 from portfolio_maker.application.public_portfolio import build_public_portfolio
+from portfolio_maker.application.render_html import render_html
+import portfolio_maker.application.render_html as render_html_module
 from portfolio_maker.domain.models import GitHubActivity, Source, SourceStatus, SourceType
 from portfolio_maker.infrastructure.sqlite_repository import SQLiteRepository
 from portfolio_maker.workspace import WorkspacePaths
@@ -182,3 +186,78 @@ def test_build_public_portfolio_empty_manifest_is_explicit(tmp_path):
     assert manifest["projects"] == []
     assert manifest["skills"] == []
     assert manifest["profile"] == {}
+
+
+def test_build_public_portfolio_excludes_legacy_public_safe_local_path_claim(
+    tmp_path,
+    monkeypatch,
+):
+    workspace = tmp_path / "workspace"
+    paths = WorkspacePaths.from_root(workspace)
+    write_sample_approval(paths)
+    approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    approval["approved_source_uris"] = ["file:///Users/june/private/project.md"]
+    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    source_id = repository.upsert_source(
+        Source(
+            None,
+            SourceType.LOCAL_FILE,
+            "file:///Users/june/private/project.md",
+            "project.md",
+            None,
+            SourceStatus.DISCOVERED,
+        )
+    )
+    project_id = repository.upsert_project("local:legacy", public_safe=True)
+    evidence_id = repository.upsert_evidence_item(
+        source_id=source_id,
+        snapshot_id=None,
+        github_activity_id=None,
+        locator="file:///Users/june/private/project.md",
+        stable_id="legacy-local-path-evidence",
+        content_hash=None,
+        public_safe=True,
+    )
+    claim_id = repository.upsert_career_claim(
+        project_id,
+        "/Users/june/private/project.md: shipped an outcome",
+        public_safe=True,
+    )
+    repository.link_claim_evidence(claim_id, evidence_id, "direct")
+
+    result = build_public_portfolio(PublicPortfolioRequest(workspace=workspace))
+
+    manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    assert manifest["projects"] == []
+    assert "/Users/june/private/project.md" not in result.manifest_path.read_text(
+        encoding="utf-8"
+    )
+
+    generated = workspace / "web" / "portfolio" / "src" / "generated"
+    generated.mkdir(parents=True)
+    (generated / "portfolio-data.ts").write_text(
+        'export const portfolioData = { version: 1, projects: [] } as const;\n',
+        encoding="utf-8",
+    )
+
+    def fake_build(*args, **kwargs):
+        dist = Path(kwargs["cwd"]) / "dist"
+        (dist / "assets").mkdir(parents=True)
+        (dist / "index.html").write_text(
+            '<script type="module" src="./assets/main.js"></script>',
+            encoding="utf-8",
+        )
+        (dist / "assets" / "main.js").write_text(
+            "document.body.textContent = 'empty';",
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(args[0], 0)
+
+    monkeypatch.setattr(render_html_module.subprocess, "run", fake_build)
+    html_result = render_html(RenderHtmlRequest(workspace=workspace))
+    assert "/Users/june/private/project.md" not in html_result.html_path.read_text(
+        encoding="utf-8"
+    )
