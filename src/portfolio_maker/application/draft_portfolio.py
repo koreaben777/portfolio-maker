@@ -15,6 +15,7 @@ from portfolio_maker.application.models import (
     DraftPortfolioRequest,
     DraftPortfolioResult,
 )
+from portfolio_maker.domain.models import PublicEvidenceRecord
 from portfolio_maker.infrastructure.artifacts import write_markdown
 from portfolio_maker.infrastructure.policy import mask_public_value
 from portfolio_maker.infrastructure.presentation import (
@@ -52,16 +53,28 @@ def draft_portfolio(request: DraftPortfolioRequest) -> DraftPortfolioResult:
         )
     except ApprovalMissingError:
         pass
-    selected_source_ids = (
-        None if selection is None else set(selection.included_source_ids)
+    selection_backed = (
+        selection is not None
+        and artifact_policy is not None
+        and not artifact_policy.legacy_compatibility
     )
     selected_claim_ids = None if selection is None else set(selection.included_claim_ids)
-    sources = [
-        source
-        for source in profile["sources"]
-        if source.get("type", "local_file") == "local_file"
-        and (selected_source_ids is None or source.get("id") in selected_source_ids)
-    ]
+    if selection_backed:
+        sources = _local_source_payloads(selection.records)
+        evidence_lines = _github_evidence_lines_from_records(selection.records)
+    else:
+        selected_source_ids = (
+            None if selection is None else set(selection.included_source_ids)
+        )
+        sources = [
+            source
+            for source in profile["sources"]
+            if source.get("type", "local_file") == "local_file"
+            and (selected_source_ids is None or source.get("id") in selected_source_ids)
+        ]
+        evidence_lines = _github_evidence_lines(
+            profile.get("claims", []), selected_claim_ids
+        )
     sections = []
     for source in sources:
         masked_name = mask_public_value(str(source["display_name"]))
@@ -86,9 +99,6 @@ def draft_portfolio(request: DraftPortfolioRequest) -> DraftPortfolioResult:
             )
         )
 
-    evidence_lines = _github_evidence_lines(
-        profile.get("claims", []), selected_claim_ids
-    )
     content = "# Portfolio Draft\n\n" + "\n".join(sections)
     if evidence_lines:
         content += "## GitHub Activity Evidence\n\n" + "\n".join(evidence_lines) + "\n"
@@ -131,6 +141,57 @@ def _load_profile(path: Path) -> dict[str, object]:
     if not isinstance(claims, list) or any(not isinstance(claim, dict) for claim in claims):
         raise ProfileFormatError("master profile claims must be a list")
     return payload
+
+
+def _local_source_payloads(
+    records: tuple[PublicEvidenceRecord, ...],
+) -> list[dict[str, object]]:
+    sources: list[dict[str, object]] = []
+    seen_source_ids: set[int] = set()
+    for record in records:
+        if record.activity_id is not None or record.source_id is None:
+            continue
+        if record.source_id in seen_source_ids:
+            continue
+        display_name = safe_local_public_label(
+            mask_public_value(record.source_display_name or "")
+        )
+        if not display_name:
+            continue
+        seen_source_ids.add(record.source_id)
+        sources.append({"id": record.source_id, "display_name": display_name})
+    return sources
+
+
+def _github_evidence_lines_from_records(
+    records: tuple[PublicEvidenceRecord, ...],
+) -> list[str]:
+    lines: list[str] = []
+    for record in records:
+        if record.activity_id is None:
+            continue
+        title = normalize_label(mask_public_value(record.activity_title or ""))
+        activity_type = normalize_label(record.activity_type or "")
+        if not title or not activity_type:
+            continue
+        if record.activity_is_private:
+            lines.extend(
+                [
+                    f"- `private GitHub activity`: {markdown_text(title)}",
+                    "  Evidence: approved private activity (URL withheld)",
+                ]
+            )
+            continue
+        url = record.activity_url
+        if not isinstance(url, str) or not is_public_github_activity_url(url):
+            continue
+        lines.extend(
+            [
+                f"- `{markdown_text(activity_type)}`: {markdown_text(title)}",
+                f"  Evidence: {url}",
+            ]
+        )
+    return lines
 
 
 def _github_evidence_lines(

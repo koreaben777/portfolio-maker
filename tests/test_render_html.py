@@ -508,6 +508,62 @@ def test_artifact_policies_share_approved_pool_but_select_independently(
     assert private_url not in html_text
 
 
+def test_draft_uses_its_own_selection_when_master_excludes_all_origins(
+    tmp_path,
+):
+    workspace, paths, source_path, snapshot_path, local_uri, _, private_url = (
+        _setup_multi_origin_render_workspace(tmp_path)
+    )
+    artifact_policy = json.loads(
+        paths.artifact_approval_path.read_text(encoding="utf-8")
+    )
+    artifact_policy["artifacts"]["master_profile"] = {
+        "delivery_scope": "restricted",
+        "include_local": False,
+        "include_public_github": False,
+        "include_private_github": False,
+    }
+    paths.artifact_approval_path.write_text(
+        json.dumps(artifact_policy), encoding="utf-8"
+    )
+
+    draft_portfolio(DraftPortfolioRequest(workspace=workspace))
+
+    profile = json.loads(paths.master_profile_json_path.read_text(encoding="utf-8"))
+    draft_text = paths.portfolio_draft_path.read_text(encoding="utf-8")
+    with SQLiteRepository(paths.db_path)._read_connection() as connection:
+        artifact = connection.execute(
+            "SELECT input_manifest FROM artifacts "
+            "WHERE kind = 'portfolio_draft' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        evidence_rows = connection.execute(
+            "SELECT id, source_id FROM evidence_items ORDER BY id"
+        ).fetchall()
+        claim_rows = connection.execute(
+            "SELECT id FROM career_claims ORDER BY id"
+        ).fetchall()
+    input_manifest = json.loads(artifact["input_manifest"])
+    expected_source_ids = {row["source_id"] for row in evidence_rows}
+    expected_evidence_ids = {row["id"] for row in evidence_rows}
+    expected_claim_ids = {row["id"] for row in claim_rows}
+
+    assert profile["sources"] == []
+    assert profile["claims"] == []
+    assert len(expected_source_ids) == 3
+    assert len(expected_evidence_ids) == 3
+    assert len(expected_claim_ids) == 3
+    assert set(input_manifest["included_source_ids"]) == expected_source_ids
+    assert set(input_manifest["included_evidence_ids"]) == expected_evidence_ids
+    assert set(input_manifest["included_claim_ids"]) == expected_claim_ids
+    assert "Local notes" in draft_text
+    assert "Public activity" in draft_text
+    assert "Private activity" in draft_text
+    assert local_uri not in draft_text
+    assert str(source_path) not in draft_text
+    assert str(snapshot_path) not in draft_text
+    assert private_url not in draft_text
+
+
 @pytest.mark.parametrize(
     "persisted_label",
     ("/synthetic/private/project", "sk-synthetic-local-token"),

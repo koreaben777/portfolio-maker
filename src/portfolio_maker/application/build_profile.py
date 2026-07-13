@@ -293,7 +293,7 @@ def _snapshot_evidence(display_name: str, text: str) -> str | None:
     for line in lines:
         if line != display_name:
             return line
-    return None
+    return lines[0] if lines else None
 
 
 def _evidence_pool_request(
