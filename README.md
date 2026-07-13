@@ -18,7 +18,7 @@ Portfolio Maker는 원본 파일을 자동으로 업로드하거나 공개하지
 - 승인 자료 목록을 바탕으로 검토용 포트폴리오 초안 골격 만들기
 - public-safe claim/evidence manifest와 프로젝트별 timeline이 있는 정적 HTML 만들기
 
-> 현재 버전은 **근거 기반 마스터 프로필**, **검토가 필요한 포트폴리오 뼈대**, **일반형 public-safe HTML 포트폴리오**를 제공합니다. 회사·채용공고별 맞춤 문장과 서술 생성은 다음 단계입니다.
+> 현재 버전은 **근거 기반 마스터 프로필**, **검토가 필요한 포트폴리오 뼈대**, **일반형 public-safe HTML 포트폴리오**를 제공합니다. 회사·채용공고별 맞춤 문장과 서술 생성은 다음 단계입니다. 일반형 HTML 구현 세부 사항은 [구현 계획](https://github.com/koreaben777/portfolio-maker/blob/main/docs/superpowers/plans/2026-07-13-portfolio-maker-general-interactive-html-sites.md)에 기록합니다.
 
 ## 이렇게 동작합니다
 
