@@ -181,7 +181,11 @@ portfolio-maker approve --workspace . --write-sample --force
 
 ## 현재 범위와 로드맵
 
-0.1.0에서는 승인된 로컬 자료, 명시 승인된 공개 GitHub activity, 조건을 충족한 private GitHub activity를 공통 evidence pool로 관리합니다. 모든 생성물은 artifact별 `EvidenceSelectionService`를 거치며, `portfolio-public.json`과 `portfolio.html`도 기본 `restricted` 결과입니다. HTML은 build-time manifest를 번들한 정적 결과이며 SQLite, 원본, snapshot, credential을 runtime에 읽지 않습니다. 회사·채용공고별 맞춤 작성(#3), Google Drive 연동, 이력서·자기소개서·면접 자료, OCR, 시맨틱 검색, MCP/app-server 인터페이스는 [GitHub Issues](https://github.com/koreaben777/portfolio-maker/issues)에서 관리합니다.
+0.1.0에서는 승인된 로컬 자료, 명시 승인된 공개 GitHub activity, 조건을 충족한 private GitHub activity를 공통 evidence pool로 관리합니다. 모든 생성물은 artifact별 `EvidenceSelectionService`를 거치며, `portfolio-public.json`과 `portfolio.html`도 기본 `restricted` 결과입니다. HTML은 build-time manifest를 번들한 정적 결과이며 SQLite, 원본, snapshot, credential을 runtime에 읽지 않습니다.
+
+현재 HTML의 `projects` 배열은 evidence origin을 표시하기 위한 기술적 grouping입니다. local file 하나가 project 하나가 되거나 private GitHub activity가 하나의 generic group으로 합쳐질 수 있으므로, 이를 사용자가 의미하는 포트폴리오 project로 해석하면 안 됩니다. 이 renderer는 근거 검토 표면으로는 사용할 수 있지만, semantic portfolio project를 만들기 위한 다음 단계가 필요합니다.
+
+다음 최우선은 [Issue #13](https://github.com/koreaben777/portfolio-maker/issues/13)의 **Codex 기반 프로젝트 식별·구성·선정**입니다. Codex는 승인·마스킹된 review bundle에서 프로젝트 후보와 근거 기반 overview를 제안하고, 사용자는 후보를 승인·병합·분할·재배정합니다. 승인된 project만 Markdown draft, manifest, HTML에 표시되며 연결되지 않은 근거는 `unassigned evidence`로 보존합니다. 이 기능은 아직 구현 전입니다.
 
 로컬 제외 폴더, GitHub private opt-in, 생성물별 근거 선택 정책은 [Issue #12](https://github.com/koreaben777/portfolio-maker/issues/12)와 [구현 계획](https://github.com/koreaben777/portfolio-maker/blob/main/docs/superpowers/plans/2026-07-14-unified-evidence-policy.md)에서 관리합니다. artifact policy가 없는 기존 workspace는 0.1.0 호환 경로로 public GitHub evidence만 manifest/HTML에 사용합니다.
 
