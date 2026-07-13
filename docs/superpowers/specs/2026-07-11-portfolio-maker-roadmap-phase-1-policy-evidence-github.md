@@ -4,7 +4,7 @@
 상태: 현재 Phase 1 정책 및 runtime 계약
 대상 Issue: #4 → #2 → #1
 현재 구현 slice: #4 → #2 → #1 → #11 일반형 renderer
-후속 확장: #3 회사/JD별 맞춤 생성 (`@sites`는 presentation/hosting 계층)
+후속 확장: #12 통합 근거 정책 → #3 회사/JD별 맞춤 생성 (`@sites`는 presentation/hosting 계층)
 
 2026-07-13 정렬 메모: #4, #2, #1 기준선과 일반형 #11 renderer가 현재 worktree에 구현되어 있다. #3 맞춤 생성은 아직 deferred이며, 이 문서의 #11 규칙은 아래 current implementation slice를 기준으로 읽는다.
 
@@ -266,6 +266,15 @@ Stage C는 approval schema에 다음 optional 필드를 추가한다.
 - 회사/JD 입력이 없으면 일반형 콘텐츠만 사용한다.
 - 회사/JD 맞춤 문장은 근거가 없으면 생성하지 않거나 review-required로 남긴다.
 - #3 구현은 #11의 UI·manifest 계약을 확장하되, raw source와 runtime 외부 API를 새로 노출하지 않는다.
+
+### 7.4 후속 Stage D — 통합 근거 풀과 생성물별 근거 선택 정책
+
+[#12](https://github.com/koreaben777/portfolio-maker/issues/12)은 로컬 파일, 공개 GitHub activity, 명시적으로 허용한 private GitHub activity를 하나의 evidence pool로 통합하고, master profile·Markdown draft·public manifest·HTML에 artifact별 include/exclude policy를 적용하는 후속 정책이다.
+
+설계 문서: [통합 근거 정책 설계](https://github.com/koreaben777/portfolio-maker/blob/main/docs/superpowers/specs/2026-07-14-unified-evidence-policy-design.md)
+구현 계획: [통합 근거 정책 구현 계획](https://github.com/koreaben777/portfolio-maker/blob/main/docs/superpowers/plans/2026-07-14-unified-evidence-policy.md)
+
+현재 #11 runtime은 그대로 유지한다. #12 구현 전까지는 public HTML이 private/local evidence를 포함하지 않으며, private GitHub discovery는 metadata opt-in 범위로만 남는다. #12 구현 시에도 public artifact의 private evidence hard deny와 private artifact/private hosting gate를 유지한다.
 
 ## 8. developer 작업 지시
 
