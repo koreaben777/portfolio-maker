@@ -274,7 +274,11 @@ Stage C는 approval schema에 다음 optional 필드를 추가한다.
 설계 문서: [통합 근거 정책 설계](https://github.com/koreaben777/portfolio-maker/blob/main/docs/superpowers/specs/2026-07-14-unified-evidence-policy-design.md)
 구현 계획: [통합 근거 정책 구현 계획](https://github.com/koreaben777/portfolio-maker/blob/main/docs/superpowers/plans/2026-07-14-unified-evidence-policy.md)
 
-현재 #11 runtime은 그대로 유지한다. #12 구현 전까지는 public HTML이 private/local evidence를 포함하지 않으며, private GitHub discovery는 metadata opt-in 범위로만 남는다. #12 구현 시에도 public artifact의 private evidence hard deny와 private artifact/private hosting gate를 유지한다.
+현재 #11 runtime은 그대로 유지한다. #12 구현 전까지 `portfolio-public.json`과 `portfolio.html`은 local/private evidence를 포함하지 않으며, private GitHub discovery는 metadata opt-in 범위로만 남는다.
+
+#12 구현 후에는 같은 파일명을 유지하되 기본 전달 범위를 `restricted`로 둔다. 이 범위의 manifest와 HTML은 승인된 로컬 근거, 승인된 공개 GitHub 근거, 정확히 명시 승인된 private GitHub 근거를 사용할 수 있다. 이는 인터넷 공개 허가가 아니라 로컬 사용, 검증된 수신자에게의 직접 전달, private Sites deployment를 위한 결과다. raw local path, credential, token은 restricted output에도 포함하지 않는다.
+
+누구나 접근 가능한 배포는 `open_public`을 사용자가 별도로 선택하고 재생성·검증한 결과에만 허용한다. 초기 `open_public` 구현은 공개 GitHub 근거만 허용하고 local/private origin 요청을 validation error로 거부한다. `@sites` public deployment는 restricted output을 거부하며, 사용자의 명시적인 공개 배포 명령 없이는 실행하지 않는다.
 
 ## 8. developer 작업 지시
 
