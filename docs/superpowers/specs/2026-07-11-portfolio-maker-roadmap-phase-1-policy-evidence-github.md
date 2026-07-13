@@ -4,9 +4,9 @@
 상태: 현재 구현 slice는 #12 통합 근거 정책이며, 아래 #4 → #2 → #1 설명은 역사적 Phase 1 기준선이다.
 역사적 기준선 대상 Issue: #4 → #2 → #1
 현재 구현 slice: #12 통합 근거 정책 (일반형 #11 renderer 포함)
-후속 확장: #3 회사/JD별 맞춤 생성 (`@sites`는 presentation/hosting 계층)
+다음 최우선: #13 Codex 기반 프로젝트 식별·구성·선정 → #3 회사/JD별 맞춤 생성 (`@sites`는 presentation/hosting 계층)
 
-2026-07-13 정렬 메모: #4, #2, #1 기준선과 일반형 #11 renderer가 현재 worktree에 구현되어 있다. #3 맞춤 생성은 아직 deferred이며, 이 문서의 #11 규칙은 아래 current implementation slice를 기준으로 읽는다.
+2026-07-13 정렬 메모: #4, #2, #1 기준선, 일반형 #11 renderer, #12 통합 근거 정책이 현재 worktree에 구현되어 있다. 테스터 실행에서 파일·repository 기반 technical grouping이 semantic portfolio project로 잘못 노출됨을 확인했으므로, #13을 #3보다 먼저 구현한다.
 
 ## 1. 목적과 범위
 
@@ -51,16 +51,20 @@ Portfolio Maker 0.1.0은 승인된 로컬 파일에서 근거 기반 master prof
   ↓
 #2 근거·주장·산출물 모델              완료
   ↓
-#1 명시적으로 승인된 공개 GitHub 활동  완료
+#1 명시적으로 승인된 GitHub 활동       완료
   ↓
-#11 일반형 public-safe HTML renderer
+#11 일반형 HTML renderer               구현 완료
       ├─ emilkowalski/skills: 디자인·모션 검토 기준
       └─ @sites: 디자인 선택·빌드 검증·선택적 호스팅
+  ↓
+#12 통합 근거 풀·생성물별 선택 정책     구현 완료
+  ↓
+#13 Codex 기반 프로젝트 식별·구성·선정  다음 최우선
   ↓
 #3 회사/JD별 맞춤 포트폴리오
 ```
 
-#11에서는 `emilkowalski/skills`를 디자인·모션 review 기준으로, `@sites`를 디자인 선택·빌드 검증·선택적 hosting 표면으로 사용한다.
+#11에서는 `emilkowalski/skills`를 디자인·모션 review 기준으로, `@sites`를 디자인 선택·빌드 검증·선택적 hosting 표면으로 사용한다. #11의 현재 project 표시는 evidence origin을 위한 technical grouping이며, 사용자가 확정한 portfolio project는 #13부터 도입한다.
 
 각 Issue의 focused test와 전체 `pytest`가 통과하기 전에는 다음 Issue의 runtime 동작을 구현하지 않는다. 문서·샘플 approval·README는 해당 Issue와 같은 변경 단위로 갱신한다.
 
@@ -186,11 +190,11 @@ Stage C는 approval schema에 다음 optional 필드를 추가한다.
 - GitHub claim은 evidence URL과 stable identifier로 추적된다.
 - public artifact에 token, raw local path, private repo name, unescaped title이 나타나지 않는다.
 
-## 7. #11 현재 구현과 #3 후속 Stage
+## 7. #11 현재 renderer, #12 근거 정책, #13 프로젝트 구성, #3 후속 Stage
 
 ### 7.1 #11 일반형 공개용 인터랙티브 HTML
 
-[#11](https://github.com/koreaben777/portfolio-maker/issues/11)을 이번 최우선 구현 대상으로 삼는다. 구현 세부 단계는 [일반형 인터랙티브 HTML + @sites 구현 계획](https://github.com/koreaben777/portfolio-maker/blob/main/docs/superpowers/plans/2026-07-13-portfolio-maker-general-interactive-html-sites.md)에 기록한다. 이 단계의 포트폴리오는 회사나 채용공고를 대상으로 하지 않는 사용자의 **기본 포트폴리오**다. 사용자가 자신의 작업과 근거를 확인하고, 방문자가 프로젝트와 역량을 이해할 수 있게 하는 것이 목적이다.
+[#11](https://github.com/koreaben777/portfolio-maker/issues/11)은 구현 완료된 일반형 인터랙티브 HTML renderer다. 구현 세부 단계는 [일반형 인터랙티브 HTML + @sites 구현 계획](https://github.com/koreaben777/portfolio-maker/blob/main/docs/superpowers/plans/2026-07-13-portfolio-maker-general-interactive-html-sites.md)에 기록한다. 이 renderer는 기본 포트폴리오의 정적 표현 계층이지만, 현재 evidence origin grouping을 semantic portfolio project로 해석해서는 안 된다. 사용자가 이해할 수 있는 작업 단위의 식별·구성은 #13의 책임이다.
 
 ### 7.2 #11 공개용 인터랙티브 HTML (현재 일반형 구현)
 
@@ -257,7 +261,20 @@ Stage C는 approval schema에 다음 optional 필드를 추가한다.
 5. 검증을 통과한 뒤에만 `sites-hosting`을 사용한다. 기본은 private 배포이며, public URL 배포는 별도 명시적 승인을 받은 경우에만 수행한다.
 6. Sites 배포가 있더라도 로컬 `.portfolio-maker/artifacts/portfolio.html`을 canonical artifact로 유지한다. 현재 구현은 hosting을 실행하지 않았으며, Sites는 presentation/hosting 계층으로만 남고 Portfolio Maker의 승인·근거 모델을 대체하지 않는다.
 
-### 7.3 #3 회사/JD별 맞춤 포트폴리오 후속 확장
+### 7.3 Stage E — #13 Codex 기반 프로젝트 식별·구성·선정
+
+[#13](https://github.com/koreaben777/portfolio-maker/issues/13)은 #12의 승인된 evidence pool과 #11의 HTML renderer 사이에 semantic project composition 계층을 추가하는 다음 최우선 단계다.
+
+설계 문서: [Codex 기반 프로젝트 식별·구성 설계](https://github.com/koreaben777/portfolio-maker/blob/main/docs/superpowers/specs/2026-07-14-codex-assisted-project-composition-design.md)
+
+- Codex는 approval·masking·artifact policy를 통과한 safe review bundle만 분석해 후보 제목, overview, grouping rationale, evidence ID를 제안한다.
+- candidate는 review-required이며 user가 approve/reject/merge/split/reassign하기 전에는 artifact의 project가 될 수 없다.
+- local file, repository, activity 하나를 자동 project로 승격하지 않는다. 연결되지 않은 근거는 unassigned로 보존한다.
+- approved portfolio project만 master profile 요약, Markdown draft, `portfolio-public.json`, `portfolio.html`에 나타난다.
+- legacy technical grouping을 자동 이관하지 않으며, project approval이 없는 새 artifact는 zero-project empty state를 보여 준다.
+- CLI의 외부 LLM API 호출·token 저장은 구현하지 않는다. Codex app의 portfolio-maker skill이 안전한 review bundle을 읽는 사용자 통제 분석 workflow다.
+
+### 7.4 #3 회사/JD별 맞춤 포트폴리오 후속 확장
 
 [#3](https://github.com/koreaben777/portfolio-maker/issues/3)은 #11이 생성한 동일한 public-safe manifest를 입력으로 받아 회사·JD별 우선순위, 표현, 섹션 구성을 추가하는 후속 단계다.
 
@@ -268,7 +285,7 @@ Stage C는 approval schema에 다음 optional 필드를 추가한다.
 - 회사/JD 맞춤 문장은 근거가 없으면 생성하지 않거나 review-required로 남긴다.
 - #3 구현은 #11의 UI·manifest 계약을 확장하되, raw source와 runtime 외부 API를 새로 노출하지 않는다.
 
-### 7.4 Stage D — 통합 근거 풀과 생성물별 근거 선택 정책 (Issue #12 구현 기준)
+### 7.5 Stage D — 통합 근거 풀과 생성물별 근거 선택 정책 (Issue #12 구현 기준)
 
 [#12](https://github.com/koreaben777/portfolio-maker/issues/12)은 로컬 파일, 공개 GitHub activity, 명시적으로 허용한 private GitHub activity를 하나의 evidence pool로 통합하고, master profile·Markdown draft·public manifest·HTML에 artifact별 include/exclude policy를 적용하는 현재 정책이다.
 
