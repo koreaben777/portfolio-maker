@@ -89,4 +89,3 @@ class RenderHtmlRequest:
 class RenderHtmlResult:
     manifest_path: Path
     html_path: Path
-    dist_path: Path

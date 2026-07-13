@@ -182,11 +182,13 @@ git commit -m "feat: add public portfolio manifest"
 
 The shipped surface is a small vanilla TypeScript/Vite project. Preserve its package manager and lockfile; do not initialize a second framework project.
 
+The prerequisite is Node.js LTS with npm. On a fresh checkout, install the committed lockfile dependencies from the Sites directory before rendering:
+
 Run:
 
 ```bash
 cd web/portfolio
-npm install
+npm ci
 npm run build
 ```
 

@@ -142,6 +142,7 @@ def test_render_html_success_publishes_without_mutating_template_or_draft(
     result = render_html(RenderHtmlRequest(workspace=workspace))
 
     assert result.html_path.is_file()
+    assert not hasattr(result, "dist_path")
     assert generated_path.read_text(encoding="utf-8") == template
     assert paths.portfolio_draft_path.read_text(encoding="utf-8") == "draft to preserve"
     assert "fetch(" not in result.html_path.read_text(encoding="utf-8")
@@ -170,6 +171,30 @@ def test_render_html_failure_removes_stale_html_but_preserves_draft_and_template
     assert not paths.portfolio_html_path.exists()
     assert paths.portfolio_draft_path.read_text(encoding="utf-8") == "draft to preserve"
     assert generated_path.read_text(encoding="utf-8") == template
+
+
+def test_render_html_missing_sites_invalidates_existing_canonical_html(tmp_path):
+    workspace = tmp_path / "missing-sites"
+    paths = WorkspacePaths.from_root(workspace)
+    paths.ensure()
+    paths.portfolio_html_path.write_text("stale public HTML", encoding="utf-8")
+
+    with pytest.raises(HtmlRenderError, match="Sites project missing"):
+        render_html(RenderHtmlRequest(workspace=workspace))
+
+    assert not paths.portfolio_html_path.exists()
+
+
+def test_render_html_unsafe_canonical_target_is_controlled(tmp_path):
+    workspace = tmp_path / "unsafe-output"
+    paths = WorkspacePaths.from_root(workspace)
+    paths.ensure()
+    paths.portfolio_html_path.mkdir()
+
+    with pytest.raises(HtmlRenderError, match="could not be invalidated"):
+        render_html(RenderHtmlRequest(workspace=workspace))
+
+    assert paths.portfolio_html_path.is_dir()
 
 
 def test_legacy_schema_approved_github_activity_reaches_profile_and_html(

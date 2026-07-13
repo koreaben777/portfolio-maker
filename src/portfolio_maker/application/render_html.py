@@ -34,6 +34,11 @@ class HtmlRenderError(RuntimeError):
 def render_html(request: RenderHtmlRequest) -> RenderHtmlResult:
     paths = WorkspacePaths.from_root(request.workspace)
     paths.ensure()
+    try:
+        remove_managed_file(paths.portfolio_html_path, missing_ok=True)
+    except OSError as error:
+        raise HtmlRenderError("managed portfolio HTML could not be invalidated") from error
+
     site_dir = paths.workspace / "web" / "portfolio"
     if not site_dir.is_dir():
         raise HtmlRenderError(f"Sites project missing: {site_dir}")
@@ -51,7 +56,6 @@ def render_html(request: RenderHtmlRequest) -> RenderHtmlResult:
     if not isinstance(manifest, dict):
         raise HtmlRenderError("public portfolio manifest must be an object")
 
-    remove_managed_file(paths.portfolio_html_path, missing_ok=True)
     try:
         with tempfile.TemporaryDirectory(prefix="portfolio-maker-sites-") as temp_dir:
             temp_site = Path(temp_dir) / "portfolio"
@@ -76,9 +80,9 @@ def render_html(request: RenderHtmlRequest) -> RenderHtmlResult:
                 text=True,
                 timeout=120,
             )
-            dist_path = temp_site / "dist"
-            validate_static_output(dist_path)
-            html = inline_static_output(dist_path)
+            temporary_dist = temp_site / "dist"
+            validate_static_output(temporary_dist)
+            html = inline_static_output(temporary_dist)
     except FileNotFoundError as error:
         raise HtmlRenderError("Sites build tool is unavailable") from error
     except subprocess.TimeoutExpired as error:
@@ -108,5 +112,4 @@ def render_html(request: RenderHtmlRequest) -> RenderHtmlResult:
     return RenderHtmlResult(
         manifest_path=paths.portfolio_public_json_path,
         html_path=paths.portfolio_html_path,
-        dist_path=dist_path,
     )

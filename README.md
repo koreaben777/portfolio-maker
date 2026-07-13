@@ -39,6 +39,7 @@ Portfolio Maker는 원본 파일을 자동으로 업로드하거나 공개하지
 - Codex app
 - Python 3.11 이상
 - Git
+- Node.js LTS와 npm (정적 HTML renderer 최초 실행 시)
 - GitHub 활동 탐색용 [GitHub CLI](https://cli.github.com/) `gh`
 
 ### 설치
@@ -49,6 +50,18 @@ python3 -m venv .venv
 pip install -e ".[dev]"
 pytest
 ```
+
+정적 HTML renderer를 처음 실행하는 checkout에서는 Node.js LTS와 npm을 준비한 뒤
+workspace의 Sites 의존성을 먼저 설치합니다.
+
+```bash
+cd web/portfolio
+npm ci
+cd ../..
+```
+
+그 다음 일반 실행 순서에서 `portfolio-maker render-html --workspace .`를 실행합니다.
+전역 Vite 설치나 `npx` fallback은 사용하지 않습니다.
 
 ### Codex app에서 실행
 
