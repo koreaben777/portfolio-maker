@@ -93,6 +93,25 @@ CREATE TABLE IF NOT EXISTS projects (
     created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS portfolio_projects (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    overview TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status = 'approved'),
+    approval_sha256 TEXT NOT NULL,
+    review_input_sha256 TEXT NOT NULL,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS portfolio_project_evidence (
+    project_id TEXT NOT NULL REFERENCES portfolio_projects(id) ON DELETE CASCADE,
+    evidence_id INTEGER NOT NULL REFERENCES evidence_items(id),
+    support_level TEXT NOT NULL CHECK(support_level IN ('direct', 'contextual')),
+    PRIMARY KEY (project_id, evidence_id),
+    UNIQUE (evidence_id)
+);
+
 CREATE TABLE IF NOT EXISTS career_claims (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     project_id INTEGER REFERENCES projects(id),
@@ -1035,6 +1054,87 @@ class SQLiteRepository:
 
     def list_evidence_selection_records(self) -> list[PublicEvidenceRecord]:
         return self.list_public_evidence_records(include_unsafe=True)
+
+    def replace_portfolio_projects(
+        self,
+        projects: tuple[dict[str, object], ...],
+        approval_sha256: str,
+        review_input_sha256: str,
+    ) -> None:
+        """Replace only the user-approved semantic project graph atomically."""
+        with self._connection() as conn:
+            conn.execute("DELETE FROM portfolio_project_evidence")
+            conn.execute("DELETE FROM portfolio_projects")
+            for project in projects:
+                project_id = project.get("id")
+                title = project.get("title")
+                overview = project.get("overview")
+                evidence_ids = project.get("evidence_ids")
+                if not all(isinstance(value, str) for value in (project_id, title, overview)):
+                    raise RepositoryError("semantic project values are invalid")
+                if not isinstance(evidence_ids, (tuple, list)):
+                    raise RepositoryError("semantic project evidence is invalid")
+                conn.execute(
+                    """
+                    INSERT INTO portfolio_projects
+                        (id, title, overview, status, approval_sha256, review_input_sha256)
+                    VALUES (?, ?, ?, 'approved', ?, ?)
+                    """,
+                    (project_id, title, overview, approval_sha256, review_input_sha256),
+                )
+                for evidence_id in evidence_ids:
+                    if not isinstance(evidence_id, int) or isinstance(evidence_id, bool):
+                        raise RepositoryError("semantic project evidence is invalid")
+                    conn.execute(
+                        """
+                        INSERT INTO portfolio_project_evidence
+                            (project_id, evidence_id, support_level)
+                        VALUES (?, ?, 'direct')
+                        """,
+                        (project_id, evidence_id),
+                    )
+
+    def list_portfolio_projects(self) -> list[dict[str, object]]:
+        with self._read_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, title, overview, status, approval_sha256,
+                       review_input_sha256, created_at, updated_at
+                FROM portfolio_projects
+                ORDER BY id
+                """
+            ).fetchall()
+            links = conn.execute(
+                """
+                SELECT project_id, evidence_id, support_level
+                FROM portfolio_project_evidence
+                ORDER BY project_id, evidence_id
+                """
+            ).fetchall()
+        grouped: dict[str, list[dict[str, object]]] = {}
+        for link in links:
+            project_id = self._required_text(link, "project_id")
+            grouped.setdefault(project_id, []).append(
+                {
+                    "evidence_id": self._required_int(link, "evidence_id"),
+                    "support_level": self._required_text(link, "support_level"),
+                }
+            )
+        try:
+            return [
+                {
+                    "id": self._required_text(row, "id"),
+                    "title": self._required_text(row, "title"),
+                    "overview": self._required_text(row, "overview"),
+                    "status": self._required_text(row, "status"),
+                    "approval_sha256": self._required_text(row, "approval_sha256"),
+                    "review_input_sha256": self._required_text(row, "review_input_sha256"),
+                    "evidence": grouped.get(self._required_text(row, "id"), []),
+                }
+                for row in rows
+            ]
+        except (KeyError, TypeError, ValueError) as error:
+            raise self._semantic_error() from error
 
     def upsert_evidence_item(
         self,

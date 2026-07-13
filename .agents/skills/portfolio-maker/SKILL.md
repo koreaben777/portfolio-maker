@@ -7,7 +7,7 @@ description: Use when generating local evidence-based career artifacts from appr
 
 Use this skill to run Portfolio Maker safely from Codex app.
 
-GitHub repositories and activities are discovery metadata by default. Only exact URLs in `approved_github_activity_urls` or `approved_private_github_activity_urls` can enter artifacts, after the matching origin and current policy checks pass. GitHub activity appears as reviewable evidence, never as an automatic project narrative.
+GitHub repositories and activities are discovery metadata by default. Only exact URLs in `approved_github_activity_urls` or `approved_private_github_activity_urls` can enter artifacts, after the matching origin and current policy checks pass. GitHub activity appears as reviewable evidence, never as an automatic project narrative or project.
 
 The generated portfolio draft is a review-required portfolio skeleton. Narrative role, technical approach, and outcome writing remains deferred; the static HTML surface renders only evidence selected by its artifact policy. Raw local paths and private GitHub URLs remain withheld.
 
@@ -85,7 +85,28 @@ The artifact policy is required for per-artifact selection and is reloaded by
 (cd web/portfolio && npm ci)
 ```
 
-11. After approval only, run the following commands from the repository root:
+11. To compose semantic portfolio projects, prepare the safe review bundle from the repository root:
+
+```bash
+portfolio-maker prepare-project-review --workspace .
+```
+
+Only `.portfolio-maker/reviews/project-review-input.json` is supplied to Codex. Codex may write
+`project-candidates.json` and `project-candidates.md` using only that bundle. Review and edit the
+candidate file, or write `project-approval.json` directly, then create the sample approval shape
+when needed:
+
+```bash
+portfolio-maker approve --workspace . --write-sample-project-approval
+portfolio-maker compose-projects --workspace .
+```
+
+Candidate output is not database truth. Only the user's `status: approved` projects are materialized;
+rejected, unassigned, stale, policy-excluded, or unknown evidence is not a project. Without project
+approval, generated project sections use an honest zero-project state while the evidence inventory
+remains available for review.
+
+12. After source, artifact, and project approval, run the following commands from the repository root:
 
 ```bash
 portfolio-maker ingest --workspace .
@@ -99,7 +120,7 @@ private Sites path after static validation. Do not infer public deployment permi
 `portfolio-public.json` or `portfolio.html` filenames; public deployment requires an explicit
 `open_public` policy and separate validation, and is not run by this workflow.
 
-12. Review generated artifacts:
+13. Review generated artifacts:
 
 ```text
 .portfolio-maker/artifacts/master-profile.json
@@ -109,7 +130,7 @@ private Sites path after static validation. Do not infer public deployment permi
 .portfolio-maker/artifacts/portfolio.html
 ```
 
-13. Report:
+14. Report:
    - what was generated
    - which commands were run
    - whether public artifacts avoided secrets and private raw paths

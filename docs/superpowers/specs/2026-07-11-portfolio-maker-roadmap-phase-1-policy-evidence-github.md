@@ -1,12 +1,12 @@
 # Portfolio Maker 로드맵 Phase 1 구현 명세
 
 날짜: 2026-07-11
-상태: 현재 구현 slice는 #12 통합 근거 정책이며, 아래 #4 → #2 → #1 설명은 역사적 Phase 1 기준선이다.
+상태: 현재 구현 slice는 #13 semantic project composition까지 포함하며, 아래 #4 → #2 → #1 설명은 역사적 Phase 1 기준선이다.
 역사적 기준선 대상 Issue: #4 → #2 → #1
-현재 구현 slice: #12 통합 근거 정책 (일반형 #11 renderer 포함)
-다음 최우선: #13 Codex 기반 프로젝트 식별·구성·선정 → #3 회사/JD별 맞춤 생성 (`@sites`는 presentation/hosting 계층)
+현재 구현 slice: #12 통합 근거 정책, 일반형 #11 renderer, #13 Codex 기반 semantic project composition
+다음 단계: #3 회사/JD별 맞춤 생성 (`@sites`는 presentation/hosting 계층)
 
-2026-07-13 정렬 메모: #4, #2, #1 기준선, 일반형 #11 renderer, #12 통합 근거 정책이 현재 worktree에 구현되어 있다. 테스터 실행에서 파일·repository 기반 technical grouping이 semantic portfolio project로 잘못 노출됨을 확인했으므로, #13을 #3보다 먼저 구현한다.
+2026-07-13 정렬 메모: #4, #2, #1 기준선, 일반형 #11 renderer, #12 통합 근거 정책이 현재 worktree에 구현되어 있다. 파일·repository 기반 technical grouping이 semantic portfolio project로 잘못 노출되지 않도록 #13 composition 계층을 추가했다.
 
 ## 1. 목적과 범위
 
@@ -194,11 +194,11 @@ Stage C는 approval schema에 다음 optional 필드를 추가한다.
 
 ### 7.1 #11 일반형 공개용 인터랙티브 HTML
 
-[#11](https://github.com/koreaben777/portfolio-maker/issues/11)은 구현 완료된 일반형 인터랙티브 HTML renderer다. 구현 세부 단계는 [일반형 인터랙티브 HTML + @sites 구현 계획](https://github.com/koreaben777/portfolio-maker/blob/main/docs/superpowers/plans/2026-07-13-portfolio-maker-general-interactive-html-sites.md)에 기록한다. 이 renderer는 기본 포트폴리오의 정적 표현 계층이지만, 현재 evidence origin grouping을 semantic portfolio project로 해석해서는 안 된다. 사용자가 이해할 수 있는 작업 단위의 식별·구성은 #13의 책임이다.
+[#11](https://github.com/koreaben777/portfolio-maker/issues/11)은 구현 완료된 일반형 인터랙티브 HTML renderer다. 구현 세부 단계는 [일반형 인터랙티브 HTML + @sites 구현 계획](https://github.com/koreaben777/portfolio-maker/blob/main/docs/superpowers/plans/2026-07-13-portfolio-maker-general-interactive-html-sites.md)에 기록한다. 이 renderer는 #13이 승인한 semantic portfolio project와 그 안의 safe evidence를 정적 HTML로 표현하며, evidence 수집·claim 생성·project 승인 권한을 갖지 않는다.
 
 ### 7.2 #11 공개용 인터랙티브 HTML (현재 일반형 구현)
 
-[#11](https://github.com/koreaben777/portfolio-maker/issues/11)은 Portfolio Maker가 만든 evidence selection 결과를 정적 HTML로 표시하는 **renderer**다. 현재 일반형 구현은 #3 회사/JD 맞춤 서술을 포함하지 않으며, #13 전에는 evidence origin-based technical grouping을 표시한다. 사용자가 승인한 semantic portfolio project의 manifest는 #13이 새로 만든다.
+[#11](https://github.com/koreaben777/portfolio-maker/issues/11)은 Portfolio Maker가 만든 #13 approved-project projection을 정적 HTML로 표시하는 **renderer**다. 현재 일반형 구현은 #3 회사/JD 맞춤 서술을 포함하지 않으며, project 승인 전에는 honest zero-project state를 표시한다.
 
 목표 출력은 기본적으로 다음과 같다.
 
@@ -210,7 +210,7 @@ Stage C는 approval schema에 다음 optional 필드를 추가한다.
 일반형 포트폴리오의 고정 정보 구조:
 
 - 소개와 기본 프로필
-- 현재 evidence grouping과, #13 이후 승인된 portfolio project
+- 사용자가 승인한 portfolio project와 연결된 evidence
 - 기술·역량 요약
 - 근거 및 provenance
 - 공개 링크/연락 경로
@@ -223,8 +223,8 @@ Stage C는 approval schema에 다음 optional 필드를 추가한다.
 - safe source label, public GitHub URL, 그리고 private GitHub의 URL 없는 safe label만 provenance로 표시
 - approval·artifact policy·delivery scope 재검증을 통과한 claim/evidence만 사용
 - project·기술·성과 표현은 evidence가 제공하는 범위를 넘지 않음
-- #12 restricted path의 HTML은 승인된 local/public/private evidence를 사용할 수 있지만, #13 전에는 이들이 semantic portfolio project로 승인되었다는 뜻이 아니다.
-- #13 이후 HTML은 approved portfolio project만 표시하며, candidate·rejected·unassigned evidence는 project 목록에 넣지 않는다.
+- #12 restricted path의 HTML은 artifact policy를 통과한 evidence 중 #13 approved project에 연결된 항목만 사용할 수 있다.
+- candidate·rejected·unassigned evidence와 semantic project approval이 없는 evidence는 project 목록에 넣지 않는다.
 - raw local path, snapshot path, `public_safe=false` data, secret-shaped text는 HTML/JS data에도 포함하지 않음
 - HTML/attribute/JavaScript context별 escaping
 - keyboard navigation, mobile layout, visible focus, 색 대비, reduced-motion 지원
@@ -265,7 +265,7 @@ Stage C는 approval schema에 다음 optional 필드를 추가한다.
 
 ### 7.3 Stage E — #13 Codex 기반 프로젝트 식별·구성·선정
 
-[#13](https://github.com/koreaben777/portfolio-maker/issues/13)은 #12의 승인된 evidence pool과 #11의 HTML renderer 사이에 semantic project composition 계층을 추가하는 다음 최우선 단계다.
+[#13](https://github.com/koreaben777/portfolio-maker/issues/13)은 #12의 승인된 evidence pool과 #11의 HTML renderer 사이에 semantic project composition 계층을 추가한 현재 구현 slice다.
 
 설계 문서: [Codex 기반 프로젝트 식별·구성 설계](https://github.com/koreaben777/portfolio-maker/blob/main/docs/superpowers/specs/2026-07-14-codex-assisted-project-composition-design.md)
 

@@ -54,6 +54,7 @@ class IngestSourcesResult:
 class BuildProfileRequest:
     workspace: Path
     invalidate_portfolio_draft: bool = True
+    write_artifacts: bool = True
 
 
 @dataclass(frozen=True)
@@ -100,3 +101,25 @@ class RenderHtmlRequest:
 class RenderHtmlResult:
     manifest_path: Path
     html_path: Path
+
+
+@dataclass(frozen=True)
+class PrepareProjectReviewRequest:
+    workspace: Path
+
+
+@dataclass(frozen=True)
+class PrepareProjectReviewResult:
+    input_path: Path
+    evidence_count: int
+
+
+@dataclass(frozen=True)
+class ComposeProjectsRequest:
+    workspace: Path
+
+
+@dataclass(frozen=True)
+class ComposeProjectsResult:
+    project_count: int
+    unassigned_evidence_count: int

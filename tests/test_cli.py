@@ -109,6 +109,41 @@ def test_cli_approve_write_sample_artifact_policy(workspace):
     assert payload["artifacts"]["portfolio_html"]["delivery_scope"] == "restricted"
 
 
+def test_cli_prepare_project_review_and_sample_approval(workspace, capsys):
+    main(["approve", "--workspace", str(workspace), "--write-sample"])
+    main(["approve", "--workspace", str(workspace), "--write-sample-artifact-policy"])
+
+    review_exit = main(["prepare-project-review", "--workspace", str(workspace)])
+    review_output = capsys.readouterr().out
+    assert review_exit == 0
+    assert "Project review input:" in review_output
+    review_path = workspace / ".portfolio-maker" / "reviews" / "project-review-input.json"
+    assert review_path.exists()
+
+    approval_exit = main(
+        ["approve", "--workspace", str(workspace), "--write-sample-project-approval"]
+    )
+    assert approval_exit == 0
+    approval_path = workspace / ".portfolio-maker" / "reviews" / "project-approval.json"
+    assert approval_path.exists()
+
+    rejected_exit = main(
+        ["approve", "--workspace", str(workspace), "--write-sample-project-approval"]
+    )
+    captured = capsys.readouterr()
+    assert rejected_exit == 1
+    assert "already exists" in captured.err
+
+
+def test_cli_compose_projects_missing_approval_is_controlled(workspace, capsys):
+    exit_code = main(["compose-projects", "--workspace", str(workspace)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "project review input is missing" in captured.err
+    assert "Traceback" not in captured.err
+
+
 def test_cli_ingest_missing_approval_exits_without_traceback(workspace, capsys):
     exit_code = main(["ingest", "--workspace", str(workspace)])
 

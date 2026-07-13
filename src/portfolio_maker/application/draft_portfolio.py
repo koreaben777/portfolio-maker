@@ -10,6 +10,10 @@ from portfolio_maker.application.evidence_selection import (
     EvidenceSelectionRequest,
     EvidenceSelectionService,
 )
+from portfolio_maker.application.project_composition import (
+    build_project_projections,
+    project_provenance_manifest,
+)
 from portfolio_maker.application.models import (
     BuildProfileRequest,
     DraftPortfolioRequest,
@@ -58,6 +62,25 @@ def draft_portfolio(request: DraftPortfolioRequest) -> DraftPortfolioResult:
         and artifact_policy is not None
         and not artifact_policy.legacy_compatibility
     )
+    if selection_backed:
+        projects = build_project_projections(
+            repository.list_portfolio_projects(),
+            selection.records,
+            set(selection.included_evidence_ids),
+        )
+        content = _project_draft_content(projects)
+        write_markdown(paths.portfolio_draft_path, content)
+        manifest = _project_draft_manifest(selection, projects)
+        repository.record_artifact(
+            "portfolio_draft",
+            1,
+            json.dumps(manifest, sort_keys=True, separators=(",", ":")),
+        )
+        return DraftPortfolioResult(
+            markdown_path=paths.portfolio_draft_path,
+            project_count=len(projects),
+        )
+
     selected_claim_ids = None if selection is None else set(selection.included_claim_ids)
     if selection_backed:
         sources = _local_source_payloads(selection.records)
@@ -122,6 +145,87 @@ def draft_portfolio(request: DraftPortfolioRequest) -> DraftPortfolioResult:
         markdown_path=paths.portfolio_draft_path,
         project_count=len(sources),
     )
+
+
+def _project_draft_content(projects: list[dict[str, object]]) -> str:
+    sections: list[str] = []
+    for project in projects:
+        lines = [
+            f"## {markdown_text(str(project['title']))}",
+            "",
+            markdown_text(str(project["overview"])),
+            "",
+            "Evidence:",
+        ]
+        claims = project.get("claims", [])
+        if isinstance(claims, list):
+            for claim in claims:
+                if not isinstance(claim, dict):
+                    continue
+                lines.append(f"- {markdown_text(str(claim.get('text', 'Evidence review required')))}")
+                evidence = claim.get("evidence", [])
+                if isinstance(evidence, list):
+                    for item in evidence:
+                        if not isinstance(item, dict):
+                            continue
+                        origin = item.get("origin")
+                        if origin == "private_github":
+                            lines.append("  - Private GitHub activity (URL withheld)")
+                        elif origin == "public_github" and item.get("url"):
+                            lines.append(f"  - {item['url']}")
+                        else:
+                            lines.append(f"  - {markdown_text(str(item.get('label', 'Approved local evidence')))}")
+        sections.append("\n".join(lines) + "\n")
+    if not sections:
+        return "# Portfolio Draft\n\nNo approved portfolio projects are available yet. Evidence remains available for review.\n"
+    return "# Portfolio Draft\n\n" + "\n".join(sections)
+
+
+def _project_draft_manifest(
+    selection: EvidenceSelectionResult,
+    projects: list[dict[str, object]],
+) -> dict[str, object]:
+    manifest = selection.input_manifest("portfolio_draft")
+    claim_ids = sorted(
+        {
+            int(claim["id"])
+            for project in projects
+            for claim in project.get("claims", [])
+            if isinstance(claim, dict) and isinstance(claim.get("id"), int)
+        }
+    )
+    evidence_ids = sorted(
+        {
+            int(evidence_id)
+            for project in projects
+            for evidence_id in project.get("evidence_ids", [])
+            if isinstance(evidence_id, int)
+        }
+    )
+    records = {record.evidence_id: record for record in selection.records}
+    source_ids = sorted(
+        {
+            records[evidence_id].source_id
+            for evidence_id in evidence_ids
+            if evidence_id in records and records[evidence_id].source_id is not None
+        }
+    )
+    manifest.update(
+        {
+            "included_source_ids": source_ids,
+            "included_evidence_ids": evidence_ids,
+            "included_claim_ids": claim_ids,
+            "source_ids": source_ids,
+            "evidence_ids": evidence_ids,
+            "claim_ids": claim_ids,
+            "portfolio_project_ids": [
+                project["id"] for project in projects if isinstance(project.get("id"), str)
+            ],
+            "portfolio_project_evidence_ids": evidence_ids,
+            **project_provenance_manifest(projects),
+        }
+    )
+    return manifest
 
 
 def _load_profile(path: Path) -> dict[str, object]:

@@ -13,12 +13,20 @@ from portfolio_maker.application.discovery import discover_sources
 from portfolio_maker.application.draft_portfolio import ProfileFormatError, draft_portfolio
 from portfolio_maker.application.ingestion import ingest_sources
 from portfolio_maker.application.render_html import HtmlRenderError, render_html
+from portfolio_maker.application.project_composition import (
+    ProjectCompositionError,
+    compose_projects,
+    prepare_project_review,
+    write_sample_project_approval,
+)
 from portfolio_maker.application.models import (
     BuildProfileRequest,
     DiscoverSourcesRequest,
     DraftPortfolioRequest,
     IngestSourcesRequest,
     RenderHtmlRequest,
+    ComposeProjectsRequest,
+    PrepareProjectReviewRequest,
 )
 from portfolio_maker.infrastructure.github_connector import GitHubDiscoveryError
 from portfolio_maker.infrastructure.local_discovery import DiscoveryRootError
@@ -41,6 +49,7 @@ def build_parser() -> argparse.ArgumentParser:
     approve.add_argument("--workspace", type=Path, default=Path("."))
     approve.add_argument("--write-sample", action="store_true")
     approve.add_argument("--write-sample-artifact-policy", action="store_true")
+    approve.add_argument("--write-sample-project-approval", action="store_true")
     approve.add_argument("--force", action="store_true")
 
     ingest = subparsers.add_parser("ingest")
@@ -54,6 +63,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     render = subparsers.add_parser("render-html")
     render.add_argument("--workspace", type=Path, default=Path("."))
+
+    review = subparsers.add_parser("prepare-project-review")
+    review.add_argument("--workspace", type=Path, default=Path("."))
+
+    compose = subparsers.add_parser("compose-projects")
+    compose.add_argument("--workspace", type=Path, default=Path("."))
 
     run_mvp = subparsers.add_parser("run-mvp")
     run_mvp.add_argument("--workspace", type=Path, default=Path("."))
@@ -75,6 +90,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         GitHubDiscoveryError,
         HtmlRenderError,
         ProfileFormatError,
+        ProjectCompositionError,
         RepositoryError,
         json.JSONDecodeError,
         OSError,
@@ -109,6 +125,11 @@ def _main(argv: Sequence[str] | None = None) -> int:
                 "Sample artifact policy file: "
                 f"{write_sample_artifact_policy(paths, force=args.force)}"
             )
+        elif args.write_sample_project_approval:
+            print(
+                "Sample project approval file: "
+                f"{write_sample_project_approval(paths, force=args.force)}"
+            )
         else:
             print(f"Approval file: {paths.approval_path}")
         return 0
@@ -134,6 +155,20 @@ def _main(argv: Sequence[str] | None = None) -> int:
         result = render_html(RenderHtmlRequest(workspace=args.workspace))
         print(f"Public manifest: {result.manifest_path}")
         print(f"Portfolio HTML: {result.html_path}")
+        return 0
+
+    if args.command == "prepare-project-review":
+        result = prepare_project_review(
+            PrepareProjectReviewRequest(workspace=args.workspace)
+        )
+        print(f"Project review input: {result.input_path}")
+        print(f"Evidence: {result.evidence_count}")
+        return 0
+
+    if args.command == "compose-projects":
+        result = compose_projects(ComposeProjectsRequest(workspace=args.workspace))
+        print(f"Composed projects: {result.project_count}")
+        print(f"Unassigned evidence: {result.unassigned_evidence_count}")
         return 0
 
     if args.command == "run-mvp":

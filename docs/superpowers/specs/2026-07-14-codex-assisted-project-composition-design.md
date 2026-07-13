@@ -1,7 +1,7 @@
 # Codex 기반 프로젝트 식별·구성 설계
 
 날짜: 2026-07-14
-상태: 사용자 승인 설계 / 구현 계획 작성 전
+상태: 승인 설계 및 구현 기준선
 추적 Issue: #13
 
 ## 1. 문제 정의
@@ -10,7 +10,7 @@ Portfolio Maker의 현재 evidence pipeline은 승인된 source, snapshot, GitHu
 
 테스터 실행에서 이 규칙은 승인된 local evidence 486개를 486개 local project로, public GitHub evidence 100개를 5개 repository group으로, private GitHub evidence 125개를 하나의 generic group으로 보였다. 이것은 portfolio project가 아니라 origin별 technical grouping이다.
 
-이 설계는 Portfolio Maker가 목표로 하는 “보험 RAG 챗봇”, “PlayMCP 공모전 준비” 같은 목적·기간·산출물·여러 근거를 가진 큰 작업 단위를 표현하지 못한다.
+이 설계는 Portfolio Maker가 목표로 하는 “보험 RAG 챗봇”, “PlayMCP 공모전 준비” 같은 목적·기간·산출물·여러 근거를 가진 큰 작업 단위를 표현하기 위한 현재 구현 계약이다.
 
 ## 2. 결정
 

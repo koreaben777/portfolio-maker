@@ -133,6 +133,27 @@ portfolio-maker approve --workspace . --write-sample-artifact-policy
 `include_*`, 제외 목록을 검토합니다. 기본은 `restricted`이며, `open_public`은 별도
 재생성과 공개 적합성 검증이 필요한 공개 GitHub 전용 범위입니다.
 
+semantic portfolio project를 구성하려면 먼저 안전한 review bundle을 만듭니다.
+
+```bash
+portfolio-maker prepare-project-review --workspace .
+```
+
+Codex는 `.portfolio-maker/reviews/project-review-input.json`만 읽어
+`project-candidates.json`과 `project-candidates.md`를 작성할 수 있습니다. candidate는
+검토 보조물일 뿐 database truth가 아니며, 사용자가 직접 작성한 approval도 허용됩니다.
+검토·수정한 `project-approval.json`을 materialize하려면 다음을 실행합니다.
+
+```bash
+portfolio-maker approve --workspace . --write-sample-project-approval
+portfolio-maker compose-projects --workspace .
+```
+
+승인된 semantic project만 profile summary, draft, manifest, HTML의 project로 표시됩니다.
+project approval이 없으면 evidence inventory는 유지되지만 project 목록은 빈 상태입니다.
+각 artifact는 자기 policy로 evidence를 다시 선택한 뒤 승인 project link와 교차하며,
+candidate·rejected·unassigned·stale evidence는 project output에 포함되지 않습니다.
+
 기존 workspace에서 provenance가 없는 legacy workflow activity는 안전을 위해 profile과
 portfolio draft의 입력에서 제외됩니다. 이를 복구하려면 `portfolio-maker discover
 --workspace .`가 성공하도록 다시 실행한 뒤 discovery report에서 해당 공개 activity의
@@ -169,7 +190,7 @@ portfolio-maker render-html --workspace .
 - `approved_github_activity_urls`는 discovery가 저장한 공개 GitHub activity URL을 정확히 지정합니다. private activity 또는 allowlist 밖·excluded repository activity는 승인되어도 산출물 입력으로 쓰지 않습니다.
 - `approved_private_github_activity_urls`는 `private_sources_allowed`, repository allowlist, 제외 정책을 모두 통과한 private activity에만 사용합니다. private provenance는 restricted 결과에서 안전한 label로만 표시합니다.
 - 어떤 delivery scope에도 비밀값, 토큰, credential, raw local path를 넣지 않습니다.
-- `portfolio-public.json`과 `portfolio.html`은 파일명과 무관하게 artifact policy의 delivery scope를 따릅니다. 프로젝트별 timeline은 선택된 evidence의 날짜와 provenance만 표시합니다.
+- `portfolio-public.json`과 `portfolio.html`은 파일명과 무관하게 artifact policy의 delivery scope를 따릅니다. 승인된 semantic project별 timeline은 선택된 evidence의 날짜와 provenance만 표시합니다.
 - `.portfolio-maker/`는 Git에 커밋하지 마세요.
 - `portfolio.db`와 journal/WAL/SHM sidecar는 하나의 관리 단위입니다. 개별 sidecar를 임의로 바꾸거나 삭제하지 마세요.
 
@@ -183,9 +204,9 @@ portfolio-maker approve --workspace . --write-sample --force
 
 0.1.0에서는 승인된 로컬 자료, 명시 승인된 공개 GitHub activity, 조건을 충족한 private GitHub activity를 공통 evidence pool로 관리합니다. 모든 생성물은 artifact별 `EvidenceSelectionService`를 거치며, `portfolio-public.json`과 `portfolio.html`도 기본 `restricted` 결과입니다. HTML은 build-time manifest를 번들한 정적 결과이며 SQLite, 원본, snapshot, credential을 runtime에 읽지 않습니다.
 
-현재 HTML의 `projects` 배열은 evidence origin을 표시하기 위한 기술적 grouping입니다. local file 하나가 project 하나가 되거나 private GitHub activity가 하나의 generic group으로 합쳐질 수 있으므로, 이를 사용자가 의미하는 포트폴리오 project로 해석하면 안 됩니다. 이 renderer는 근거 검토 표면으로는 사용할 수 있지만, semantic portfolio project를 만들기 위한 다음 단계가 필요합니다.
+현재 HTML의 `projects` 배열은 사용자가 승인한 semantic portfolio project만 표시합니다. local file, repository, activity 하나는 자동 project가 되지 않습니다. `portfolio-maker prepare-project-review`가 현재 artifact policy를 통과한 안전한 evidence bundle을 만들고, Codex candidate는 검토 보조물로만 사용됩니다. 사용자가 `project-approval.json`을 승인한 뒤 `compose-projects`를 실행해야만 project가 materialize됩니다.
 
-다음 최우선은 [Issue #13](https://github.com/koreaben777/portfolio-maker/issues/13)의 **Codex 기반 프로젝트 식별·구성·선정**입니다. Codex는 승인·마스킹된 review bundle에서 프로젝트 후보와 근거 기반 overview를 제안하고, 사용자는 후보를 승인·병합·분할·재배정합니다. 승인된 project만 Markdown draft, manifest, HTML에 표시되며 연결되지 않은 근거는 `unassigned evidence`로 보존합니다. 이 기능은 아직 구현 전입니다.
+승인된 project가 없으면 master profile의 evidence inventory는 유지하면서 draft, manifest, HTML은 정직한 zero-project 상태를 생성합니다. 승인된 project의 effective evidence는 각 artifact policy의 선택 결과와 semantic link의 교집합이며, candidate·rejected·unassigned·stale evidence는 project output에 포함되지 않습니다. project approval에는 merge, split, reassign, reject, unassigned 결정을 직접 반영할 수 있고, 외부 LLM API나 token 저장은 사용하지 않습니다.
 
 로컬 제외 폴더, GitHub private opt-in, 생성물별 근거 선택 정책은 [Issue #12](https://github.com/koreaben777/portfolio-maker/issues/12)와 [구현 계획](https://github.com/koreaben777/portfolio-maker/blob/main/docs/superpowers/plans/2026-07-14-unified-evidence-policy.md)에서 관리합니다. artifact policy가 없는 기존 workspace는 0.1.0 호환 경로로 public GitHub evidence만 manifest/HTML에 사용합니다.
 
