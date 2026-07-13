@@ -198,7 +198,7 @@ Stage C는 approval schema에 다음 optional 필드를 추가한다.
 
 ### 7.2 #11 공개용 인터랙티브 HTML (현재 일반형 구현)
 
-[#11](https://github.com/koreaben777/portfolio-maker/issues/11)은 Portfolio Maker가 만든 public-safe claim/evidence/artifact manifest를 정적 HTML로 표시하는 **renderer**다. 현재 일반형 구현은 #3 회사/JD 맞춤 서술을 포함하지 않으며, 새 비즈니스 모델을 만들지 않고 manifest만 읽는다.
+[#11](https://github.com/koreaben777/portfolio-maker/issues/11)은 Portfolio Maker가 만든 evidence selection 결과를 정적 HTML로 표시하는 **renderer**다. 현재 일반형 구현은 #3 회사/JD 맞춤 서술을 포함하지 않으며, #13 전에는 evidence origin-based technical grouping을 표시한다. 사용자가 승인한 semantic portfolio project의 manifest는 #13이 새로 만든다.
 
 목표 출력은 기본적으로 다음과 같다.
 
@@ -210,7 +210,7 @@ Stage C는 approval schema에 다음 optional 필드를 추가한다.
 일반형 포트폴리오의 고정 정보 구조:
 
 - 소개와 기본 프로필
-- 선택 프로젝트
+- 현재 evidence grouping과, #13 이후 승인된 portfolio project
 - 기술·역량 요약
 - 근거 및 provenance
 - 공개 링크/연락 경로
@@ -220,10 +220,11 @@ Stage C는 approval schema에 다음 optional 필드를 추가한다.
 
 - 외부 tracker, CDN, remote API 없이 브라우저에서 직접 열리는 정적 HTML
 - 프로젝트 목록, 필터/탐색, 근거 상세 보기, 프로젝트별 timeline, keyboard navigation, mobile layout
-- safe source label과 public GitHub URL만 provenance로 표시
-- 승인·정책 재검증을 통과한 public-safe claim/evidence만 사용
-- 프로젝트·기술·성과 표현은 evidence가 제공하는 범위를 넘지 않음
-- 현재 public HTML은 approved public GitHub activity evidence만 표시한다. `approved_source_uris`는 local profile/draft 승인이지 public HTML 승인으로 해석하지 않으며, local public label/description approval field는 후속 계약이다.
+- safe source label, public GitHub URL, 그리고 private GitHub의 URL 없는 safe label만 provenance로 표시
+- approval·artifact policy·delivery scope 재검증을 통과한 claim/evidence만 사용
+- project·기술·성과 표현은 evidence가 제공하는 범위를 넘지 않음
+- #12 restricted path의 HTML은 승인된 local/public/private evidence를 사용할 수 있지만, #13 전에는 이들이 semantic portfolio project로 승인되었다는 뜻이 아니다.
+- #13 이후 HTML은 approved portfolio project만 표시하며, candidate·rejected·unassigned evidence는 project 목록에 넣지 않는다.
 - raw local path, snapshot path, `public_safe=false` data, secret-shaped text는 HTML/JS data에도 포함하지 않음
 - HTML/attribute/JavaScript context별 escaping
 - keyboard navigation, mobile layout, visible focus, 색 대비, reduced-motion 지원
@@ -245,7 +246,8 @@ Stage C는 approval schema에 다음 optional 필드를 추가한다.
 
 ```text
 승인된 evidence/claim graph
-  → Portfolio Maker public-safe manifest
+  → #12 evidence selection
+  → #13 approved portfolio project manifest
   → web/portfolio build-time data module
   → 정적 HTML/자산
   → .portfolio-maker/artifacts/portfolio.html
@@ -254,7 +256,7 @@ Stage C는 approval schema에 다음 optional 필드를 추가한다.
 
 구현 절차:
 
-1. public-safe manifest와 HTML 정보 구조를 로컬에서 확정한다. 현재 일반형 구현은 #3 산출물 없이도 verified evidence를 표시할 수 있으며, 원본 경로, `.portfolio-maker/` 내부 파일, SQLite, 자격 증명은 Sites 입력에서 제외한다.
+1. #13이 만든 approved-project manifest와 HTML 정보 구조를 로컬에서 확정한다. #3 산출물 없이도 verified project evidence를 표시할 수 있으며, 원본 경로, `.portfolio-maker/` 내부 파일, SQLite, 자격 증명, candidate/unassigned evidence는 Sites 입력에서 제외한다.
 2. 공개 대상과 방문자, 섹션, 탐색/필터, 근거 상세, 키보드·모바일·대비 요구를 포함한 디자인 brief를 만든다.
 3. `@sites` 디자인 흐름에서 비교 가능한 시안을 **정확히 3개** 순차 제시하고 하나를 선택한다. 설치된 `emilkowalski/skills`는 선택안의 motion/interaction review checklist로 적용하며 런타임 의존성으로 포함하지 않는다.
 4. 선택한 방향으로 정적 HTML 표면을 빌드하고 `npm run build`, 로컬 파일 직접 열기, Codex 브라우저의 키보드·모바일·접근성 수동 검증을 통과시킨다.
