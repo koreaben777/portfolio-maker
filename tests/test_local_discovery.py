@@ -56,14 +56,31 @@ def test_discover_local_candidates_finds_readme_and_skips_forbidden_and_policy_p
     (forbidden / "README.md").write_text("# Secret\n", encoding="utf-8")
     (node_modules / "package.json").write_text("{}", encoding="utf-8")
 
-    candidates, skipped = discover_local_candidates(home, forbidden_paths=(forbidden,))
+    candidates, skipped = discover_local_candidates(
+        home,
+        forbidden_paths=(forbidden,),
+        excluded_directories=(node_modules,),
+    )
 
     assert [(candidate.path, candidate.display_name) for candidate in candidates] == [
         (readme.resolve(), "README.md")
     ]
     assert candidates[0].uri == readme.resolve().as_uri()
     assert (forbidden.resolve(), "forbidden") in [(item.path, item.reason) for item in skipped]
-    assert (node_modules.resolve(), "skipped_policy") in [(item.path, item.reason) for item in skipped]
+    assert (node_modules.resolve(), "excluded_directory") in [(item.path, item.reason) for item in skipped]
+
+
+def test_discover_local_candidates_does_not_implicitly_exclude_normal_directories(tmp_path):
+    home = tmp_path / "home"
+    dependencies = home / "node_modules"
+    dependencies.mkdir(parents=True)
+    package = dependencies / "package.json"
+    package.write_text('{"name": "synthetic"}', encoding="utf-8")
+
+    candidates, skipped = discover_local_candidates(home)
+
+    assert [candidate.path for candidate in candidates] == [package.resolve()]
+    assert skipped == []
 
 
 def test_discover_local_candidates_skips_filename_pattern_before_candidate(tmp_path):
@@ -988,6 +1005,29 @@ def test_discover_sources_uses_approval_forbidden_paths_on_rerun(workspace, tmp_
     report = result.report_path.read_text(encoding="utf-8")
     assert result.discovered_count == 0
     assert "forbidden: [redacted]" in report
+    assert secret.name not in report
+
+
+def test_discover_sources_uses_approval_excluded_directories_on_rerun(workspace, tmp_path):
+    home = tmp_path / "home"
+    excluded = home / "excluded"
+    excluded.mkdir(parents=True)
+    secret = excluded / "README.md"
+    secret.write_text("# Secret\n", encoding="utf-8")
+    paths = WorkspacePaths.from_root(workspace)
+    paths.ensure()
+    paths.approval_path.write_text(
+        json.dumps({"excluded_directories": [str(excluded)]}),
+        encoding="utf-8",
+    )
+
+    result = discover_sources(
+        DiscoverSourcesRequest(workspace=workspace, home=home, include_github=False)
+    )
+
+    report = result.report_path.read_text(encoding="utf-8")
+    assert result.discovered_count == 0
+    assert "excluded_directory" in report
     assert secret.name not in report
 
 

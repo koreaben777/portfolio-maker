@@ -11,10 +11,11 @@ from portfolio_maker.infrastructure.policy import (
 
 
 def test_default_exclusions_include_sensitive_and_large_dirs():
-    assert ".Trash" in DEFAULT_EXCLUDED_NAMES
-    assert "Library" in DEFAULT_EXCLUDED_NAMES
-    assert "node_modules" in DEFAULT_EXCLUDED_NAMES
-    assert ".git" in DEFAULT_EXCLUDED_NAMES
+    assert ".portfolio-maker" in DEFAULT_EXCLUDED_NAMES
+    assert ".Trash" not in DEFAULT_EXCLUDED_NAMES
+    assert "Library" not in DEFAULT_EXCLUDED_NAMES
+    assert "node_modules" not in DEFAULT_EXCLUDED_NAMES
+    assert ".git" not in DEFAULT_EXCLUDED_NAMES
 
 
 def test_forbidden_path_blocks_descendants(tmp_path):
@@ -32,7 +33,9 @@ def test_env_and_private_key_files_are_skipped(tmp_path):
     assert policy.classify_path(tmp_path / ".env") == "skipped_policy"
     assert policy.classify_path(tmp_path / "credentials.JSON") == "skipped_policy"
     assert policy.classify_path(tmp_path / "id_rsa") == "skipped_policy"
-    assert policy.classify_path(tmp_path / "node_modules" / "pkg.js") == "skipped_policy"
+    assert policy.classify_path(tmp_path / "node_modules" / "pkg.js") == "candidate"
+    selected = FilePolicy(forbidden_paths=(tmp_path / "node_modules",))
+    assert selected.classify_path(tmp_path / "node_modules" / "pkg.js") == "forbidden"
     assert policy.classify_path(tmp_path / "project.md") == "candidate"
 
 
@@ -149,7 +152,8 @@ def test_relative_forbidden_path_blocks_descendants(tmp_path, monkeypatch):
 def test_default_excluded_directory_names_are_case_insensitive(tmp_path):
     policy = FilePolicy()
 
-    assert policy.classify_path(tmp_path / "NODE_MODULES" / "pkg.js") == "skipped_policy"
+    assert policy.classify_path(tmp_path / "NODE_MODULES" / "pkg.js") == "candidate"
+    assert policy.classify_path(tmp_path / ".PORTFOLIO-MAKER" / "db") == "skipped_policy"
 
 
 def test_file_policy_skips_common_password_export_names(tmp_path):

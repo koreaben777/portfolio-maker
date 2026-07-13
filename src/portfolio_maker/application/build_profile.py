@@ -35,7 +35,7 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
     approval = load_approval(paths)
     approved_uris = set(approval.approved_source_uris)
     policy = FilePolicy(
-        forbidden_paths=approval.forbidden_paths,
+        forbidden_paths=approval.excluded_directories,
         excluded_file_patterns=approval.excluded_file_patterns,
     )
     repository = SQLiteRepository(paths.db_path)
@@ -251,7 +251,8 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
             separators=(",", ":"),
         ),
     )
-    remove_managed_file(paths.portfolio_draft_path, missing_ok=True)
+    if request.invalidate_portfolio_draft:
+        remove_managed_file(paths.portfolio_draft_path, missing_ok=True)
     return BuildProfileResult(
         json_path=paths.master_profile_json_path,
         markdown_path=paths.master_profile_md_path,

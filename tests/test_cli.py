@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 
 from portfolio_maker.adapters.cli import main
@@ -24,6 +25,40 @@ def test_cli_discover_command_creates_report(workspace, tmp_path):
 
     assert exit_code == 0
     assert (workspace / ".portfolio-maker" / "reviews" / "discovery-report.md").exists()
+
+
+def test_cli_discover_exclude_directory_persists_policy_and_excludes_files(workspace, tmp_path):
+    home = tmp_path / "home"
+    excluded = home / "excluded"
+    excluded.mkdir(parents=True)
+    secret = excluded / "README.md"
+    secret.write_text("# excluded\n", encoding="utf-8")
+
+    exit_code = main(
+        [
+            "discover",
+            "--workspace",
+            str(workspace),
+            "--home",
+            str(home),
+            "--no-github",
+            "--exclude-directory",
+            str(excluded),
+        ]
+    )
+
+    approval = json.loads(
+        (workspace / ".portfolio-maker" / "reviews" / "source-approval.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    report = (workspace / ".portfolio-maker" / "reviews" / "discovery-report.md").read_text(
+        encoding="utf-8"
+    )
+    assert exit_code == 0
+    assert str(excluded.resolve()) in approval["excluded_directories"]
+    assert "excluded_directory: [redacted]" in report
+    assert secret.name not in report
 
 
 def test_cli_approve_write_sample(workspace):

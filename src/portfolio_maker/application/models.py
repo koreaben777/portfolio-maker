@@ -2,6 +2,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
+
+
+ArtifactKind = Literal[
+    "master_profile",
+    "portfolio_draft",
+    "portfolio_public_manifest",
+    "portfolio_html",
+]
+ArtifactDeliveryScope = Literal["restricted", "open_public"]
 
 
 @dataclass(frozen=True)
@@ -17,6 +27,7 @@ class DiscoverSourcesRequest:
     home: Path
     include_github: bool = True
     forbidden_paths: tuple[Path, ...] = ()
+    excluded_directories: tuple[Path, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -42,6 +53,7 @@ class IngestSourcesResult:
 @dataclass(frozen=True)
 class BuildProfileRequest:
     workspace: Path
+    invalidate_portfolio_draft: bool = True
 
 
 @dataclass(frozen=True)
@@ -88,4 +100,3 @@ class RenderHtmlRequest:
 class RenderHtmlResult:
     manifest_path: Path
     html_path: Path
-    dist_path: Path

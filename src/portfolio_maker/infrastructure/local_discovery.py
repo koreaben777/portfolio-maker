@@ -33,6 +33,7 @@ def discover_local_candidates(
     forbidden_paths: tuple[Path, ...] = (),
     excluded_file_patterns: tuple[str, ...] = (),
     max_candidates: int = 500,
+    excluded_directories: tuple[Path, ...] = (),
 ) -> tuple[list[LocalCandidate], list[SkippedPath]]:
     policy = FilePolicy(
         forbidden_paths=forbidden_paths,
@@ -56,7 +57,9 @@ def discover_local_candidates(
     if max_candidates <= 0:
         return candidates, skipped
 
-    home_classification = policy.classify_path(home_resolved)
+    home_classification = _classify_directory(
+        home_resolved, policy, excluded_directories
+    )
     if home_classification != "candidate":
         return candidates, [SkippedPath(home_resolved, home_classification)]
 
@@ -82,7 +85,9 @@ def discover_local_candidates(
             path = Path(root) / dirname
             try:
                 resolved = path.resolve()
-                classification = policy.classify_path(resolved)
+                classification = _classify_directory(
+                    resolved, policy, excluded_directories
+                )
             except RuntimeError:
                 skipped.append(SkippedPath(path.absolute(), "skipped_unresolvable"))
                 dirs.remove(dirname)
@@ -102,7 +107,11 @@ def discover_local_candidates(
                     skipped.append(SkippedPath(path.absolute(), "skipped_unresolvable"))
                     continue
                 resolved = path.resolve()
-                classification = policy.classify_path(resolved)
+                classification = (
+                    "excluded_directory"
+                    if _is_under_any(resolved, excluded_directories)
+                    else policy.classify_path(resolved)
+                )
                 if classification != "candidate":
                     skipped.append(SkippedPath(resolved, classification))
                     continue
@@ -132,3 +141,20 @@ def discover_local_candidates(
                 skipped.append(SkippedPath(skipped_path, "skipped_permission_denied"))
 
     return candidates, skipped
+
+
+def _classify_directory(
+    path: Path, policy: FilePolicy, excluded_directories: tuple[Path, ...]
+) -> str:
+    if _is_under_any(path, excluded_directories):
+        return "excluded_directory"
+    return policy.classify_path(path)
+
+
+def _is_under_any(path: Path, directories: tuple[Path, ...]) -> bool:
+    resolved = path.resolve(strict=False)
+    return any(
+        resolved == directory.resolve(strict=False)
+        or directory.resolve(strict=False) in resolved.parents
+        for directory in directories
+    )

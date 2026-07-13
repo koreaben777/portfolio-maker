@@ -5,6 +5,7 @@ import re
 import subprocess
 import unicodedata
 from dataclasses import dataclass
+from dataclasses import replace
 from datetime import datetime
 from typing import Any
 from urllib.parse import urlparse, urlunsplit
@@ -35,6 +36,7 @@ class GitHubActivityCandidate:
     created_at: str
     merged_at: str | None
     state_field: str | None = None
+    is_private: bool = False
 
 
 @dataclass(frozen=True)
@@ -271,7 +273,10 @@ def discover_github_candidates(
     excluded_repositories: tuple[str, ...] = (),
     allowed_repositories: tuple[str, ...] = (),
     private_sources_allowed: bool = False,
+    approved_private_github_activity_urls: tuple[str, ...] = (),
 ) -> GitHubDiscoveryResult:
+    if private_sources_allowed:
+        run_gh_auth_status()
     repository_payload = run_gh_json(
         [
             "repo",
@@ -305,6 +310,10 @@ def discover_github_candidates(
     ]
     activities: list[GitHubActivityCandidate] = []
     statuses: list[str] = []
+    approved_private_urls = {
+        canonical_public_github_activity_url(url)
+        for url in approved_private_github_activity_urls
+    }
     if not repositories_complete:
         statuses.append(
             "GitHub repository list discovery incomplete: result reached the 100-item limit"
@@ -368,7 +377,13 @@ def discover_github_candidates(
             args = [part.format(repo=repo.name_with_owner) for part in args_template]
             try:
                 parsed_activities = parser(repo.name_with_owner, run_gh_json(args))
-                activities.extend(parsed_activities)
+                for activity in parsed_activities:
+                    activity = replace(activity, is_private=repo.is_private)
+                    if repo.is_private:
+                        canonical_url = canonical_public_github_activity_url(activity.url)
+                        if canonical_url not in approved_private_urls:
+                            continue
+                    activities.append(activity)
                 if len(parsed_activities) >= page_limit:
                     statuses.append(
                         f"GitHub {label} discovery incomplete for {repo.name_with_owner}: "
@@ -388,6 +403,20 @@ def discover_github_candidates(
         repositories_complete,
         observed_private_repositories,
     )
+
+
+def run_gh_auth_status() -> None:
+    try:
+        subprocess.run(
+            ["gh", "auth", "status"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError) as error:
+        raise GitHubDiscoveryError(
+            "GitHub private discovery unavailable; run gh auth status"
+        ) from error
 
 
 def _list_payload(payload: Any, label: str) -> list[dict[str, Any]]:

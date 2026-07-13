@@ -7,14 +7,6 @@ from pathlib import Path
 
 
 DEFAULT_EXCLUDED_NAMES = {
-    ".Trash",
-    "Library",
-    "Applications",
-    "node_modules",
-    ".git",
-    ".venv",
-    "venv",
-    "__pycache__",
     ".portfolio-maker",
 }
 

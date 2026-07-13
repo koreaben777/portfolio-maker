@@ -34,6 +34,7 @@ def build_parser() -> argparse.ArgumentParser:
     discover.add_argument("--home", type=Path, default=Path.home())
     discover.add_argument("--no-github", action="store_true")
     discover.add_argument("--forbidden-path", type=Path, action="append", default=[])
+    discover.add_argument("--exclude-directory", type=Path, action="append", default=[])
 
     approve = subparsers.add_parser("approve")
     approve.add_argument("--workspace", type=Path, default=Path("."))
@@ -57,6 +58,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_mvp.add_argument("--home", type=Path, default=Path.home())
     run_mvp.add_argument("--no-github", action="store_true")
     run_mvp.add_argument("--forbidden-path", type=Path, action="append", default=[])
+    run_mvp.add_argument("--exclude-directory", type=Path, action="append", default=[])
 
     return parser
 
@@ -89,6 +91,7 @@ def _main(argv: Sequence[str] | None = None) -> int:
                 home=args.home,
                 include_github=not args.no_github,
                 forbidden_paths=tuple(args.forbidden_path),
+                excluded_directories=tuple(args.exclude_directory),
             )
         )
         print(f"Discovery report: {result.report_path}")
@@ -133,6 +136,7 @@ def _main(argv: Sequence[str] | None = None) -> int:
                 home=args.home,
                 include_github=not args.no_github,
                 forbidden_paths=tuple(args.forbidden_path),
+                excluded_directories=tuple(args.exclude_directory),
             )
         )
         print(f"Discovery report: {result.report_path}")
