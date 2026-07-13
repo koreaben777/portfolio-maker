@@ -1,8 +1,8 @@
 # #13 Codex 기반 프로젝트 식별·구성 구현 계획
 
-날짜: 2026-07-14  
-상태: 승인 설계 기반 구현 계획  
-추적 Issue: [#13](https://github.com/koreaben777/portfolio-maker/issues/13)  
+날짜: 2026-07-14
+상태: 승인 설계 기반 구현 계획
+추적 Issue: [#13](https://github.com/koreaben777/portfolio-maker/issues/13)
 선행 설계: [Codex 기반 프로젝트 식별·구성 설계](../specs/2026-07-14-codex-assisted-project-composition-design.md)
 
 ## 1. 목표와 범위
