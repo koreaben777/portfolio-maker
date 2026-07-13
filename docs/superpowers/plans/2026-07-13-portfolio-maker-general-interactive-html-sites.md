@@ -1,6 +1,8 @@
 
 # 일반형 인터랙티브 HTML 포트폴리오 + @sites 구현 계획
 
+상태: 현재 일반형 renderer 구현 완료. 아래 checklist는 구현 당시의 실행 기록이며, shipped behavior는 `Current shipped contract`와 실제 Python/Vite 경로를 따른다.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 승인된 public-safe 근거로 사용자의 기본 포트폴리오를 본인과 방문자가 확인할 수 있는 정적 인터랙티브 HTML로 만들고, 같은 사이트 표면을 Codex `@sites`에서 디자인·빌드·선택적 호스팅한다.
