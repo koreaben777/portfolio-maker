@@ -301,19 +301,20 @@ artifact policy가 없는 기존 #11 workspace는 0.1.0 호환 경로로 `portfo
 ## 8. developer 작업 지시
 
 1. 현재 `origin/main`에서 작업을 시작하고 dirty/untracked 파일을 먼저 분리한다.
-2. #4에 대해 failing test를 작성하고 Stage A만 구현한다.
-3. #4 focused tests, 전체 test, `git diff --check`를 통과시킨다.
-4. 같은 방식으로 #2, 그다음 #1을 순서대로 진행한다.
-5. 각 stage가 끝날 때 README, sample approval, Issue의 현재 상태를 code behavior와 맞춘다.
-6. #3 회사/JD 문장 생성 또는 다른 roadmap Issue는 구현하지 않는다. 현재 #11 renderer는 일반형 public-safe evidence/timeline 표면에 한정한다.
-7. #11을 구현할 때에만 7.3의 emilkowalski/skills + @sites 흐름을 적용한다. #4 → #2 → #1 구현 중에는 Sites 초기화·디자인 선택·호스팅을 실행하지 않는다.
-8. 최종 보고에는 변경 파일, HEAD, 실행한 검증 명령, 결과, 남은 위험을 포함한다.
+2. #4, #2, #1, #11, #12는 현재 기준선으로 재구현하거나 의미를 넓히지 않는다.
+3. 다음 구현은 #13만 대상으로 한다. 먼저 candidate와 approved portfolio project를 technical evidence grouping에서 분리하는 failing test를 작성한다.
+4. Codex analysis input은 approval·artifact policy·masking을 통과한 safe review bundle로 제한한다. CLI 내부 외부 LLM API, token 저장, raw local path/private URL 전달을 추가하지 않는다.
+5. candidate는 user approval 전 artifact project가 될 수 없고, unassigned evidence는 portfolio project 수에 포함하지 않는다.
+6. #13 focused tests, 전체 test, Vite build, static HTML/browser 검증, `git diff --check`를 통과시킨다.
+7. #3 회사/JD 문장 생성, actual Sites hosting, private repository raw clone/ingestion, Google Drive/OCR/semantic search/MCP는 구현하지 않는다. `@sites`는 #13이 만든 approved-project manifest의 presentation 검증 계층으로만 유지한다.
+8. 각 stage가 끝날 때 README, portfolio-maker skill, sample review files, Issue #13의 현재 상태를 실제 code behavior와 맞춘다.
+9. 최종 보고에는 변경 파일, HEAD, 실행한 검증 명령, candidate/approved/unassigned counts, 결과, 남은 위험을 포함한다.
 
 ## 9. 명세 자체 점검
 
-- #4의 policy 변화가 기존 approval 파일과 호환되도록 정의했다.
-- #2가 #1과 #11에 필요한 근거 추적 모델을 제공한다.
-- #1은 explicit activity approval과 public/private 경계를 분리한다.
-- #11은 public-safe data만 렌더링하며 #3 이전 구현 범위에 섞이지 않는다.
-- #11은 emilkowalski/skills를 설계·리뷰 기준으로, @sites를 presentation/hosting 표면으로 사용하되 evidence authority를 대체하지 않는다.
-- 현재 0.1.0의 local-first, approval-first, GitHub fail-open, review-required portfolio 경계를 유지한다.
+- #4, #2, #1, #11, #12는 evidence discovery·approval·selection·renderer 기준선을 제공한다.
+- #13은 technical evidence grouping과 semantic portfolio project를 분리하고, Codex proposal과 user approval을 별도의 gate로 둔다.
+- #13은 single file/repository/activity 자동 project 승격을 막고 unassigned evidence를 보존한다.
+- #11은 #13의 approved project manifest를 렌더링하되 evidence authority나 Codex candidate approval을 대체하지 않는다.
+- #3은 approved semantic project를 입력으로 쓰는 후속 단계이며 #13보다 먼저 구현하지 않는다.
+- 현재 local-first, approval-first, GitHub fail-open, review-required, raw-path/credential non-disclosure 경계를 유지한다.
