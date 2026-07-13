@@ -56,7 +56,7 @@ artifact별 restricted/open_public 선택을 포함한다. Issue #12는 실제 p
 - `load_artifact_policy(paths: WorkspacePaths) -> ArtifactPolicySet`
 - `write_sample_artifact_policy(paths: WorkspacePaths, force: bool = False) -> Path`
 
-- [ ] **Step 1: Write failing schema tests**
+- [x] **Step 1: Write failing schema tests**
 
 Cover all of the following.
 
@@ -85,7 +85,7 @@ def test_open_public_policy_rejects_local_or_private_include_flags(tmp_path):
 
 Also cover legacy `forbidden_paths` merge, an empty private-activity approval list, malformed delivery scope, and compatibility when `artifact-approval.json` is absent.
 
-- [ ] **Step 2: Run focused tests and confirm the new fields fail**
+- [x] **Step 2: Run focused tests and confirm the new fields fail**
 
 ~~~bash
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python -m pytest -q tests/test_approval.py tests/test_artifact_approval.py
@@ -93,7 +93,7 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python -m pytest -q tests/test_approval
 
 Expected: FAIL because the new fields, policy file, and loader do not exist.
 
-- [ ] **Step 3: Implement policy parsing and compatibility defaults**
+- [x] **Step 3: Implement policy parsing and compatibility defaults**
 
 Implement:
 
@@ -104,7 +104,7 @@ Implement:
 5. Missing artifact policy preserves existing 0.1.0 behavior, including public-GitHub-only manifest/HTML.
 6. Controlled `ApprovalFormatError` messages with no sensitive path, repository, or token output.
 
-- [ ] **Step 4: Run focused tests**
+- [x] **Step 4: Run focused tests**
 
 ~~~bash
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python -m pytest -q tests/test_approval.py tests/test_artifact_approval.py
@@ -112,7 +112,7 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python -m pytest -q tests/test_approval
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ~~~bash
 git add src/portfolio_maker/application/approval.py src/portfolio_maker/application/artifact_approval.py src/portfolio_maker/application/models.py src/portfolio_maker/workspace.py tests/test_approval.py tests/test_artifact_approval.py
@@ -138,7 +138,7 @@ git commit -m "feat: add artifact delivery policy schema"
 - `GitHubRepositoryCandidate.is_private: bool`
 - `GitHubActivityCandidate.is_private: bool`
 
-- [ ] **Step 1: Write discovery regressions**
+- [x] **Step 1: Write discovery regressions**
 
 Cover:
 
@@ -149,7 +149,7 @@ Cover:
 - excluded repositories override allowlist and private opt-in;
 - private activity URLs cannot be approved through the public activity field.
 
-- [ ] **Step 2: Run focused tests before implementation**
+- [x] **Step 2: Run focused tests before implementation**
 
 ~~~bash
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python -m pytest -q tests/test_local_discovery.py tests/test_github_connector.py tests/test_github_private_policy.py
@@ -157,7 +157,7 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python -m pytest -q tests/test_local_di
 
 Expected: FAIL for the new exclusion semantics and private origin path.
 
-- [ ] **Step 3: Implement discovery semantics**
+- [x] **Step 3: Implement discovery semantics**
 
 1. Persist `--exclude-directory` in `source-approval.json` before later ingest/build revalidation.
 2. Remove ordinary implicit user-policy directory exclusions; preserve only selected excluded directories and operational hard boundaries.
@@ -165,7 +165,7 @@ Expected: FAIL for the new exclusion semantics and private origin path.
 4. Do not clone repositories, retrieve raw repository files, or persist tokens.
 5. Distinguish `excluded_directory`, permissions, symlink, extraction, GitHub-auth, and policy states in discovery output without leaking private paths or URLs.
 
-- [ ] **Step 4: Run focused tests and perform redaction scan**
+- [x] **Step 4: Run focused tests and perform redaction scan**
 
 ~~~bash
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python -m pytest -q tests/test_local_discovery.py tests/test_github_connector.py tests/test_github_private_policy.py
@@ -174,7 +174,7 @@ rg -n "ghp_|token=|Authorization" .portfolio-maker/reviews || true
 
 Expected: PASS with no credential-like output.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ~~~bash
 git add src/portfolio_maker/infrastructure/local_discovery.py src/portfolio_maker/infrastructure/policy.py src/portfolio_maker/infrastructure/github_connector.py src/portfolio_maker/application/discovery.py src/portfolio_maker/adapters/cli.py tests/test_local_discovery.py tests/test_github_connector.py tests/test_github_private_policy.py
@@ -199,7 +199,7 @@ git commit -m "feat: discover approved local and private github evidence"
 - `EvidenceSelectionResult(included_source_ids, included_evidence_ids, included_claim_ids, excluded_decisions, policy_hash)`
 - `select_evidence_for_artifact(repository: SQLiteRepository, request: EvidenceSelectionRequest) -> EvidenceSelectionResult`
 
-- [ ] **Step 1: Write selection-matrix tests**
+- [x] **Step 1: Write selection-matrix tests**
 
 Use one fixture containing approved local, approved public GitHub, exact-approved private GitHub, excluded, and unknown evidence.
 
@@ -212,7 +212,7 @@ Use one fixture containing approved local, approved public GitHub, exact-approve
 
 Assert that unapproved private activity is excluded even when `include_private_github=true`, and that an `open_public` policy asking for local/private origins fails validation before output generation.
 
-- [ ] **Step 2: Run focused tests and confirm the selector is absent**
+- [x] **Step 2: Run focused tests and confirm the selector is absent**
 
 ~~~bash
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python -m pytest -q tests/test_evidence_selection.py
@@ -220,11 +220,11 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python -m pytest -q tests/test_evidence
 
 Expected: FAIL until migration and selector exist.
 
-- [ ] **Step 3: Add additive visibility migration**
+- [x] **Step 3: Add additive visibility migration**
 
 Add origin visibility/origin type columns where necessary with safe defaults. Preserve legacy `public_safe` values and map old records conservatively. Do not rewrite or delete raw snapshots. Record migration version and validate pre-policy workspace fixtures.
 
-- [ ] **Step 4: Implement EvidenceSelectionService**
+- [x] **Step 4: Implement EvidenceSelectionService**
 
 The selector must:
 
@@ -239,7 +239,7 @@ The selector must:
 
 No builder may reinterpret this policy.
 
-- [ ] **Step 5: Run migration and selector tests**
+- [x] **Step 5: Run migration and selector tests**
 
 ~~~bash
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python -m pytest -q tests/test_sqlite_repository.py tests/test_evidence_selection.py
@@ -247,7 +247,7 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python -m pytest -q tests/test_sqlite_r
 
 Expected: PASS with old and new workspace fixtures.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ~~~bash
 git add src/portfolio_maker/infrastructure/sqlite_repository.py src/portfolio_maker/application/evidence_selection.py src/portfolio_maker/domain/models.py src/portfolio_maker/application/models.py tests/test_sqlite_repository.py tests/test_evidence_selection.py
@@ -273,7 +273,7 @@ git commit -m "feat: centralize evidence delivery selection"
 - `render_html` consumes its manifest policy only; it introduces no separate public/private origin filter.
 - Restricted private repository provenance uses an approved/safe label. Any private URL display requires a separately approved shared locator.
 
-- [ ] **Step 1: Add cross-artifact regressions**
+- [x] **Step 1: Add cross-artifact regressions**
 
 Create a fixture with local, public GitHub, and private GitHub evidence. Assert:
 
@@ -284,7 +284,7 @@ Create a fixture with local, public GitHub, and private GitHub evidence. Assert:
 - raw local paths, tokens, credentials, secret-shaped text, and unapproved private repository names never appear in output;
 - repeated builds are deterministic and reference the same source/evidence/claim IDs.
 
-- [ ] **Step 2: Run focused builder tests before implementation**
+- [x] **Step 2: Run focused builder tests before implementation**
 
 ~~~bash
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python -m pytest -q tests/test_profile_and_portfolio.py tests/test_public_portfolio.py tests/test_render_html.py tests/test_static_site.py
@@ -292,18 +292,18 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python -m pytest -q tests/test_profile_
 
 Expected: FAIL for common selection, restricted sharing metadata, and scope gates.
 
-- [ ] **Step 3: Replace builder-specific filtering**
+- [x] **Step 3: Replace builder-specific filtering**
 
 Keep each builder responsible for presentation only. It can format selector-approved records but must not decide whether a source is local, public, private, excluded, or open-public eligible.
 
-- [ ] **Step 4: Validate output contracts**
+- [x] **Step 4: Validate output contracts**
 
 - Restricted HTML remains self-contained: no runtime fetch, SQLite access, source file access, or credential data.
 - Restricted HTML/manifest may include approved local and private evidence, but only safe labels/approved locators; never raw local paths.
 - Open-public HTML/manifest is regenerated from its own selector result and fails if any local/private origin remains.
 - The visual renderer exposes no misleading “publicly hosted” claim merely because the artifact filename contains `public`.
 
-- [ ] **Step 5: Run focused tests**
+- [x] **Step 5: Run focused tests**
 
 ~~~bash
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python -m pytest -q tests/test_profile_and_portfolio.py tests/test_public_portfolio.py tests/test_render_html.py tests/test_static_site.py
@@ -311,7 +311,7 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python -m pytest -q tests/test_profile_
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ~~~bash
 git add src/portfolio_maker/application/build_profile.py src/portfolio_maker/application/draft_portfolio.py src/portfolio_maker/application/public_portfolio.py src/portfolio_maker/application/render_html.py src/portfolio_maker/infrastructure/static_site.py tests/test_profile_and_portfolio.py tests/test_public_portfolio.py tests/test_render_html.py tests/test_static_site.py
@@ -337,7 +337,7 @@ git commit -m "feat: apply delivery policy to portfolio artifacts"
 - rendering records `restricted` or `open_public` in the manifest and the generated HTML metadata.
 - any Sites public deployment path rejects `restricted` output; private deployment/preview is allowed only after normal static validation.
 
-- [ ] **Step 1: Add CLI and deployment-gate regressions**
+- [x] **Step 1: Add CLI and deployment-gate regressions**
 
 Cover sample policy creation, missing policy compatibility, invalid open-public policy, exclusion option persistence, artifact metadata, and the following gates:
 
@@ -354,7 +354,7 @@ def test_private_deployment_accepts_validated_restricted_html(tmp_path):
     assert prepare_private_deployment(artifact).delivery_scope == "restricted"
 ~~~
 
-- [ ] **Step 2: Implement documented workflow**
+- [x] **Step 2: Implement documented workflow**
 
 Document and implement this sequence:
 
@@ -368,7 +368,7 @@ Document and implement this sequence:
 8. select `open_public` only when its additional validation passes, then explicitly choose a public deployment;
 9. never infer deployment authorization from the legacy `public` filename.
 
-- [ ] **Step 3: Run focused CLI and frontend tests**
+- [x] **Step 3: Run focused CLI and frontend tests**
 
 ~~~bash
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python -m pytest -q tests/test_cli.py tests/test_render_html.py tests/test_static_site.py
@@ -377,7 +377,7 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python -m pytest -q tests/test_cli.py t
 
 Expected: PASS.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ~~~bash
 git add src/portfolio_maker/adapters/cli.py .agents/skills/portfolio-maker/SKILL.md README.md web/portfolio/src/main.ts web/portfolio/src/styles.css tests/test_cli.py tests/test_render_html.py tests/test_static_site.py
@@ -395,7 +395,7 @@ git commit -m "docs: expose restricted portfolio sharing workflow"
 - Update: GitHub Issue #12
 - Keep open: Issue #3
 
-- [ ] **Step 1: Run the complete validation set**
+- [x] **Step 1: Run the complete validation set**
 
 ~~~bash
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python -m pytest -q
@@ -406,7 +406,7 @@ git show --check --format=short HEAD
 
 Expected: all Python tests, Vite build, and Git checks pass.
 
-- [ ] **Step 2: Verify migration behavior**
+- [x] **Step 2: Verify migration behavior**
 
 Open a pre-policy workspace fixture and confirm it preserves current artifact selection. Open a new policy-initialized workspace and confirm:
 
@@ -415,7 +415,7 @@ Open a pre-policy workspace fixture and confirm it preserves current artifact se
 - `open_public` rejects local/private origins;
 - public deployment rejects restricted output.
 
-- [ ] **Step 3: Synchronize public documentation**
+- [x] **Step 3: Synchronize public documentation**
 
 Document:
 
@@ -426,11 +426,11 @@ Document:
 - `open_public` as explicit, stricter, separate generation;
 - no automatic public hosting, no private raw repository ingestion, and #3 tailoring remains out of scope.
 
-- [ ] **Step 4: Final self-review**
+- [x] **Step 4: Final self-review**
 
 Confirm no builder bypasses EvidenceSelectionService; no restricted or open-public output has credentials/raw local paths; no restricted artifact can enter public Sites deployment; old approval/workspaces remain readable.
 
-- [ ] **Step 5: Commit docs and verification**
+- [x] **Step 5: Commit docs and verification**
 
 ~~~bash
 git add docs/superpowers/specs/2026-07-14-unified-evidence-policy-design.md docs/superpowers/plans/2026-07-14-unified-evidence-policy.md docs/superpowers/specs/2026-07-11-portfolio-maker-roadmap-phase-1-policy-evidence-github.md README.md .agents/skills/portfolio-maker/SKILL.md docs/reviews/2026-07-14-unified-evidence-policy-verification.md
