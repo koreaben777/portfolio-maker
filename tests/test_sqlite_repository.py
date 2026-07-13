@@ -89,6 +89,25 @@ def test_sqlite_repository_creates_phase_one_evidence_tables(workspace):
     } <= repository.table_names()
 
 
+def test_sqlite_repository_adds_evidence_origin_columns(workspace):
+    repository = SQLiteRepository(WorkspacePaths.from_root(workspace).db_path)
+
+    repository.initialize()
+
+    assert {
+        "origin_type",
+        "origin_visibility",
+    } <= column_names(repository, "sources")
+    assert {
+        "origin_type",
+        "origin_visibility",
+    } <= column_names(repository, "github_activities")
+    assert {
+        "origin_type",
+        "origin_visibility",
+    } <= column_names(repository, "evidence_items")
+
+
 def test_sqlite_repository_evidence_relationships_enforce_foreign_keys(workspace):
     paths = WorkspacePaths.from_root(workspace)
     repository = SQLiteRepository(paths.db_path)
@@ -234,6 +253,8 @@ def test_sqlite_repository_upsert_source_updates_existing_uri(workspace):
         display_name="updated project",
         owner="june",
         status=SourceStatus.APPROVED,
+        origin_type="public_github",
+        origin_visibility="public",
     )
 
 
@@ -597,6 +618,21 @@ def test_sqlite_repository_migrates_legacy_mvp_schema(workspace):
         public_safe=False,
     )
     repository.link_claim_evidence(claim_id, evidence_id, "direct")
+    github_evidence_id = repository.upsert_evidence_item(
+        source_id=source_id,
+        snapshot_id=None,
+        github_activity_id=None,
+        locator="https://github.com/octo/demo/pull/1",
+        stable_id="legacy-github-evidence:1",
+        content_hash=None,
+        public_safe=True,
+    )
+    github_claim_id = repository.upsert_github_activity_claim(
+        github_evidence_id,
+        project_id,
+        "Legacy GitHub evidence",
+    )
+    assert github_claim_id != claim_id
     repository.record_artifact("legacy-check", 1, "{}")
 
 
