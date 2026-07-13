@@ -133,6 +133,8 @@ portfolio-maker approve --workspace . --write-sample --force
 
 0.1.0에서는 승인된 로컬 자료와 명시 승인된 공개 GitHub activity를 profile 근거로 사용하고, 검토용 포트폴리오 초안과 일반형 public-safe HTML을 제공합니다. HTML은 build-time manifest를 번들한 정적 결과이며 SQLite, 원본, snapshot, credential을 runtime에 읽지 않습니다. 작업 이력은 사용자가 `.portfolio-maker/`를 직접 정리할 때까지 로컬에 남으며, 자동 보존·정리 기능은 아직 제공하지 않습니다. 회사·채용공고별 맞춤 작성(#3), Google Drive 연동, 이력서·자기소개서·면접 자료, OCR, 시맨틱 검색, MCP/app-server 인터페이스는 [GitHub Issues](https://github.com/koreaben777/portfolio-maker/issues)에서 관리합니다.
 
+로컬 제외 폴더, GitHub private opt-in, 생성물별 근거 선택 정책은 [Issue #12](https://github.com/koreaben777/portfolio-maker/issues/12)와 [구현 계획](https://github.com/koreaben777/portfolio-maker/blob/main/docs/superpowers/plans/2026-07-14-unified-evidence-policy.md)에서 관리합니다.
+
 ## 버그와 제안
 
 버그 리포트, 기능 아이디어, 개선 제안은 모두 [GitHub Issues](https://github.com/koreaben777/portfolio-maker/issues)로 남겨 주세요. 재현 방법, 기대한 결과, 실제 결과를 함께 적어 주시면 빠르게 확인할 수 있습니다.
