@@ -160,14 +160,15 @@ restricted: local, direct transfer, private Sites
 open_public: explicit revalidation and optional public Sites deployment
 ~~~
 
-각 `artifacts.input_manifest`에는 다음을 기록한다.
+공통 `EvidenceSelectionResult.input_manifest()`가 각 `artifacts.input_manifest`에 다음을 기록한다.
 
-- artifact kind와 `delivery_scope`
-- policy file hash
-- 포함된 source/evidence/claim/project ID와 origin type
-- 제외된 ID와 reason
-- 생성 시각과 source policy version
-- `open_public`인 경우 공개 적합성 검증 결과
+- `artifact_kind`와 `delivery_scope`
+- 활성 artifact policy와 source approval 입력을 함께 반영한 결정론적 selection-input `policy_hash` (artifact policy 파일만의 hash가 아님)
+- 포함된 source/evidence/claim ID와 하위 호환용 `source_ids`/`evidence_ids`/`claim_ids` 별칭
+- 포함되지 않은 evidence의 `excluded_decisions` (ID와 reason)
+- 선택 결과의 origin별 합계인 `origin_counts`
+
+`portfolio_html` artifact record에는 위 manifest에 더해 HTML 전용 in-memory payload의 결정론적 JSON bytes에서 계산한 `manifest_sha256`을 기록한다.
 
 ## 5. 보안 및 하위 호환성
 
