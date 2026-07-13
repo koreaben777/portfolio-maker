@@ -1,8 +1,16 @@
 # 통합 근거 풀과 생성물별 근거 선택 정책 구현 계획
 
-상태: 설계 문서 작성 완료, 구현 전
+상태: Issue #12 구현 완료 기준 및 검증 기록
 설계: docs/superpowers/specs/2026-07-14-unified-evidence-policy-design.md
 추적 Issue: #12
+
+현재 구현은 #4 승인·discovery 정책, #2 origin/migration/공통 selector, #1 공개 activity 반영과
+artifact별 restricted/open_public 선택을 포함한다. Issue #12는 실제 public hosting이나 #3
+회사/JD 맞춤 생성을 포함하지 않으므로 열린 상태로 유지한다.
+
+구현 상태: Stage A(#4), Stage B(#2), Stage C(#1), artifact builder 적용, CLI·Sites gate와
+현재 문서 정합성 갱신을 완료했다. 명령별 실행 근거는
+`docs/reviews/2026-07-14-unified-evidence-policy-verification.md`에 기록한다.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -25,7 +33,7 @@
 - `open_public`은 명시적인 선택이 필요하다. 초기 구현에서 local 또는 private GitHub는 `open_public`에 포함할 수 없으며 validation error가 된다.
 - restricted output은 로컬 파일, 직접 전달, private Sites deployment에만 쓸 수 있다. public Sites deployment는 거부한다.
 - credential, token, private raw path, secret-shaped text는 어떤 artifact에도 출력하지 않는다.
-- 현재 0.1.0 behavior는 #12가 구현되기 전까지 유지한다. 즉 현재 public manifest/HTML은 private/local evidence를 계속 제외한다.
+- artifact policy가 없는 기존 workspace는 0.1.0 호환 경로로 public manifest/HTML에서 private/local evidence를 계속 제외한다.
 - 회사/JD 맞춤 포트폴리오(#3), Google Drive, OCR, semantic search, MCP/app-server, external LLM은 구현하지 않는다.
 
 ---
@@ -431,13 +439,13 @@ git commit -m "docs: define restricted evidence sharing rollout"
 
 ## Definition of Done
 
-- [ ] Local scan uses selected excluded directories as the ordinary user-controlled exclusion policy.
-- [ ] Private GitHub discovery requires gh authentication and explicit opt-in/allowlist/approval.
-- [ ] Every generator uses the normalized common evidence graph through EvidenceSelectionService.
-- [ ] Artifact policy can exclude selected sources/evidence independently per output.
-- [ ] Default restricted public-manifest/HTML output can use approved local, public GitHub, and exact-approved private GitHub evidence.
-- [ ] Open-public output is explicit and rejects local/private origins in the first implementation.
-- [ ] Restricted output cannot be deployed publicly; private hosting or verified-recipient delivery remains available.
-- [ ] Input manifests record policy, delivery scope, origin type, and selection decisions.
-- [ ] Existing workspace migration and complete regression suite pass.
-- [ ] README, skill, Phase spec, design spec, plan, Issue #12, and verification report agree.
+- [x] Local scan uses selected excluded directories as the ordinary user-controlled exclusion policy.
+- [x] Private GitHub discovery requires gh authentication and explicit opt-in/allowlist/approval.
+- [x] Every generator uses the normalized common evidence graph through EvidenceSelectionService.
+- [x] Artifact policy can exclude selected sources/evidence independently per output.
+- [x] Default restricted public-manifest/HTML output can use approved local, public GitHub, and exact-approved private GitHub evidence.
+- [x] Open-public output is explicit and rejects local/private origins in the first implementation.
+- [x] Restricted output cannot be deployed publicly; private hosting or verified-recipient delivery remains available.
+- [x] Input manifests record policy, delivery scope, origin type, and selection decisions.
+- [x] Existing workspace migration and complete regression suite pass.
+- [x] README, skill, Phase spec, design spec, plan, and verification report agree; Issue #12 remains open.

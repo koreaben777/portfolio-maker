@@ -91,6 +91,24 @@ def test_cli_approve_sample_preserves_existing_approval_unless_forced(workspace,
     assert "file:///approved.txt" not in approval_path.read_text(encoding="utf-8")
 
 
+def test_cli_approve_write_sample_artifact_policy(workspace):
+    exit_code = main(
+        [
+            "approve",
+            "--workspace",
+            str(workspace),
+            "--write-sample-artifact-policy",
+        ]
+    )
+
+    policy_path = (
+        workspace / ".portfolio-maker" / "reviews" / "artifact-approval.json"
+    )
+    assert exit_code == 0
+    payload = json.loads(policy_path.read_text(encoding="utf-8"))
+    assert payload["artifacts"]["portfolio_html"]["delivery_scope"] == "restricted"
+
+
 def test_cli_ingest_missing_approval_exits_without_traceback(workspace, capsys):
     exit_code = main(["ingest", "--workspace", str(workspace)])
 

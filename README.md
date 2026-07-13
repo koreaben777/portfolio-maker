@@ -65,7 +65,8 @@ portfolio-maker approve --workspace . --write-sample
 ```
 
 탐색 전에는 `forbidden_paths`, `excluded_repositories`, `allowed_repositories`,
-`private_sources_allowed`, `excluded_file_patterns`만 검토합니다. 정확한 activity URL은
+`private_sources_allowed`, `excluded_file_patterns`만 검토합니다. `forbidden_paths`는
+하위 호환 alias이며 새로 지정하는 폴더는 `excluded_directories`에 기록합니다. 정확한 activity URL은
 아직 존재하지 않으므로 `approved_github_activity_urls`는 비워 둡니다.
 
 그다음 후보를 확인하고 승인 내용을 검토합니다.
@@ -80,9 +81,23 @@ portfolio-maker discover --workspace .
 ```
 
 discovery report의 `GitHub Activities`에서 URL을 고르기 전에, 대응하는
-`GitHub Repositories` 항목이 `(public)`으로 표시되는지 확인합니다. 선택한 정확한 URL을
-`approved_github_activity_urls`에 복사한 뒤, 로컬 `approved_source_uris`를 함께
-검토·완성합니다. private, excluded, missing, stale activity는 승인하지 않습니다.
+`GitHub Repositories` 항목이 `(public)`으로 표시되거나 private opt-in/allowlist를
+통과했는지 확인합니다. 선택한 정확한 URL을
+공개 activity는 `approved_github_activity_urls`에, private activity는 private opt-in과
+allowlist를 확인한 뒤 `approved_private_github_activity_urls`에 복사합니다. 로컬
+`approved_source_uris`도 함께 검토·완성합니다. excluded, missing, stale activity는
+승인하지 않습니다.
+
+로컬·공개 GitHub·private GitHub 근거를 생성물별로 선택하려면 artifact policy 예시도
+초기화합니다.
+
+```bash
+portfolio-maker approve --workspace . --write-sample-artifact-policy
+```
+
+`.portfolio-maker/reviews/artifact-approval.json`에서 생성물별 `delivery_scope`와
+`include_*`, 제외 목록을 검토합니다. 기본은 `restricted`이며, `open_public`은 별도
+재생성과 공개 적합성 검증이 필요한 공개 GitHub 전용 범위입니다.
 
 기존 workspace에서 provenance가 없는 legacy workflow activity는 안전을 위해 profile과
 portfolio draft의 입력에서 제외됩니다. 이를 복구하려면 `portfolio-maker discover
@@ -118,8 +133,9 @@ portfolio-maker render-html --workspace .
 - `allowed_repositories`가 비어 있지 않으면 그 `owner/repo`만 GitHub 탐색 대상으로 남습니다.
 - `excluded_file_patterns`는 대소문자를 구분하지 않는 파일명 glob으로 로컬 후보와 재수집을 제외합니다.
 - `approved_github_activity_urls`는 discovery가 저장한 공개 GitHub activity URL을 정확히 지정합니다. private activity 또는 allowlist 밖·excluded repository activity는 승인되어도 산출물 입력으로 쓰지 않습니다.
-- 공개 포트폴리오에는 비밀값, 토큰, 원본의 비공개 경로를 넣지 않아야 합니다.
-- `portfolio-public.json`과 `portfolio.html`은 public-safe claim/evidence와 승인된 공개 GitHub URL만 사용합니다. 프로젝트별 timeline은 해당 evidence의 날짜와 provenance만 표시합니다.
+- `approved_private_github_activity_urls`는 `private_sources_allowed`, repository allowlist, 제외 정책을 모두 통과한 private activity에만 사용합니다. private provenance는 restricted 결과에서 안전한 label로만 표시합니다.
+- 어떤 delivery scope에도 비밀값, 토큰, credential, raw local path를 넣지 않습니다.
+- `portfolio-public.json`과 `portfolio.html`은 파일명과 무관하게 artifact policy의 delivery scope를 따릅니다. 프로젝트별 timeline은 선택된 evidence의 날짜와 provenance만 표시합니다.
 - `.portfolio-maker/`는 Git에 커밋하지 마세요.
 - `portfolio.db`와 journal/WAL/SHM sidecar는 하나의 관리 단위입니다. 개별 sidecar를 임의로 바꾸거나 삭제하지 마세요.
 
@@ -131,11 +147,11 @@ portfolio-maker approve --workspace . --write-sample --force
 
 ## 현재 범위와 로드맵
 
-0.1.0에서는 승인된 로컬 자료와 명시 승인된 공개 GitHub activity를 profile 근거로 사용하고, 검토용 포트폴리오 초안과 일반형 public-safe HTML을 제공합니다. HTML은 build-time manifest를 번들한 정적 결과이며 SQLite, 원본, snapshot, credential을 runtime에 읽지 않습니다. 작업 이력은 사용자가 `.portfolio-maker/`를 직접 정리할 때까지 로컬에 남으며, 자동 보존·정리 기능은 아직 제공하지 않습니다. 회사·채용공고별 맞춤 작성(#3), Google Drive 연동, 이력서·자기소개서·면접 자료, OCR, 시맨틱 검색, MCP/app-server 인터페이스는 [GitHub Issues](https://github.com/koreaben777/portfolio-maker/issues)에서 관리합니다.
+0.1.0에서는 승인된 로컬 자료, 명시 승인된 공개 GitHub activity, 조건을 충족한 private GitHub activity를 공통 evidence pool로 관리합니다. 모든 생성물은 artifact별 `EvidenceSelectionService`를 거치며, `portfolio-public.json`과 `portfolio.html`도 기본 `restricted` 결과입니다. HTML은 build-time manifest를 번들한 정적 결과이며 SQLite, 원본, snapshot, credential을 runtime에 읽지 않습니다. 회사·채용공고별 맞춤 작성(#3), Google Drive 연동, 이력서·자기소개서·면접 자료, OCR, 시맨틱 검색, MCP/app-server 인터페이스는 [GitHub Issues](https://github.com/koreaben777/portfolio-maker/issues)에서 관리합니다.
 
-로컬 제외 폴더, GitHub private opt-in, 생성물별 근거 선택 정책은 [Issue #12](https://github.com/koreaben777/portfolio-maker/issues/12)와 [구현 계획](https://github.com/koreaben777/portfolio-maker/blob/main/docs/superpowers/plans/2026-07-14-unified-evidence-policy.md)에서 관리합니다. 이 정책은 아직 구현 전이므로 현재 `portfolio-public.json`과 `portfolio.html`은 기존처럼 public-safe 공개 GitHub 근거만 사용합니다.
+로컬 제외 폴더, GitHub private opt-in, 생성물별 근거 선택 정책은 [Issue #12](https://github.com/koreaben777/portfolio-maker/issues/12)와 [구현 계획](https://github.com/koreaben777/portfolio-maker/blob/main/docs/superpowers/plans/2026-07-14-unified-evidence-policy.md)에서 관리합니다. artifact policy가 없는 기존 workspace는 0.1.0 호환 경로로 public GitHub evidence만 manifest/HTML에 사용합니다.
 
-#12 구현 후에도 두 파일명의 `public`은 호환성 이름입니다. 기본 결과는 **제한 공유(restricted)**로 생성되어, 승인된 로컬 자료·승인된 공개 GitHub·명시 승인된 private GitHub 근거를 포함할 수 있습니다. 이는 자동 인터넷 공개를 뜻하지 않으며 로컬 사용, 검증된 수신자 전달, private hosting을 위한 범위입니다. 누구나 접근 가능한 배포는 별도 `open_public` 선택과 재검증을 거쳐야 합니다.
+두 파일명의 `public`은 호환성 이름입니다. `restricted`는 자동 인터넷 공개를 뜻하지 않으며 로컬 사용, 검증된 수신자 전달, private hosting을 위한 범위입니다. 누구나 접근 가능한 배포는 별도 `open_public` 선택과 재검증을 거쳐야 하며, 이 구현에서는 local/private origin을 거부합니다.
 
 ## 버그와 제안
 
@@ -163,7 +179,7 @@ gh auth login
 
 ### 권한 오류
 
-권한이 없는 경로는 건너뛰고 보고서에 기록됩니다. 민감한 폴더는 `.portfolio-maker/reviews/source-approval.json`의 `forbidden_paths`에 추가하세요.
+권한이 없는 경로는 건너뛰고 보고서에 기록됩니다. 민감한 폴더는 `.portfolio-maker/reviews/source-approval.json`의 `excluded_directories`에 추가하세요. 기존 `forbidden_paths`도 하위 호환 alias로 읽습니다.
 
 ### 데이터베이스 복구
 

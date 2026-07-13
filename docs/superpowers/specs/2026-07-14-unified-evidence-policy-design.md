@@ -1,7 +1,7 @@
 # 통합 근거 풀과 생성물별 근거 선택 정책 설계
 
 날짜: 2026-07-14
-상태: 제안 설계 / 구현 전
+상태: Issue #12 구현 기준
 추적 Issue: #12
 
 ## 1. 목적
@@ -176,7 +176,7 @@ open_public: explicit revalidation and optional public Sites deployment
 - private source/activity의 이름·URL을 restricted output에 넣는 경우도 artifact policy와 locator 공유 승인을 재검증한다.
 - approval 파일과 artifact policy 파일의 JSON 오류는 traceback 없는 controlled error가 된다.
 - 기존 `source-approval.json`에는 artifact policy가 없어도 기존 0.1.0 workspace가 열려야 한다.
-- #12 구현 전 기존 public HTML은 private/local evidence를 포함하지 않는 보수적 현재 동작을 유지한다.
+- artifact policy가 없는 기존 workspace는 0.1.0 호환 경로로 private/local evidence를 포함하지 않는 보수적 선택을 유지한다.
 - 전달 범위를 바꾸면 이전 artifact를 그대로 재사용하지 않고 해당 artifact를 다시 생성한다.
 - source/evidence의 origin visibility와 `delivery_scope`를 혼동하지 않는다. private origin 근거가 restricted artifact에 들어갈 수 있어도 open public 허용을 뜻하지 않는다.
 
