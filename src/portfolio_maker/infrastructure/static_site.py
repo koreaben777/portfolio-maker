@@ -3,10 +3,29 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import re
+from dataclasses import dataclass
 
 
 class StaticSiteError(ValueError):
     pass
+
+
+@dataclass(frozen=True)
+class DeploymentArtifact:
+    path: Path
+    delivery_scope: str
+
+
+def prepare_public_deployment(artifact: DeploymentArtifact) -> DeploymentArtifact:
+    if artifact.delivery_scope != "open_public":
+        raise StaticSiteError("public deployment requires open_public output")
+    return artifact
+
+
+def prepare_private_deployment(artifact: DeploymentArtifact) -> DeploymentArtifact:
+    if artifact.delivery_scope not in {"restricted", "open_public"}:
+        raise StaticSiteError("private deployment requires a validated delivery scope")
+    return artifact
 
 
 _ROOT_ASSET_REFERENCE = re.compile(r"(?:src|href)=\s*[\"']/")

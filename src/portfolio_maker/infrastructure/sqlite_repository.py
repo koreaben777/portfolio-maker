@@ -38,6 +38,8 @@ CREATE TABLE IF NOT EXISTS sources (
     status TEXT NOT NULL CHECK(status IN (
         'discovered', 'approved', 'ingested', 'skipped_policy', 'extract_failed', 'stale_source'
     )),
+    origin_type TEXT NOT NULL DEFAULT 'local',
+    origin_visibility TEXT NOT NULL DEFAULT 'unknown',
     discovered_at TEXT DEFAULT CURRENT_TIMESTAMP,
     approved_at TEXT
 );
@@ -64,6 +66,8 @@ CREATE TABLE IF NOT EXISTS github_activities (
     merged_at TEXT,
     is_private INTEGER NOT NULL DEFAULT 0 CHECK(is_private IN (0, 1)),
     state_field TEXT CHECK(state_field IS NULL OR state_field IN ('conclusion', 'status')),
+    origin_type TEXT NOT NULL DEFAULT 'public_github',
+    origin_visibility TEXT NOT NULL DEFAULT 'unknown',
     UNIQUE(repo, activity_type, url)
 );
 
@@ -76,6 +80,8 @@ CREATE TABLE IF NOT EXISTS evidence_items (
     stable_id TEXT NOT NULL UNIQUE,
     content_hash TEXT,
     public_safe INTEGER NOT NULL DEFAULT 0 CHECK(public_safe IN (0, 1)),
+    origin_type TEXT NOT NULL DEFAULT 'local',
+    origin_visibility TEXT NOT NULL DEFAULT 'unknown',
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
     CHECK(source_id IS NOT NULL OR github_activity_id IS NOT NULL)
 );
@@ -452,6 +458,7 @@ class SQLiteRepository:
             self._ensure_github_activity_visibility_column(conn)
             self._ensure_github_activity_state_field_column(conn)
             self._ensure_legacy_normalized_columns(conn)
+            self._ensure_origin_columns(conn)
 
     @staticmethod
     def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
@@ -543,6 +550,75 @@ class SQLiteRepository:
                 "CHECK(state_field IS NULL OR state_field IN ('conclusion', 'status'))"
             )
 
+    @staticmethod
+    def _ensure_origin_columns(conn: sqlite3.Connection) -> None:
+        table_defaults = (
+            ("sources", "origin_type", "local"),
+            ("sources", "origin_visibility", "unknown"),
+            ("github_activities", "origin_type", "public_github"),
+            ("github_activities", "origin_visibility", "unknown"),
+            ("evidence_items", "origin_type", "local"),
+            ("evidence_items", "origin_visibility", "unknown"),
+        )
+        for table, column, default in table_defaults:
+            if column not in SQLiteRepository._table_columns(conn, table):
+                conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {column} TEXT NOT NULL DEFAULT '{default}'"
+                )
+        conn.execute(
+            """
+            UPDATE sources
+            SET origin_type = CASE
+                WHEN type = 'github_repository' THEN 'public_github'
+                ELSE 'local'
+            END,
+            origin_visibility = CASE
+                WHEN type = 'local_file' THEN 'private'
+                WHEN EXISTS (
+                    SELECT 1 FROM github_activities
+                    WHERE github_activities.source_id = sources.id
+                      AND github_activities.is_private = 1
+                ) THEN 'private'
+                ELSE 'public'
+            END
+            WHERE origin_visibility = 'unknown'
+            """
+        )
+        conn.execute(
+            """
+            UPDATE github_activities
+            SET origin_type = CASE WHEN is_private = 1 THEN 'private_github' ELSE 'public_github' END,
+                origin_visibility = CASE WHEN is_private = 1 THEN 'private' ELSE 'public' END
+            WHERE origin_visibility = 'unknown'
+            """
+        )
+        conn.execute(
+            """
+            UPDATE evidence_items
+            SET origin_type = CASE
+                    WHEN github_activity_id IS NOT NULL
+                        AND EXISTS (
+                            SELECT 1 FROM github_activities
+                            WHERE github_activities.id = evidence_items.github_activity_id
+                              AND github_activities.is_private = 1
+                        ) THEN 'private_github'
+                    WHEN github_activity_id IS NOT NULL THEN 'public_github'
+                    ELSE 'local'
+                END,
+                origin_visibility = CASE
+                    WHEN github_activity_id IS NOT NULL
+                        AND EXISTS (
+                            SELECT 1 FROM github_activities
+                            WHERE github_activities.id = evidence_items.github_activity_id
+                              AND github_activities.is_private = 1
+                        ) THEN 'private'
+                    WHEN github_activity_id IS NOT NULL THEN 'public'
+                    ELSE 'private'
+                END
+            WHERE origin_visibility = 'unknown'
+            """
+        )
+
     def table_names(self) -> set[str]:
         with self._read_connection() as conn:
             rows = conn.execute(
@@ -552,29 +628,70 @@ class SQLiteRepository:
 
     def upsert_source(self, source: Source) -> int:
         with self._connection() as conn:
-            conn.execute(
-                """
-                INSERT INTO sources (type, uri, display_name, owner, status)
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(uri) DO UPDATE SET
-                    type = excluded.type,
-                    display_name = excluded.display_name,
-                    owner = excluded.owner,
-                    status = CASE
-                        WHEN sources.status = ? AND excluded.status = ? THEN sources.status
-                        ELSE excluded.status
-                    END
-                """,
-                (
-                    source.type.value,
-                    source.uri,
-                    source.display_name,
-                    source.owner,
-                    source.status.value,
-                    SourceStatus.INGESTED.value,
-                    SourceStatus.DISCOVERED.value,
-                ),
+            columns = self._table_columns(conn, "sources")
+            origin_type = source.origin_type or (
+                "public_github"
+                if source.type == SourceType.GITHUB_REPOSITORY
+                else "local"
             )
+            origin_visibility = source.origin_visibility or (
+                "public"
+                if source.type == SourceType.GITHUB_REPOSITORY
+                else "private"
+            )
+            if {"origin_type", "origin_visibility"} <= columns:
+                conn.execute(
+                    """
+                    INSERT INTO sources
+                        (type, uri, display_name, owner, status, origin_type, origin_visibility)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(uri) DO UPDATE SET
+                        type = excluded.type,
+                        display_name = excluded.display_name,
+                        owner = excluded.owner,
+                        origin_type = excluded.origin_type,
+                        origin_visibility = excluded.origin_visibility,
+                        status = CASE
+                            WHEN sources.status = ? AND excluded.status = ? THEN sources.status
+                            ELSE excluded.status
+                        END
+                    """,
+                    (
+                        source.type.value,
+                        source.uri,
+                        source.display_name,
+                        source.owner,
+                        source.status.value,
+                        origin_type,
+                        origin_visibility,
+                        SourceStatus.INGESTED.value,
+                        SourceStatus.DISCOVERED.value,
+                    ),
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO sources (type, uri, display_name, owner, status)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(uri) DO UPDATE SET
+                        type = excluded.type,
+                        display_name = excluded.display_name,
+                        owner = excluded.owner,
+                        status = CASE
+                            WHEN sources.status = ? AND excluded.status = ? THEN sources.status
+                            ELSE excluded.status
+                        END
+                    """,
+                    (
+                        source.type.value,
+                        source.uri,
+                        source.display_name,
+                        source.owner,
+                        source.status.value,
+                        SourceStatus.INGESTED.value,
+                        SourceStatus.DISCOVERED.value,
+                    ),
+                )
             row = conn.execute(
                 "SELECT id FROM sources WHERE uri = ?",
                 (source.uri,),
@@ -596,6 +713,13 @@ class SQLiteRepository:
         if activity_url is None:
             raise RepositoryError("GitHub activity URL is invalid")
         with self._connection() as conn:
+            columns = self._table_columns(conn, "github_activities")
+            origin_type = activity.origin_type or (
+                "private_github" if activity.is_private else "public_github"
+            )
+            origin_visibility = activity.origin_visibility or (
+                "private" if activity.is_private else "public"
+            )
             values = (
                 activity.source_id,
                 repository_name,
@@ -609,6 +733,17 @@ class SQLiteRepository:
                 int(activity.is_private),
                 activity.state_field,
             )
+            if {"origin_type", "origin_visibility"} <= columns:
+                values = (*values, origin_type, origin_visibility)
+                if activity.source_id is not None:
+                    conn.execute(
+                        """
+                        UPDATE sources
+                        SET origin_type = ?, origin_visibility = ?
+                        WHERE id = ? AND type = 'github_repository'
+                        """,
+                        (origin_type, origin_visibility, activity.source_id),
+                    )
             candidate_rows = conn.execute(
                 """
                 SELECT id, url FROM github_activities
@@ -642,25 +777,51 @@ class SQLiteRepository:
                         f"DELETE FROM github_activities WHERE id IN ({placeholders})",
                         duplicate_ids,
                     )
-                conn.execute(
-                    """
-                    UPDATE github_activities SET
-                        source_id = ?, repo = ?, activity_type = ?, url = ?,
-                        title = ?, state = ?, author = ?, created_at = ?,
-                        merged_at = ?, is_private = ?, state_field = ?
-                    WHERE id = ?
-                    """,
-                    (*values, survivor_id),
-                )
+                if {"origin_type", "origin_visibility"} <= columns:
+                    conn.execute(
+                        """
+                        UPDATE github_activities SET
+                            source_id = ?, repo = ?, activity_type = ?, url = ?,
+                            title = ?, state = ?, author = ?, created_at = ?,
+                            merged_at = ?, is_private = ?, state_field = ?,
+                            origin_type = ?, origin_visibility = ?
+                        WHERE id = ?
+                        """,
+                        (*values, survivor_id),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        UPDATE github_activities SET
+                            source_id = ?, repo = ?, activity_type = ?, url = ?,
+                            title = ?, state = ?, author = ?, created_at = ?,
+                            merged_at = ?, is_private = ?, state_field = ?
+                        WHERE id = ?
+                        """,
+                        (*values, survivor_id),
+                    )
             else:
-                conn.execute(
-                    """
-                    INSERT INTO github_activities
-                        (source_id, repo, activity_type, url, title, state, author, created_at, merged_at, is_private, state_field)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    values,
-                )
+                if {"origin_type", "origin_visibility"} <= columns:
+                    conn.execute(
+                        """
+                        INSERT INTO github_activities
+                            (source_id, repo, activity_type, url, title, state, author,
+                             created_at, merged_at, is_private, state_field,
+                             origin_type, origin_visibility)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        values,
+                    )
+                else:
+                    conn.execute(
+                        """
+                        INSERT INTO github_activities
+                            (source_id, repo, activity_type, url, title, state, author,
+                             created_at, merged_at, is_private, state_field)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        values,
+                    )
             row = conn.execute(
                 """
                 SELECT id FROM github_activities
@@ -723,10 +884,16 @@ class SQLiteRepository:
 
     def list_github_activities(self) -> list[GitHubActivity]:
         with self._read_connection() as conn:
+            columns = self._table_columns(conn, "github_activities")
+            origin_type = "origin_type" if "origin_type" in columns else "'public_github'"
+            origin_visibility = (
+                "origin_visibility" if "origin_visibility" in columns else "'unknown'"
+            )
             rows = conn.execute(
-                """
+                f"""
                 SELECT id, source_id, repo, activity_type, url, title, state, author,
-                       created_at, merged_at, is_private, state_field
+                       created_at, merged_at, is_private, state_field,
+                       {origin_type} AS origin_type, {origin_visibility} AS origin_visibility
                 FROM github_activities
                 ORDER BY id
                 """
@@ -749,16 +916,25 @@ class SQLiteRepository:
                         merged_at=self._optional_text(row, "merged_at"),
                         is_private=bool(self._required_boolean(row, "is_private")),
                         state_field=self._optional_text(row, "state_field"),
+                        origin_type=self._required_text(row, "origin_type"),
+                        origin_visibility=self._required_text(row, "origin_visibility"),
                     )
                 )
             return activities
         except (KeyError, TypeError, ValueError) as error:
             raise self._semantic_error() from error
 
-    def list_public_evidence_records(self) -> list[PublicEvidenceRecord]:
+    def list_public_evidence_records(
+        self, *, include_unsafe: bool = False
+    ) -> list[PublicEvidenceRecord]:
+        safety_clause = "" if include_unsafe else """
+                WHERE projects.public_safe = 1
+                  AND career_claims.public_safe = 1
+                  AND evidence_items.public_safe = 1
+        """
         with self._read_connection() as conn:
             rows = conn.execute(
-                """
+                f"""
                 SELECT
                     projects.id AS project_id,
                     projects.name AS project_name,
@@ -767,11 +943,15 @@ class SQLiteRepository:
                     evidence_items.id AS evidence_id,
                     evidence_items.stable_id AS evidence_stable_id,
                     evidence_items.locator AS evidence_locator,
+                    evidence_items.origin_type AS evidence_origin_type,
+                    evidence_items.origin_visibility AS evidence_origin_visibility,
                     sources.id AS source_id,
                     sources.type AS source_type,
                     sources.uri AS source_uri,
                     sources.display_name AS source_display_name,
                     sources.status AS source_status,
+                    sources.origin_type AS source_origin_type,
+                    sources.origin_visibility AS source_origin_visibility,
                     github_activities.id AS activity_id,
                     github_activities.repo AS activity_repo,
                     github_activities.activity_type AS activity_type,
@@ -781,7 +961,9 @@ class SQLiteRepository:
                     github_activities.state_field AS activity_state_field,
                     github_activities.author AS activity_author,
                     github_activities.created_at AS activity_created_at,
-                    github_activities.is_private AS activity_is_private
+                    github_activities.is_private AS activity_is_private,
+                    github_activities.origin_type AS activity_origin_type,
+                    github_activities.origin_visibility AS activity_origin_visibility
                 FROM projects
                 JOIN career_claims
                   ON career_claims.project_id = projects.id
@@ -796,9 +978,7 @@ class SQLiteRepository:
                       evidence_items.source_id,
                       github_activities.source_id
                   )
-                WHERE projects.public_safe = 1
-                  AND career_claims.public_safe = 1
-                  AND evidence_items.public_safe = 1
+                {safety_clause}
                 ORDER BY projects.id, career_claims.id, evidence_items.id
                 """
             ).fetchall()
@@ -835,11 +1015,26 @@ class SQLiteRepository:
                         activity_author=self._optional_text(row, "activity_author"),
                         activity_created_at=self._optional_text(row, "activity_created_at"),
                         activity_is_private=activity_is_private,
+                        evidence_origin_type=self._required_text(row, "evidence_origin_type"),
+                        evidence_origin_visibility=self._required_text(
+                            row, "evidence_origin_visibility"
+                        ),
+                        source_origin_type=self._optional_text(row, "source_origin_type"),
+                        source_origin_visibility=self._optional_text(
+                            row, "source_origin_visibility"
+                        ),
+                        activity_origin_type=self._optional_text(row, "activity_origin_type"),
+                        activity_origin_visibility=self._optional_text(
+                            row, "activity_origin_visibility"
+                        ),
                     )
                 )
             return records
         except (KeyError, TypeError, ValueError) as error:
             raise self._semantic_error() from error
+
+    def list_evidence_selection_records(self) -> list[PublicEvidenceRecord]:
+        return self.list_public_evidence_records(include_unsafe=True)
 
     def upsert_evidence_item(
         self,
@@ -851,10 +1046,28 @@ class SQLiteRepository:
         stable_id: str,
         content_hash: str | None,
         public_safe: bool,
+        origin_type: str | None = None,
+        origin_visibility: str | None = None,
     ) -> int:
         with self._connection() as conn:
             columns = self._table_columns(conn, "evidence_items")
-            values = (
+            if github_activity_id is not None and (
+                origin_type is None or origin_visibility is None
+            ):
+                activity_row = conn.execute(
+                    "SELECT is_private FROM github_activities WHERE id = ?",
+                    (github_activity_id,),
+                ).fetchone()
+                is_private = activity_row is not None and activity_row["is_private"] == 1
+                origin_type = origin_type or (
+                    "private_github" if is_private else "public_github"
+                )
+                origin_visibility = origin_visibility or (
+                    "private" if is_private else "public"
+                )
+            origin_type = origin_type or "local"
+            origin_visibility = origin_visibility or "private"
+            base_values = (
                 source_id,
                 snapshot_id,
                 github_activity_id,
@@ -863,7 +1076,31 @@ class SQLiteRepository:
                 content_hash,
                 int(public_safe),
             )
-            if {"kind", "summary", "confidence"} <= columns:
+            if {"origin_type", "origin_visibility"} <= columns:
+                values = (*base_values, origin_type, origin_visibility)
+            else:
+                values = base_values
+            if {"kind", "summary", "confidence", "origin_type", "origin_visibility"} <= columns:
+                conn.execute(
+                    """
+                    INSERT INTO evidence_items
+                        (source_id, snapshot_id, github_activity_id, locator, stable_id,
+                         content_hash, public_safe, origin_type, origin_visibility,
+                         kind, summary, confidence)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'evidence', ?, 'medium')
+                    ON CONFLICT(stable_id) DO UPDATE SET
+                        source_id = excluded.source_id,
+                        snapshot_id = excluded.snapshot_id,
+                        github_activity_id = excluded.github_activity_id,
+                        locator = excluded.locator,
+                        content_hash = excluded.content_hash,
+                        public_safe = excluded.public_safe,
+                        origin_type = excluded.origin_type,
+                        origin_visibility = excluded.origin_visibility
+                    """,
+                    (*values, locator),
+                )
+            elif {"kind", "summary", "confidence"} <= columns:
                 conn.execute(
                     """
                     INSERT INTO evidence_items
@@ -878,7 +1115,26 @@ class SQLiteRepository:
                         content_hash = excluded.content_hash,
                         public_safe = excluded.public_safe
                     """,
-                    (*values[:5], values[5], values[6], locator),
+                    (*base_values[:5], base_values[5], base_values[6], locator),
+                )
+            elif {"origin_type", "origin_visibility"} <= columns:
+                conn.execute(
+                    """
+                    INSERT INTO evidence_items
+                        (source_id, snapshot_id, github_activity_id, locator, stable_id,
+                         content_hash, public_safe, origin_type, origin_visibility)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(stable_id) DO UPDATE SET
+                        source_id = excluded.source_id,
+                        snapshot_id = excluded.snapshot_id,
+                        github_activity_id = excluded.github_activity_id,
+                        locator = excluded.locator,
+                        content_hash = excluded.content_hash,
+                        public_safe = excluded.public_safe,
+                        origin_type = excluded.origin_type,
+                        origin_visibility = excluded.origin_visibility
+                    """,
+                    values,
                 )
             else:
                 conn.execute(
@@ -894,7 +1150,7 @@ class SQLiteRepository:
                         content_hash = excluded.content_hash,
                         public_safe = excluded.public_safe
                     """,
-                    values,
+                    base_values,
                 )
             row = conn.execute(
                 "SELECT id FROM evidence_items WHERE stable_id = ?", (stable_id,)
@@ -1154,14 +1410,22 @@ class SQLiteRepository:
             raise self._semantic_error() from error
 
     def list_sources(self, status: SourceStatus | None = None) -> list[Source]:
-        sql = "SELECT id, type, uri, display_name, owner, status FROM sources"
-        params: tuple[str, ...] = ()
-        if status is not None:
-            sql += " WHERE status = ?"
-            params = (status.value,)
-        sql += " ORDER BY id"
-
         with self._read_connection() as conn:
+            columns = self._table_columns(conn, "sources")
+            origin_type = "origin_type" if "origin_type" in columns else "'local'"
+            origin_visibility = (
+                "origin_visibility" if "origin_visibility" in columns else "'unknown'"
+            )
+            sql = (
+                "SELECT id, type, uri, display_name, owner, status, "
+                f"{origin_type} AS origin_type, {origin_visibility} AS origin_visibility "
+                "FROM sources"
+            )
+            params: tuple[str, ...] = ()
+            if status is not None:
+                sql += " WHERE status = ?"
+                params = (status.value,)
+            sql += " ORDER BY id"
             rows = conn.execute(sql, params).fetchall()
 
         try:
@@ -1173,6 +1437,8 @@ class SQLiteRepository:
                     display_name=self._required_text(row, "display_name"),
                     owner=self._optional_text(row, "owner"),
                     status=SourceStatus(self._required_text(row, "status")),
+                    origin_type=self._required_text(row, "origin_type"),
+                    origin_visibility=self._required_text(row, "origin_visibility"),
                 )
                 for row in rows
             ]

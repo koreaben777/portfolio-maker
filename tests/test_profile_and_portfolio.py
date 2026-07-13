@@ -151,7 +151,7 @@ def test_build_profile_and_draft_portfolio_from_ingested_source(tmp_path):
     assert profile["sources"][0] == {
         "id": source_id,
         "type": "local_file",
-        "uri": source_path.resolve().as_uri(),
+        "uri": f"local-source:{source_id}",
         "display_name": "Portfolio Maker",
         "owner": None,
         "status": "ingested",
@@ -162,8 +162,8 @@ def test_build_profile_and_draft_portfolio_from_ingested_source(tmp_path):
             "text": "Portfolio Maker: Built an approval-gated evidence pipeline.",
             "confidence": "medium",
             "public_safe": False,
-            "evidence_uri": source_path.resolve().as_uri(),
-            "evidence_snapshot": str(snapshot_path),
+            "evidence_uri": f"local-evidence:{profile_result.evidence_ids[0]}",
+            "evidence_snapshot": "local-snapshot:1",
         }
     ]
     profile_markdown = paths.master_profile_md_path.read_text(encoding="utf-8")
@@ -183,6 +183,56 @@ def test_build_profile_and_draft_portfolio_from_ingested_source(tmp_path):
     assert "- Outcome: Evidence review required" in draft
     assert "Internal evidence reference: `Portfolio Maker`" in draft
     assert str(source_path) not in draft
+
+
+def test_build_profile_keeps_normal_one_line_snapshot_evidence(tmp_path):
+    workspace = tmp_path / "workspace"
+    paths = WorkspacePaths.from_root(workspace)
+    source_path = tmp_path / "project" / "README.md"
+    source_path.parent.mkdir()
+    source_path.write_text("# README.md", encoding="utf-8")
+    write_sample_approval(paths)
+    approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    approval["approved_source_uris"] = [source_path.resolve().as_uri()]
+    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    source_id = repository.upsert_source(
+        Source(
+            None,
+            SourceType.LOCAL_FILE,
+            source_path.resolve().as_uri(),
+            "README.md",
+            None,
+            SourceStatus.INGESTED,
+        )
+    )
+    extracted = extract_text(source_path)
+    snapshot_path = paths.local_snapshots_dir / f"source-{source_id}-{extracted.content_hash}.json"
+    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+    snapshot_path.write_text(
+        json.dumps(
+            {
+                "source_id": source_id,
+                "source_uri": source_path.resolve().as_uri(),
+                "display_name": "README.md",
+                "content_hash": extracted.content_hash,
+                "extractor": extracted.extractor,
+                "extracted_at": "2026-07-13T00:00:00Z",
+                "text": "# README.md",
+            }
+        ),
+        encoding="utf-8",
+    )
+    repository.insert_source_snapshot(
+        source_id, snapshot_path, extracted.content_hash, extracted.extractor
+    )
+
+    result = build_profile(BuildProfileRequest(workspace=workspace))
+
+    assert result.claim_count == 1
+    profile = json.loads(paths.master_profile_json_path.read_text(encoding="utf-8"))
+    assert profile["claims"][0]["text"] == "README.md: README.md"
 
 
 def test_build_profile_includes_only_explicitly_approved_public_github_activity(tmp_path):

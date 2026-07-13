@@ -22,11 +22,13 @@ def test_write_sample_approval_creates_empty_versioned_json(workspace):
         "version": 1,
         "approved_source_uris": [],
         "forbidden_paths": [],
+        "excluded_directories": [],
         "excluded_repositories": [],
         "private_sources_allowed": False,
         "allowed_repositories": [],
         "excluded_file_patterns": [],
         "approved_github_activity_urls": [],
+        "approved_private_github_activity_urls": [],
     }
 
 
@@ -109,6 +111,50 @@ def test_load_approval_reads_valid_payload(workspace):
     assert approval.forbidden_paths == ((workspace / "secrets").resolve(),)
     assert approval.excluded_repositories == ("private-org/private-repo",)
     assert approval.private_sources_allowed is True
+
+
+def test_load_approval_merges_legacy_forbidden_paths_and_excluded_directories(workspace):
+    paths = WorkspacePaths.from_root(workspace)
+    paths.ensure()
+    paths.approval_path.write_text(
+        json.dumps(
+            {
+                "forbidden_paths": ["legacy", "shared"],
+                "excluded_directories": ["shared", "new"],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    approval = load_approval(paths)
+
+    expected = (
+        (workspace / "legacy").resolve(),
+        (workspace / "shared").resolve(),
+        (workspace / "new").resolve(),
+    )
+    assert approval.excluded_directories == expected
+    assert approval.forbidden_paths == expected
+
+
+def test_load_approval_reads_private_activity_approvals(workspace):
+    paths = WorkspacePaths.from_root(workspace)
+    paths.ensure()
+    paths.approval_path.write_text(
+        json.dumps(
+            {
+                "private_sources_allowed": True,
+                "approved_private_github_activity_urls": [
+                    "https://github.com/octo/private/pull/7"
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert load_approval(paths).approved_private_github_activity_urls == (
+        "https://github.com/octo/private/pull/7",
+    )
 
 
 def test_load_approval_reads_repository_allowlist_and_filename_patterns(workspace):

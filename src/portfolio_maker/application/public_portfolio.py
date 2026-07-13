@@ -1,31 +1,27 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 
 from portfolio_maker.application.approval import load_approval
+from portfolio_maker.application.artifact_approval import load_artifact_policy
 from portfolio_maker.application.build_profile import build_profile
+from portfolio_maker.application.evidence_selection import (
+    EvidenceSelectionRequest,
+    EvidenceSelectionResult,
+    EvidenceSelectionService,
+)
 from portfolio_maker.application.models import (
+    ArtifactKind,
     BuildProfileRequest,
     PublicPortfolioRequest,
     PublicPortfolioResult,
 )
 from portfolio_maker.domain.models import PublicEvidenceRecord
 from portfolio_maker.infrastructure.artifacts import write_json
-from portfolio_maker.infrastructure.github_connector import (
-    canonical_public_github_activity_url,
-    canonical_repository_name,
-    contains_unicode_control,
-    is_valid_github_activity_state,
-    is_valid_github_timestamp,
-    public_github_activity_identity,
-    public_github_repository_name,
-)
-from portfolio_maker.infrastructure.policy import (
-    contains_hidden_secret_shaped_public_value,
-    mask_public_value,
-)
-from portfolio_maker.infrastructure.presentation import normalize_label
+from portfolio_maker.infrastructure.policy import mask_public_value
+from portfolio_maker.infrastructure.presentation import normalize_label, safe_local_public_label
 from portfolio_maker.infrastructure.sqlite_repository import SQLiteRepository
 from portfolio_maker.workspace import WorkspacePaths
 
@@ -34,7 +30,48 @@ class PublicPortfolioError(ValueError):
     pass
 
 
+@dataclass(frozen=True)
+class PublicPortfolioBuild:
+    payload: dict[str, object]
+    selection: EvidenceSelectionResult
+    result: PublicPortfolioResult
+
+
 def build_public_portfolio(request: PublicPortfolioRequest) -> PublicPortfolioResult:
+    paths = WorkspacePaths.from_root(request.workspace)
+    build = build_public_portfolio_payload(request, "portfolio_public_manifest")
+    selection = build.selection
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+
+    write_json(paths.portfolio_public_json_path, build.payload)
+    repository.record_artifact(
+        "portfolio_public",
+        1,
+        json.dumps(
+            {
+                **selection.input_manifest("portfolio_public_manifest"),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+    )
+    return PublicPortfolioResult(
+        manifest_path=paths.portfolio_public_json_path,
+        project_count=build.result.project_count,
+        claim_count=build.result.claim_count,
+        evidence_count=build.result.evidence_count,
+        claim_ids=build.result.claim_ids,
+        evidence_ids=build.result.evidence_ids,
+    )
+
+
+def build_public_portfolio_payload(
+    request: PublicPortfolioRequest,
+    artifact_kind: ArtifactKind,
+) -> PublicPortfolioBuild:
+    if artifact_kind not in {"portfolio_public_manifest", "portfolio_html"}:
+        raise PublicPortfolioError("unsupported public portfolio artifact kind")
     paths = WorkspacePaths.from_root(request.workspace)
     paths.ensure()
     build_profile(
@@ -43,15 +80,40 @@ def build_public_portfolio(request: PublicPortfolioRequest) -> PublicPortfolioRe
             invalidate_portfolio_draft=False,
         )
     )
-    approval = load_approval(paths)
     repository = SQLiteRepository(paths.db_path)
     repository.initialize()
+    selection = EvidenceSelectionService().select(
+        repository,
+        EvidenceSelectionRequest(
+            artifact_kind=artifact_kind,
+            policy=load_artifact_policy(paths),
+            current_approval=load_approval(paths),
+        ),
+    )
+    payload, claim_ids, evidence_ids = _assemble_payload(selection, artifact_kind)
+    return PublicPortfolioBuild(
+        payload=payload,
+        selection=selection,
+        result=PublicPortfolioResult(
+            manifest_path=paths.portfolio_public_json_path,
+            project_count=len(payload["projects"]),
+            claim_count=len(set(claim_ids)),
+            evidence_count=len(set(evidence_ids)),
+            claim_ids=tuple(sorted(set(claim_ids))),
+            evidence_ids=tuple(sorted(set(evidence_ids))),
+        ),
+    )
 
+
+def _assemble_payload(
+    selection: EvidenceSelectionResult,
+    artifact_kind: ArtifactKind,
+) -> tuple[dict[str, object], list[int], list[int]]:
     projects: dict[str, dict[str, object]] = {}
     claim_ids: list[int] = []
     evidence_ids: list[int] = []
-    for record in repository.list_public_evidence_records():
-        item = _public_record(record, approval)
+    for record in selection.records:
+        item = _public_record(record)
         if item is None:
             continue
         project_key = str(item["project_key"])
@@ -104,6 +166,9 @@ def build_public_portfolio(request: PublicPortfolioRequest) -> PublicPortfolioRe
 
     payload = {
         "version": 1,
+        "delivery_scope": selection.delivery_scope,
+        "policy_hash": selection.policy_hash,
+        "selection": selection.input_manifest(artifact_kind),
         "generated_at": datetime.now(timezone.utc)
         .replace(microsecond=0)
         .isoformat()
@@ -113,100 +178,51 @@ def build_public_portfolio(request: PublicPortfolioRequest) -> PublicPortfolioRe
         "skills": [],
         "links": [],
     }
-    write_json(paths.portfolio_public_json_path, payload)
-    repository.record_artifact(
-        "portfolio_public",
-        1,
-        json.dumps(
-            {
-                "claim_ids": sorted(set(claim_ids)),
-                "evidence_ids": sorted(set(evidence_ids)),
+    return payload, claim_ids, evidence_ids
+
+
+def _public_record(record: PublicEvidenceRecord) -> dict[str, object] | None:
+    if record.activity_id is None:
+        label = safe_local_public_label(mask_public_value(record.source_display_name or ""))
+        if not label:
+            return None
+        return {
+            "project_key": f"local:{record.source_id}",
+            "project_name": label,
+            "repository": None,
+            "claim_id": record.claim_id,
+            "claim_text": f"Approved local evidence: {label}",
+            "evidence": {
+                "id": record.evidence_id,
+                "kind": "local_evidence",
+                "public_safe": True,
+                "source_label": label,
+                "provenance": "Approved local evidence",
             },
-            sort_keys=True,
-            separators=(",", ":"),
-        ),
-    )
-    return PublicPortfolioResult(
-        manifest_path=paths.portfolio_public_json_path,
-        project_count=len(projects),
-        claim_count=len(set(claim_ids)),
-        evidence_count=len(set(evidence_ids)),
-        claim_ids=tuple(sorted(set(claim_ids))),
-        evidence_ids=tuple(sorted(set(evidence_ids))),
-    )
+            "timeline": {
+                "evidence_id": record.evidence_id,
+                "activity_type": "local_evidence",
+                "title": label,
+                "created_at": "",
+                "provenance": "Approved local evidence",
+            },
+        }
 
-
-def _public_record(
-    record: PublicEvidenceRecord,
-    approval,
-) -> dict[str, object] | None:
-    if record.activity_id is not None:
-        return _public_github_record(record, approval)
-    return None
-
-
-def _public_github_record(record: PublicEvidenceRecord, approval) -> dict[str, object] | None:
-    required = (
-        record.activity_id,
-        record.source_id,
-        record.source_type,
-        record.source_uri,
-        record.source_status,
-        record.activity_repo,
-        record.activity_type,
-        record.activity_url,
-        record.activity_title,
-        record.activity_state,
-        record.activity_author,
-        record.activity_created_at,
-        record.activity_is_private,
-    )
-    if any(value is None for value in required):
-        return None
-    if record.source_type != "github_repository" or record.activity_is_private:
-        return None
-    if record.source_status in {"skipped_policy", "extract_failed", "stale_source"}:
-        return None
-    try:
-        repository_name = canonical_repository_name(record.activity_repo)
-    except ValueError:
-        return None
-    activity_url = canonical_public_github_activity_url(record.activity_url)
-    if activity_url is None:
-        return None
-    if (
-        activity_url not in approval.approved_github_activity_urls
-        or repository_name in set(approval.excluded_repositories)
-        or (
-            approval.allowed_repositories
-            and repository_name not in set(approval.allowed_repositories)
-        )
-        or public_github_repository_name(record.source_uri) != repository_name
-        or public_github_activity_identity(activity_url)
-        != (repository_name, record.activity_type)
-    ):
-        return None
-    if (
-        contains_unicode_control(record.activity_title)
-        or contains_unicode_control(record.activity_author)
-        or contains_unicode_control(record.activity_state)
-        or contains_hidden_secret_shaped_public_value(record.activity_title)
-        or contains_hidden_secret_shaped_public_value(record.activity_author)
-        or contains_hidden_secret_shaped_public_value(record.activity_state)
-        or not is_valid_github_activity_state(
-            record.activity_type,
-            record.activity_state,
-            record.activity_state_field,
-        )
-        or not is_valid_github_timestamp(record.activity_created_at)
-    ):
-        return None
-    title = normalize_label(mask_public_value(record.activity_title))
-    author = normalize_label(mask_public_value(record.activity_author))
-    state = normalize_label(mask_public_value(record.activity_state))
+    title = normalize_label(mask_public_value(record.activity_title or ""))
+    author = normalize_label(mask_public_value(record.activity_author or ""))
+    state = normalize_label(mask_public_value(record.activity_state or ""))
     if not title or not author or not state:
         return None
-    claim_text = f"{repository_name}: {title}"
+    if record.activity_is_private:
+        project_key = "github:private"
+        project_name = "Private GitHub evidence"
+        claim_text = f"Private GitHub activity: {title}"
+        safe_url = "Private GitHub activity (URL withheld)"
+    else:
+        project_key = f"github:{record.activity_repo}"
+        project_name = str(record.activity_repo)
+        claim_text = f"{record.activity_repo}: {title}"
+        safe_url = record.activity_url
     evidence = {
         "id": record.evidence_id,
         "kind": "github_activity",
@@ -216,12 +232,12 @@ def _public_github_record(record: PublicEvidenceRecord, approval) -> dict[str, o
         "author": author,
         "state": state,
         "created_at": record.activity_created_at,
-        "url": activity_url,
+        "url": safe_url,
     }
     return {
-        "project_key": f"github:{repository_name}",
-        "project_name": repository_name,
-        "repository": repository_name,
+        "project_key": project_key,
+        "project_name": project_name,
+        "repository": None if record.activity_is_private else record.activity_repo,
         "claim_id": record.claim_id,
         "claim_text": claim_text,
         "evidence": evidence,
@@ -230,6 +246,6 @@ def _public_github_record(record: PublicEvidenceRecord, approval) -> dict[str, o
             "activity_type": record.activity_type,
             "title": title,
             "created_at": record.activity_created_at,
-            "url": activity_url,
+            "url": safe_url,
         },
     }

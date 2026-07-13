@@ -89,6 +89,25 @@ def test_sqlite_repository_creates_phase_one_evidence_tables(workspace):
     } <= repository.table_names()
 
 
+def test_sqlite_repository_adds_evidence_origin_columns(workspace):
+    repository = SQLiteRepository(WorkspacePaths.from_root(workspace).db_path)
+
+    repository.initialize()
+
+    assert {
+        "origin_type",
+        "origin_visibility",
+    } <= column_names(repository, "sources")
+    assert {
+        "origin_type",
+        "origin_visibility",
+    } <= column_names(repository, "github_activities")
+    assert {
+        "origin_type",
+        "origin_visibility",
+    } <= column_names(repository, "evidence_items")
+
+
 def test_sqlite_repository_evidence_relationships_enforce_foreign_keys(workspace):
     paths = WorkspacePaths.from_root(workspace)
     repository = SQLiteRepository(paths.db_path)
@@ -234,6 +253,8 @@ def test_sqlite_repository_upsert_source_updates_existing_uri(workspace):
         display_name="updated project",
         owner="june",
         status=SourceStatus.APPROVED,
+        origin_type="public_github",
+        origin_visibility="public",
     )
 
 

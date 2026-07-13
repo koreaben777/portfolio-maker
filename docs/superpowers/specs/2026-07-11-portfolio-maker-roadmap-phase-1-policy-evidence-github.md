@@ -1,9 +1,9 @@
 # Portfolio Maker 로드맵 Phase 1 구현 명세
 
 날짜: 2026-07-11
-상태: 현재 Phase 1 정책 및 runtime 계약
-대상 Issue: #4 → #2 → #1
-현재 구현 slice: #4 → #2 → #1 → #11 일반형 renderer
+상태: 현재 구현 slice는 #12 통합 근거 정책이며, 아래 #4 → #2 → #1 설명은 역사적 Phase 1 기준선이다.
+역사적 기준선 대상 Issue: #4 → #2 → #1
+현재 구현 slice: #12 통합 근거 정책 (일반형 #11 renderer 포함)
 후속 확장: #3 회사/JD별 맞춤 생성 (`@sites`는 presentation/hosting 계층)
 
 2026-07-13 정렬 메모: #4, #2, #1 기준선과 일반형 #11 renderer가 현재 worktree에 구현되어 있다. #3 맞춤 생성은 아직 deferred이며, 이 문서의 #11 규칙은 아래 current implementation slice를 기준으로 읽는다.
@@ -267,6 +267,19 @@ Stage C는 approval schema에 다음 optional 필드를 추가한다.
 - 회사/JD 입력이 없으면 일반형 콘텐츠만 사용한다.
 - 회사/JD 맞춤 문장은 근거가 없으면 생성하지 않거나 review-required로 남긴다.
 - #3 구현은 #11의 UI·manifest 계약을 확장하되, raw source와 runtime 외부 API를 새로 노출하지 않는다.
+
+### 7.4 Stage D — 통합 근거 풀과 생성물별 근거 선택 정책 (Issue #12 구현 기준)
+
+[#12](https://github.com/koreaben777/portfolio-maker/issues/12)은 로컬 파일, 공개 GitHub activity, 명시적으로 허용한 private GitHub activity를 하나의 evidence pool로 통합하고, master profile·Markdown draft·public manifest·HTML에 artifact별 include/exclude policy를 적용하는 현재 정책이다.
+
+설계 문서: [통합 근거 정책 설계](https://github.com/koreaben777/portfolio-maker/blob/main/docs/superpowers/specs/2026-07-14-unified-evidence-policy-design.md)
+구현 계획: [통합 근거 정책 구현 계획](https://github.com/koreaben777/portfolio-maker/blob/main/docs/superpowers/plans/2026-07-14-unified-evidence-policy.md)
+
+artifact policy가 없는 기존 #11 workspace는 0.1.0 호환 경로로 `portfolio-public.json`과 `portfolio.html`에서 local/private evidence를 계속 제외하며, private GitHub discovery는 metadata opt-in 범위로만 남는다.
+
+현재 구현은 같은 파일명을 유지하되 기본 전달 범위를 `restricted`로 둔다. 이 범위의 manifest와 HTML은 승인된 로컬 근거, 승인된 공개 GitHub 근거, 정확히 명시 승인된 private GitHub 근거를 사용할 수 있다. 이는 인터넷 공개 허가가 아니라 로컬 사용, 검증된 수신자에게의 직접 전달, private Sites deployment를 위한 결과다. raw local path, credential, token은 restricted output에도 포함하지 않는다.
+
+누구나 접근 가능한 배포는 `open_public`을 사용자가 별도로 선택하고 재생성·검증한 결과에만 허용한다. 초기 `open_public` 구현은 공개 GitHub 근거만 허용하고 local/private origin 요청을 validation error로 거부한다. `@sites` public deployment는 restricted output을 거부하며, 사용자의 명시적인 공개 배포 명령 없이는 실행하지 않는다.
 
 ## 8. developer 작업 지시
 

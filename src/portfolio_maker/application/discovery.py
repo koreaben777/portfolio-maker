@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-from portfolio_maker.application.approval import load_approval, normalize_workspace_path
+from portfolio_maker.application.approval import (
+    load_approval,
+    normalize_workspace_path,
+    persist_excluded_directories,
+)
 from portfolio_maker.application.models import DiscoverSourcesRequest, DiscoverSourcesResult, ProgressEvent
 from portfolio_maker.domain.models import GitHubActivity, Source, SourceStatus, SourceType
 from portfolio_maker.infrastructure.github_connector import (
@@ -24,15 +28,29 @@ def discover_sources(request: DiscoverSourcesRequest) -> DiscoverSourcesResult:
     repository = SQLiteRepository(paths.db_path)
     repository.initialize()
 
+    if request.excluded_directories:
+        persist_excluded_directories(paths, request.excluded_directories)
     approval = load_approval(paths) if paths.approval_path.exists() else None
-    approved_forbidden_paths = approval.forbidden_paths if approval else ()
+    approved_excluded_directories = approval.excluded_directories if approval else ()
     requested_forbidden_paths = tuple(
         normalize_workspace_path(paths, path) for path in request.forbidden_paths
     )
+    requested_excluded_directories = tuple(
+        normalize_workspace_path(paths, path) for path in request.excluded_directories
+    )
     candidates, skipped = discover_local_candidates(
         request.home,
-        requested_forbidden_paths + (paths.root,) + approved_forbidden_paths,
+        requested_forbidden_paths
+        + (paths.root,)
+        + (approval.legacy_forbidden_paths if approval else ()),
         approval.excluded_file_patterns if approval else (),
+        excluded_directories=requested_excluded_directories
+        + tuple(
+            path
+            for path in approved_excluded_directories
+            if not approval
+            or path not in approval.legacy_forbidden_paths
+        ),
     )
     for candidate in candidates:
         repository.upsert_source(
@@ -54,11 +72,16 @@ def discover_sources(request: DiscoverSourcesRequest) -> DiscoverSourcesResult:
         allowed_repositories = approval.allowed_repositories if approval else ()
         private_sources_allowed = approval.private_sources_allowed if approval else False
         try:
-            discovery_result = discover_github_candidates(
-                excluded_repositories=tuple(excluded_repositories),
-                allowed_repositories=tuple(allowed_repositories),
-                private_sources_allowed=private_sources_allowed,
-            )
+            github_kwargs = {
+                "excluded_repositories": tuple(excluded_repositories),
+                "allowed_repositories": tuple(allowed_repositories),
+                "private_sources_allowed": private_sources_allowed,
+            }
+            if approval and approval.approved_private_github_activity_urls:
+                github_kwargs["approved_private_github_activity_urls"] = (
+                    approval.approved_private_github_activity_urls
+                )
+            discovery_result = discover_github_candidates(**github_kwargs)
             github_repos = discovery_result.repositories
             github_activities = discovery_result.activities
             github_statuses = discovery_result.statuses
@@ -98,6 +121,8 @@ def discover_sources(request: DiscoverSourcesRequest) -> DiscoverSourcesResult:
                     display_name=repo.name_with_owner,
                     owner=repo.name_with_owner.split("/", 1)[0],
                     status=SourceStatus.DISCOVERED,
+                    origin_type=("private_github" if repo.is_private else "public_github"),
+                    origin_visibility=("private" if repo.is_private else "public"),
                 )
             )
             repo_visibility[repo.name_with_owner] = repo.is_private
@@ -185,7 +210,11 @@ def _render_report(
             lines.append(f"- {label}: {markdown_text(status)}")
     lines.extend(["", "## Skipped"])
     for item in skipped:
-        path = "[redacted]" if item.reason in {"forbidden", "skipped_policy"} else item.path
+        path = (
+            "[redacted]"
+            if item.reason in {"forbidden", "excluded_directory", "skipped_policy"}
+            else item.path
+        )
         rendered_path = str(path) if path == "[redacted]" else markdown_text(str(path))
         lines.append(f"- {item.reason}: {rendered_path}")
     lines.append("")

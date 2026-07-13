@@ -26,6 +26,8 @@ class Source:
     display_name: str
     owner: str | None
     status: SourceStatus
+    origin_type: str | None = None
+    origin_visibility: str | None = None
 
 
 @dataclass(frozen=True)
@@ -42,6 +44,8 @@ class GitHubActivity:
     merged_at: str | None
     is_private: bool = False
     state_field: str | None = None
+    origin_type: str | None = None
+    origin_visibility: str | None = None
 
 
 @dataclass(frozen=True)
@@ -68,3 +72,9 @@ class PublicEvidenceRecord:
     activity_author: str | None
     activity_created_at: str | None
     activity_is_private: bool | None
+    evidence_origin_type: str | None = None
+    evidence_origin_visibility: str | None = None
+    source_origin_type: str | None = None
+    source_origin_visibility: str | None = None
+    activity_origin_type: str | None = None
+    activity_origin_visibility: str | None = None

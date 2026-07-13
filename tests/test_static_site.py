@@ -5,11 +5,22 @@ import json
 import pytest
 
 from portfolio_maker.infrastructure.static_site import (
+    DeploymentArtifact,
     StaticSiteError,
     inline_static_output,
+    prepare_private_deployment,
+    prepare_public_deployment,
     validate_static_output,
     write_generated_data_module,
 )
+
+
+def test_deployment_gate_rejects_restricted_public_and_allows_private(tmp_path):
+    artifact = DeploymentArtifact(tmp_path / "portfolio.html", "restricted")
+
+    with pytest.raises(StaticSiteError, match="open_public"):
+        prepare_public_deployment(artifact)
+    assert prepare_private_deployment(artifact).delivery_scope == "restricted"
 
 
 def test_static_validator_accepts_relative_assets_and_no_runtime_fetch(tmp_path):

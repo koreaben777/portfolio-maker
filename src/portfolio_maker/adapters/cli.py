@@ -7,6 +7,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from portfolio_maker.application.approval import ApprovalFormatError, ApprovalMissingError, write_sample_approval
+from portfolio_maker.application.artifact_approval import write_sample_artifact_policy
 from portfolio_maker.application.build_profile import build_profile
 from portfolio_maker.application.discovery import discover_sources
 from portfolio_maker.application.draft_portfolio import ProfileFormatError, draft_portfolio
@@ -34,10 +35,12 @@ def build_parser() -> argparse.ArgumentParser:
     discover.add_argument("--home", type=Path, default=Path.home())
     discover.add_argument("--no-github", action="store_true")
     discover.add_argument("--forbidden-path", type=Path, action="append", default=[])
+    discover.add_argument("--exclude-directory", type=Path, action="append", default=[])
 
     approve = subparsers.add_parser("approve")
     approve.add_argument("--workspace", type=Path, default=Path("."))
     approve.add_argument("--write-sample", action="store_true")
+    approve.add_argument("--write-sample-artifact-policy", action="store_true")
     approve.add_argument("--force", action="store_true")
 
     ingest = subparsers.add_parser("ingest")
@@ -57,6 +60,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_mvp.add_argument("--home", type=Path, default=Path.home())
     run_mvp.add_argument("--no-github", action="store_true")
     run_mvp.add_argument("--forbidden-path", type=Path, action="append", default=[])
+    run_mvp.add_argument("--exclude-directory", type=Path, action="append", default=[])
 
     return parser
 
@@ -89,6 +93,7 @@ def _main(argv: Sequence[str] | None = None) -> int:
                 home=args.home,
                 include_github=not args.no_github,
                 forbidden_paths=tuple(args.forbidden_path),
+                excluded_directories=tuple(args.exclude_directory),
             )
         )
         print(f"Discovery report: {result.report_path}")
@@ -99,6 +104,11 @@ def _main(argv: Sequence[str] | None = None) -> int:
         paths = WorkspacePaths.from_root(args.workspace)
         if args.write_sample:
             print(f"Sample approval file: {write_sample_approval(paths, force=args.force)}")
+        elif args.write_sample_artifact_policy:
+            print(
+                "Sample artifact policy file: "
+                f"{write_sample_artifact_policy(paths, force=args.force)}"
+            )
         else:
             print(f"Approval file: {paths.approval_path}")
         return 0
@@ -133,6 +143,7 @@ def _main(argv: Sequence[str] | None = None) -> int:
                 home=args.home,
                 include_github=not args.no_github,
                 forbidden_paths=tuple(args.forbidden_path),
+                excluded_directories=tuple(args.exclude_directory),
             )
         )
         print(f"Discovery report: {result.report_path}")

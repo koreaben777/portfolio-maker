@@ -3,15 +3,26 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from portfolio_maker.application.approval import ApprovalMissingError, load_approval
+from portfolio_maker.application.artifact_approval import load_artifact_policy
 from portfolio_maker.application.build_profile import build_profile
+from portfolio_maker.application.evidence_selection import (
+    EvidenceSelectionRequest,
+    EvidenceSelectionService,
+)
 from portfolio_maker.application.models import (
     BuildProfileRequest,
     DraftPortfolioRequest,
     DraftPortfolioResult,
 )
+from portfolio_maker.domain.models import PublicEvidenceRecord
 from portfolio_maker.infrastructure.artifacts import write_markdown
 from portfolio_maker.infrastructure.policy import mask_public_value
-from portfolio_maker.infrastructure.presentation import markdown_text, normalize_label
+from portfolio_maker.infrastructure.presentation import (
+    markdown_text,
+    normalize_label,
+    safe_local_public_label,
+)
 from portfolio_maker.infrastructure.github_connector import is_public_github_activity_url
 from portfolio_maker.infrastructure.sqlite_repository import SQLiteRepository
 from portfolio_maker.workspace import WorkspacePaths
@@ -26,13 +37,51 @@ def draft_portfolio(request: DraftPortfolioRequest) -> DraftPortfolioResult:
     paths.ensure()
     profile_result = build_profile(BuildProfileRequest(workspace=request.workspace))
     profile = _load_profile(paths.master_profile_json_path)
-    sources = [
-        source for source in profile["sources"] if source.get("type", "local_file") == "local_file"
-    ]
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    artifact_policy = None
+    selection = None
+    try:
+        artifact_policy = load_artifact_policy(paths)
+        selection = EvidenceSelectionService().select(
+            repository,
+            EvidenceSelectionRequest(
+                artifact_kind="portfolio_draft",
+                policy=artifact_policy,
+                current_approval=load_approval(paths),
+            ),
+        )
+    except ApprovalMissingError:
+        pass
+    selection_backed = (
+        selection is not None
+        and artifact_policy is not None
+        and not artifact_policy.legacy_compatibility
+    )
+    selected_claim_ids = None if selection is None else set(selection.included_claim_ids)
+    if selection_backed:
+        sources = _local_source_payloads(selection.records)
+        evidence_lines = _github_evidence_lines_from_records(selection.records)
+    else:
+        selected_source_ids = (
+            None if selection is None else set(selection.included_source_ids)
+        )
+        sources = [
+            source
+            for source in profile["sources"]
+            if source.get("type", "local_file") == "local_file"
+            and (selected_source_ids is None or source.get("id") in selected_source_ids)
+        ]
+        evidence_lines = _github_evidence_lines(
+            profile.get("claims", []), selected_claim_ids
+        )
     sections = []
     for source in sources:
         masked_name = mask_public_value(str(source["display_name"]))
-        display_name = masked_name if masked_name == "[REDACTED]" else markdown_text(masked_name)
+        safe_name = safe_local_public_label(masked_name)
+        display_name = (
+            safe_name if safe_name == "[REDACTED]" else markdown_text(safe_name)
+        )
         sections.append(
             "\n".join(
                 [
@@ -50,20 +99,21 @@ def draft_portfolio(request: DraftPortfolioRequest) -> DraftPortfolioResult:
             )
         )
 
-    evidence_lines = _github_evidence_lines(profile.get("claims", []))
     content = "# Portfolio Draft\n\n" + "\n".join(sections)
     if evidence_lines:
         content += "## GitHub Activity Evidence\n\n" + "\n".join(evidence_lines) + "\n"
     write_markdown(paths.portfolio_draft_path, content)
     claim_ids = profile_result.claim_ids
     evidence_ids = profile_result.evidence_ids
-    repository = SQLiteRepository(paths.db_path)
-    repository.initialize()
     repository.record_artifact(
         "portfolio_draft",
         1,
         json.dumps(
-            {"claim_ids": claim_ids, "evidence_ids": evidence_ids},
+            (
+                {"claim_ids": claim_ids, "evidence_ids": evidence_ids}
+                if selection is None or artifact_policy.legacy_compatibility
+                else selection.input_manifest("portfolio_draft")
+            ),
             sort_keys=True,
             separators=(",", ":"),
         ),
@@ -93,10 +143,69 @@ def _load_profile(path: Path) -> dict[str, object]:
     return payload
 
 
-def _github_evidence_lines(claims: list[object]) -> list[str]:
+def _local_source_payloads(
+    records: tuple[PublicEvidenceRecord, ...],
+) -> list[dict[str, object]]:
+    sources: list[dict[str, object]] = []
+    seen_source_ids: set[int] = set()
+    for record in records:
+        if record.activity_id is not None or record.source_id is None:
+            continue
+        if record.source_id in seen_source_ids:
+            continue
+        display_name = safe_local_public_label(
+            mask_public_value(record.source_display_name or "")
+        )
+        if not display_name:
+            continue
+        seen_source_ids.add(record.source_id)
+        sources.append({"id": record.source_id, "display_name": display_name})
+    return sources
+
+
+def _github_evidence_lines_from_records(
+    records: tuple[PublicEvidenceRecord, ...],
+) -> list[str]:
+    lines: list[str] = []
+    for record in records:
+        if record.activity_id is None:
+            continue
+        title = normalize_label(mask_public_value(record.activity_title or ""))
+        activity_type = normalize_label(record.activity_type or "")
+        if not title or not activity_type:
+            continue
+        if record.activity_is_private:
+            lines.extend(
+                [
+                    f"- `private GitHub activity`: {markdown_text(title)}",
+                    "  Evidence: approved private activity (URL withheld)",
+                ]
+            )
+            continue
+        url = record.activity_url
+        if not isinstance(url, str) or not is_public_github_activity_url(url):
+            continue
+        lines.extend(
+            [
+                f"- `{markdown_text(activity_type)}`: {markdown_text(title)}",
+                f"  Evidence: {url}",
+            ]
+        )
+    return lines
+
+
+def _github_evidence_lines(
+    claims: list[object], selected_claim_ids: set[int] | None
+) -> list[str]:
     lines: list[str] = []
     for claim in claims:
         if not isinstance(claim, dict) or claim.get("claim_type") != "approved_github_activity":
+            continue
+        if (
+            selected_claim_ids is not None
+            and claim.get("claim_id") is not None
+            and claim.get("claim_id") not in selected_claim_ids
+        ):
             continue
         if claim.get("public_safe") is not True:
             continue
@@ -104,6 +213,14 @@ def _github_evidence_lines(claims: list[object]) -> list[str]:
         activity_type = claim.get("activity_type")
         url = claim.get("evidence_uri")
         if not all(isinstance(value, str) for value in (title, activity_type, url)):
+            continue
+        if claim.get("origin_type") == "private_github":
+            lines.extend(
+                [
+                    f"- `private GitHub activity`: {markdown_text(mask_public_value(title))}",
+                    "  Evidence: approved private activity (URL withheld)",
+                ]
+            )
             continue
         if not is_public_github_activity_url(url):
             continue
