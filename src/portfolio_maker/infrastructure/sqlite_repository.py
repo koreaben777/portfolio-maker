@@ -451,6 +451,71 @@ class SQLiteRepository:
                     conn.execute(statement)
             self._ensure_github_activity_visibility_column(conn)
             self._ensure_github_activity_state_field_column(conn)
+            self._ensure_legacy_normalized_columns(conn)
+
+    @staticmethod
+    def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+        return {
+            SQLiteRepository._required_text(row, "name")
+            for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+
+    @classmethod
+    def _ensure_legacy_normalized_columns(cls, conn: sqlite3.Connection) -> None:
+        projects = cls._table_columns(conn, "projects")
+        if "public_safe" not in projects:
+            conn.execute(
+                "ALTER TABLE projects ADD COLUMN public_safe INTEGER NOT NULL DEFAULT 0 "
+                "CHECK(public_safe IN (0, 1))"
+            )
+
+        claims = cls._table_columns(conn, "career_claims")
+        if "project_id" not in claims:
+            conn.execute(
+                "ALTER TABLE career_claims ADD COLUMN project_id INTEGER "
+                "REFERENCES projects(id)"
+            )
+
+        evidence = cls._table_columns(conn, "evidence_items")
+        if "github_activity_id" not in evidence:
+            conn.execute(
+                "ALTER TABLE evidence_items ADD COLUMN github_activity_id INTEGER "
+                "REFERENCES github_activities(id)"
+            )
+        if "stable_id" not in evidence:
+            conn.execute("ALTER TABLE evidence_items ADD COLUMN stable_id TEXT")
+        if "content_hash" not in evidence:
+            conn.execute("ALTER TABLE evidence_items ADD COLUMN content_hash TEXT")
+        if "public_safe" not in evidence:
+            conn.execute(
+                "ALTER TABLE evidence_items ADD COLUMN public_safe INTEGER NOT NULL DEFAULT 0 "
+                "CHECK(public_safe IN (0, 1))"
+            )
+        conn.execute(
+            "UPDATE evidence_items SET stable_id = 'legacy-evidence:' || id "
+            "WHERE stable_id IS NULL OR trim(stable_id) = ''"
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS evidence_items_stable_id_unique "
+            "ON evidence_items(stable_id)"
+        )
+
+        artifacts = cls._table_columns(conn, "artifacts")
+        if "kind" not in artifacts:
+            conn.execute("ALTER TABLE artifacts ADD COLUMN kind TEXT")
+        if "version" not in artifacts:
+            conn.execute("ALTER TABLE artifacts ADD COLUMN version INTEGER")
+        if "input_manifest" not in artifacts:
+            conn.execute("ALTER TABLE artifacts ADD COLUMN input_manifest TEXT")
+        if "type" in artifacts:
+            conn.execute(
+                "UPDATE artifacts SET kind = COALESCE(kind, type) WHERE kind IS NULL"
+            )
+        conn.execute("UPDATE artifacts SET kind = 'legacy' WHERE kind IS NULL")
+        conn.execute("UPDATE artifacts SET version = 1 WHERE version IS NULL")
+        conn.execute(
+            "UPDATE artifacts SET input_manifest = '{}' WHERE input_manifest IS NULL"
+        )
 
     @staticmethod
     def _ensure_github_activity_visibility_column(conn: sqlite3.Connection) -> None:
@@ -593,15 +658,6 @@ class SQLiteRepository:
                     INSERT INTO github_activities
                         (source_id, repo, activity_type, url, title, state, author, created_at, merged_at, is_private, state_field)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(repo, activity_type, url) DO UPDATE SET
-                        source_id = excluded.source_id,
-                        title = excluded.title,
-                        state = excluded.state,
-                        author = excluded.author,
-                        created_at = excluded.created_at,
-                        merged_at = excluded.merged_at,
-                        is_private = excluded.is_private,
-                        state_field = excluded.state_field
                     """,
                     values,
                 )
@@ -797,29 +853,49 @@ class SQLiteRepository:
         public_safe: bool,
     ) -> int:
         with self._connection() as conn:
-            conn.execute(
-                """
-                INSERT INTO evidence_items
-                    (source_id, snapshot_id, github_activity_id, locator, stable_id, content_hash, public_safe)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(stable_id) DO UPDATE SET
-                    source_id = excluded.source_id,
-                    snapshot_id = excluded.snapshot_id,
-                    github_activity_id = excluded.github_activity_id,
-                    locator = excluded.locator,
-                    content_hash = excluded.content_hash,
-                    public_safe = excluded.public_safe
-                """,
-                (
-                    source_id,
-                    snapshot_id,
-                    github_activity_id,
-                    locator,
-                    stable_id,
-                    content_hash,
-                    int(public_safe),
-                ),
+            columns = self._table_columns(conn, "evidence_items")
+            values = (
+                source_id,
+                snapshot_id,
+                github_activity_id,
+                locator,
+                stable_id,
+                content_hash,
+                int(public_safe),
             )
+            if {"kind", "summary", "confidence"} <= columns:
+                conn.execute(
+                    """
+                    INSERT INTO evidence_items
+                        (source_id, snapshot_id, github_activity_id, locator, stable_id,
+                         content_hash, public_safe, kind, summary, confidence)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 'evidence', ?, 'medium')
+                    ON CONFLICT(stable_id) DO UPDATE SET
+                        source_id = excluded.source_id,
+                        snapshot_id = excluded.snapshot_id,
+                        github_activity_id = excluded.github_activity_id,
+                        locator = excluded.locator,
+                        content_hash = excluded.content_hash,
+                        public_safe = excluded.public_safe
+                    """,
+                    (*values[:5], values[5], values[6], locator),
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO evidence_items
+                        (source_id, snapshot_id, github_activity_id, locator, stable_id, content_hash, public_safe)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(stable_id) DO UPDATE SET
+                        source_id = excluded.source_id,
+                        snapshot_id = excluded.snapshot_id,
+                        github_activity_id = excluded.github_activity_id,
+                        locator = excluded.locator,
+                        content_hash = excluded.content_hash,
+                        public_safe = excluded.public_safe
+                    """,
+                    values,
+                )
             row = conn.execute(
                 "SELECT id FROM evidence_items WHERE stable_id = ?", (stable_id,)
             ).fetchone()
@@ -827,18 +903,36 @@ class SQLiteRepository:
 
     def upsert_project(self, name: str, public_safe: bool) -> int:
         with self._connection() as conn:
-            conn.execute(
-                """
-                INSERT INTO projects (name, public_safe) VALUES (?, ?)
-                ON CONFLICT(name) DO UPDATE SET public_safe = excluded.public_safe
-                """,
-                (name, int(public_safe)),
-            )
-            row = conn.execute("SELECT id FROM projects WHERE name = ?", (name,)).fetchone()
-        return self._required_int(row, "id")
+            columns = self._table_columns(conn, "projects")
+            row = conn.execute(
+                "SELECT id FROM projects WHERE name = ? ORDER BY id LIMIT 1", (name,)
+            ).fetchone()
+            if row is not None:
+                project_id = self._required_int(row, "id")
+                conn.execute(
+                    "UPDATE projects SET public_safe = ? WHERE id = ?",
+                    (int(public_safe), project_id),
+                )
+                return project_id
+            if {"summary", "status", "visibility"} <= columns:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO projects
+                        (name, summary, status, visibility, public_safe)
+                    VALUES (?, '', 'draft', 'public', ?)
+                    """,
+                    (name, int(public_safe)),
+                )
+            else:
+                cursor = conn.execute(
+                    "INSERT INTO projects (name, public_safe) VALUES (?, ?)",
+                    (name, int(public_safe)),
+                )
+            return int(cursor.lastrowid)
 
     def upsert_career_claim(self, project_id: int, text: str, public_safe: bool) -> int:
         with self._connection() as conn:
+            columns = self._table_columns(conn, "career_claims")
             row = conn.execute(
                 """
                 SELECT id FROM career_claims
@@ -849,10 +943,20 @@ class SQLiteRepository:
             ).fetchone()
             if row is not None:
                 return self._required_int(row, "id")
-            cursor = conn.execute(
-                "INSERT INTO career_claims (project_id, text, public_safe) VALUES (?, ?, ?)",
-                (project_id, text, int(public_safe)),
-            )
+            if {"claim_type", "confidence"} <= columns:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO career_claims
+                        (project_id, claim_type, text, confidence, public_safe)
+                    VALUES (?, 'project_evidence', ?, 'medium', ?)
+                    """,
+                    (project_id, text, int(public_safe)),
+                )
+            else:
+                cursor = conn.execute(
+                    "INSERT INTO career_claims (project_id, text, public_safe) VALUES (?, ?, ?)",
+                    (project_id, text, int(public_safe)),
+                )
         return int(cursor.lastrowid)
 
     def reconcile_github_artifact_safety(self) -> None:
@@ -933,10 +1037,21 @@ class SQLiteRepository:
 
     def record_artifact(self, kind: str, version: int, input_manifest: str) -> None:
         with self._connection() as conn:
-            conn.execute(
-                "INSERT INTO artifacts (kind, version, input_manifest) VALUES (?, ?, ?)",
-                (kind, version, input_manifest),
-            )
+            columns = self._table_columns(conn, "artifacts")
+            if {"type", "path", "source_profile_version"} <= columns:
+                conn.execute(
+                    """
+                    INSERT INTO artifacts
+                        (type, path, source_profile_version, kind, version, input_manifest)
+                    VALUES (?, '', ?, ?, ?, ?)
+                    """,
+                    (kind, str(version), kind, version, input_manifest),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO artifacts (kind, version, input_manifest) VALUES (?, ?, ?)",
+                    (kind, version, input_manifest),
+                )
 
     def insert_source_snapshot(
         self,

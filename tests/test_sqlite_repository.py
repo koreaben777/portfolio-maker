@@ -511,6 +511,95 @@ def test_sqlite_repository_accepts_normal_persisted_wal_and_shm_sidecars(workspa
         writer.close()
 
 
+def test_sqlite_repository_migrates_legacy_mvp_schema(workspace):
+    paths = WorkspacePaths.from_root(workspace)
+    paths.ensure()
+    with sqlite3.connect(paths.db_path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE projects (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                status TEXT NOT NULL,
+                visibility TEXT NOT NULL,
+                primary_source_id INTEGER
+            );
+            CREATE TABLE career_claims (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                claim_type TEXT NOT NULL,
+                text TEXT NOT NULL,
+                confidence TEXT NOT NULL,
+                public_safe INTEGER NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE evidence_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_id INTEGER NOT NULL,
+                snapshot_id INTEGER,
+                kind TEXT NOT NULL,
+                locator TEXT NOT NULL,
+                quote_hash TEXT,
+                summary TEXT NOT NULL,
+                confidence TEXT NOT NULL
+            );
+            CREATE TABLE artifacts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                type TEXT NOT NULL,
+                path TEXT NOT NULL,
+                source_profile_version TEXT NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        )
+
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+
+    with repository._read_connection() as connection:
+        columns = {
+            table: {row["name"] for row in connection.execute(f"PRAGMA table_info({table})")}
+            for table in ("projects", "career_claims", "evidence_items", "artifacts")
+        }
+    assert "public_safe" in columns["projects"]
+    assert "project_id" in columns["career_claims"]
+    assert {
+        "github_activity_id",
+        "stable_id",
+        "content_hash",
+        "public_safe",
+    } <= columns["evidence_items"]
+    assert {"kind", "version", "input_manifest"} <= columns["artifacts"]
+
+    source_id = repository.upsert_source(
+        Source(
+            None,
+            SourceType.LOCAL_FILE,
+            "file:///legacy.md",
+            "legacy.md",
+            None,
+            SourceStatus.DISCOVERED,
+        )
+    )
+    project_id = repository.upsert_project("local:legacy", public_safe=False)
+    evidence_id = repository.upsert_evidence_item(
+        source_id=source_id,
+        snapshot_id=None,
+        github_activity_id=None,
+        locator="file:///legacy.md",
+        stable_id="legacy-source:1",
+        content_hash=None,
+        public_safe=False,
+    )
+    claim_id = repository.upsert_career_claim(
+        project_id,
+        "Legacy evidence",
+        public_safe=False,
+    )
+    repository.link_claim_evidence(claim_id, evidence_id, "direct")
+    repository.record_artifact("legacy-check", 1, "{}")
+
+
 def test_sqlite_repository_rejects_main_replacement_before_connect(workspace, tmp_path, monkeypatch):
     paths = WorkspacePaths.from_root(workspace)
     repository = SQLiteRepository(paths.db_path)
