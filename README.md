@@ -71,6 +71,27 @@ cd ../..
 $portfolio-maker
 ```
 
+### GitHub에서 받은 다른 사용자의 시작
+
+다른 사용자는 `main` 브랜치를 clone한 뒤, 자신의 컴퓨터에서 아래 준비를 마칩니다.
+
+```bash
+git clone https://github.com/koreaben777/portfolio-maker.git
+cd portfolio-maker
+python3 -m venv .venv
+. .venv/bin/activate
+pip install -e ".[dev]"
+(cd web/portfolio && npm ci)
+```
+
+그 다음 Codex app에서 repository root를 열고 새 task에 `$portfolio-maker`를 입력합니다.
+스킬이 목록에 바로 보이지 않으면 새 task를 열거나 Codex app을 다시 시작합니다. GitHub 활동을
+탐색할 때만 `gh auth login`이 필요하며, 로컬 파일만 사용할 때는 GitHub 인증 없이 진행할 수 있습니다.
+
+각 사용자는 자신의 `.portfolio-maker/` 작업 공간을 별도로 만듭니다. 이 디렉터리에는 승인 파일,
+로컬 SQLite 데이터베이스, 스냅샷, 생성물이 들어갈 수 있으므로 다른 사용자와 공유하거나 Git에
+커밋하지 않습니다.
+
 처음에는 승인 파일 예시를 만듭니다.
 
 ```bash
