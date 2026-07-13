@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 
-from portfolio_maker.application.approval import load_approval
-from portfolio_maker.application.artifact_approval import load_artifact_policy
+from portfolio_maker.application.approval import SourceApproval, load_approval
+from portfolio_maker.application.artifact_approval import (
+    ArtifactPolicySet,
+    load_artifact_policy,
+)
 from portfolio_maker.application.evidence_selection import (
     EvidenceSelectionRequest,
     EvidenceSelectionService,
@@ -39,6 +43,7 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
         policy=artifact_policy,
         current_approval=approval,
     )
+    pool_request = _evidence_pool_request(artifact_policy, approval)
     policy = FilePolicy(
         forbidden_paths=approval.excluded_directories,
         excluded_file_patterns=approval.excluded_file_patterns,
@@ -58,7 +63,7 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
         if (
             source.type != SourceType.LOCAL_FILE
             or source.id is None
-            or selection_service.decision_for_source(source, selection_request) is not None
+            or selection_service.decision_for_source(source, pool_request) is not None
         ):
             continue
         try:
@@ -92,11 +97,12 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
         if snapshot is None:
             repository.update_source_status(source.id, SourceStatus.STALE_SOURCE)
             continue
-        display_name = safe_local_public_label(mask_public_value(source.display_name))
-        evidence = _snapshot_evidence(display_name, str(snapshot["text"]))
+        raw_display_name = normalize_label(source.display_name)
+        display_name = safe_local_public_label(mask_public_value(raw_display_name))
+        evidence = _snapshot_evidence(raw_display_name, str(snapshot["text"]))
         if evidence is None:
             continue
-        evidence = normalize_label(evidence)
+        evidence = safe_local_public_label(mask_public_value(evidence))
         claim_text = f"{display_name}: {evidence}"
         project_id = repository.upsert_project(f"local:{source.id}", public_safe=False)
         evidence_id = repository.upsert_evidence_item(
@@ -110,10 +116,12 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
         )
         claim_id = repository.upsert_career_claim(project_id, claim_text, public_safe=False)
         repository.link_claim_evidence(claim_id, evidence_id, "direct")
-        evidence_ids.append(evidence_id)
-        claim_ids.append(claim_id)
+        if selection_service.decision_for_source(source, selection_request) is not None:
+            continue
 
         sources.append(source)
+        evidence_ids.append(evidence_id)
+        claim_ids.append(claim_id)
         claims.append(
             {
                 "claim_type": "project_evidence",
@@ -135,7 +143,7 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
         if source is None:
             continue
         if selection_service.decision_for_activity(
-            activity, source, selection_request
+            activity, source, pool_request
         ) is not None:
             continue
         canonical_activity_url = activity.url
@@ -151,9 +159,6 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
         if activity_key in seen_activities:
             continue
         seen_activities.add(activity_key)
-        if source not in sources:
-            sources.append(source)
-        github_source_repositories[source.id] = repository_name
         author = normalize_label(mask_public_value(activity.author))
         state = normalize_label(mask_public_value(activity.state))
         is_private = activity.is_private
@@ -182,6 +187,14 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
             project_id,
             claim_text,
         )
+        if selection_service.decision_for_activity(
+            activity, source, selection_request
+        ) is not None:
+            continue
+
+        if source not in sources:
+            sources.append(source)
+        github_source_repositories[source.id] = repository_name
         evidence_ids.append(evidence_id)
         claim_ids.append(claim_id)
         claims.append(
@@ -280,7 +293,31 @@ def _snapshot_evidence(display_name: str, text: str) -> str | None:
     for line in lines:
         if line != display_name:
             return line
-    return lines[0] if lines else None
+    return None
+
+
+def _evidence_pool_request(
+    artifact_policy: ArtifactPolicySet,
+    approval: SourceApproval,
+) -> EvidenceSelectionRequest:
+    pool_policies = tuple(
+        replace(
+            policy,
+            delivery_scope="restricted",
+            include_local=True,
+            include_public_github=True,
+            include_private_github=True,
+            excluded_source_uris=(),
+            excluded_repositories=(),
+            excluded_activity_urls=(),
+        )
+        for policy in artifact_policy.policies
+    )
+    return EvidenceSelectionRequest(
+        artifact_kind="master_profile",
+        policy=ArtifactPolicySet(pool_policies, explicit=artifact_policy.explicit),
+        current_approval=approval,
+    )
 
 
 def _public_source_payload(

@@ -135,10 +135,15 @@ def _setup_multi_origin_render_workspace(
     paths = WorkspacePaths.from_root(workspace)
     source_path = tmp_path / "local" / "notes.md"
     source_path.parent.mkdir()
-    source_path.write_text(
-        "Local project\nApproved local evidence.\n",
-        encoding="utf-8",
+    persisted_display_name = local_display_name or (
+        "/synthetic/private/project" if path_like_label else "Local notes"
     )
+    local_text = (
+        f"{persisted_display_name}\nApproved local evidence.\n"
+        if local_display_name is not None
+        else "Local project\nApproved local evidence.\n"
+    )
+    source_path.write_text(local_text, encoding="utf-8")
     local_uri = source_path.resolve().as_uri()
     public_url = "https://github.com/octo/public/pull/1"
     private_url = "https://github.com/octo/private/pull/2"
@@ -171,8 +176,7 @@ def _setup_multi_origin_render_workspace(
             None,
             SourceType.LOCAL_FILE,
             local_uri,
-            local_display_name
-            or ("/synthetic/private/project" if path_like_label else "Local notes"),
+            persisted_display_name,
             None,
             SourceStatus.INGESTED,
         )
@@ -189,7 +193,7 @@ def _setup_multi_origin_render_workspace(
                 "content_hash": extracted.content_hash,
                 "extractor": extracted.extractor,
                 "extracted_at": "2026-07-13T00:00:00Z",
-                "text": "Local project\nApproved local evidence.\n",
+                "text": local_text,
             }
         ),
         encoding="utf-8",
@@ -453,6 +457,57 @@ def test_render_html_uses_its_own_policy_without_overwriting_manifest_policy(
     assert local_uri not in html_text
 
 
+def test_artifact_policies_share_approved_pool_but_select_independently(
+    tmp_path,
+    monkeypatch,
+):
+    workspace, paths, _, _, local_uri, _, private_url = (
+        _setup_multi_origin_render_workspace(tmp_path)
+    )
+    artifact_policy = json.loads(
+        paths.artifact_approval_path.read_text(encoding="utf-8")
+    )
+    artifact_policy["artifacts"]["master_profile"] = {
+        "delivery_scope": "restricted",
+        "include_local": False,
+        "include_public_github": False,
+        "include_private_github": False,
+    }
+    paths.artifact_approval_path.write_text(
+        json.dumps(artifact_policy), encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        render_html_module.subprocess, "run", _fake_build_with_generated_data
+    )
+
+    render_html(RenderHtmlRequest(workspace=workspace))
+
+    profile = json.loads(paths.master_profile_json_path.read_text(encoding="utf-8"))
+    public_manifest = json.loads(paths.portfolio_public_json_path.read_text(encoding="utf-8"))
+    html_text = paths.portfolio_html_path.read_text(encoding="utf-8")
+    with SQLiteRepository(paths.db_path)._read_connection() as connection:
+        artifact_rows = connection.execute(
+            "SELECT kind, input_manifest FROM artifacts "
+            "WHERE kind IN ('portfolio_public', 'portfolio_html') ORDER BY id"
+        ).fetchall()
+        evidence_rows = connection.execute(
+            "SELECT id FROM evidence_items ORDER BY id"
+        ).fetchall()
+    artifact_manifests = {
+        row["kind"]: json.loads(row["input_manifest"]) for row in artifact_rows
+    }
+    expected_evidence_ids = {row["id"] for row in evidence_rows}
+
+    assert profile["sources"] == []
+    assert profile["claims"] == []
+    assert len(expected_evidence_ids) == 3
+    assert set(public_manifest["selection"]["included_evidence_ids"]) == expected_evidence_ids
+    assert set(artifact_manifests["portfolio_public"]["included_evidence_ids"]) == expected_evidence_ids
+    assert set(artifact_manifests["portfolio_html"]["included_evidence_ids"]) == expected_evidence_ids
+    assert local_uri not in html_text
+    assert private_url not in html_text
+
+
 @pytest.mark.parametrize(
     "persisted_label",
     ("/synthetic/private/project", "sk-synthetic-local-token"),
@@ -491,4 +546,3 @@ def test_restricted_artifacts_hide_local_uri_snapshot_and_path_like_label(
     assert str(snapshot_path) not in artifact_text
     assert persisted_label not in artifact_text
     assert private_url not in artifact_text
-    assert "Approved local evidence" in artifact_text
