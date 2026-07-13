@@ -133,7 +133,7 @@ Portfolio Maker 0.1.0은 승인된 로컬 파일에서 근거 기반 master prof
 - `public_safe=true`는 추론이 아니라 명시적 승인 또는 deterministic policy 검증 결과여야 한다.
 - local file evidence는 raw absolute path를 public artifact에 쓰지 않는다. 공개용 locator는 안전한 source label 또는 사용자가 승인한 설명을 쓴다.
 - GitHub evidence는 public repository의 공개 URL만 public artifact에 쓸 수 있다.
-- private repository, revoked source, forbidden path, stale/damaged snapshot, malformed metadata는 evidence/claim/artifact 입력에서 제외한다.
+- private repository raw data/URL, revoked source, forbidden path, stale/damaged snapshot, malformed metadata는 evidence/claim/artifact 입력에서 제외한다. 사용자가 직접 승인한 semantic project title/overview의 private repository name display text는 restricted presentation에서만 허용한다.
 
 ### 5.3 기존 산출물 호환성
 
@@ -188,7 +188,7 @@ Stage C는 approval schema에 다음 optional 필드를 추가한다.
 - private activity, malformed URL, duplicate activity, stale/missing source는 artifact 입력이 되지 않는다.
 - GitHub discovery failure는 기존처럼 local output을 보존한다.
 - GitHub claim은 evidence URL과 stable identifier로 추적된다.
-- public artifact에 token, raw local path, private repo name, unescaped title이 나타나지 않는다.
+- public artifact에 token, raw local path, private repository URL/locator, unescaped title이 나타나지 않는다. 사용자가 직접 승인한 semantic project title/overview의 private repository name은 restricted display text로만 허용한다.
 
 ## 7. #11 현재 renderer, #12 근거 정책, #13 프로젝트 구성, #3 후속 Stage
 
@@ -273,6 +273,7 @@ Stage C는 approval schema에 다음 optional 필드를 추가한다.
 - candidate는 review-required이며 user가 approve/reject/merge/split/reassign하기 전에는 artifact의 project가 될 수 없다.
 - local file, repository, activity 하나를 자동 project로 승격하지 않는다. 연결되지 않은 근거는 unassigned로 보존한다.
 - approved portfolio project만 master profile 요약, Markdown draft, `portfolio-public.json`, `portfolio.html`에 나타난다.
+- restricted approved project의 title/overview에는 사용자가 직접 승인한 private repository name을 display text로 포함할 수 있지만, private URL과 raw locator는 계속 withheld한다.
 - legacy technical grouping을 자동 이관하지 않으며, project approval이 없는 새 artifact는 zero-project empty state를 보여 준다.
 - CLI의 외부 LLM API 호출·token 저장은 구현하지 않는다. Codex app의 portfolio-maker skill이 안전한 review bundle을 읽는 사용자 통제 분석 workflow다.
 

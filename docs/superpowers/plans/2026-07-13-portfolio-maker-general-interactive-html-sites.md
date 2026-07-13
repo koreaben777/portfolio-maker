@@ -139,7 +139,7 @@ Implement `build_public_portfolio` so that it:
 2. selects only public-safe projects and claims;
 3. requires every emitted claim to have at least one linked public-safe evidence row;
 4. emits safe labels and approved public GitHub URLs only;
-5. strips absolute paths, snapshot paths, private repository data, and secret-shaped strings;
+5. strips absolute paths, snapshot paths, private repository URLs/locators and raw data, and secret-shaped strings; user-approved restricted project display text may retain a private repository name;
 6. writes `.portfolio-maker/artifacts/portfolio-public.json` through the existing managed-artifact writer;
 7. records an `artifacts` row with kind `portfolio_public` and an input manifest of project/claim/evidence IDs.
 

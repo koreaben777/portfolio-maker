@@ -271,7 +271,7 @@ git commit -m "feat: centralize evidence delivery selection"
 - All four builders call `select_evidence_for_artifact` before writing output.
 - Every `artifacts.input_manifest` records delivery scope, policy hash, included IDs, excluded IDs, reasons, and origin counts.
 - `render_html` consumes its manifest policy only; it introduces no separate public/private origin filter.
-- Restricted private repository provenance uses an approved/safe label. Any private URL display requires a separately approved shared locator.
+- Automatic restricted private repository provenance uses an approved/safe label. A user-approved semantic project title/overview may contain the private repository name as display text, but any private URL/raw locator display remains prohibited and would require a separate locator-sharing boundary.
 
 - [x] **Step 1: Add cross-artifact regressions**
 
@@ -281,7 +281,7 @@ Create a fixture with local, public GitHub, and private GitHub evidence. Assert:
 - an excluded source disappears from one selected artifact but remains in the common pool;
 - `portfolio-public.json` and `portfolio.html` carry `delivery_scope: "restricted"` provenance;
 - open-public manifest/HTML reject local/private origins;
-- raw local paths, tokens, credentials, secret-shaped text, and unapproved private repository names never appear in output;
+- raw local paths, tokens, credentials, secret-shaped text, and private repository URLs/locators never appear in output; a private repository name may appear only as user-approved semantic project display text in restricted output;
 - repeated builds are deterministic and reference the same source/evidence/claim IDs.
 
 - [x] **Step 2: Run focused builder tests before implementation**

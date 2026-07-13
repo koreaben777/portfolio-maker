@@ -405,6 +405,57 @@ def test_render_html_projects_use_one_approved_multi_origin_semantic_project(
     assert public_url in manifest_text + html_text
 
 
+def test_restricted_approved_private_repository_name_is_display_text_only(
+    tmp_path,
+    monkeypatch,
+):
+    workspace, paths, _, _, _, _, private_url = _setup_multi_origin_render_workspace(tmp_path)
+    review = prepare_project_review(PrepareProjectReviewRequest(workspace=workspace))
+    review_payload = json.loads(review.input_path.read_text(encoding="utf-8"))
+    write_managed_text(
+        paths.project_approval_path,
+        json.dumps(
+            {
+                "version": 1,
+                "review_input_sha256": review_payload["input_sha256"],
+                "projects": [
+                    {
+                        "id": "private-display-project",
+                        "title": "octo/private-project",
+                        "overview": "User-approved work for octo/private-project",
+                        "evidence_ids": [
+                            item["evidence_id"] for item in review_payload["evidence"]
+                        ],
+                        "status": "approved",
+                    }
+                ],
+                "rejected_candidate_ids": [],
+                "unassigned_evidence_ids": [],
+            },
+            indent=2,
+        )
+        + "\n",
+    )
+    compose_projects(ComposeProjectsRequest(workspace=workspace))
+    profile = build_profile(BuildProfileRequest(workspace=workspace))
+    draft = draft_portfolio(DraftPortfolioRequest(workspace=workspace))
+    manifest = build_public_portfolio(PublicPortfolioRequest(workspace=workspace))
+    monkeypatch.setattr(render_html_module.subprocess, "run", _fake_build_with_generated_data)
+    render_html(RenderHtmlRequest(workspace=workspace))
+
+    output_text = "\n".join(
+        (
+            profile.json_path.read_text(encoding="utf-8"),
+            profile.markdown_path.read_text(encoding="utf-8"),
+            draft.markdown_path.read_text(encoding="utf-8"),
+            manifest.manifest_path.read_text(encoding="utf-8"),
+            paths.portfolio_html_path.read_text(encoding="utf-8"),
+        )
+    )
+    assert "octo/private-project" in output_text
+    assert private_url not in output_text
+
+
 def test_render_html_failure_removes_stale_html_but_preserves_draft_and_template(
     tmp_path,
     monkeypatch,
