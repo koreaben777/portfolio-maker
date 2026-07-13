@@ -133,7 +133,9 @@ portfolio-maker approve --workspace . --write-sample --force
 
 0.1.0에서는 승인된 로컬 자료와 명시 승인된 공개 GitHub activity를 profile 근거로 사용하고, 검토용 포트폴리오 초안과 일반형 public-safe HTML을 제공합니다. HTML은 build-time manifest를 번들한 정적 결과이며 SQLite, 원본, snapshot, credential을 runtime에 읽지 않습니다. 작업 이력은 사용자가 `.portfolio-maker/`를 직접 정리할 때까지 로컬에 남으며, 자동 보존·정리 기능은 아직 제공하지 않습니다. 회사·채용공고별 맞춤 작성(#3), Google Drive 연동, 이력서·자기소개서·면접 자료, OCR, 시맨틱 검색, MCP/app-server 인터페이스는 [GitHub Issues](https://github.com/koreaben777/portfolio-maker/issues)에서 관리합니다.
 
-로컬 제외 폴더, GitHub private opt-in, 생성물별 근거 선택 정책은 [Issue #12](https://github.com/koreaben777/portfolio-maker/issues/12)와 [구현 계획](https://github.com/koreaben777/portfolio-maker/blob/main/docs/superpowers/plans/2026-07-14-unified-evidence-policy.md)에서 관리합니다.
+로컬 제외 폴더, GitHub private opt-in, 생성물별 근거 선택 정책은 [Issue #12](https://github.com/koreaben777/portfolio-maker/issues/12)와 [구현 계획](https://github.com/koreaben777/portfolio-maker/blob/main/docs/superpowers/plans/2026-07-14-unified-evidence-policy.md)에서 관리합니다. 이 정책은 아직 구현 전이므로 현재 `portfolio-public.json`과 `portfolio.html`은 기존처럼 public-safe 공개 GitHub 근거만 사용합니다.
+
+#12 구현 후에도 두 파일명의 `public`은 호환성 이름입니다. 기본 결과는 **제한 공유(restricted)**로 생성되어, 승인된 로컬 자료·승인된 공개 GitHub·명시 승인된 private GitHub 근거를 포함할 수 있습니다. 이는 자동 인터넷 공개를 뜻하지 않으며 로컬 사용, 검증된 수신자 전달, private hosting을 위한 범위입니다. 누구나 접근 가능한 배포는 별도 `open_public` 선택과 재검증을 거쳐야 합니다.
 
 ## 버그와 제안
 
