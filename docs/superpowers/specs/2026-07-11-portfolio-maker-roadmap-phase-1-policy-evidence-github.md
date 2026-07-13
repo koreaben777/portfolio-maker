@@ -219,6 +219,7 @@ Stage C는 approval schema에 다음 optional 필드를 추가한다.
 - safe source label과 public GitHub URL만 provenance로 표시
 - 승인·정책 재검증을 통과한 public-safe claim/evidence만 사용
 - 프로젝트·기술·성과 표현은 evidence가 제공하는 범위를 넘지 않음
+- 현재 public HTML은 approved public GitHub activity evidence만 표시한다. `approved_source_uris`는 local profile/draft 승인이지 public HTML 승인으로 해석하지 않으며, local public label/description approval field는 후속 계약이다.
 - raw local path, snapshot path, `public_safe=false` data, secret-shaped text는 HTML/JS data에도 포함하지 않음
 - HTML/attribute/JavaScript context별 escaping
 - keyboard navigation, mobile layout, visible focus, 색 대비, reduced-motion 지원

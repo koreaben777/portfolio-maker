@@ -989,6 +989,7 @@ class SQLiteRepository:
         text: str,
     ) -> int:
         with self._connection() as conn:
+            columns = self._table_columns(conn, "career_claims")
             row = conn.execute(
                 """
                 SELECT career_claims.id
@@ -1001,10 +1002,20 @@ class SQLiteRepository:
                 (evidence_id,),
             ).fetchone()
             if row is None:
-                cursor = conn.execute(
-                    "INSERT INTO career_claims (project_id, text, public_safe) VALUES (?, ?, 1)",
-                    (project_id, text),
-                )
+                if {"claim_type", "confidence"} <= columns:
+                    cursor = conn.execute(
+                        """
+                        INSERT INTO career_claims
+                            (project_id, claim_type, text, confidence, public_safe)
+                        VALUES (?, 'approved_github_activity', ?, 'high', 1)
+                        """,
+                        (project_id, text),
+                    )
+                else:
+                    cursor = conn.execute(
+                        "INSERT INTO career_claims (project_id, text, public_safe) VALUES (?, ?, 1)",
+                        (project_id, text),
+                    )
                 claim_id = int(cursor.lastrowid)
                 conn.execute(
                     """

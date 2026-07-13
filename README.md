@@ -120,6 +120,7 @@ portfolio-maker render-html --workspace .
 - `approved_github_activity_urls`는 discovery가 저장한 공개 GitHub activity URL을 정확히 지정합니다. private activity 또는 allowlist 밖·excluded repository activity는 승인되어도 산출물 입력으로 쓰지 않습니다.
 - 공개 포트폴리오에는 비밀값, 토큰, 원본의 비공개 경로를 넣지 않아야 합니다.
 - `portfolio-public.json`과 `portfolio.html`은 public-safe claim/evidence와 승인된 공개 GitHub URL만 사용합니다. 프로젝트별 timeline은 해당 evidence의 날짜와 provenance만 표시합니다.
+- `approved_source_uris`는 현재 master profile과 검토용 draft 입력 승인입니다. public HTML은 local evidence를 아직 공개하지 않으며, 명시적 public label/description approval field가 후속 계약으로 추가되기 전까지 GitHub-backed evidence만 사용합니다.
 - `.portfolio-maker/`는 Git에 커밋하지 마세요.
 - `portfolio.db`와 journal/WAL/SHM sidecar는 하나의 관리 단위입니다. 개별 sidecar를 임의로 바꾸거나 삭제하지 마세요.
 

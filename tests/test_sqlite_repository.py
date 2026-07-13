@@ -597,6 +597,21 @@ def test_sqlite_repository_migrates_legacy_mvp_schema(workspace):
         public_safe=False,
     )
     repository.link_claim_evidence(claim_id, evidence_id, "direct")
+    github_evidence_id = repository.upsert_evidence_item(
+        source_id=source_id,
+        snapshot_id=None,
+        github_activity_id=None,
+        locator="https://github.com/octo/demo/pull/1",
+        stable_id="legacy-github-evidence:1",
+        content_hash=None,
+        public_safe=True,
+    )
+    github_claim_id = repository.upsert_github_activity_claim(
+        github_evidence_id,
+        project_id,
+        "Legacy GitHub evidence",
+    )
+    assert github_claim_id != claim_id
     repository.record_artifact("legacy-check", 1, "{}")
 
 

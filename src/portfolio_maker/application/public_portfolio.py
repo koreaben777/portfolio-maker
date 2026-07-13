@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import json
-from pathlib import Path
 
 from portfolio_maker.application.approval import load_approval
 from portfolio_maker.application.build_profile import build_profile
@@ -38,7 +37,12 @@ class PublicPortfolioError(ValueError):
 def build_public_portfolio(request: PublicPortfolioRequest) -> PublicPortfolioResult:
     paths = WorkspacePaths.from_root(request.workspace)
     paths.ensure()
-    build_profile(BuildProfileRequest(workspace=request.workspace))
+    build_profile(
+        BuildProfileRequest(
+            workspace=request.workspace,
+            invalidate_portfolio_draft=False,
+        )
+    )
     approval = load_approval(paths)
     repository = SQLiteRepository(paths.db_path)
     repository.initialize()
@@ -47,7 +51,7 @@ def build_public_portfolio(request: PublicPortfolioRequest) -> PublicPortfolioRe
     claim_ids: list[int] = []
     evidence_ids: list[int] = []
     for record in repository.list_public_evidence_records():
-        item = _public_record(record, approval.approved_source_uris, approval)
+        item = _public_record(record, approval)
         if item is None:
             continue
         project_key = str(item["project_key"])
@@ -134,12 +138,11 @@ def build_public_portfolio(request: PublicPortfolioRequest) -> PublicPortfolioRe
 
 def _public_record(
     record: PublicEvidenceRecord,
-    approved_source_uris: tuple[str, ...],
     approval,
 ) -> dict[str, object] | None:
     if record.activity_id is not None:
         return _public_github_record(record, approval)
-    return _public_local_record(record, approved_source_uris)
+    return None
 
 
 def _public_github_record(record: PublicEvidenceRecord, approval) -> dict[str, object] | None:
@@ -228,50 +231,5 @@ def _public_github_record(record: PublicEvidenceRecord, approval) -> dict[str, o
             "title": title,
             "created_at": record.activity_created_at,
             "url": activity_url,
-        },
-    }
-
-
-def _public_local_record(
-    record: PublicEvidenceRecord,
-    approved_source_uris: tuple[str, ...],
-) -> dict[str, object] | None:
-    if (
-        record.source_type != "local_file"
-        or record.source_id is None
-        or record.source_uri not in approved_source_uris
-        or record.source_status in {"skipped_policy", "extract_failed", "stale_source"}
-        or not record.source_display_name
-        or "/" in record.source_display_name
-        or "\\" in record.source_display_name
-        or contains_unicode_control(record.source_display_name)
-        or contains_hidden_secret_shaped_public_value(record.source_display_name)
-        or contains_unicode_control(record.claim_text)
-        or contains_hidden_secret_shaped_public_value(record.claim_text)
-    ):
-        return None
-    display_name = normalize_label(mask_public_value(Path(record.source_display_name).name))
-    claim_text = normalize_label(mask_public_value(record.claim_text))
-    if not display_name or not claim_text:
-        return None
-    evidence = {
-        "id": record.evidence_id,
-        "kind": "local_source",
-        "public_safe": True,
-        "label": display_name,
-    }
-    return {
-        "project_key": f"local:{record.source_id}",
-        "project_name": display_name,
-        "repository": None,
-        "claim_id": record.claim_id,
-        "claim_text": claim_text,
-        "evidence": evidence,
-        "timeline": {
-            "evidence_id": record.evidence_id,
-            "activity_type": "local_source",
-            "title": display_name,
-            "created_at": "",
-            "url": None,
         },
     }

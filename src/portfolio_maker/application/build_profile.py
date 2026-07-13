@@ -251,7 +251,8 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
             separators=(",", ":"),
         ),
     )
-    remove_managed_file(paths.portfolio_draft_path, missing_ok=True)
+    if request.invalidate_portfolio_draft:
+        remove_managed_file(paths.portfolio_draft_path, missing_ok=True)
     return BuildProfileResult(
         json_path=paths.master_profile_json_path,
         markdown_path=paths.master_profile_md_path,

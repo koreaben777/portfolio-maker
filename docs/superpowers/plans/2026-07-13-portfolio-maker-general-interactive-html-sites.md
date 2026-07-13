@@ -7,7 +7,18 @@
 
 **Architecture:** Portfolio Maker의 Python/SQLite 계층은 승인, evidence/claim 검증, public manifest 생성의 단일 권위로 유지한다. Sites 프로젝트는 이 빌드 시점 manifest를 번들에 포함하는 UI/정적 export 계층이며, 런타임에 SQLite·원본 파일·원격 API를 읽지 않는다. 생성된 로컬 `.portfolio-maker/artifacts/portfolio.html`은 Sites 배포 여부와 무관하게 canonical artifact로 남긴다.
 
-**Tech Stack:** Python 3.11+, 기존 Portfolio Maker CLI/application/infrastructure, SQLite, Codex `@sites` bundled starter/vinext, TypeScript/React, Vite-compatible static build, Codex in-app Browser, 설치된 `emilkowalski/skills`의 디자인·모션 리뷰 원칙
+**Tech Stack:** Python 3.11+, 기존 Portfolio Maker CLI/application/infrastructure, SQLite, `web/portfolio` vanilla TypeScript/Vite static build, Codex in-app Browser, 설치된 `emilkowalski/skills`의 디자인·모션 리뷰 원칙
+
+## Current shipped contract (2026-07-13)
+
+이 계획은 구현 전 초안이었다. 현재 runtime의 authoritative contract는 다음과 같다.
+
+- Python entry points: `build_public_portfolio(PublicPortfolioRequest)`와 `render_html(RenderHtmlRequest)`.
+- Manifest shape: `version`, `generated_at`, `profile`, `projects`, `skills`, `links`. Project는 `id`, `name`, `repository`, `public_safe`, `claims`, `timeline`을 가지며 claim/evidence는 public-safe GitHub activity provenance만 포함한다.
+- `portfolio_type`, `audience`, `technologies`, `outcomes`는 현재 0.1.0 manifest에 없는 future fields다. 근거 없는 값을 채우지 않는다.
+- `approved_source_uris`는 local profile/draft 승인이다. local evidence는 explicit public label/description approval field가 추가될 때까지 public manifest/HTML에서 제외한다.
+- Build paths: `web/portfolio/src/main.ts`, `src/styles.css`, `src/generated/portfolio-data.ts`, `vite.config.ts`; Python static validation은 `src/portfolio_maker/infrastructure/static_site.py`가 담당한다.
+- CLI path: `portfolio-maker render-html --workspace PATH`; the current renderer is `src/portfolio_maker/application/render_html.py` and the current Vite surface is under `web/portfolio/src/`.
 
 ## Global Constraints
 
@@ -39,47 +50,60 @@
 - Produces:
   - `PublicPortfolioRequest(workspace: Path)`
   - `PublicPortfolioResult(manifest_path: Path, project_count: int, claim_count: int)`
-  - `build_public_portfolio_manifest(request: PublicPortfolioRequest) -> PublicPortfolioResult`
+  - `build_public_portfolio(request: PublicPortfolioRequest) -> PublicPortfolioResult`
 
-Manifest의 최소 형태는 다음과 같이 고정한다.
+현재 manifest의 최소 형태는 다음과 같다.
 
 ```json
 {
   "version": 1,
-  "portfolio_type": "general",
-  "audience": "self-and-public-visitors",
+  "generated_at": "2026-07-13T00:00:00Z",
+  "profile": {},
   "projects": [
     {
-      "id": "project-1",
-      "title": "safe project label",
-      "summary": "evidence-backed summary",
-      "technologies": [],
-      "outcomes": [],
+      "id": "github:owner/repo",
+      "name": "owner/repo",
+      "repository": "owner/repo",
+      "public_safe": true,
       "claims": [
         {
+          "id": 1,
           "text": "public-safe claim",
+          "public_safe": true,
           "evidence": [
             {
-              "label": "safe source label",
+              "id": 1,
+              "kind": "github_activity",
+              "public_safe": true,
+              "activity_type": "pull_request",
+              "title": "safe activity title",
+              "author": "owner",
+              "state": "MERGED",
+              "created_at": "2026-01-01T00:00:00Z",
               "url": "https://github.com/owner/repo/pull/1"
             }
           ]
         }
-      ]
+      ],
+      "timeline": []
     }
-  ]
+  ],
+  "skills": [],
+  "links": []
 }
 ```
+
+Local evidence is intentionally not admitted to this current manifest. `approved_source_uris` remains a profile/draft approval; a future explicit public label/description field is required before local evidence can be rendered publicly.
 
 - [ ] **Step 1: Write failing manifest tests**
 
 ```python
 def test_public_manifest_contains_only_public_safe_evidence(tmp_path):
-    result = build_public_portfolio_manifest(PublicPortfolioRequest(workspace=tmp_path))
+    result = build_public_portfolio(PublicPortfolioRequest(workspace=tmp_path))
     manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
 
     assert manifest["version"] == 1
-    assert manifest["portfolio_type"] == "general"
+    assert manifest["projects"] == []
     assert all(
         "public_safe=false" not in json.dumps(project)
         for project in manifest["projects"]
@@ -87,7 +111,7 @@ def test_public_manifest_contains_only_public_safe_evidence(tmp_path):
 
 
 def test_public_manifest_excludes_private_paths_and_unlinked_claims(tmp_path):
-    result = build_public_portfolio_manifest(PublicPortfolioRequest(workspace=tmp_path))
+    result = build_public_portfolio(PublicPortfolioRequest(workspace=tmp_path))
     manifest_text = result.manifest_path.read_text(encoding="utf-8")
 
     assert "/Users/" not in manifest_text
@@ -100,14 +124,14 @@ def test_public_manifest_excludes_private_paths_and_unlinked_claims(tmp_path):
 Run:
 
 ```bash
-PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m pytest -q -p no:cacheprovider tests/test_public_portfolio.py
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python -m pytest -q tests/test_public_portfolio.py
 ```
 
-Expected: FAIL because the request/result types and manifest builder do not exist.
+Expected: FAIL until the public manifest projection is implemented.
 
 - [ ] **Step 3: Implement the minimal projection**
 
-Implement `build_public_portfolio_manifest` so that it:
+Implement `build_public_portfolio` so that it:
 
 1. reloads the current approval/policy state;
 2. selects only public-safe projects and claims;
@@ -115,7 +139,7 @@ Implement `build_public_portfolio_manifest` so that it:
 4. emits safe labels and approved public GitHub URLs only;
 5. strips absolute paths, snapshot paths, private repository data, and secret-shaped strings;
 6. writes `.portfolio-maker/artifacts/portfolio-public.json` through the existing managed-artifact writer;
-7. records an `artifacts` row with kind `portfolio_public_manifest` and an input manifest of project/claim/evidence IDs.
+7. records an `artifacts` row with kind `portfolio_public` and an input manifest of project/claim/evidence IDs.
 
 Do not generate new career claims or infer outcomes in this task.
 
@@ -124,7 +148,7 @@ Do not generate new career claims or infer outcomes in this task.
 Run:
 
 ```bash
-PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m pytest -q -p no:cacheprovider tests/test_public_portfolio.py
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python -m pytest -q tests/test_public_portfolio.py
 ```
 
 Expected: PASS.
@@ -139,13 +163,12 @@ git commit -m "feat: add public portfolio manifest"
 ## Task 2: Sites project surface and build-time data boundary
 
 **Files:**
-- Create: `web/portfolio/` using the bundled Sites starter
-- Create/Modify: `web/portfolio/app/page.tsx`
-- Create/Modify: `web/portfolio/app/layout.tsx`
-- Create/Modify: `web/portfolio/app/globals.css`
-- Create/Modify: `web/portfolio/vite.config.ts` or the starter's equivalent build config
-- Create: `web/portfolio/src/generated/portfolio-data.ts` as a generated, gitignored file
-- Create: `web/portfolio/.openai/hosting.json` only when the Sites project is created by the hosting flow
+- Create: `web/portfolio/index.html`
+- Create: `web/portfolio/src/main.ts`
+- Create: `web/portfolio/src/styles.css`
+- Create: `web/portfolio/src/generated/portfolio-data.ts`
+- Create: `web/portfolio/vite.config.ts`
+- Create: `web/portfolio/package.json` and `package-lock.json`
 - Modify: `.gitignore`
 
 **Interfaces:**
@@ -153,20 +176,19 @@ git commit -m "feat: add public portfolio manifest"
 - Consumes: `.portfolio-maker/artifacts/portfolio-public.json`
 - Produces: a static Sites build whose JavaScript bundle contains the manifest at build time and never fetches local JSON at runtime
 
-- [ ] **Step 1: Initialize the Sites project before editing product UI**
+- [ ] **Step 1: Use the existing Vite project**
 
-Use the bundled Sites initializer once with `web/portfolio` as its target. Preserve the starter package manager and lockfile.
+The shipped surface is a small vanilla TypeScript/Vite project. Preserve its package manager and lockfile; do not initialize a second framework project.
 
 Run:
 
 ```bash
-mkdir -p web/portfolio
 cd web/portfolio
-/path/to/sites/scripts/init-site.sh "$PWD"
-npm run dev
+npm install
+npm run build
 ```
 
-Use the exact local URL printed by the starter for Codex Browser preview. Do not initialize a second Sites project.
+Use the Codex in-app Browser for local preview when available. Do not initialize a second Sites project.
 
 - [ ] **Step 2: Configure local-file-safe static output**
 
@@ -177,8 +199,8 @@ The generated module must have this shape:
 ```ts
 export const portfolioData = {
   version: 1,
-  portfolio_type: "general",
-  audience: "self-and-public-visitors",
+  generated_at: "",
+  profile: {},
   projects: []
 } as const;
 ```
@@ -188,7 +210,7 @@ export const portfolioData = {
 Run:
 
 ```bash
-rg -n "portfolio\.db|\.portfolio-maker/reviews|/Users/|file://|fetch\(" web/portfolio
+rg -n "portfolio\.db|\.portfolio-maker/reviews|/Users/|file://|fetch\(" web/portfolio/src web/portfolio/index.html
 ```
 
 Expected: no product source or runtime fetch references. Generated build input is allowed to contain only the public manifest fields.
@@ -203,8 +225,7 @@ git commit -m "feat: scaffold sites portfolio surface"
 ## Task 3: General portfolio design direction and review gate
 
 **Files:**
-- Create: `docs/design/2026-07-13-general-portfolio-design-brief.md`
-- Create: `docs/design/2026-07-13-general-portfolio-motion-review.md`
+- Create: `docs/superpowers/specs/2026-07-13-portfolio-maker-general-html-design-selection.md`
 
 **Interfaces:**
 
@@ -241,22 +262,20 @@ git diff --check
 
 Expected: PASS with the selected design brief and motion review files containing no trailing whitespace.
 
-- [ ] **Step 5: Commit the design contract**
+- [ ] **Step 5: Record the design contract**
 
 ```bash
-git add docs/design/2026-07-13-general-portfolio-design-brief.md docs/design/2026-07-13-general-portfolio-motion-review.md
-git commit -m "docs: record general portfolio design direction"
+git add docs/superpowers/specs/2026-07-13-portfolio-maker-general-html-design-selection.md
 ```
 
 ## Task 4: Implement the general portfolio UI
 
 **Files:**
-- Modify: `web/portfolio/app/page.tsx`
-- Modify: `web/portfolio/app/layout.tsx`
-- Modify: `web/portfolio/app/globals.css`
+- Modify: `web/portfolio/src/main.ts`
+- Modify: `web/portfolio/src/styles.css`
 - Modify: `web/portfolio/src/generated/portfolio-data.ts`
 - Test: `tests/test_public_portfolio.py`
-- Test: `web/portfolio/scripts/validate-static-output.mjs`
+- Test: `tests/test_static_site.py`
 
 **Interfaces:**
 
@@ -278,7 +297,7 @@ def test_general_html_contract_requires_sections_and_relative_assets(tmp_path):
 
 - [ ] **Step 2: Implement page structure**
 
-Implement semantic regions for introduction, projects, capabilities, evidence, and public links. Project cards must be generated from `portfolioData.projects`; an empty project list must render a truthful empty state rather than invented content.
+Implement semantic regions for introduction, projects, capabilities, evidence, and public links in `web/portfolio/src/main.ts`. Project rows and timeline entries must be generated from `portfolioData.projects`; an empty project list must render a truthful empty state rather than invented content.
 
 - [ ] **Step 3: Implement interactions**
 
@@ -304,7 +323,7 @@ Run:
 ```bash
 cd web/portfolio
 npm run build
-node scripts/validate-static-output.mjs dist
+PYTHONPATH=../../src python -c "from pathlib import Path; from portfolio_maker.infrastructure.static_site import validate_static_output; validate_static_output(Path('dist'))"
 ```
 
 Expected: build succeeds, required sections exist, assets are relative, no external tracker/CDN/API is referenced, and the output can be copied as a standalone HTML artifact.
@@ -319,7 +338,8 @@ git commit -m "feat: build general interactive portfolio"
 ## Task 5: Integrate the CLI and export the canonical local artifact
 
 **Files:**
-- Create: `src/portfolio_maker/infrastructure/site_renderer.py`
+- Create: `src/portfolio_maker/application/render_html.py`
+- Create: `src/portfolio_maker/infrastructure/static_site.py`
 - Modify: `src/portfolio_maker/adapters/cli.py`
 - Modify: `src/portfolio_maker/application/models.py`
 - Modify: `src/portfolio_maker/workspace.py`
@@ -330,8 +350,8 @@ git commit -m "feat: build general interactive portfolio"
 **Interfaces:**
 
 - CLI command: `portfolio-maker render-html --workspace PATH`
-- Application function: `render_general_portfolio(request: RenderPortfolioRequest) -> RenderPortfolioResult`
-- Renderer responsibility: write the public manifest, generate the TypeScript data module, invoke the existing Sites build command, validate the build, and copy the entry HTML/assets into managed artifact paths
+- Application function: `render_html(request: RenderHtmlRequest) -> RenderHtmlResult`
+- Renderer responsibility: write the public manifest, generate the TypeScript data module in a temporary site copy, invoke Vite, validate the build, and publish the inlined HTML into the managed artifact path
 - Renderer must return non-zero controlled errors for missing approval, unsafe manifest data, missing Sites project, build failure, or invalid static output
 
 - [ ] **Step 1: Write CLI and integration regressions**
@@ -347,7 +367,7 @@ def test_cli_render_html_requires_approved_public_inputs(workspace, capsys):
 
 
 def test_cli_render_html_reports_canonical_artifact(workspace, capsys, monkeypatch):
-    monkeypatch.setattr("portfolio_maker.infrastructure.site_renderer.run_site_build", lambda _: None)
+    monkeypatch.setattr("portfolio_maker.application.render_html.subprocess.run", lambda *args, **kwargs: None)
 
     exit_code = main(["render-html", "--workspace", str(workspace)])
 
@@ -360,24 +380,24 @@ def test_cli_render_html_reports_canonical_artifact(workspace, capsys, monkeypat
 
 The adapter must:
 
-1. call `build_public_portfolio_manifest`;
-2. write the generated module under the ignored build-input directory;
+1. call `build_public_portfolio`;
+2. copy the Vite site to a temporary build tree and write the generated module there;
 3. run `npm run build` with `web/portfolio` as the working directory;
-4. run the static-output validator;
-5. copy the built entry HTML and relative assets into managed artifact paths;
+4. run the Python static-output validator;
+5. inline the validated entry HTML and atomically publish it to the managed artifact path;
 6. record the `portfolio_html` artifact with manifest hash and build metadata;
 7. never upload or read the SQLite database from the Sites process.
 
 - [ ] **Step 3: Add the CLI parser branch**
 
-Add `render-html` to `build_parser` and map it to `render_general_portfolio`. Keep business logic out of the CLI adapter.
+Add `render-html` to `build_parser` and map it to `render_html`. Keep business logic out of the CLI adapter.
 
 - [ ] **Step 4: Run focused CLI and portfolio tests**
 
 Run:
 
 ```bash
-PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m pytest -q -p no:cacheprovider tests/test_cli.py tests/test_public_portfolio.py
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python -m pytest -q tests/test_cli.py tests/test_public_portfolio.py tests/test_render_html.py
 ```
 
 Expected: PASS.
@@ -385,16 +405,14 @@ Expected: PASS.
 - [ ] **Step 5: Commit the integrated export slice**
 
 ```bash
-git add src/portfolio_maker/infrastructure/site_renderer.py src/portfolio_maker/application/models.py src/portfolio_maker/adapters/cli.py src/portfolio_maker/workspace.py tests/test_cli.py tests/test_public_portfolio.py
-git commit -m "feat: export general portfolio html"
+git add src/portfolio_maker/application/render_html.py src/portfolio_maker/infrastructure/static_site.py src/portfolio_maker/application/models.py src/portfolio_maker/adapters/cli.py src/portfolio_maker/workspace.py tests/test_cli.py tests/test_public_portfolio.py tests/test_render_html.py
 ```
 
 ## Task 6: Browser, accessibility, and privacy verification
 
 **Files:**
 - Modify: `tests/test_public_portfolio.py`
-- Modify: `web/portfolio/scripts/validate-static-output.mjs`
-- Create: `docs/reviews/2026-07-13-general-portfolio-html-verification.md`
+- Modify: `tests/test_static_site.py`
 
 **Interfaces:**
 
@@ -406,10 +424,10 @@ git commit -m "feat: export general portfolio html"
 Run:
 
 ```bash
-PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m pytest -q -p no:cacheprovider tests/test_public_portfolio.py tests/test_cli.py
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python -m pytest -q tests/test_public_portfolio.py tests/test_cli.py tests/test_render_html.py tests/test_static_site.py
 cd web/portfolio
 npm run build
-node scripts/validate-static-output.mjs dist
+PYTHONPATH=../../src python -c "from pathlib import Path; from portfolio_maker.infrastructure.static_site import validate_static_output; validate_static_output(Path('dist'))"
 ```
 
 Expected: all commands pass.
@@ -440,13 +458,12 @@ Expected: no matches.
 
 - [ ] **Step 4: Record the verification result**
 
-The review file must record the commit, commands, browser observations, generated artifact paths, and any non-blocking residual risk. It must not contain personal source content or credentials.
+Record the commit, commands, browser observations, generated artifact paths, and any non-blocking residual risk in the review thread. Do not record personal source content or credentials.
 
-- [ ] **Step 5: Commit verification evidence**
+- [ ] **Step 5: Commit verification code**
 
 ```bash
-git add tests/test_public_portfolio.py web/portfolio/scripts/validate-static-output.mjs docs/reviews/2026-07-13-general-portfolio-html-verification.md
-git commit -m "test: verify general portfolio html"
+git add tests/test_public_portfolio.py tests/test_static_site.py
 ```
 
 ## Task 7: Optional private Sites hosting
@@ -488,9 +505,7 @@ git commit -m "chore: record private portfolio site"
 **Files:**
 - Modify: `README.md`
 - Modify: `docs/superpowers/specs/2026-07-11-portfolio-maker-roadmap-phase-1-policy-evidence-github.md`
-- Modify: `docs/design/2026-07-13-general-portfolio-design-brief.md`
-- Modify: `docs/reviews/2026-07-13-general-portfolio-html-verification.md`
-- Update: GitHub Issue #11
+- Modify: `docs/superpowers/specs/2026-07-13-portfolio-maker-general-html-design-selection.md`
 - Keep open: GitHub Issue #3 as the company/JD tailoring extension
 
 **Interfaces:**
@@ -503,10 +518,10 @@ git commit -m "chore: record private portfolio site"
 Run:
 
 ```
-PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m pytest -q -p no:cacheprovider
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python -m pytest -q
 cd web/portfolio
 npm run build
-node scripts/validate-static-output.mjs dist
+PYTHONPATH=../../src python -c "from pathlib import Path; from portfolio_maker.infrastructure.static_site import validate_static_output; validate_static_output(Path('dist'))"
 git diff --check
 git show --check --format=short HEAD
 ```
@@ -542,8 +557,7 @@ Confirm:
 - [ ] **Step 5: Commit documentation synchronization**
 
 ```bash
-git add README.md docs/superpowers/specs/2026-07-11-portfolio-maker-roadmap-phase-1-policy-evidence-github.md docs/design docs/reviews
-git commit -m "docs: define general portfolio html scope"
+git add README.md docs/superpowers/specs/2026-07-11-portfolio-maker-roadmap-phase-1-policy-evidence-github.md docs/superpowers/specs/2026-07-13-portfolio-maker-general-html-design-selection.md docs/superpowers/plans/2026-07-13-portfolio-maker-general-interactive-html-sites.md
 ```
 
 ## Definition of Done

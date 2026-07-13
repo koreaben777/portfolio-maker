@@ -42,6 +42,7 @@ class IngestSourcesResult:
 @dataclass(frozen=True)
 class BuildProfileRequest:
     workspace: Path
+    invalidate_portfolio_draft: bool = True
 
 
 @dataclass(frozen=True)
