@@ -65,6 +65,9 @@ def crawl_local_structure(
         (entry.source_id, entry.provider_item_key): entry.node_id
         for entry in prior_entries
     }
+    prior_entries_by_hierarchy = {
+        (entry.source_id, entry.relative_hierarchy): entry for entry in prior_entries
+    }
     entries: dict[str, StructuralEntry] = {}
     used_inode_keys: set[str] = set()
     errors: list[StructuralCrawlError] = []
@@ -79,10 +82,19 @@ def crawl_local_structure(
     ) -> StructuralEntry:
         provider_item_key, device, inode = _provider_identity(path_stat, relative_hierarchy)
         if device is not None and inode is not None:
-            if provider_item_key in used_inode_keys:
+            inode_key = provider_item_key
+            prior_entry = prior_entries_by_hierarchy.get((source_id, relative_hierarchy))
+            if prior_entry is not None and (prior_entry.device, prior_entry.inode) == (
+                device,
+                inode,
+            ):
+                provider_item_key = prior_entry.provider_item_key
+                if provider_item_key == inode_key:
+                    used_inode_keys.add(inode_key)
+            elif inode_key in used_inode_keys:
                 provider_item_key = relative_hierarchy
             else:
-                used_inode_keys.add(provider_item_key)
+                used_inode_keys.add(inode_key)
         node_id = prior_node_ids.get(
             (source_id, provider_item_key), stable_node_id(source_id, provider_item_key)
         )

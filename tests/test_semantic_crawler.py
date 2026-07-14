@@ -133,6 +133,26 @@ def test_structural_crawl_keeps_hard_linked_files_as_distinct_entries(
     assert len({entry.node_id for entry in linked_entries}) == 2
 
 
+def test_structural_crawl_retains_hard_link_alias_ids_after_alias_rename(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    original = root / "original.md"
+    alias = root / "alias.md"
+    original.write_text("evidence", encoding="utf-8")
+    os.link(original, alias)
+    first = crawl_local_structure(root, approval_for(root))
+    prior_entries = {entry.relative_hierarchy: entry for entry in first.entries}
+
+    alias.rename(root / "renamed-alias.md")
+    renamed = crawl_local_structure(root, approval_for(root), prior_entries=first.entries)
+    renamed_entries = {entry.relative_hierarchy: entry for entry in renamed.entries}
+
+    assert renamed_entries["original.md"].node_id == prior_entries["original.md"].node_id
+    assert renamed_entries["renamed-alias.md"].node_id == prior_entries["alias.md"].node_id
+
+
 def test_structural_crawl_is_deterministic_and_retains_ids_after_rename(tmp_path: Path) -> None:
     root = tmp_path / "root"
     root.mkdir()
