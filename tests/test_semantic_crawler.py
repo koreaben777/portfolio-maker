@@ -7,7 +7,10 @@ import pytest
 
 from portfolio_maker.application.approval import SourceApproval
 from portfolio_maker.domain.semantic_models import AnalysisStatus, SemanticNodeKind
-from portfolio_maker.infrastructure.semantic_crawler import crawl_local_structure
+from portfolio_maker.infrastructure.semantic_crawler import (
+    StructuralCrawlRootError,
+    crawl_local_structure,
+)
 
 
 def approval_for(root: Path, *, excluded: tuple[Path, ...] = ()) -> SourceApproval:
@@ -94,6 +97,40 @@ def test_broken_and_directory_symlinks_are_not_followed(tmp_path: Path) -> None:
         ("broken-link", AnalysisStatus.UNSUPPORTED),
         ("directory-link", AnalysisStatus.UNSUPPORTED),
     ]
+
+
+def test_symlink_crawl_root_is_rejected_without_traversing_target(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "outside.md").write_text("outside", encoding="utf-8")
+    root_link = tmp_path / "root-link"
+    root_link.symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(StructuralCrawlRootError, match="symbolic link"):
+        crawl_local_structure(root_link, approval_for(root_link))
+
+
+def test_structural_crawl_keeps_hard_linked_files_as_distinct_entries(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    original = root / "original.md"
+    original.write_text("evidence", encoding="utf-8")
+    os.link(original, root / "alias.md")
+
+    result = crawl_local_structure(root, approval_for(root))
+    linked_entries = [
+        entry
+        for entry in result.entries
+        if entry.relative_hierarchy in {"original.md", "alias.md"}
+    ]
+
+    assert {entry.relative_hierarchy for entry in linked_entries} == {
+        "original.md",
+        "alias.md",
+    }
+    assert len({entry.node_id for entry in linked_entries}) == 2
 
 
 def test_structural_crawl_is_deterministic_and_retains_ids_after_rename(tmp_path: Path) -> None:

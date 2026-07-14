@@ -66,6 +66,7 @@ def crawl_local_structure(
         for entry in prior_entries
     }
     entries: dict[str, StructuralEntry] = {}
+    used_inode_keys: set[str] = set()
     errors: list[StructuralCrawlError] = []
 
     def add_entry(
@@ -77,6 +78,11 @@ def crawl_local_structure(
         path_stat: os.stat_result,
     ) -> StructuralEntry:
         provider_item_key, device, inode = _provider_identity(path_stat, relative_hierarchy)
+        if device is not None and inode is not None:
+            if provider_item_key in used_inode_keys:
+                provider_item_key = relative_hierarchy
+            else:
+                used_inode_keys.add(provider_item_key)
         node_id = prior_node_ids.get(
             (source_id, provider_item_key), stable_node_id(source_id, provider_item_key)
         )
@@ -204,6 +210,9 @@ def crawl_local_structure(
 
 
 def _resolve_root(root: Path) -> Path:
+    root_stat = _lstat(root)
+    if stat.S_ISLNK(root_stat.st_mode):
+        raise StructuralCrawlRootError("Structural crawl root is a symbolic link")
     try:
         resolved = root.resolve(strict=True)
     except (OSError, RuntimeError) as error:
