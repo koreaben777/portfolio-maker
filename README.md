@@ -1,6 +1,9 @@
 # Portfolio Maker
 
 > 현재 공개 버전: `0.1.0`
+>
+> 다음 개발 완료 목표: `0.2.0` — 계층형 의미 인덱스, Project Boundary Detection,
+> medium 이상 자동 구성과 가역적 제외, multi-skill Codex plugin
 
 승인한 내 작업 자료를 바탕으로, **근거를 확인할 수 있는 커리어 프로필**과 **검토용 포트폴리오 초안**, **public-safe 정적 HTML 포트폴리오**를 만드는 로컬 우선 도구입니다.
 
@@ -71,7 +74,23 @@ cd ../..
 $portfolio-maker
 ```
 
-### GitHub에서 받은 다른 사용자의 시작
+### 첫 포트폴리오 튜토리얼
+
+아래 순서는 Codex app에서 **처음으로 자신의 기본 포트폴리오를 만드는 전체 흐름**입니다. 후보를
+자동으로 포트폴리오에 넣지 않으며, 각 단계에서 사용자가 근거와 project 구성을 승인합니다.
+
+먼저 두 경로를 구분합니다.
+
+- `--workspace .`는 이 저장소를 clone한 작업 공간입니다. `.portfolio-maker/`의 승인 파일·로컬
+  데이터베이스·생성물과 HTML renderer가 여기에 생깁니다.
+- `discover --home PATH`는 포트폴리오 근거 후보를 찾을 로컬 탐색 루트입니다. 기본값은 홈
+  디렉터리지만, 튜토리얼에서는 명시적으로 지정합니다. 필요한 범위가 더 좁다면 `"$HOME"` 대신
+  해당 폴더를 사용하세요.
+
+아래 명령은 모두 clone한 저장소의 root에서 실행합니다. `$PWD`는 도구 저장소 자체이므로 첫
+탐색에서 제외합니다.
+
+#### 1. 설치하고 Codex에서 열기
 
 다른 사용자는 `main` 브랜치를 clone한 뒤, 자신의 컴퓨터에서 아래 준비를 마칩니다.
 
@@ -88,6 +107,8 @@ pip install -e ".[dev]"
 스킬이 목록에 바로 보이지 않으면 새 task를 열거나 Codex app을 다시 시작합니다. GitHub 활동을
 탐색할 때만 `gh auth login`이 필요하며, 로컬 파일만 사용할 때는 GitHub 인증 없이 진행할 수 있습니다.
 
+#### 2. 탐색 제외 규칙을 먼저 승인하기
+
 각 사용자는 자신의 `.portfolio-maker/` 작업 공간을 별도로 만듭니다. 이 디렉터리에는 승인 파일,
 로컬 SQLite 데이터베이스, 스냅샷, 생성물이 들어갈 수 있으므로 다른 사용자와 공유하거나 Git에
 커밋하지 않습니다.
@@ -98,15 +119,22 @@ pip install -e ".[dev]"
 portfolio-maker approve --workspace . --write-sample
 ```
 
-탐색 전에는 `forbidden_paths`, `excluded_repositories`, `allowed_repositories`,
-`private_sources_allowed`, `excluded_file_patterns`만 검토합니다. `forbidden_paths`는
-하위 호환 alias이며 새로 지정하는 폴더는 `excluded_directories`에 기록합니다. 정확한 activity URL은
-아직 존재하지 않으므로 `approved_github_activity_urls`는 비워 둡니다.
+`.portfolio-maker/reviews/source-approval.json`을 열어 탐색에서 제외할 폴더와 저장소를 정합니다.
+새 제외 폴더는 `excluded_directories`에 기록하고, 이전 형식의 `forbidden_paths`는 하위 호환용으로
+유지합니다. 비공개 GitHub을 검토하려면 `private_sources_allowed`를 `true`로 바꾸고 필요한
+`allowed_repositories`만 `owner/repo` 형식으로 추가합니다. 정확한 activity URL과
+`approved_source_uris`는 아직 후보를 확인하지 않았으므로 비워 둡니다.
+
+#### 3. 후보를 탐색하고 근거를 승인하기
+
+홈 디렉터리 전체를 기준으로 시작하려면 다음을 실행합니다. `--exclude-directory "$PWD"`는 현재
+도구 저장소를 후보에서 빼고 그 선택을 승인 파일에 기록합니다. 로컬 파일만 먼저 검토하려면
+마지막에 `--no-github`를 추가하세요.
 
 그다음 후보를 확인하고 승인 내용을 검토합니다.
 
 ```bash
-portfolio-maker discover --workspace .
+portfolio-maker discover --workspace . --home "$HOME" --exclude-directory "$PWD"
 ```
 
 ```text
@@ -119,8 +147,10 @@ discovery report의 `GitHub Activities`에서 URL을 고르기 전에, 대응하
 통과했는지 확인합니다. 선택한 정확한 URL을
 공개 activity는 `approved_github_activity_urls`에, private activity는 private opt-in과
 allowlist를 확인한 뒤 `approved_private_github_activity_urls`에 복사합니다. 로컬
-`approved_source_uris`도 함께 검토·완성합니다. excluded, missing, stale activity는
+후보의 `file://` URI만 `approved_source_uris`에 복사합니다. excluded, missing, stale activity는
 승인하지 않습니다.
+
+#### 4. 생성물별 공유 범위를 정하기
 
 로컬·공개 GitHub·private GitHub 근거를 생성물별로 선택하려면 artifact policy 예시도
 초기화합니다.
@@ -133,16 +163,33 @@ portfolio-maker approve --workspace . --write-sample-artifact-policy
 `include_*`, 제외 목록을 검토합니다. 기본은 `restricted`이며, `open_public`은 별도
 재생성과 공개 적합성 검증이 필요한 공개 GitHub 전용 범위입니다.
 
+#### 5. 의미 있는 포트폴리오 project를 구성하기
+
 semantic portfolio project를 구성하려면 먼저 안전한 review bundle을 만듭니다.
 
 ```bash
+portfolio-maker ingest --workspace .
 portfolio-maker prepare-project-review --workspace .
+```
+
+Codex에게는 다음처럼 요청합니다. Codex는 지정된 review bundle만 읽어 후보 파일을 작성하며,
+원본 파일·로컬 경로·private GitHub URL을 다시 탐색하거나 추론해서는 안 됩니다.
+
+```text
+$portfolio-maker
+`.portfolio-maker/reviews/project-review-input.json`만 근거로 읽고,
+의미 있는 작업 단위의 후보를 `.portfolio-maker/reviews/project-candidates.json`과
+`.portfolio-maker/reviews/project-candidates.md`에 작성해 주세요. 각 후보는 검토 필요 상태로
+두고, 확신이 없거나 작은 단발성 근거는 unassigned로 남겨 주세요.
 ```
 
 Codex는 `.portfolio-maker/reviews/project-review-input.json`만 읽어
 `project-candidates.json`과 `project-candidates.md`를 작성할 수 있습니다. candidate는
 검토 보조물일 뿐 database truth가 아니며, 사용자가 직접 작성한 approval도 허용됩니다.
-검토·수정한 `project-approval.json`을 materialize하려면 다음을 실행합니다.
+후보를 검토한 뒤 approval 예시를 만들고 `project-approval.json`을 수정합니다. 새 예시는 모든
+근거를 unassigned로 시작하므로, 승인할 project의 `id`, `title`, `overview`, `evidence_ids`와
+`status: "approved"`를 직접 확정해야 합니다. 검토·수정한 approval을 materialize하려면 다음을
+실행합니다.
 
 ```bash
 portfolio-maker approve --workspace . --write-sample-project-approval
@@ -153,6 +200,8 @@ portfolio-maker compose-projects --workspace .
 project approval이 없으면 evidence inventory는 유지되지만 project 목록은 빈 상태입니다.
 각 artifact는 자기 policy로 evidence를 다시 선택한 뒤 승인 project link와 교차하며,
 candidate·rejected·unassigned·stale evidence는 project output에 포함되지 않습니다.
+
+#### 6. 프로필·초안·인터랙티브 HTML 생성하기
 
 기존 workspace에서 provenance가 없는 legacy workflow activity는 안전을 위해 profile과
 portfolio draft의 입력에서 제외됩니다. 이를 복구하려면 `portfolio-maker discover
@@ -166,6 +215,10 @@ portfolio-maker build-profile --workspace .
 portfolio-maker draft-portfolio --workspace .
 portfolio-maker render-html --workspace .
 ```
+
+`portfolio.html`은 정적 파일이므로 웹 브라우저로 열어 filter, project detail, timeline을
+확인할 수 있습니다. `restricted` 결과는 로컬 사용·검증된 수신자 전달·private hosting을 위한
+범위이며, 파일명이 `public`이라고 자동 인터넷 공개되는 것은 아닙니다.
 
 생성 결과는 다음 위치에 저장됩니다.
 
@@ -215,13 +268,30 @@ portfolio-maker approve --workspace . --write-sample --force
 
 두 파일명의 `public`은 호환성 이름입니다. `restricted`는 자동 인터넷 공개를 뜻하지 않으며 로컬 사용, 검증된 수신자 전달, private hosting을 위한 범위입니다. 누구나 접근 가능한 배포는 별도 `open_public` 선택과 재검증을 거쳐야 하며, 이 구현에서는 local/private origin을 거부합니다.
 
+### 0.2.0 개발 목표
+
+현재 0.1.0의 project composition은 안전한 evidence 목록을 Codex가 검토하는 방식이며, local
+discovery는 최대 500개 후보에서 멈춥니다. 0.2.0에서는 이를 다음 구조로 확장할 계획입니다.
+
+- 허용된 전체 폴더·파일 구조를 전역 개수 상한 없이 기록하는 계층형 의미 인덱스
+- 코드·문서·테스트·설정 파일의 역할 요약과 하위에서 상위로 합성하는 폴더 요약
+- 상위 폴더의 공통 맥락과 독립 하위 제품·공모전·배포물을 구분하는 Codex Project Boundary Detection
+- 검토 모드와, `high`·`medium` 후보를 포함하는 명시적 자동 모드
+- 자동 포함 project를 원본이나 evidence 삭제 없이 선택 제외하고 다시 포함하는 검토 흐름
+- source governance, semantic indexing, candidate curation, review, artifact 생성을 나눈 multi-skill Codex plugin
+- 향후 개인 근거 지식 그래프와 Google Drive 등 추가 source로 확장할 수 있는 공통 node/provenance model
+
+0.2.0 자동 포함은 evidence 승인, delivery scope 또는 공개 배포 승인을 대신하지 않습니다. 현재
+실행 가능한 0.1.0 명령과 위 계획 기능을 구분하며, 전체 완료 기준은
+[0.2.0 설계 명세](docs/superpowers/specs/2026-07-14-portfolio-maker-0.2.0-semantic-index-plugin-design.md)에서 관리합니다.
+
 ## 버그와 제안
 
 버그 리포트, 기능 아이디어, 개선 제안은 모두 [GitHub Issues](https://github.com/koreaben777/portfolio-maker/issues)로 남겨 주세요. 재현 방법, 기대한 결과, 실제 결과를 함께 적어 주시면 빠르게 확인할 수 있습니다.
 
 ## README 갱신 원칙
 
-기능, 실행 방법, 요구 사항, 보안 정책, 생성 산출물이 달라지는 업데이트는 **같은 푸시에 README를 함께 갱신**합니다. 아직 구현되지 않은 제안과 논의는 README의 현재 기능으로 표현하지 않고 Issues에서 추적합니다.
+기능, 실행 방법, 요구 사항, 보안 정책, 생성 산출물이 달라지는 업데이트는 **같은 푸시에 README를 함께 갱신**합니다. 설계나 구현 계획이 승인되어 roadmap이 달라진 경우에도 별도 요청을 기다리지 않고 권위 명세, roadmap, 개발 원칙과 README의 future section을 함께 검토합니다. 아직 구현되지 않은 제안과 논의는 README의 현재 기능으로 표현하지 않고 Issues에서 추적합니다.
 
 ## 문제 해결
 

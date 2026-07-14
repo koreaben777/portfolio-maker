@@ -1,12 +1,15 @@
 # Portfolio Maker 로드맵 Phase 1 구현 명세
 
 날짜: 2026-07-11
-상태: 현재 구현 slice는 #13 semantic project composition까지 포함하며, 아래 #4 → #2 → #1 설명은 역사적 Phase 1 기준선이다.
+상태: 현재 0.1.0 구현 slice는 #13 semantic project composition까지 포함하며, 0.2.0 계층형 의미 인덱스·plugin 확장이 승인된 다음 release 목표다. 아래 #4 → #2 → #1 설명은 역사적 Phase 1 기준선이다.
 역사적 기준선 대상 Issue: #4 → #2 → #1
 현재 구현 slice: #12 통합 근거 정책, 일반형 #11 renderer, #13 Codex 기반 semantic project composition
-다음 단계: #3 회사/JD별 맞춤 생성 (`@sites`는 presentation/hosting 계층)
+다음 release 목표: 0.2.0 계층형 의미 인덱스, Project Boundary Detection, multi-skill Codex plugin
+후속 제품 단계: #3 회사/JD별 맞춤 생성 (`@sites`는 presentation/hosting 계층)
 
 2026-07-13 정렬 메모: #4, #2, #1 기준선, 일반형 #11 renderer, #12 통합 근거 정책이 현재 worktree에 구현되어 있다. 파일·repository 기반 technical grouping이 semantic portfolio project로 잘못 노출되지 않도록 #13 composition 계층을 추가했다.
+
+2026-07-14 0.2.0 결정: #13의 현재 flat review bundle을 계층형 의미 인덱스로 확장하고, 책임별 skill을 하나의 installable Codex plugin으로 묶는다. 0.2.0 전체 설계는 [계층형 의미 인덱스·플러그인 설계](2026-07-14-portfolio-maker-0.2.0-semantic-index-plugin-design.md)를 따른다. 이 기능은 승인된 개발 목표이며 현재 0.1.0 runtime으로 표현하지 않는다.
 
 ## 1. 목적과 범위
 
@@ -59,7 +62,9 @@ Portfolio Maker 0.1.0은 승인된 로컬 파일에서 근거 기반 master prof
   ↓
 #12 통합 근거 풀·생성물별 선택 정책     구현 완료
   ↓
-#13 Codex 기반 프로젝트 식별·구성·선정  다음 최우선
+#13 Codex 기반 프로젝트 식별·구성·선정  0.1.0 구현 기준선
+  ↓
+0.2.0 계층형 의미 인덱스·Project Boundary Detection·Codex plugin
   ↓
 #3 회사/JD별 맞춤 포트폴리오
 ```
@@ -278,7 +283,25 @@ Stage C는 approval schema에 다음 optional 필드를 추가한다.
 - legacy technical grouping을 자동 이관하지 않으며, project approval이 없는 새 artifact는 zero-project empty state를 보여 준다.
 - CLI의 외부 LLM API 호출·token 저장은 구현하지 않는다. Codex app의 portfolio-maker skill이 안전한 review bundle을 읽는 사용자 통제 분석 workflow다.
 
-### 7.4 #3 회사/JD별 맞춤 포트폴리오 후속 확장
+### 7.4 Release 0.2.0 — 계층형 의미 인덱스와 multi-skill Codex plugin
+
+0.2.0은 #13의 현재 승인·materialization 경계를 유지하면서 candidate input과 사용자 경험을 확장한다.
+
+설계 문서: [Portfolio Maker 0.2.0 계층형 의미 인덱스·플러그인 설계](2026-07-14-portfolio-maker-0.2.0-semantic-index-plugin-design.md)
+
+- local discovery의 전역 500 candidate 상한을 새 semantic index 경로에서 제거한다.
+- 모든 허용 directory/file을 structure node로 기록하고 file semantic summary를 bottom-up directory summary로 합성한다.
+- Codex는 parent context, independent child, cross-directory relation, counter signal을 함께 보고 project boundary를 제안한다.
+- review mode는 모든 candidate의 사용자 결정을 요구한다.
+- explicit automatic mode는 `high`와 `medium`을 포함하고 `medium`을 review recommended로 표시한다.
+- 자동 포함 project는 원본·evidence·index를 삭제하지 않고 artifact projection에서 가역적으로 제외·재포함할 수 있다.
+- source governance, semantic index, curation, review, artifact responsibility를 별도 skill로 나누고 `$portfolio-maker`를 representative router로 유지한다.
+- current policy, index revision, candidate input, decision, artifact manifest를 hash chain으로 연결한다.
+- personal evidence knowledge graph와 Google Drive는 0.2.0 node/provenance model의 후속 확장으로 남기며 이번 release에서 구현하지 않는다.
+
+0.2.0은 위 설계의 완료 기준, migration, full test, static build, browser validation, 실제 user-scope smoke test를 모두 통과해야 완료로 표시한다.
+
+### 7.5 #3 회사/JD별 맞춤 포트폴리오 후속 확장
 
 [#3](https://github.com/koreaben777/portfolio-maker/issues/3)은 #11이 생성한 동일한 public-safe manifest를 입력으로 받아 회사·JD별 우선순위, 표현, 섹션 구성을 추가하는 후속 단계다.
 
@@ -289,7 +312,7 @@ Stage C는 approval schema에 다음 optional 필드를 추가한다.
 - 회사/JD 맞춤 문장은 근거가 없으면 생성하지 않거나 review-required로 남긴다.
 - #3 구현은 #11의 UI·manifest 계약을 확장하되, raw source와 runtime 외부 API를 새로 노출하지 않는다.
 
-### 7.5 Stage D — 통합 근거 풀과 생성물별 근거 선택 정책 (Issue #12 구현 기준)
+### 7.6 Stage D — 통합 근거 풀과 생성물별 근거 선택 정책 (Issue #12 구현 기준)
 
 [#12](https://github.com/koreaben777/portfolio-maker/issues/12)은 로컬 파일, 공개 GitHub activity, 명시적으로 허용한 private GitHub activity를 하나의 evidence pool로 통합하고, master profile·Markdown draft·public manifest·HTML에 artifact별 include/exclude policy를 적용하는 현재 정책이다.
 
@@ -302,23 +325,28 @@ artifact policy가 없는 기존 #11 workspace는 0.1.0 호환 경로로 `portfo
 
 누구나 접근 가능한 배포는 `open_public`을 사용자가 별도로 선택하고 재생성·검증한 결과에만 허용한다. 초기 `open_public` 구현은 공개 GitHub 근거만 허용하고 local/private origin 요청을 validation error로 거부한다. `@sites` public deployment는 restricted output을 거부하며, 사용자의 명시적인 공개 배포 명령 없이는 실행하지 않는다.
 
-## 8. developer 작업 지시
+## 8. 다음 developer 작업 지시
 
-1. 현재 `origin/main`에서 작업을 시작하고 dirty/untracked 파일을 먼저 분리한다.
-2. #4, #2, #1, #11, #12는 현재 기준선으로 재구현하거나 의미를 넓히지 않는다.
-3. 다음 구현은 #13만 대상으로 한다. 먼저 candidate와 approved portfolio project를 technical evidence grouping에서 분리하는 failing test를 작성한다.
-4. Codex analysis input은 approval·artifact policy·masking을 통과한 safe review bundle로 제한한다. CLI 내부 외부 LLM API, token 저장, raw local path/private URL 전달을 추가하지 않는다.
-5. candidate는 user approval 전 artifact project가 될 수 없고, unassigned evidence는 portfolio project 수에 포함하지 않는다.
-6. #13 focused tests, 전체 test, Vite build, static HTML/browser 검증, `git diff --check`를 통과시킨다.
-7. #3 회사/JD 문장 생성, actual Sites hosting, private repository raw clone/ingestion, Google Drive/OCR/semantic search/MCP는 구현하지 않는다. `@sites`는 #13이 만든 approved-project manifest의 presentation 검증 계층으로만 유지한다.
-8. 각 stage가 끝날 때 README, portfolio-maker skill, sample review files, Issue #13의 현재 상태를 실제 code behavior와 맞춘다.
-9. 최종 보고에는 변경 파일, HEAD, 실행한 검증 명령, candidate/approved/unassigned counts, 결과, 남은 위험을 포함한다.
+1. 현재 구현 branch와 dirty/untracked 파일을 먼저 확인하고, 0.1.0 #13 기준선을 재구현하지 않는다.
+2. 다음 implementation plan은 [0.2.0 계층형 의미 인덱스·플러그인 설계](2026-07-14-portfolio-maker-0.2.0-semantic-index-plugin-design.md)의 완료 기준을 독립 task로 나눈다.
+3. 계층형 의미 인덱스, Project Boundary Detection, automatic review policy, plugin packaging의 순서와 migration checkpoint를 명시한다.
+4. 먼저 전역 500 candidate cap과 flat evidence context로 known project가 누락되는 회귀 fixture를 작성한다.
+5. source approval, artifact policy, masking, private GitHub, delivery scope, EvidenceSelectionService를 우회하거나 의미를 넓히지 않는다.
+6. CLI 내부 외부 LLM API, token 저장, raw locator의 Codex review/artifact 전달을 추가하지 않는다.
+7. `high`와 `medium` automatic inclusion은 explicit automatic mode에서만 동작하고, reversible exclusion과 manual-decision precedence를 함께 구현한다.
+8. plugin skill은 권한·workflow 책임별로 분리하고 Python application use case를 복제하지 않는다. MCP/App은 0.2.0 필수 범위에 넣지 않는다.
+9. focused tests, 전체 pytest, plugin/skill validation, TypeScript check, Vite build, static HTML/browser 검증, 실제 user-scope smoke test, `git diff --check`를 통과시킨다.
+10. 각 implementation slice에서 README, plugin skills, sample review files, roadmap, development principles, Issue 상태를 실제 code behavior와 맞춘다.
+11. 최종 보고에는 변경 파일, HEAD, 실행한 검증 명령, index coverage, candidate/auto/manual/excluded/unassigned counts, migration 결과, 남은 위험을 포함한다.
 
 ## 9. 명세 자체 점검
 
 - #4, #2, #1, #11, #12는 evidence discovery·approval·selection·renderer 기준선을 제공한다.
 - #13은 technical evidence grouping과 semantic portfolio project를 분리하고, Codex proposal과 user approval을 별도의 gate로 둔다.
 - #13은 single file/repository/activity 자동 project 승격을 막고 unassigned evidence를 보존한다.
+- 0.2.0은 #13의 승인 경계를 유지하며 flat input을 hierarchical semantic index로 교체한다.
+- 0.2.0 automatic mode는 medium 이상을 포함하지만 manual decision, evidence policy, delivery scope를 우회하지 않는다.
+- 0.2.0 plugin은 workflow를 skill로 분리하되 deterministic application engine을 복제하지 않는다.
 - #11은 #13의 approved project manifest를 렌더링하되 evidence authority나 Codex candidate approval을 대체하지 않는다.
-- #3은 approved semantic project를 입력으로 쓰는 후속 단계이며 #13보다 먼저 구현하지 않는다.
+- #3은 approved semantic project를 입력으로 쓰는 후속 단계이며 0.2.0 project discovery 개선 뒤에 진행한다.
 - 현재 local-first, approval-first, GitHub fail-open, review-required, raw-path/credential non-disclosure 경계를 유지한다.
