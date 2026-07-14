@@ -11,7 +11,7 @@ from portfolio_maker.infrastructure.github_connector import (
 )
 
 
-def test_private_discovery_requires_auth_and_exact_activity_approval(monkeypatch):
+def test_private_discovery_reports_allowlisted_activity_without_prior_approval(monkeypatch):
     auth_calls = []
     json_calls = []
     approved_url = "https://github.com/octo/private/pull/7"
@@ -62,13 +62,16 @@ def test_private_discovery_requires_auth_and_exact_activity_approval(monkeypatch
         excluded_repositories=("octo/excluded",),
         allowed_repositories=("octo/private", "octo/excluded"),
         private_sources_allowed=True,
-        approved_private_github_activity_urls=(approved_url,),
+        approved_private_github_activity_urls=(),
     )
 
     assert auth_calls == [True]
     assert [repo.name_with_owner for repo in result.repositories] == ["octo/private"]
-    assert [activity.url for activity in result.activities] == [approved_url]
-    assert result.activities[0].is_private is True
+    assert [activity.url for activity in result.activities] == [
+        approved_url,
+        "https://github.com/octo/private/pull/8",
+    ]
+    assert all(activity.is_private is True for activity in result.activities)
     assert all("octo/excluded" not in " ".join(call) for call in json_calls)
 
 

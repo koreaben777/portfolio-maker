@@ -379,6 +379,50 @@ def test_discover_sources_persists_and_hydrates_workflow_state_provenance(
     assert hydrated[0].state_field == "status"
 
 
+def test_discover_sources_reports_allowlisted_private_activity_before_approval(
+    workspace, tmp_path, monkeypatch
+):
+    paths = WorkspacePaths.from_root(workspace)
+    write_sample_approval(paths)
+    approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    approval.update(
+        {
+            "private_sources_allowed": True,
+            "allowed_repositories": ["octo/private"],
+            "approved_private_github_activity_urls": [],
+        }
+    )
+    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+    repo = GitHubRepositoryCandidate(
+        name_with_owner="octo/private",
+        url="https://github.com/octo/private",
+        is_private=True,
+    )
+    activity = GitHubActivityCandidate(
+        repo="octo/private",
+        activity_type="pull_request",
+        url="https://github.com/octo/private/pull/7",
+        title="Private review candidate",
+        state="OPEN",
+        author="octo",
+        created_at="2026-01-01T00:00:00Z",
+        merged_at=None,
+    )
+    monkeypatch.setattr(
+        "portfolio_maker.application.discovery.discover_github_candidates",
+        lambda **kwargs: github_discovery_result([repo], [activity]),
+    )
+
+    result = discover_sources(
+        DiscoverSourcesRequest(workspace=workspace, home=tmp_path, include_github=True)
+    )
+
+    report = result.report_path.read_text(encoding="utf-8")
+    assert activity.url in report
+    repository = SQLiteRepository(paths.db_path)
+    assert [item.url for item in repository.list_github_activities()] == [activity.url]
+
+
 def test_discover_sources_keeps_local_report_when_github_fails(workspace, tmp_path, monkeypatch):
     readme = tmp_path / "README.md"
     readme.write_text("# Demo\n", encoding="utf-8")

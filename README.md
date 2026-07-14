@@ -189,6 +189,7 @@ portfolio-maker render-html --workspace .
 - `excluded_file_patterns`는 대소문자를 구분하지 않는 파일명 glob으로 로컬 후보와 재수집을 제외합니다.
 - `approved_github_activity_urls`는 discovery가 저장한 공개 GitHub activity URL을 정확히 지정합니다. private activity 또는 allowlist 밖·excluded repository activity는 승인되어도 산출물 입력으로 쓰지 않습니다.
 - `approved_private_github_activity_urls`는 `private_sources_allowed`, repository allowlist, 제외 정책을 모두 통과한 private activity에만 사용합니다. private provenance는 restricted 결과에서 안전한 label로만 표시합니다.
+- 정확한 private activity URL은 discovery report라는 로컬 승인 표면에서만 확인·선택할 수 있으며, 생성 artifact와 safe semantic review bundle에는 표시하지 않습니다.
 - restricted semantic project의 title/overview에는 사용자가 approval file에서 직접 승인한 private repository name을 display text로 포함할 수 있습니다. 이는 자동 source label 공개가 아니며, private GitHub URL·raw locator·snapshot/database path·credential/token은 계속 출력하지 않습니다.
 - 어떤 delivery scope에도 비밀값, 토큰, credential, raw local path를 넣지 않습니다.
 - `portfolio-public.json`과 `portfolio.html`은 파일명과 무관하게 artifact policy의 delivery scope를 따릅니다. 승인된 semantic project별 timeline은 선택된 evidence의 날짜와 provenance만 표시합니다.

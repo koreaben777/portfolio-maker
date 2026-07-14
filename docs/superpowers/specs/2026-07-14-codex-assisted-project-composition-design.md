@@ -66,6 +66,7 @@ bundle은 다음 safe field만 포함한다.
 - 현재 delivery scope와 policy hash
 
 bundle에는 raw absolute path, `file://` URI, snapshot path, private GitHub URL, credential, token, database path를 넣지 않는다. current approval 또는 artifact policy에서 제외된 evidence도 넣지 않는다.
+private activity의 정확한 URL은 discovery report라는 로컬 승인 표면에서 사용자가 선택할 때만 확인할 수 있으며, 이 safe review bundle이나 생성 artifact에는 넣지 않는다.
 
 ### 3.2 Codex candidate review
 

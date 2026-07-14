@@ -405,6 +405,40 @@ def test_render_html_projects_use_one_approved_multi_origin_semantic_project(
     assert public_url in manifest_text + html_text
 
 
+def test_unapproved_private_activity_stays_out_of_all_review_and_artifacts(
+    tmp_path,
+    monkeypatch,
+):
+    workspace, paths, _, _, local_uri, public_url, private_url = (
+        _setup_multi_origin_render_workspace(tmp_path)
+    )
+    approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    approval["approved_private_github_activity_urls"] = []
+    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+
+    profile = build_profile(BuildProfileRequest(workspace=workspace))
+    draft = draft_portfolio(DraftPortfolioRequest(workspace=workspace))
+    manifest = build_public_portfolio(PublicPortfolioRequest(workspace=workspace))
+    review = prepare_project_review(PrepareProjectReviewRequest(workspace=workspace))
+    monkeypatch.setattr(render_html_module.subprocess, "run", _fake_build_with_generated_data)
+    render_html(RenderHtmlRequest(workspace=workspace))
+
+    output_text = "\n".join(
+        (
+            profile.json_path.read_text(encoding="utf-8"),
+            profile.markdown_path.read_text(encoding="utf-8"),
+            draft.markdown_path.read_text(encoding="utf-8"),
+            manifest.manifest_path.read_text(encoding="utf-8"),
+            review.input_path.read_text(encoding="utf-8"),
+            paths.portfolio_html_path.read_text(encoding="utf-8"),
+        )
+    )
+    assert private_url not in output_text
+    assert "Private activity" not in output_text
+    assert local_uri not in output_text
+    assert public_url in output_text
+
+
 def test_restricted_approved_private_repository_name_is_display_text_only(
     tmp_path,
     monkeypatch,

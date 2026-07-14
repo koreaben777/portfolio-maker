@@ -156,6 +156,7 @@ Portfolio Maker 0.1.0은 승인된 로컬 파일에서 근거 기반 master prof
 ### 6.1 별도 승인 게이트
 
 GitHub discovery 성공 또는 `private_sources_allowed=true`는 artifact 사용 승인이 아니다.
+private discovery가 인증·opt-in·allowlist를 통과하면 discovery report에 exact private activity URL이 로컬 승인 표면으로 표시될 수 있지만, 사용자가 별도 승인하기 전에는 evidence가 아니며 생성 artifact와 safe semantic review input에는 포함하지 않는다.
 
 Stage C는 approval schema에 다음 optional 필드를 추가한다.
 

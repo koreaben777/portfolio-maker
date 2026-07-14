@@ -52,7 +52,7 @@ persist the resulting policy before ingest, profile, or draft generation.
 .portfolio-maker/reviews/discovery-report.md
 ```
 
-7. In `GitHub Activities`, find each candidate URL only after confirming its matching entry in `GitHub Repositories` is marked `(public)` or is an explicitly allowed private repository. Copy selected exact public URLs into `approved_github_activity_urls` and exact private URLs into `approved_private_github_activity_urls`. Do not approve excluded, missing, or stale activities.
+7. In `GitHub Activities`, find each candidate URL only after confirming its matching entry in `GitHub Repositories` is marked `(public)` or is an explicitly allowed private repository. Copy selected exact public URLs into `approved_github_activity_urls` and exact private URLs into `approved_private_github_activity_urls`. A private URL may appear on this local discovery/approval surface so the user can make that explicit selection; it must not enter generated artifacts or the safe semantic review bundle. Do not approve excluded, missing, or stale activities.
 
 8. Legacy workflow activities without persisted provenance remain ineligible for profile and portfolio artifacts. Recover them by completing a successful rediscovery:
 

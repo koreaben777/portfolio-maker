@@ -310,10 +310,6 @@ def discover_github_candidates(
     ]
     activities: list[GitHubActivityCandidate] = []
     statuses: list[str] = []
-    approved_private_urls = {
-        canonical_public_github_activity_url(url)
-        for url in approved_private_github_activity_urls
-    }
     if not repositories_complete:
         statuses.append(
             "GitHub repository list discovery incomplete: result reached the 100-item limit"
@@ -379,10 +375,6 @@ def discover_github_candidates(
                 parsed_activities = parser(repo.name_with_owner, run_gh_json(args))
                 for activity in parsed_activities:
                     activity = replace(activity, is_private=repo.is_private)
-                    if repo.is_private:
-                        canonical_url = canonical_public_github_activity_url(activity.url)
-                        if canonical_url not in approved_private_urls:
-                            continue
                     activities.append(activity)
                 if len(parsed_activities) >= page_limit:
                     statuses.append(
