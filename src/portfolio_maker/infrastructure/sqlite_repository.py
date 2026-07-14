@@ -870,52 +870,71 @@ class SQLiteRepository:
         self,
         observed_activities: tuple[tuple[str, str, str], ...],
     ) -> None:
-        predicates = " OR ".join(
-            "(lower(repo) = ? AND activity_type = ? AND lower(url) = ?)"
-            for _ in observed_activities
-        )
-        parameters = tuple(
-            value
-            for activity in observed_activities
-            for value in activity
-        )
-        observed_clause = f"NOT ({predicates})" if predicates else "1 = 1"
         with self._connection() as conn:
+            conn.execute("DROP TABLE IF EXISTS temp.observed_github_activity_keys")
             conn.execute(
-                f"""
-                UPDATE github_activities
-                SET is_private = 1,
-                    is_current = 0
-                WHERE {observed_clause}
-                """,
-                parameters,
-            )
-            conn.execute(
-                f"""
-                UPDATE evidence_items
-                SET public_safe = 0
-                WHERE github_activity_id IN (
-                    SELECT id FROM github_activities WHERE {observed_clause}
+                """
+                CREATE TEMP TABLE observed_github_activity_keys (
+                    repo TEXT COLLATE NOCASE NOT NULL,
+                    activity_type TEXT NOT NULL,
+                    url TEXT COLLATE NOCASE NOT NULL,
+                    PRIMARY KEY (repo, activity_type, url)
                 )
-                """,
-                parameters,
+                """
             )
-            conn.execute(
-                f"""
-                UPDATE career_claims
-                SET public_safe = 0
-                WHERE id IN (
-                    SELECT claim_evidence.claim_id
-                    FROM claim_evidence
-                    JOIN evidence_items
-                      ON evidence_items.id = claim_evidence.evidence_id
-                    JOIN github_activities
-                      ON github_activities.id = evidence_items.github_activity_id
-                    WHERE {observed_clause}
+            try:
+                conn.executemany(
+                    """
+                    INSERT OR IGNORE INTO observed_github_activity_keys
+                        (repo, activity_type, url)
+                    VALUES (?, ?, ?)
+                    """,
+                    observed_activities,
                 )
-                """,
-                parameters,
-            )
+                stale_clause = """
+                    NOT EXISTS (
+                        SELECT 1
+                        FROM temp.observed_github_activity_keys AS observed
+                        WHERE observed.repo = github_activities.repo
+                          AND observed.activity_type = github_activities.activity_type
+                          AND observed.url = github_activities.url
+                    )
+                """
+                conn.execute(
+                    f"""
+                    UPDATE github_activities
+                    SET is_private = 1,
+                        is_current = 0
+                    WHERE {stale_clause}
+                    """
+                )
+                conn.execute(
+                    f"""
+                    UPDATE evidence_items
+                    SET public_safe = 0
+                    WHERE github_activity_id IN (
+                        SELECT id FROM github_activities
+                        WHERE {stale_clause}
+                    )
+                    """
+                )
+                conn.execute(
+                    f"""
+                    UPDATE career_claims
+                    SET public_safe = 0
+                    WHERE id IN (
+                        SELECT claim_evidence.claim_id
+                        FROM claim_evidence
+                        JOIN evidence_items
+                          ON evidence_items.id = claim_evidence.evidence_id
+                        JOIN github_activities
+                          ON github_activities.id = evidence_items.github_activity_id
+                        WHERE {stale_clause}
+                    )
+                    """
+                )
+            finally:
+                conn.execute("DROP TABLE temp.observed_github_activity_keys")
 
     def invalidate_unconfirmed_github_activity_visibility(
         self,
@@ -960,7 +979,38 @@ class SQLiteRepository:
         )
         with self._connection() as conn:
             conn.execute(
-                f"UPDATE github_activities SET is_private = 1 WHERE {predicates}",
+                f"""
+                UPDATE github_activities
+                SET is_private = 1,
+                    is_current = 0
+                WHERE {predicates}
+                """,
+                parameters,
+            )
+            conn.execute(
+                f"""
+                UPDATE evidence_items
+                SET public_safe = 0
+                WHERE github_activity_id IN (
+                    SELECT id FROM github_activities WHERE {predicates}
+                )
+                """,
+                parameters,
+            )
+            conn.execute(
+                f"""
+                UPDATE career_claims
+                SET public_safe = 0
+                WHERE id IN (
+                    SELECT claim_evidence.claim_id
+                    FROM claim_evidence
+                    JOIN evidence_items
+                      ON evidence_items.id = claim_evidence.evidence_id
+                    JOIN github_activities
+                      ON github_activities.id = evidence_items.github_activity_id
+                    WHERE {predicates}
+                )
+                """,
                 parameters,
             )
 

@@ -115,11 +115,7 @@ def discover_sources(request: DiscoverSourcesRequest) -> DiscoverSourcesResult:
                         confirmed_repositories
                     )
                 repository.invalidate_github_activity_visibility_for_endpoints(
-                    tuple(
-                        endpoint
-                        for endpoint in discovery_result.completed_endpoints
-                        if endpoint[0] in confirmed_repositories
-                    )
+                    discovery_result.completed_endpoints
                 )
         except (GitHubDiscoveryError, FileNotFoundError) as error:
             github_statuses = [str(error) or "GitHub discovery failed"]

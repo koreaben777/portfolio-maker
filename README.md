@@ -185,7 +185,7 @@ portfolio-maker render-html --workspace .
 - 프로필 생성 전에는 승인 상태, 금지 경로, 원본 파일 해시, 최신 스냅샷을 다시 확인합니다.
 - 비공개 GitHub 저장소는 `private_sources_allowed`를 명시적으로 허용하지 않는 한 건너뜁니다.
 - `excluded_repositories`에 넣은 저장소는 GitHub 탐색에서 제외합니다.
-- `allowed_repositories`가 비어 있지 않으면 그 `owner/repo`만 GitHub 탐색 대상으로 남습니다.
+- GitHub repository 목록은 먼저 계정 범위를 전역 열거한 뒤 allowlist로 필터링하며, allowlist 밖 저장소에는 repository-scoped activity endpoint만 호출하지 않습니다.
 - 공개 GitHub는 `allowed_repositories`가 비어 있으면 기존처럼 공개 저장소 전체를 탐색하지만, private GitHub discovery는 `private_sources_allowed=true`와 비어 있지 않은 canonical allowlist가 모두 있어야 하며 allowlist 밖 저장소는 endpoint를 호출하지 않습니다.
 - `excluded_file_patterns`는 대소문자를 구분하지 않는 파일명 glob으로 로컬 후보와 재수집을 제외합니다.
 - `approved_github_activity_urls`는 discovery가 저장한 공개 GitHub activity URL을 정확히 지정합니다. private activity 또는 allowlist 밖·excluded repository activity는 승인되어도 산출물 입력으로 쓰지 않습니다.

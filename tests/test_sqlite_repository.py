@@ -352,6 +352,45 @@ def test_sqlite_repository_upserts_github_activity_by_repo_type_and_url(workspac
     assert [(row["id"], row["title"]) for row in rows] == [(first_id, "Updated title")]
 
 
+def test_sqlite_repository_reconciles_large_complete_activity_snapshot(workspace):
+    paths = WorkspacePaths.from_root(workspace)
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    activity_count = 10_001
+    rows = [
+        (
+            "octo/demo",
+            "issue",
+            f"https://github.com/octo/demo/issues/{index}",
+            f"Issue {index}",
+            "OPEN",
+            "octo",
+            "2026-01-01T00:00:00Z",
+            0,
+        )
+        for index in range(1, activity_count + 1)
+    ]
+    with repository._connection() as conn:
+        conn.executemany(
+            """
+            INSERT INTO github_activities
+                (repo, activity_type, url, title, state, author, created_at, is_private)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+
+    repository.invalidate_unobserved_github_activities(
+        tuple((repo, activity_type, url) for repo, activity_type, url, *_ in rows)
+    )
+
+    with repository._read_connection() as conn:
+        stale_count = conn.execute(
+            "SELECT COUNT(*) AS count FROM github_activities WHERE is_current = 0"
+        ).fetchone()["count"]
+    assert stale_count == 0
+
+
 def test_sqlite_repository_legacy_alias_lookup_does_not_scan_unrelated_rows(
     workspace, monkeypatch
 ):

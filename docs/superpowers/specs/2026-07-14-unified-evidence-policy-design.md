@@ -45,7 +45,7 @@ private activity discovery 조건:
 2. `source-approval.json`에서 `private_sources_allowed`가 `true`다.
 3. `allowed_repositories`가 비어 있지 않으며 사용자가 선택한 repository가 포함된다.
 4. `excluded_repositories`가 우선 적용된다.
-5. public activity는 `approved_github_activity_urls`, private activity는 `approved_private_github_activity_urls`에서 정확히 승인된다.
+5. public/private activity metadata는 위 discovery 조건을 통과한 repository에 대해 탐색한다. exact URL approval은 fresh local discovery의 선행 조건이 아니라, discovery report에서 사용자가 선택한 뒤 artifact eligibility에 적용하는 별도 gate다.
 
 private repository 또는 private activity가 discovery report에 나타나는 것은 artifact 사용 승인과 다르다. `restricted` 생성물에 넣으려면 위 조건과 artifact policy의 포함 설정을 모두 통과해야 한다.
 

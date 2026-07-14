@@ -11,9 +11,11 @@ import pytest
 from portfolio_maker.application.approval import write_sample_approval
 from portfolio_maker.application.artifact_approval import write_sample_artifact_policy
 from portfolio_maker.application.build_profile import build_profile
+from portfolio_maker.application.discovery import discover_sources
 from portfolio_maker.application.draft_portfolio import draft_portfolio
 from portfolio_maker.application.models import (
     BuildProfileRequest,
+    DiscoverSourcesRequest,
     DraftPortfolioRequest,
     PublicPortfolioRequest,
     RenderHtmlRequest,
@@ -26,6 +28,11 @@ from portfolio_maker.application.render_html import HtmlRenderError, render_html
 import portfolio_maker.application.render_html as render_html_module
 from portfolio_maker.domain.models import GitHubActivity, Source, SourceStatus, SourceType
 from portfolio_maker.infrastructure.extractors import extract_text
+from portfolio_maker.infrastructure.github_connector import (
+    GitHubActivityCandidate,
+    GitHubDiscoveryResult,
+    GitHubRepositoryCandidate,
+)
 from portfolio_maker.infrastructure.sqlite_repository import SQLiteRepository
 from portfolio_maker.infrastructure.managed_files import write_managed_text
 from portfolio_maker.workspace import WorkspacePaths
@@ -470,6 +477,83 @@ def test_stale_private_activity_stays_out_after_repository_reinitialization(
     assert "Private activity" not in output_text
     assert local_uri not in output_text
     assert public_url not in output_text
+
+
+def test_partial_private_rediscovery_revokes_completed_empty_endpoint_everywhere(
+    tmp_path,
+    monkeypatch,
+):
+    workspace, paths, _ = _setup_render_workspace(tmp_path)
+    write_sample_artifact_policy(paths)
+    activity = GitHubActivityCandidate(
+        repo="octo/private",
+        activity_type="pull_request",
+        url="https://github.com/octo/private/pull/2",
+        title="Private activity",
+        state="MERGED",
+        author="octo",
+        created_at="2026-01-01T00:00:00Z",
+        merged_at="2026-01-02T00:00:00Z",
+    )
+    private_repo = GitHubRepositoryCandidate(
+        "octo/private", "https://github.com/octo/private", True
+    )
+    responses = [
+        GitHubDiscoveryResult(
+            [private_repo],
+            [activity],
+            [],
+            (("octo/private", "pull_request"),),
+        ),
+        GitHubDiscoveryResult(
+            [private_repo],
+            [],
+            ["GitHub workflow runs discovery failed for octo/private"],
+            (("octo/private", "pull_request"),),
+        ),
+    ]
+    monkeypatch.setattr(
+        "portfolio_maker.application.discovery.discover_github_candidates",
+        lambda **kwargs: responses.pop(0),
+    )
+    request = DiscoverSourcesRequest(
+        workspace=workspace,
+        home=tmp_path,
+        include_github=True,
+    )
+    discover_sources(request)
+
+    approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    approval.update(
+        {
+            "private_sources_allowed": True,
+            "allowed_repositories": ["octo/private"],
+            "approved_private_github_activity_urls": [activity.url],
+        }
+    )
+    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+    assert build_profile(BuildProfileRequest(workspace=workspace)).claim_count == 1
+
+    discover_sources(request)
+
+    assert build_profile(BuildProfileRequest(workspace=workspace)).claim_count == 0
+    draft = draft_portfolio(DraftPortfolioRequest(workspace=workspace))
+    manifest = build_public_portfolio(PublicPortfolioRequest(workspace=workspace))
+    review = prepare_project_review(PrepareProjectReviewRequest(workspace=workspace))
+    monkeypatch.setattr(render_html_module.subprocess, "run", _fake_build_with_generated_data)
+    render_html(RenderHtmlRequest(workspace=workspace))
+    output_text = "\n".join(
+        (
+            paths.master_profile_json_path.read_text(encoding="utf-8"),
+            paths.master_profile_md_path.read_text(encoding="utf-8"),
+            draft.markdown_path.read_text(encoding="utf-8"),
+            manifest.manifest_path.read_text(encoding="utf-8"),
+            review.input_path.read_text(encoding="utf-8"),
+            paths.portfolio_html_path.read_text(encoding="utf-8"),
+        )
+    )
+    assert activity.title not in output_text
+    assert activity.url not in output_text
 
 
 def test_restricted_approved_private_repository_name_is_display_text_only(
