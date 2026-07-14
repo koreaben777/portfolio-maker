@@ -10,10 +10,14 @@ from portfolio_maker.application.approval import write_sample_approval
 from portfolio_maker.application.build_profile import build_profile
 from portfolio_maker.application.discovery import discover_sources
 from portfolio_maker.application.draft_portfolio import draft_portfolio
+from portfolio_maker.application.public_portfolio import build_public_portfolio
+from portfolio_maker.application.project_composition import prepare_project_review
 from portfolio_maker.application.models import (
     BuildProfileRequest,
     DiscoverSourcesRequest,
     DraftPortfolioRequest,
+    PrepareProjectReviewRequest,
+    PublicPortfolioRequest,
 )
 from portfolio_maker.domain.models import SourceStatus, SourceType
 from portfolio_maker.infrastructure.github_connector import (
@@ -512,6 +516,84 @@ def test_successful_github_rediscovery_invalidates_disappeared_activities(worksp
 
     assert repository.list_github_activities()[0].is_private is True
     assert build_profile(BuildProfileRequest(workspace=workspace)).claim_count == 0
+
+
+def test_successful_private_rediscovery_revokes_stale_approved_activity(
+    workspace, tmp_path, monkeypatch
+):
+    activity = GitHubActivityCandidate(
+        repo="octo/private",
+        activity_type="pull_request",
+        url="https://github.com/octo/private/pull/1",
+        title="Previously approved private work",
+        state="MERGED",
+        author="octo",
+        created_at="2026-01-01T00:00:00Z",
+        merged_at="2026-01-02T00:00:00Z",
+    )
+    repo = GitHubRepositoryCandidate(
+        "octo/private", "https://github.com/octo/private", True
+    )
+    responses = [
+        github_discovery_result([repo], [activity]),
+        github_discovery_result([repo], []),
+        github_discovery_result([repo], [activity]),
+    ]
+    monkeypatch.setattr(
+        "portfolio_maker.application.discovery.discover_github_candidates",
+        lambda **kwargs: responses.pop(0),
+    )
+    request = DiscoverSourcesRequest(workspace=workspace, home=tmp_path, include_github=True)
+    discover_sources(request)
+
+    paths = WorkspacePaths.from_root(workspace)
+    write_sample_approval(paths)
+    approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    approval.update(
+        {
+            "private_sources_allowed": True,
+            "allowed_repositories": ["octo/private"],
+            "approved_private_github_activity_urls": [activity.url],
+        }
+    )
+    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+    assert build_profile(BuildProfileRequest(workspace=workspace)).claim_count == 1
+
+    discover_sources(request)
+
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    assert repository.list_github_activities()[0].is_current is False
+    with repository._read_connection() as connection:
+        evidence_row = connection.execute(
+            "SELECT public_safe FROM evidence_items WHERE github_activity_id = 1"
+        ).fetchone()
+        claim_row = connection.execute(
+            "SELECT public_safe FROM career_claims WHERE id = 1"
+        ).fetchone()
+    assert evidence_row["public_safe"] == 0
+    assert claim_row["public_safe"] == 0
+    assert build_profile(BuildProfileRequest(workspace=workspace)).claim_count == 0
+    draft_portfolio(DraftPortfolioRequest(workspace=workspace))
+    build_public_portfolio(PublicPortfolioRequest(workspace=workspace))
+    review = prepare_project_review(
+        PrepareProjectReviewRequest(workspace=workspace)
+    )
+    output_text = "\n".join(
+        (
+            paths.master_profile_json_path.read_text(encoding="utf-8"),
+            paths.portfolio_draft_path.read_text(encoding="utf-8"),
+            paths.portfolio_public_json_path.read_text(encoding="utf-8"),
+            review.input_path.read_text(encoding="utf-8"),
+        )
+    )
+    assert activity.title not in output_text
+    assert activity.url not in output_text
+
+    discover_sources(request)
+    repository.initialize()
+    assert repository.list_github_activities()[0].is_current is True
+    assert build_profile(BuildProfileRequest(workspace=workspace)).claim_count == 1
 
 
 def test_failed_github_rediscovery_preserves_existing_activity_visibility(workspace, tmp_path, monkeypatch):

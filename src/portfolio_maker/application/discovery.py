@@ -11,6 +11,7 @@ from portfolio_maker.infrastructure.github_connector import (
     GitHubDiscoveryError,
     GitHubActivityCandidate,
     GitHubRepositoryCandidate,
+    canonical_public_github_activity_url,
     canonical_repository_name,
     discover_github_candidates,
 )
@@ -91,7 +92,20 @@ def discover_sources(request: DiscoverSourcesRequest) -> DiscoverSourcesResult:
             # Only a complete GitHub discovery is a visibility authority. A
             # failed endpoint leaves confirmed public repositories intact for retry.
             if discovery_result.repositories_complete and not github_statuses:
-                repository.invalidate_github_activity_visibility()
+                observed_activity_keys = []
+                for activity in github_activities:
+                    try:
+                        repository_name = canonical_repository_name(activity.repo)
+                        activity_url = canonical_public_github_activity_url(activity.url)
+                    except (TypeError, ValueError):
+                        continue
+                    if activity_url is not None:
+                        observed_activity_keys.append(
+                            (repository_name, activity.activity_type, activity_url)
+                        )
+                repository.invalidate_unobserved_github_activities(
+                    tuple(observed_activity_keys)
+                )
             else:
                 confirmed_repositories = tuple(
                     repo.name_with_owner for repo in github_repos if not repo.is_private

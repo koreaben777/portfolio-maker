@@ -301,13 +301,21 @@ def discover_github_candidates(
     )
     excluded = {canonical_repository_name(name) for name in excluded_repositories}
     allowed = {canonical_repository_name(name) for name in allowed_repositories}
-    repos = [
-        repo
-        for repo in discovered_repositories
-        if canonical_repository_name(repo.name_with_owner) not in excluded
-        and (not allowed or canonical_repository_name(repo.name_with_owner) in allowed)
-        and (private_sources_allowed or not repo.is_private)
-    ]
+    repos: list[GitHubRepositoryCandidate] = []
+    for repo in discovered_repositories:
+        repository_name = canonical_repository_name(repo.name_with_owner)
+        if repository_name in excluded:
+            continue
+        if repo.is_private:
+            if (
+                not private_sources_allowed
+                or not allowed
+                or repository_name not in allowed
+            ):
+                continue
+        elif allowed and repository_name not in allowed:
+            continue
+        repos.append(repo)
     activities: list[GitHubActivityCandidate] = []
     statuses: list[str] = []
     if not repositories_complete:

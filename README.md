@@ -186,6 +186,7 @@ portfolio-maker render-html --workspace .
 - 비공개 GitHub 저장소는 `private_sources_allowed`를 명시적으로 허용하지 않는 한 건너뜁니다.
 - `excluded_repositories`에 넣은 저장소는 GitHub 탐색에서 제외합니다.
 - `allowed_repositories`가 비어 있지 않으면 그 `owner/repo`만 GitHub 탐색 대상으로 남습니다.
+- 공개 GitHub는 `allowed_repositories`가 비어 있으면 기존처럼 공개 저장소 전체를 탐색하지만, private GitHub discovery는 `private_sources_allowed=true`와 비어 있지 않은 canonical allowlist가 모두 있어야 하며 allowlist 밖 저장소는 endpoint를 호출하지 않습니다.
 - `excluded_file_patterns`는 대소문자를 구분하지 않는 파일명 glob으로 로컬 후보와 재수집을 제외합니다.
 - `approved_github_activity_urls`는 discovery가 저장한 공개 GitHub activity URL을 정확히 지정합니다. private activity 또는 allowlist 밖·excluded repository activity는 승인되어도 산출물 입력으로 쓰지 않습니다.
 - `approved_private_github_activity_urls`는 `private_sources_allowed`, repository allowlist, 제외 정책을 모두 통과한 private activity에만 사용합니다. private provenance는 restricted 결과에서 안전한 label로만 표시합니다.

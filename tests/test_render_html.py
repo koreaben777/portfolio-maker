@@ -439,6 +439,39 @@ def test_unapproved_private_activity_stays_out_of_all_review_and_artifacts(
     assert public_url in output_text
 
 
+def test_stale_private_activity_stays_out_after_repository_reinitialization(
+    tmp_path,
+    monkeypatch,
+):
+    workspace, paths, _, _, local_uri, public_url, private_url = (
+        _setup_multi_origin_render_workspace(tmp_path)
+    )
+    repository = SQLiteRepository(paths.db_path)
+    assert build_profile(BuildProfileRequest(workspace=workspace)).claim_count == 3
+    repository.invalidate_unobserved_github_activities(())
+    repository.initialize()
+
+    draft = draft_portfolio(DraftPortfolioRequest(workspace=workspace))
+    manifest = build_public_portfolio(PublicPortfolioRequest(workspace=workspace))
+    review = prepare_project_review(PrepareProjectReviewRequest(workspace=workspace))
+    monkeypatch.setattr(render_html_module.subprocess, "run", _fake_build_with_generated_data)
+    render_html(RenderHtmlRequest(workspace=workspace))
+
+    output_text = "\n".join(
+        (
+            paths.master_profile_json_path.read_text(encoding="utf-8"),
+            draft.markdown_path.read_text(encoding="utf-8"),
+            manifest.manifest_path.read_text(encoding="utf-8"),
+            review.input_path.read_text(encoding="utf-8"),
+            paths.portfolio_html_path.read_text(encoding="utf-8"),
+        )
+    )
+    assert private_url not in output_text
+    assert "Private activity" not in output_text
+    assert local_uri not in output_text
+    assert public_url not in output_text
+
+
 def test_restricted_approved_private_repository_name_is_display_text_only(
     tmp_path,
     monkeypatch,

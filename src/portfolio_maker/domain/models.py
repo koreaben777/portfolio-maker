@@ -46,6 +46,7 @@ class GitHubActivity:
     state_field: str | None = None
     origin_type: str | None = None
     origin_visibility: str | None = None
+    is_current: bool = True
 
 
 @dataclass(frozen=True)
@@ -78,3 +79,4 @@ class PublicEvidenceRecord:
     source_origin_visibility: str | None = None
     activity_origin_type: str | None = None
     activity_origin_visibility: str | None = None
+    activity_is_current: bool | None = None

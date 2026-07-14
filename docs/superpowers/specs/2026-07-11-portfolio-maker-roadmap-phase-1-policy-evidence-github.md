@@ -89,7 +89,7 @@ Portfolio Maker 0.1.0은 승인된 로컬 파일에서 근거 기반 master prof
 - `allowed_repositories`: canonical `owner/repo` 목록이다. 빈 목록은 기존 동작을 보존하며 allowlist 제한을 적용하지 않는다.
 - `excluded_file_patterns`: **파일명**에만 적용하는 대소문자 비구분 glob 목록이다. 경로 제외는 계속 `forbidden_paths`를 사용한다.
 - 허용 목록과 제외 목록이 충돌하면 제외가 우선한다.
-- private repository는 기존 `private_sources_allowed`가 `true`여도 allowlist 또는 activity approval 자체를 의미하지 않는다.
+- public GitHub는 빈 `allowed_repositories`를 기존처럼 허용하지만, private GitHub discovery는 `private_sources_allowed=true`와 비어 있지 않은 canonical `allowed_repositories`를 모두 요구한다. allowlist 밖 private repository와 제외 repository는 activity endpoint를 호출하지 않는다.
 - pattern은 빈 문자열, 제어 문자, `/`, `\\`를 포함하면 거부한다. 패턴은 파일명 matcher로만 해석해 path traversal 의미를 갖지 않게 한다.
 
 ### 4.2 적용 위치

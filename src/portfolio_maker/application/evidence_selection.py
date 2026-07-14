@@ -154,6 +154,7 @@ class EvidenceSelectionService:
             source_origin_visibility=source.origin_visibility or visibility,
             activity_origin_type=activity.origin_type or origin,
             activity_origin_visibility=visibility,
+            activity_is_current=activity.is_current,
         )
         return self._exclusion_reason(
             record,
@@ -233,6 +234,8 @@ class EvidenceSelectionService:
             return "missing_activity"
         if record.source_type == "local_file" and record.activity_id is not None:
             return "invalid_origin"
+        if record.activity_id is not None and record.activity_is_current is not True:
+            return "stale_activity"
 
         if origin == "local":
             if legacy_public_compat:

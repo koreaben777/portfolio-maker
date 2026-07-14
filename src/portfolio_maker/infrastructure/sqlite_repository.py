@@ -68,6 +68,7 @@ CREATE TABLE IF NOT EXISTS github_activities (
     state_field TEXT CHECK(state_field IS NULL OR state_field IN ('conclusion', 'status')),
     origin_type TEXT NOT NULL DEFAULT 'public_github',
     origin_visibility TEXT NOT NULL DEFAULT 'unknown',
+    is_current INTEGER NOT NULL DEFAULT 1 CHECK(is_current IN (0, 1)),
     UNIQUE(repo, activity_type, url)
 );
 
@@ -476,6 +477,7 @@ class SQLiteRepository:
                     conn.execute(statement)
             self._ensure_github_activity_visibility_column(conn)
             self._ensure_github_activity_state_field_column(conn)
+            self._ensure_github_activity_current_column(conn)
             self._ensure_legacy_normalized_columns(conn)
             self._ensure_origin_columns(conn)
 
@@ -567,6 +569,16 @@ class SQLiteRepository:
                 "ALTER TABLE github_activities "
                 "ADD COLUMN state_field TEXT "
                 "CHECK(state_field IS NULL OR state_field IN ('conclusion', 'status'))"
+            )
+
+    @staticmethod
+    def _ensure_github_activity_current_column(conn: sqlite3.Connection) -> None:
+        columns = SQLiteRepository._table_columns(conn, "github_activities")
+        if "is_current" not in columns:
+            conn.execute(
+                "ALTER TABLE github_activities "
+                "ADD COLUMN is_current INTEGER NOT NULL DEFAULT 1 "
+                "CHECK(is_current IN (0, 1))"
             )
 
     @staticmethod
@@ -753,7 +765,7 @@ class SQLiteRepository:
                 activity.state_field,
             )
             if {"origin_type", "origin_visibility"} <= columns:
-                values = (*values, origin_type, origin_visibility)
+                values = (*values, origin_type, origin_visibility, int(activity.is_current))
                 if activity.source_id is not None:
                     conn.execute(
                         """
@@ -803,7 +815,7 @@ class SQLiteRepository:
                             source_id = ?, repo = ?, activity_type = ?, url = ?,
                             title = ?, state = ?, author = ?, created_at = ?,
                             merged_at = ?, is_private = ?, state_field = ?,
-                            origin_type = ?, origin_visibility = ?
+                            origin_type = ?, origin_visibility = ?, is_current = ?
                         WHERE id = ?
                         """,
                         (*values, survivor_id),
@@ -826,8 +838,8 @@ class SQLiteRepository:
                         INSERT INTO github_activities
                             (source_id, repo, activity_type, url, title, state, author,
                              created_at, merged_at, is_private, state_field,
-                             origin_type, origin_visibility)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                             origin_type, origin_visibility, is_current)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         values,
                     )
@@ -853,6 +865,57 @@ class SQLiteRepository:
     def invalidate_github_activity_visibility(self) -> None:
         with self._connection() as conn:
             conn.execute("UPDATE github_activities SET is_private = 1")
+
+    def invalidate_unobserved_github_activities(
+        self,
+        observed_activities: tuple[tuple[str, str, str], ...],
+    ) -> None:
+        predicates = " OR ".join(
+            "(lower(repo) = ? AND activity_type = ? AND lower(url) = ?)"
+            for _ in observed_activities
+        )
+        parameters = tuple(
+            value
+            for activity in observed_activities
+            for value in activity
+        )
+        observed_clause = f"NOT ({predicates})" if predicates else "1 = 1"
+        with self._connection() as conn:
+            conn.execute(
+                f"""
+                UPDATE github_activities
+                SET is_private = 1,
+                    is_current = 0
+                WHERE {observed_clause}
+                """,
+                parameters,
+            )
+            conn.execute(
+                f"""
+                UPDATE evidence_items
+                SET public_safe = 0
+                WHERE github_activity_id IN (
+                    SELECT id FROM github_activities WHERE {observed_clause}
+                )
+                """,
+                parameters,
+            )
+            conn.execute(
+                f"""
+                UPDATE career_claims
+                SET public_safe = 0
+                WHERE id IN (
+                    SELECT claim_evidence.claim_id
+                    FROM claim_evidence
+                    JOIN evidence_items
+                      ON evidence_items.id = claim_evidence.evidence_id
+                    JOIN github_activities
+                      ON github_activities.id = evidence_items.github_activity_id
+                    WHERE {observed_clause}
+                )
+                """,
+                parameters,
+            )
 
     def invalidate_unconfirmed_github_activity_visibility(
         self,
@@ -912,7 +975,8 @@ class SQLiteRepository:
                 f"""
                 SELECT id, source_id, repo, activity_type, url, title, state, author,
                        created_at, merged_at, is_private, state_field,
-                       {origin_type} AS origin_type, {origin_visibility} AS origin_visibility
+                       {origin_type} AS origin_type, {origin_visibility} AS origin_visibility,
+                       is_current
                 FROM github_activities
                 ORDER BY id
                 """
@@ -937,6 +1001,7 @@ class SQLiteRepository:
                         state_field=self._optional_text(row, "state_field"),
                         origin_type=self._required_text(row, "origin_type"),
                         origin_visibility=self._required_text(row, "origin_visibility"),
+                        is_current=bool(self._required_boolean(row, "is_current")),
                     )
                 )
             return activities
@@ -981,6 +1046,7 @@ class SQLiteRepository:
                     github_activities.author AS activity_author,
                     github_activities.created_at AS activity_created_at,
                     github_activities.is_private AS activity_is_private,
+                    github_activities.is_current AS activity_is_current,
                     github_activities.origin_type AS activity_origin_type,
                     github_activities.origin_visibility AS activity_origin_visibility
                 FROM projects
@@ -1010,6 +1076,11 @@ class SQLiteRepository:
                     if activity_id is None
                     else self._required_boolean(row, "activity_is_private")
                 )
+                activity_is_current = (
+                    None
+                    if activity_id is None
+                    else bool(self._required_boolean(row, "activity_is_current"))
+                )
                 records.append(
                     PublicEvidenceRecord(
                         project_id=self._required_int(row, "project_id"),
@@ -1034,6 +1105,7 @@ class SQLiteRepository:
                         activity_author=self._optional_text(row, "activity_author"),
                         activity_created_at=self._optional_text(row, "activity_created_at"),
                         activity_is_private=activity_is_private,
+                        activity_is_current=activity_is_current,
                         evidence_origin_type=self._required_text(row, "evidence_origin_type"),
                         evidence_origin_visibility=self._required_text(
                             row, "evidence_origin_visibility"

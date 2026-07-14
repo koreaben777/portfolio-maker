@@ -89,3 +89,37 @@ def test_private_discovery_auth_failure_is_controlled_without_credentials(monkey
 
     assert "token" not in str(error.value).casefold()
     assert "Bearer" not in str(error.value)
+
+
+def test_private_discovery_requires_nonempty_allowlist_before_activity_calls(monkeypatch):
+    auth_calls = []
+    activity_calls = []
+
+    def fake_auth_status():
+        auth_calls.append(True)
+
+    def fake_run_gh_json(args):
+        if args[:2] == ["repo", "list"]:
+            return [
+                {
+                    "nameWithOwner": "octo/private",
+                    "url": "https://github.com/octo/private",
+                    "isPrivate": True,
+                }
+            ]
+        activity_calls.append(args)
+        return []
+
+    monkeypatch.setattr(github_connector, "run_gh_auth_status", fake_auth_status)
+    monkeypatch.setattr(github_connector, "run_gh_json", fake_run_gh_json)
+
+    result = discover_github_candidates(
+        private_sources_allowed=True,
+        allowed_repositories=(),
+        approved_private_github_activity_urls=(),
+    )
+
+    assert auth_calls == [True]
+    assert result.repositories == []
+    assert result.activities == []
+    assert activity_calls == []
