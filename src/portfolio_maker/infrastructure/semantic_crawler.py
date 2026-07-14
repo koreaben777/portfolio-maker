@@ -65,11 +65,14 @@ def crawl_local_structure(
         (entry.source_id, entry.provider_item_key): entry.node_id
         for entry in prior_entries
     }
-    prior_entries_by_hierarchy = {
-        (entry.source_id, entry.relative_hierarchy): entry for entry in prior_entries
-    }
+    (
+        reserved_prior_entries,
+        renamed_prior_entries_by_inode,
+        reserved_provider_keys,
+    ) = _reserve_prior_entries(root_path, source_id, prior_entries, policy)
+    renamed_prior_entry_indexes: dict[tuple[int, int], int] = {}
     entries: dict[str, StructuralEntry] = {}
-    used_inode_keys: set[str] = set()
+    assigned_provider_keys: set[str] = set()
     errors: list[StructuralCrawlError] = []
 
     def add_entry(
@@ -83,18 +86,21 @@ def crawl_local_structure(
         provider_item_key, device, inode = _provider_identity(path_stat, relative_hierarchy)
         if device is not None and inode is not None:
             inode_key = provider_item_key
-            prior_entry = prior_entries_by_hierarchy.get((source_id, relative_hierarchy))
-            if prior_entry is not None and (prior_entry.device, prior_entry.inode) == (
-                device,
-                inode,
-            ):
+            prior_entry = reserved_prior_entries.get(relative_hierarchy)
+            if prior_entry is not None:
                 provider_item_key = prior_entry.provider_item_key
-                if provider_item_key == inode_key:
-                    used_inode_keys.add(inode_key)
-            elif inode_key in used_inode_keys:
-                provider_item_key = relative_hierarchy
             else:
-                used_inode_keys.add(inode_key)
+                prior_inode_entries = renamed_prior_entries_by_inode.get((device, inode), ())
+                prior_index = renamed_prior_entry_indexes.get((device, inode), 0)
+                if prior_index < len(prior_inode_entries):
+                    provider_item_key = prior_inode_entries[prior_index].provider_item_key
+                    renamed_prior_entry_indexes[(device, inode)] = prior_index + 1
+                elif (
+                    inode_key in reserved_provider_keys
+                    or inode_key in assigned_provider_keys
+                ):
+                    provider_item_key = relative_hierarchy
+            assigned_provider_keys.add(provider_item_key)
         node_id = prior_node_ids.get(
             (source_id, provider_item_key), stable_node_id(source_id, provider_item_key)
         )
@@ -247,6 +253,61 @@ def _provider_identity(path_stat: os.stat_result, relative_hierarchy: str) -> tu
     if device is not None and inode is not None and inode > 0:
         return f"{device}:{inode}", device, inode
     return relative_hierarchy, None, None
+
+
+def _reserve_prior_entries(
+    root_path: Path,
+    source_id: str,
+    prior_entries: tuple[StructuralEntry, ...],
+    policy: FilePolicy,
+) -> tuple[
+    dict[str, StructuralEntry],
+    dict[tuple[int, int], tuple[StructuralEntry, ...]],
+    set[str],
+]:
+    source_prior_entries = tuple(
+        entry for entry in prior_entries if entry.source_id == source_id
+    )
+    reserved_entries: dict[str, StructuralEntry] = {}
+    for entry in source_prior_entries:
+        path = (
+            root_path
+            if entry.relative_hierarchy == "."
+            else root_path / entry.relative_hierarchy
+        )
+        if policy.classify_path(path) != "candidate":
+            continue
+        try:
+            _, device, inode = _provider_identity(_lstat(path), entry.relative_hierarchy)
+        except StructuralCrawlRootError:
+            continue
+        if (device, inode) == (entry.device, entry.inode):
+            reserved_entries[entry.relative_hierarchy] = entry
+
+    renamed_entries_by_inode: dict[tuple[int, int], list[StructuralEntry]] = {}
+    for entry in source_prior_entries:
+        if entry.relative_hierarchy in reserved_entries:
+            continue
+        if entry.device is None or entry.inode is None:
+            continue
+        renamed_entries_by_inode.setdefault((entry.device, entry.inode), []).append(entry)
+
+    return (
+        reserved_entries,
+        {
+            identity: tuple(
+                sorted(
+                    entries,
+                    key=lambda entry: (
+                        entry.relative_hierarchy,
+                        entry.provider_item_key,
+                    ),
+                )
+            )
+            for identity, entries in renamed_entries_by_inode.items()
+        },
+        {entry.provider_item_key for entry in reserved_entries.values()},
+    )
 
 
 def _relative_hierarchy(root: Path, path: Path) -> str:

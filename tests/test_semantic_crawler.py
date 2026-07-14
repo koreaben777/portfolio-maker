@@ -153,6 +153,38 @@ def test_structural_crawl_retains_hard_link_alias_ids_after_alias_rename(
     assert renamed_entries["renamed-alias.md"].node_id == prior_entries["alias.md"].node_id
 
 
+def test_structural_crawl_reserves_hard_link_keys_before_alias_rename(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    original = root / "original.md"
+    alias = root / "zzz-alias.md"
+    original.write_text("evidence", encoding="utf-8")
+    os.link(original, alias)
+    first = crawl_local_structure(root, approval_for(root))
+    prior_entries = {entry.relative_hierarchy: entry for entry in first.entries}
+
+    alias.rename(root / "aaa-alias.md")
+    renamed = crawl_local_structure(root, approval_for(root), prior_entries=first.entries)
+    renamed_entries = {entry.relative_hierarchy: entry for entry in renamed.entries}
+
+    assert {"original.md", "aaa-alias.md"} <= renamed_entries.keys()
+    assert renamed_entries["original.md"].node_id == prior_entries["original.md"].node_id
+    assert (
+        renamed_entries["aaa-alias.md"].node_id
+        == prior_entries["zzz-alias.md"].node_id
+    )
+    assert (
+        renamed_entries["original.md"].provider_item_key
+        == prior_entries["original.md"].provider_item_key
+    )
+    assert (
+        renamed_entries["aaa-alias.md"].provider_item_key
+        == prior_entries["zzz-alias.md"].provider_item_key
+    )
+
+
 def test_structural_crawl_is_deterministic_and_retains_ids_after_rename(tmp_path: Path) -> None:
     root = tmp_path / "root"
     root.mkdir()
