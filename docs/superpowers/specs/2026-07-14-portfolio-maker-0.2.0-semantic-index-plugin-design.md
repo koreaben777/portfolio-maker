@@ -96,6 +96,28 @@ approved source scope
 - artifact는 materialized project와 현재 evidence policy의 교집합만 사용한다.
 - project 자동 포함은 공개 배포 승인이 아니다.
 
+### 4.1 Codex 의미 분석 실행 경계
+
+CLI가 외부 LLM API를 직접 호출하거나 token을 보관하지 않는다. 의미 인덱스 생성은 다음과 같은
+검증 가능한 교환 단계로 수행한다.
+
+```text
+portfolio-maker prepare-semantic-index
+  -> locator-free safe input chunks
+  -> portfolio-semantic-index skill의 Codex 분석
+  -> schema와 input hash가 포함된 output chunks
+  -> portfolio-maker apply-semantic-index
+  -> 검증 성공 시 새 active revision으로 원자적 전환
+```
+
+`prepare-semantic-index`는 현재 source policy를 적용한 구조와 분석 입력만 만든다. Codex skill은
+생성된 safe chunk만 읽어 file·directory summary를 작성하며 임의의 raw file 탐색으로 범위를 넓히지
+않는다. `apply-semantic-index`는 schema, policy hash, input hash, node coverage를 검증한다. 일부 chunk가
+없거나 변조·stale 상태면 새 revision을 활성화하지 않고 이전 active revision을 유지한다.
+
+구체적인 파일, API, 테스트, commit 단위는
+[0.2.0 구현 계획](../plans/2026-07-14-portfolio-maker-0.2.0.md)에서 관리한다.
+
 ## 5. Codex plugin과 skill 경계
 
 0.2.0은 repository 자체를 installable Codex plugin으로 확장한다. Python application과 SQLite는 결정론적 엔진으로 유지하고, plugin은 workflow·Codex 분석·승인 조율을 담당한다.

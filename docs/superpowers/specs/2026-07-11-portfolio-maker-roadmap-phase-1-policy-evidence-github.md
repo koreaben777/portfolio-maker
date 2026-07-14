@@ -289,6 +289,8 @@ Stage C는 approval schema에 다음 optional 필드를 추가한다.
 
 설계 문서: [Portfolio Maker 0.2.0 계층형 의미 인덱스·플러그인 설계](2026-07-14-portfolio-maker-0.2.0-semantic-index-plugin-design.md)
 
+구현 계획: [Portfolio Maker 0.2.0 Implementation Plan](../plans/2026-07-14-portfolio-maker-0.2.0.md)
+
 - local discovery의 전역 500 candidate 상한을 새 semantic index 경로에서 제거한다.
 - 모든 허용 directory/file을 structure node로 기록하고 file semantic summary를 bottom-up directory summary로 합성한다.
 - Codex는 parent context, independent child, cross-directory relation, counter signal을 함께 보고 project boundary를 제안한다.
