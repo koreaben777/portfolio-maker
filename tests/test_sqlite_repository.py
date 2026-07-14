@@ -9,6 +9,12 @@ from stat import S_IMODE
 import pytest
 
 from portfolio_maker.domain.models import GitHubActivity, Source, SourceStatus, SourceType
+from portfolio_maker.domain.semantic_models import (
+    AnalysisStatus,
+    SemanticEdge,
+    SemanticNode,
+    SemanticNodeKind,
+)
 import portfolio_maker.infrastructure.sqlite_repository as sqlite_repository_module
 from portfolio_maker.infrastructure.sqlite_repository import RepositoryError, SQLiteRepository
 from portfolio_maker.workspace import WorkspacePaths
@@ -46,6 +52,88 @@ def test_sqlite_repository_initialize_creates_schema_tables(workspace):
         "source_snapshots",
         "github_activities",
     } <= repository.table_names()
+
+
+def test_semantic_revision_activation_is_atomic_and_supersedes_previous(workspace) -> None:
+    repository = SQLiteRepository(WorkspacePaths.from_root(workspace).db_path)
+    repository.initialize()
+
+    repository.create_semantic_revision("rev-1", "source-1", "a" * 64, "semantic-v1")
+    repository.activate_semantic_revision("rev-1")
+    repository.create_semantic_revision("rev-2", "source-1", "a" * 64, "semantic-v1")
+    repository.activate_semantic_revision("rev-2")
+
+    active = repository.get_active_semantic_revision("source-1")
+
+    assert {
+        "semantic_index_revisions",
+        "semantic_nodes",
+        "semantic_node_locators",
+        "semantic_edges",
+    } <= repository.table_names()
+    assert active is not None
+    assert active["id"] == "rev-2"
+
+
+def test_failed_staging_semantic_revision_keeps_previous_active(workspace) -> None:
+    repository = SQLiteRepository(WorkspacePaths.from_root(workspace).db_path)
+    repository.initialize()
+    repository.create_semantic_revision("rev-1", "source-1", "a" * 64, "semantic-v1")
+    repository.activate_semantic_revision("rev-1")
+    repository.create_semantic_revision("rev-2", "source-1", "a" * 64, "semantic-v1")
+
+    repository.fail_semantic_revision("rev-2")
+
+    active = repository.get_active_semantic_revision("source-1")
+    assert active is not None
+    assert active["id"] == "rev-1"
+
+
+def test_semantic_revision_graph_persists_locator_separately_from_listed_nodes(workspace) -> None:
+    repository = SQLiteRepository(WorkspacePaths.from_root(workspace).db_path)
+    repository.initialize()
+    repository.create_semantic_revision("rev-1", "source-1", "a" * 64, "semantic-v1")
+    node = SemanticNode(
+        node_id="node-1",
+        source_id="source-1",
+        node_kind=SemanticNodeKind.FILE,
+        parent_node_id=None,
+        display_name="README.md",
+        relative_hierarchy="README.md",
+        content_fingerprint="sha256:content",
+        semantic_summary="Project overview",
+        semantic_roles=("documentation",),
+        topics=("portfolio",),
+        evidence_ids=(1,),
+        analysis_status=AnalysisStatus.COMPLETE,
+        analyzer_version="semantic-v1",
+        updated_at="2026-07-14T00:00:00Z",
+    )
+
+    repository.replace_semantic_revision_graph(
+        "rev-1",
+        (node,),
+        {"node-1": ("/private/workspace/README.md", 10, 20)},
+        (SemanticEdge("rev-1", "node-1", "relates_to", "node-1", "high"),),
+    )
+
+    assert repository.list_semantic_nodes("rev-1") == [
+        {
+            "node_id": "node-1",
+            "source_id": "source-1",
+            "node_kind": "file",
+            "parent_node_id": None,
+            "display_name": "README.md",
+            "relative_hierarchy": "README.md",
+            "content_fingerprint": "sha256:content",
+            "semantic_summary": "Project overview",
+            "semantic_roles": ["documentation"],
+            "topics": ["portfolio"],
+            "evidence_ids": [1],
+            "analysis_status": "complete",
+            "analyzer_version": "semantic-v1",
+        }
+    ]
 
 
 def test_sqlite_repository_keeps_schema_creation_inside_guarded_transaction(

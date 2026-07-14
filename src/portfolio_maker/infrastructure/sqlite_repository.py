@@ -4,6 +4,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 import fcntl
+import json
 import os
 import sqlite3
 import threading
@@ -17,6 +18,7 @@ from portfolio_maker.domain.models import (
     SourceStatus,
     SourceType,
 )
+from portfolio_maker.domain.semantic_models import SemanticEdge, SemanticNode
 from portfolio_maker.infrastructure.github_connector import (
     canonical_public_github_activity_url,
     canonical_repository_name,
@@ -134,6 +136,54 @@ CREATE TABLE IF NOT EXISTS artifacts (
     version INTEGER NOT NULL,
     input_manifest TEXT NOT NULL,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS semantic_index_revisions (
+    id TEXT PRIMARY KEY,
+    source_id TEXT NOT NULL,
+    policy_hash TEXT NOT NULL,
+    analyzer_version TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('staging','active','superseded','failed')),
+    started_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    completed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS semantic_nodes (
+    revision_id TEXT NOT NULL REFERENCES semantic_index_revisions(id) ON DELETE CASCADE,
+    node_id TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    node_kind TEXT NOT NULL,
+    parent_node_id TEXT,
+    display_name TEXT NOT NULL,
+    relative_hierarchy TEXT NOT NULL,
+    content_fingerprint TEXT,
+    semantic_summary TEXT NOT NULL DEFAULT '',
+    semantic_roles_json TEXT NOT NULL DEFAULT '[]',
+    topics_json TEXT NOT NULL DEFAULT '[]',
+    evidence_ids_json TEXT NOT NULL DEFAULT '[]',
+    analysis_status TEXT NOT NULL,
+    analyzer_version TEXT NOT NULL,
+    PRIMARY KEY (revision_id, node_id)
+);
+
+CREATE TABLE IF NOT EXISTS semantic_node_locators (
+    revision_id TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    locator TEXT NOT NULL,
+    device INTEGER,
+    inode INTEGER,
+    PRIMARY KEY (revision_id, node_id),
+    FOREIGN KEY (revision_id, node_id)
+      REFERENCES semantic_nodes(revision_id, node_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS semantic_edges (
+    revision_id TEXT NOT NULL,
+    from_node_id TEXT NOT NULL,
+    relation TEXT NOT NULL,
+    to_node_id TEXT NOT NULL,
+    confidence TEXT,
+    PRIMARY KEY (revision_id, from_node_id, relation, to_node_id)
 );
 
 """
@@ -656,6 +706,218 @@ class SQLiteRepository:
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         return {row["name"] for row in rows}
+
+    def create_semantic_revision(
+        self,
+        revision_id: str,
+        source_id: str,
+        policy_hash: str,
+        analyzer_version: str,
+    ) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO semantic_index_revisions
+                    (id, source_id, policy_hash, analyzer_version, status)
+                VALUES (?, ?, ?, ?, 'staging')
+                """,
+                (revision_id, source_id, policy_hash, analyzer_version),
+            )
+
+    def replace_semantic_revision_graph(
+        self,
+        revision_id: str,
+        nodes: tuple[SemanticNode, ...],
+        locators: dict[str, tuple[str, int | None, int | None]],
+        edges: tuple[SemanticEdge, ...],
+    ) -> None:
+        with self._connection() as conn:
+            revision = conn.execute(
+                """
+                SELECT source_id FROM semantic_index_revisions
+                WHERE id = ? AND status = 'staging'
+                """,
+                (revision_id,),
+            ).fetchone()
+            if revision is None:
+                raise RepositoryError("semantic revision is not staging")
+            source_id = self._required_text(revision, "source_id")
+            node_ids = {node.node_id for node in nodes}
+            if len(node_ids) != len(nodes) or set(locators) != node_ids:
+                raise RepositoryError("semantic revision graph is invalid")
+            if any(node.source_id != source_id for node in nodes):
+                raise RepositoryError("semantic revision graph is invalid")
+            if any(
+                edge.revision_id != revision_id
+                or edge.from_node_id not in node_ids
+                or edge.to_node_id not in node_ids
+                for edge in edges
+            ):
+                raise RepositoryError("semantic revision graph is invalid")
+
+            conn.execute("DELETE FROM semantic_edges WHERE revision_id = ?", (revision_id,))
+            conn.execute("DELETE FROM semantic_node_locators WHERE revision_id = ?", (revision_id,))
+            conn.execute("DELETE FROM semantic_nodes WHERE revision_id = ?", (revision_id,))
+            for node in nodes:
+                conn.execute(
+                    """
+                    INSERT INTO semantic_nodes (
+                        revision_id, node_id, source_id, node_kind, parent_node_id,
+                        display_name, relative_hierarchy, content_fingerprint,
+                        semantic_summary, semantic_roles_json, topics_json,
+                        evidence_ids_json, analysis_status, analyzer_version
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        revision_id,
+                        node.node_id,
+                        node.source_id,
+                        node.node_kind.value,
+                        node.parent_node_id,
+                        node.display_name,
+                        node.relative_hierarchy,
+                        node.content_fingerprint,
+                        node.semantic_summary,
+                        json.dumps(node.semantic_roles),
+                        json.dumps(node.topics),
+                        json.dumps(node.evidence_ids),
+                        node.analysis_status.value,
+                        node.analyzer_version,
+                    ),
+                )
+                locator, device, inode = locators[node.node_id]
+                if (
+                    not isinstance(locator, str)
+                    or (device is not None and type(device) is not int)
+                    or (inode is not None and type(inode) is not int)
+                ):
+                    raise RepositoryError("semantic node locator is invalid")
+                conn.execute(
+                    """
+                    INSERT INTO semantic_node_locators
+                        (revision_id, node_id, locator, device, inode)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (revision_id, node.node_id, locator, device, inode),
+                )
+            for edge in edges:
+                conn.execute(
+                    """
+                    INSERT INTO semantic_edges
+                        (revision_id, from_node_id, relation, to_node_id, confidence)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        revision_id,
+                        edge.from_node_id,
+                        edge.relation,
+                        edge.to_node_id,
+                        edge.confidence,
+                    ),
+                )
+
+    def activate_semantic_revision(self, revision_id: str) -> None:
+        with self._connection() as conn:
+            revision = conn.execute(
+                """
+                SELECT source_id FROM semantic_index_revisions
+                WHERE id = ? AND status = 'staging'
+                """,
+                (revision_id,),
+            ).fetchone()
+            if revision is None:
+                raise RepositoryError("semantic revision is not staging")
+            source_id = self._required_text(revision, "source_id")
+            conn.execute(
+                """
+                UPDATE semantic_index_revisions
+                SET status = 'superseded'
+                WHERE source_id = ? AND status = 'active'
+                """,
+                (source_id,),
+            )
+            conn.execute(
+                """
+                UPDATE semantic_index_revisions
+                SET status = 'active', completed_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND status = 'staging'
+                """,
+                (revision_id,),
+            )
+
+    def fail_semantic_revision(self, revision_id: str) -> None:
+        with self._connection() as conn:
+            result = conn.execute(
+                """
+                UPDATE semantic_index_revisions
+                SET status = 'failed', completed_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND status = 'staging'
+                """,
+                (revision_id,),
+            )
+            if result.rowcount != 1:
+                raise RepositoryError("semantic revision is not staging")
+
+    def get_active_semantic_revision(self, source_id: str) -> dict[str, str | None] | None:
+        with self._read_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT id, source_id, policy_hash, analyzer_version, status, started_at, completed_at
+                FROM semantic_index_revisions
+                WHERE source_id = ? AND status = 'active'
+                """,
+                (source_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            return {
+                "id": self._required_text(row, "id"),
+                "source_id": self._required_text(row, "source_id"),
+                "policy_hash": self._required_text(row, "policy_hash"),
+                "analyzer_version": self._required_text(row, "analyzer_version"),
+                "status": self._required_text(row, "status"),
+                "started_at": self._optional_text(row, "started_at"),
+                "completed_at": self._optional_text(row, "completed_at"),
+            }
+        except (KeyError, TypeError, ValueError) as error:
+            raise self._semantic_error() from error
+
+    def list_semantic_nodes(self, revision_id: str) -> list[dict[str, object]]:
+        with self._read_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT node_id, source_id, node_kind, parent_node_id, display_name,
+                       relative_hierarchy, content_fingerprint, semantic_summary,
+                       semantic_roles_json, topics_json, evidence_ids_json,
+                       analysis_status, analyzer_version
+                FROM semantic_nodes
+                WHERE revision_id = ?
+                ORDER BY relative_hierarchy, node_id
+                """,
+                (revision_id,),
+            ).fetchall()
+        try:
+            return [
+                {
+                    "node_id": self._required_text(row, "node_id"),
+                    "source_id": self._required_text(row, "source_id"),
+                    "node_kind": self._required_text(row, "node_kind"),
+                    "parent_node_id": self._optional_text(row, "parent_node_id"),
+                    "display_name": self._required_text(row, "display_name"),
+                    "relative_hierarchy": self._required_text(row, "relative_hierarchy"),
+                    "content_fingerprint": self._optional_text(row, "content_fingerprint"),
+                    "semantic_summary": self._required_text(row, "semantic_summary"),
+                    "semantic_roles": self._required_text_list(row, "semantic_roles_json"),
+                    "topics": self._required_text_list(row, "topics_json"),
+                    "evidence_ids": self._required_int_list(row, "evidence_ids_json"),
+                    "analysis_status": self._required_text(row, "analysis_status"),
+                    "analyzer_version": self._required_text(row, "analyzer_version"),
+                }
+                for row in rows
+            ]
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise self._semantic_error() from error
 
     def upsert_source(self, source: Source) -> int:
         with self._connection() as conn:
@@ -1679,6 +1941,20 @@ class SQLiteRepository:
         value = row[name]
         if not isinstance(value, str):
             raise TypeError(f"{name} must be text")
+        return value
+
+    @classmethod
+    def _required_text_list(cls, row: sqlite3.Row, name: str) -> list[str]:
+        value = json.loads(cls._required_text(row, name))
+        if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+            raise TypeError(f"{name} must be a text list")
+        return value
+
+    @classmethod
+    def _required_int_list(cls, row: sqlite3.Row, name: str) -> list[int]:
+        value = json.loads(cls._required_text(row, name))
+        if not isinstance(value, list) or not all(type(item) is int for item in value):
+            raise TypeError(f"{name} must be an integer list")
         return value
 
     @staticmethod
