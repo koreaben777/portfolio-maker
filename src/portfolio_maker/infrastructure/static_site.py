@@ -30,7 +30,9 @@ def prepare_private_deployment(artifact: DeploymentArtifact) -> DeploymentArtifa
 
 _ROOT_ASSET_REFERENCE = re.compile(r"(?:src|href)=\s*[\"']/")
 _RELATIVE_ASSET_REFERENCE = re.compile(r"(?:src|href)=\s*[\"'](\./[^\"']+)[\"']")
-_CSS_REFERENCE = re.compile(r"href=\"\./assets/([^\"]+)\"")
+_CSS_REFERENCE = re.compile(
+    r'<link(?=[^>]*\brel=["\']stylesheet["\'])(?P<attrs>[^>]*)\bhref=["\']\./assets/(?P<name>[^"\']+)["\'][^>]*>'
+)
 _SCRIPT_REFERENCE = re.compile(
     r"<script(?P<attrs>[^>]*)src=\"\./assets/(?P<name>[^\"]+)\"(?P<tail>[^>]*)></script>"
 )
@@ -95,7 +97,7 @@ def inline_static_output(dist: Path) -> str:
     html = index_path.read_text(encoding="utf-8")
 
     def replace_css(match: re.Match[str]) -> str:
-        asset = dist / "assets" / match.group(1)
+        asset = dist / "assets" / match.group("name")
         return "<style>\n" + _read_asset(asset) + "\n</style>"
 
     def replace_script(match: re.Match[str]) -> str:
