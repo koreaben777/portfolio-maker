@@ -21,6 +21,7 @@
 | semantic index | 1 safe chunk, 90 indexed nodes, 270 persisted semantic nodes |
 | project review input | 34 evidence records, restricted scope |
 | candidate / linked evidence | 1 candidate, 30 linked evidence records |
+| policy identities | index `68de9d5e...a33836`, review `cf3f62eb...1d1c96`, artifact selection `b3b7daff...a75f0d` |
 | automatic composition | 1 project, 0 review-required, 0 excluded |
 | medium exclusion / re-inclusion | 1 / 1; evidence and semantic-node counts unchanged |
 | candidate confidence | 0 high, 1 medium, 0 low |
@@ -68,6 +69,6 @@ The following results are tied to the verification sequence above:
 | `PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python -m pytest -q tests/test_semantic_acceptance.py tests/test_semantic_index.py tests/test_project_composition.py tests/test_static_site.py tests/test_render_html.py` | 65 passed in 2.22s |
 | `PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python -m pytest -q` | 515 passed in 12.12s |
 | `(cd web/portfolio && npm run build)` | Vite 6.4.3 build passed |
-| static output validator plus canonical HTML safety assertions | passed; one inlined stylesheet, no `<link>`, no `fetch(` |
-| loopback browser interaction checks | passed; populated project path and 390px mobile path |
+| `PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python -c 'import os; from pathlib import Path; from portfolio_maker.infrastructure.static_site import validate_static_output; validate_static_output(Path(os.environ["PORTFOLIO_SMOKE_WORKSPACE"]) / "web/portfolio/dist")'` plus canonical HTML assertions | passed; one inlined stylesheet, no `<link>`, no `fetch(` |
+| `python -m http.server 8765 --directory "$PORTFOLIO_SMOKE_WORKSPACE/.portfolio-maker/artifacts"` plus Codex in-app Browser checks at `http://127.0.0.1:8765/portfolio.html` | passed; filter click, detail Enter, timeline, 390px mobile, reduced motion, and safety markers |
 | `git diff --check` | exit 0 |
