@@ -13,6 +13,11 @@ from portfolio_maker.application.discovery import discover_sources
 from portfolio_maker.application.draft_portfolio import ProfileFormatError, draft_portfolio
 from portfolio_maker.application.ingestion import ingest_sources
 from portfolio_maker.application.render_html import HtmlRenderError, render_html
+from portfolio_maker.application.semantic_index import (
+    SemanticIndexError,
+    apply_semantic_index,
+    prepare_semantic_index,
+)
 from portfolio_maker.application.project_composition import (
     ProjectCompositionError,
     compose_projects,
@@ -27,10 +32,14 @@ from portfolio_maker.application.models import (
     RenderHtmlRequest,
     ComposeProjectsRequest,
     PrepareProjectReviewRequest,
+    ApplySemanticIndexRequest,
+    PrepareSemanticIndexRequest,
 )
 from portfolio_maker.infrastructure.github_connector import GitHubDiscoveryError
 from portfolio_maker.infrastructure.local_discovery import DiscoveryRootError
+from portfolio_maker.infrastructure.managed_files import write_managed_text
 from portfolio_maker.infrastructure.sqlite_repository import RepositoryError
+from portfolio_maker.infrastructure.sqlite_repository import SQLiteRepository
 from portfolio_maker.workspace import WorkspacePaths
 
 
@@ -70,6 +79,13 @@ def build_parser() -> argparse.ArgumentParser:
     compose = subparsers.add_parser("compose-projects")
     compose.add_argument("--workspace", type=Path, default=Path("."))
 
+    prepare_index = subparsers.add_parser("prepare-semantic-index")
+    prepare_index.add_argument("--workspace", type=Path, default=Path("."))
+    prepare_index.add_argument("--root", type=Path, required=True)
+
+    apply_index = subparsers.add_parser("apply-semantic-index")
+    apply_index.add_argument("--workspace", type=Path, default=Path("."))
+
     run_mvp = subparsers.add_parser("run-mvp")
     run_mvp.add_argument("--workspace", type=Path, default=Path("."))
     run_mvp.add_argument("--home", type=Path, default=Path.home())
@@ -92,6 +108,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         ProfileFormatError,
         ProjectCompositionError,
         RepositoryError,
+        SemanticIndexError,
         json.JSONDecodeError,
         OSError,
     ) as error:
@@ -171,6 +188,37 @@ def _main(argv: Sequence[str] | None = None) -> int:
         print(f"Unassigned evidence: {result.unassigned_evidence_count}")
         return 0
 
+    if args.command == "prepare-semantic-index":
+        try:
+            result = prepare_semantic_index(
+                PrepareSemanticIndexRequest(workspace=args.workspace, root=args.root)
+            )
+            _write_semantic_index_report(
+                WorkspacePaths.from_root(args.workspace), result.revision_id
+            )
+        except ApprovalMissingError as error:
+            raise SemanticIndexError("semantic index approval is missing") from error
+        except ApprovalFormatError as error:
+            raise SemanticIndexError("semantic index approval is invalid") from error
+        except OSError as error:
+            raise SemanticIndexError("semantic index preparation failed") from error
+        print("Semantic index input prepared.")
+        print(f"Chunks: {result.chunk_count}")
+        return 0
+
+    if args.command == "apply-semantic-index":
+        try:
+            result = apply_semantic_index(
+                ApplySemanticIndexRequest(workspace=args.workspace)
+            )
+            _write_semantic_index_report(
+                WorkspacePaths.from_root(args.workspace), result.revision_id
+            )
+        except OSError as error:
+            raise SemanticIndexError("semantic index application failed") from error
+        print("Semantic index applied.")
+        return 0
+
     if args.command == "run-mvp":
         result = discover_sources(
             DiscoverSourcesRequest(
@@ -186,3 +234,30 @@ def _main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     return 2
+
+
+def _write_semantic_index_report(paths: WorkspacePaths, revision_id: str) -> None:
+    repository = SQLiteRepository(paths.db_path)
+    nodes = repository.list_semantic_nodes(revision_id)
+    source_id = str(nodes[0]["source_id"])
+    active = repository.get_active_semantic_revision(source_id)
+
+    def count_nodes(field: str, value: str) -> int:
+        return sum(node[field] == value for node in nodes)
+
+    report = "\n".join(
+        (
+            "# Semantic Index Report",
+            "",
+            f"Directories: {count_nodes('node_kind', 'directory')}",
+            f"Files: {count_nodes('node_kind', 'file')}",
+            f"Complete: {count_nodes('analysis_status', 'complete')}",
+            f"Partial: {count_nodes('analysis_status', 'partial')}",
+            f"Unsupported: {count_nodes('analysis_status', 'unsupported')}",
+            f"Unreadable: {count_nodes('analysis_status', 'unreadable')}",
+            f"Failed: {count_nodes('analysis_status', 'failed')}",
+            f"Active revision: {active['id'] if active is not None else 'none'}",
+            "",
+        )
+    )
+    write_managed_text(paths.semantic_index_report_path, report)

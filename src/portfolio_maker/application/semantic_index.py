@@ -36,7 +36,11 @@ from portfolio_maker.infrastructure.semantic_analyzers import (
     ANALYZER_VERSION,
     analyze_file_input,
 )
-from portfolio_maker.infrastructure.semantic_crawler import StructuralEntry, crawl_local_structure
+from portfolio_maker.infrastructure.semantic_crawler import (
+    StructuralCrawlRootError,
+    StructuralEntry,
+    crawl_local_structure,
+)
 from portfolio_maker.infrastructure.sqlite_repository import SQLiteRepository
 from portfolio_maker.workspace import WorkspacePaths
 
@@ -78,7 +82,10 @@ def prepare_semantic_index(
     paths = WorkspacePaths.from_root(request.workspace)
     paths.ensure()
     approval = load_approval(paths)
-    crawl = crawl_local_structure(request.root, approval)
+    try:
+        crawl = crawl_local_structure(request.root, approval)
+    except StructuralCrawlRootError as error:
+        raise SemanticIndexError("semantic index root is invalid") from error
     if not crawl.entries:
         raise SemanticIndexError("semantic index root contains no structural entries")
 
@@ -310,12 +317,18 @@ def _parse_output_chunks(
     manifest: dict[str, object],
     input_nodes: dict[str, dict[str, object]],
 ) -> dict[str, dict[str, object]]:
+    output_dir = paths.semantic_index_dir / "output"
+    try:
+        if not output_dir.exists():
+            raise SemanticIndexError("semantic index output is missing")
+    except OSError as error:
+        raise SemanticIndexError("semantic index output is invalid") from error
     expected_paths = {
-        paths.semantic_index_dir / "output" / path.name
+        output_dir / path.name
         for path in published.chunk_texts
     }
     try:
-        actual_paths = set((paths.semantic_index_dir / "output").glob("chunk-*.json"))
+        actual_paths = set(output_dir.glob("chunk-*.json"))
     except OSError as error:
         raise SemanticIndexError("semantic index output is invalid") from error
     if actual_paths != expected_paths or any(
@@ -325,7 +338,7 @@ def _parse_output_chunks(
 
     output_nodes: dict[str, dict[str, object]] = {}
     for input_path, input_text in published.chunk_texts.items():
-        output_path = paths.semantic_index_dir / "output" / input_path.name
+        output_path = output_dir / input_path.name
         try:
             output_text = read_managed_bytes(output_path).decode("utf-8")
             output = json.loads(output_text)

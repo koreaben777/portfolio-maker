@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 
+from portfolio_maker.application.approval import write_sample_approval
 from portfolio_maker.adapters.cli import main
 from portfolio_maker.infrastructure.sqlite_repository import SQLiteRepository
 from portfolio_maker.workspace import WorkspacePaths
@@ -66,6 +67,121 @@ def test_cli_approve_write_sample(workspace):
 
     assert exit_code == 0
     assert (workspace / ".portfolio-maker" / "reviews" / "source-approval.json").exists()
+
+
+def test_cli_prepare_semantic_index_reports_chunks_without_locator_values(
+    workspace, tmp_path, capsys
+):
+    root = tmp_path / "approved-root"
+    root.mkdir()
+    for index in range(501):
+        (root / f"item-{index:03}.md").write_text("evidence", encoding="utf-8")
+    write_sample_approval(WorkspacePaths.from_root(workspace))
+
+    exit_code = main(
+        [
+            "prepare-semantic-index",
+            "--workspace",
+            str(workspace),
+            "--root",
+            str(root),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    report = (
+        workspace / ".portfolio-maker" / "reviews" / "semantic-index-report.md"
+    )
+    assert exit_code == 0
+    assert "Semantic index input" in captured.out
+    assert "Chunks: 6" in captured.out
+    assert str(workspace) not in captured.out
+    assert str(root) not in captured.out
+    assert report.exists()
+    report_text = report.read_text(encoding="utf-8")
+    assert "Files: 501" in report_text
+    assert "Directories:" in report_text
+    assert "Complete:" in report_text
+    assert "Partial:" in report_text
+    assert "Unsupported:" in report_text
+    assert "Unreadable:" in report_text
+    assert "Failed:" in report_text
+    assert "Active revision: none" in report_text
+
+
+def test_cli_apply_semantic_index_is_controlled_when_output_missing(
+    workspace, tmp_path, capsys
+):
+    root = tmp_path / "approved-root"
+    root.mkdir()
+    (root / "README.md").write_text("evidence", encoding="utf-8")
+    write_sample_approval(WorkspacePaths.from_root(workspace))
+    assert main(
+        [
+            "prepare-semantic-index",
+            "--workspace",
+            str(workspace),
+            "--root",
+            str(root),
+        ]
+    ) == 0
+    capsys.readouterr()
+
+    exit_code = main(["apply-semantic-index", "--workspace", str(workspace)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "semantic index output is missing" in captured.err
+    assert "Traceback" not in captured.err
+    assert str(workspace) not in captured.err
+
+
+def test_cli_prepare_semantic_index_invalid_root_is_controlled_without_locator(
+    workspace, tmp_path, capsys
+):
+    write_sample_approval(WorkspacePaths.from_root(workspace))
+    missing_root = tmp_path / "missing-root"
+
+    exit_code = main(
+        [
+            "prepare-semantic-index",
+            "--workspace",
+            str(workspace),
+            "--root",
+            str(missing_root),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "semantic index root is invalid" in captured.err
+    assert "Traceback" not in captured.err
+    assert str(workspace) not in captured.err
+    assert str(missing_root) not in captured.err
+
+
+def test_cli_prepare_semantic_index_missing_approval_is_controlled_without_locator(
+    workspace, tmp_path, capsys
+):
+    root = tmp_path / "approved-root"
+    root.mkdir()
+
+    exit_code = main(
+        [
+            "prepare-semantic-index",
+            "--workspace",
+            str(workspace),
+            "--root",
+            str(root),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "semantic index approval is missing" in captured.err
+    assert "Traceback" not in captured.err
+    assert str(workspace) not in captured.err
+    assert str(root) not in captured.err
 
 
 def test_cli_approve_sample_preserves_existing_approval_unless_forced(workspace, capsys):

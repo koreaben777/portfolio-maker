@@ -26,6 +26,7 @@ class WorkspacePaths:
     semantic_index_dir: Path
     semantic_index_input_dir: Path
     semantic_index_manifest_path: Path
+    semantic_index_report_path: Path
     master_profile_json_path: Path
     master_profile_md_path: Path
     portfolio_draft_path: Path
@@ -59,6 +60,7 @@ class WorkspacePaths:
             semantic_index_dir=reviews_dir / "semantic-index",
             semantic_index_input_dir=reviews_dir / "semantic-index" / "input",
             semantic_index_manifest_path=reviews_dir / "semantic-index" / "input-manifest.json",
+            semantic_index_report_path=reviews_dir / "semantic-index-report.md",
             master_profile_json_path=artifacts_dir / "master-profile.json",
             master_profile_md_path=artifacts_dir / "master-profile.md",
             portfolio_draft_path=artifacts_dir / "portfolio-draft.md",
