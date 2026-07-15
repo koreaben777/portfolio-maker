@@ -1,0 +1,19 @@
+{
+  "name": "portfolio-maker",
+  "version": "0.2.0",
+  "description": "Local-first evidence-based portfolio workflow for Codex",
+  "author": {"name": "koreaben777"},
+  "repository": "https://github.com/koreaben777/portfolio-maker",
+  "license": "MIT",
+  "keywords": ["portfolio", "career", "evidence", "semantic-index"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Portfolio Maker",
+    "shortDescription": "Build an evidence-based portfolio from approved sources",
+    "longDescription": "Index approved local structure, curate project boundaries, review decisions, and generate portfolio artifacts.",
+    "developerName": "koreaben777",
+    "category": "Productivity",
+    "capabilities": ["Interactive", "Write"],
+    "defaultPrompt": ["내 자료에서 기본 포트폴리오를 만들어줘"]
+  }
+}
