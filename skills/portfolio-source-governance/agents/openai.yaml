@@ -1,0 +1,4 @@
+interface:
+  display_name: "Portfolio Source Governance"
+  short_description: "Configure Portfolio Maker source and evidence policy"
+  default_prompt: "포트폴리오 자료 범위와 제외 폴더를 설정해줘"
