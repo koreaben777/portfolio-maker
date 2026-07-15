@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
+import threading
 from pathlib import Path
 
 import pytest
@@ -10,6 +12,7 @@ import portfolio_maker.application.semantic_index as semantic_index_module
 from portfolio_maker.application.approval import write_sample_approval
 from portfolio_maker.application.models import PrepareSemanticIndexRequest
 from portfolio_maker.application.semantic_index import prepare_semantic_index
+from portfolio_maker.infrastructure.sqlite_repository import SQLiteRepository
 from portfolio_maker.workspace import WorkspacePaths
 
 
@@ -153,6 +156,75 @@ def test_prepare_semantic_index_replaces_only_prior_managed_chunks(
     assert unrelated_path.read_text(encoding="utf-8") == "preserve this file"
 
 
+def test_prepare_semantic_index_reader_never_observes_incoherent_generation(
+    workspace: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "approved-root"
+    root.mkdir()
+    (root / "README.md").write_text("current evidence", encoding="utf-8")
+    (root / "first-only.md").write_text("old chunk payload", encoding="utf-8")
+    approve_root(workspace, root)
+
+    first = prepare_semantic_index(
+        PrepareSemanticIndexRequest(workspace=workspace, root=root, chunk_size=1)
+    )
+    (root / "first-only.md").unlink()
+
+    original_write = semantic_index_module.write_managed_text
+    reader_started = threading.Event()
+    reader_finished = threading.Event()
+    reader_results: list[object] = []
+    reader_thread: threading.Thread | None = None
+
+    def read_during_publication() -> None:
+        reader_started.set()
+        try:
+            reader_results.append(
+                semantic_index_module._read_published_semantic_input(
+                    WorkspacePaths.from_root(workspace)
+                )
+            )
+        except Exception as error:
+            reader_results.append(error)
+        finally:
+            reader_finished.set()
+
+    def inject_reader_before_manifest(path: Path, content: str, *, overwrite: bool = True) -> Path:
+        nonlocal reader_thread
+        if path == WorkspacePaths.from_root(workspace).semantic_index_manifest_path:
+            reader_thread = threading.Thread(target=read_during_publication)
+            reader_thread.start()
+            assert reader_started.wait(timeout=1)
+            assert not reader_finished.wait(timeout=0.1)
+        return original_write(path, content, overwrite=overwrite)
+
+    monkeypatch.setattr(
+        semantic_index_module, "write_managed_text", inject_reader_before_manifest
+    )
+
+    second = prepare_semantic_index(
+        PrepareSemanticIndexRequest(workspace=workspace, root=root, chunk_size=1)
+    )
+
+    assert reader_thread is not None
+    reader_thread.join(timeout=1)
+    assert not reader_thread.is_alive()
+    assert len(reader_results) == 1
+    assert not isinstance(reader_results[0], BaseException)
+    published = reader_results[0]
+    assert isinstance(published, semantic_index_module._PublishedSemanticInput)
+    manifest = json.loads(published.manifest_text or "{}")
+    assert manifest["revision_id"] in {first.revision_id, second.revision_id}
+    assert [
+        hashlib.sha256(chunk_text.encode("utf-8")).hexdigest()
+        for chunk_text in published.chunk_texts.values()
+    ] == manifest["chunk_sha256s"]
+    assert all(
+        json.loads(chunk_text)["revision_id"] == manifest["revision_id"]
+        for chunk_text in published.chunk_texts.values()
+    )
+
+
 def test_prepare_semantic_index_restores_previous_input_when_publication_fails(
     workspace: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -165,6 +237,9 @@ def test_prepare_semantic_index_restores_previous_input_when_publication_fails(
     first = prepare_semantic_index(
         PrepareSemanticIndexRequest(workspace=workspace, root=root, chunk_size=1)
     )
+    repository = SQLiteRepository(WorkspacePaths.from_root(workspace).db_path)
+    repository.activate_semantic_revision(first.revision_id)
+    source_id = json.loads(first.manifest_path.read_text(encoding="utf-8"))["source_id"]
     input_dir = first.manifest_path.parent / "input"
     previous_manifest = first.manifest_path.read_text(encoding="utf-8")
     previous_chunks = {
@@ -174,6 +249,8 @@ def test_prepare_semantic_index_restores_previous_input_when_publication_fails(
     (root / "first-only.md").unlink()
 
     original_write = semantic_index_module.write_managed_text
+    original_create = SQLiteRepository.create_semantic_revision
+    created_revision_ids: list[str] = []
     failed = False
 
     def fail_second_chunk(path: Path, content: str, *, overwrite: bool = True) -> Path:
@@ -183,7 +260,18 @@ def test_prepare_semantic_index_restores_previous_input_when_publication_fails(
             raise OSError("synthetic publication failure")
         return original_write(path, content, overwrite=overwrite)
 
+    def capture_created_revision(
+        self: SQLiteRepository,
+        revision_id: str,
+        created_source_id: str,
+        policy_hash: str,
+        analyzer_version: str,
+    ) -> None:
+        created_revision_ids.append(revision_id)
+        original_create(self, revision_id, created_source_id, policy_hash, analyzer_version)
+
     monkeypatch.setattr(semantic_index_module, "write_managed_text", fail_second_chunk)
+    monkeypatch.setattr(SQLiteRepository, "create_semantic_revision", capture_created_revision)
 
     with pytest.raises(OSError, match="synthetic publication failure"):
         prepare_semantic_index(
@@ -195,3 +283,15 @@ def test_prepare_semantic_index_restores_previous_input_when_publication_fails(
         path.name: path.read_text(encoding="utf-8")
         for path in input_dir.glob("chunk-*.json")
     } == previous_chunks
+    active = repository.get_active_semantic_revision(source_id)
+    assert active is not None
+    assert active["id"] == first.revision_id
+    assert active["status"] == "active"
+    assert created_revision_ids
+    with sqlite3.connect(WorkspacePaths.from_root(workspace).db_path) as connection:
+        statuses = connection.execute(
+            "SELECT id, status FROM semantic_index_revisions WHERE source_id = ?",
+            (source_id,),
+        ).fetchall()
+    assert (created_revision_ids[0], "failed") in statuses
+    assert all(status != "staging" for _, status in statuses)

@@ -99,18 +99,23 @@ def prepare_semantic_index(
     repository.create_semantic_revision(
         revision_id, source_id, policy_hash, ANALYZER_VERSION
     )
-    repository.replace_semantic_revision_graph(
-        revision_id,
-        tuple(item.node for item in prepared_nodes),
-        {item.node.node_id: item.locator for item in prepared_nodes},
-        tuple(
-            SemanticEdge(revision_id, item.node.parent_node_id, "contains", item.node.node_id)
-            for item in prepared_nodes
-            if item.node.parent_node_id is not None
-        ),
-    )
-
-    _publish_semantic_input(paths, chunk_texts, _canonical_json(manifest))
+    try:
+        repository.replace_semantic_revision_graph(
+            revision_id,
+            tuple(item.node for item in prepared_nodes),
+            {item.node.node_id: item.locator for item in prepared_nodes},
+            tuple(
+                SemanticEdge(revision_id, item.node.parent_node_id, "contains", item.node.node_id)
+                for item in prepared_nodes
+                if item.node.parent_node_id is not None
+            ),
+        )
+        _publish_semantic_input(
+            repository, paths, chunk_texts, _canonical_json(manifest)
+        )
+    except Exception:
+        repository.fail_semantic_revision(revision_id)
+        raise
 
     return PrepareSemanticIndexResult(
         manifest_path=paths.semantic_index_manifest_path,
@@ -220,28 +225,40 @@ class _PublishedSemanticInput:
 
 
 def _publish_semantic_input(
-    paths: WorkspacePaths, chunk_texts: tuple[str, ...], manifest_text: str
+    repository: SQLiteRepository,
+    paths: WorkspacePaths,
+    chunk_texts: tuple[str, ...],
+    manifest_text: str,
 ) -> None:
-    ensure_managed_directory(paths.semantic_index_dir)
-    ensure_managed_directory(paths.semantic_index_input_dir)
-    previous = _read_published_semantic_input(paths)
-    current = {
-        paths.semantic_index_input_dir / f"chunk-{index:04}.json": chunk_text
-        for index, chunk_text in enumerate(chunk_texts, start=1)
-    }
+    with repository._repository_critical_section():
+        ensure_managed_directory(paths.semantic_index_dir)
+        ensure_managed_directory(paths.semantic_index_input_dir)
+        previous = _read_published_semantic_input_unlocked(paths)
+        current = {
+            paths.semantic_index_input_dir / f"chunk-{index:04}.json": chunk_text
+            for index, chunk_text in enumerate(chunk_texts, start=1)
+        }
 
-    try:
-        for path, chunk_text in current.items():
-            write_managed_text(path, chunk_text)
-        for path in previous.chunk_texts.keys() - current.keys():
-            remove_managed_file(path)
-        write_managed_text(paths.semantic_index_manifest_path, manifest_text)
-    except Exception:
-        _restore_published_semantic_input(paths, previous, current)
-        raise
+        try:
+            for path, chunk_text in current.items():
+                write_managed_text(path, chunk_text)
+            for path in previous.chunk_texts.keys() - current.keys():
+                remove_managed_file(path)
+            write_managed_text(paths.semantic_index_manifest_path, manifest_text)
+        except Exception:
+            _restore_published_semantic_input(paths, previous, current)
+            raise
 
 
 def _read_published_semantic_input(paths: WorkspacePaths) -> _PublishedSemanticInput:
+    repository = SQLiteRepository(paths.db_path)
+    with repository._repository_critical_section():
+        return _read_published_semantic_input_unlocked(paths)
+
+
+def _read_published_semantic_input_unlocked(
+    paths: WorkspacePaths,
+) -> _PublishedSemanticInput:
     try:
         manifest_text = read_managed_bytes(paths.semantic_index_manifest_path).decode("utf-8")
     except FileNotFoundError:
