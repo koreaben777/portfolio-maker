@@ -38,6 +38,22 @@ def test_static_validator_accepts_relative_assets_and_no_runtime_fetch(tmp_path)
     assert validate_static_output(dist) == dist / "index.html"
 
 
+def test_static_validator_allows_portfolio_maker_name_in_embedded_evidence(tmp_path):
+    dist = tmp_path / "dist"
+    assets = dist / "assets"
+    assets.mkdir(parents=True)
+    (dist / "index.html").write_text(
+        '<script type="module" src="./assets/main.js"></script>',
+        encoding="utf-8",
+    )
+    (assets / "main.js").write_text(
+        'const evidenceTitle = "Review .portfolio-maker policy";',
+        encoding="utf-8",
+    )
+
+    assert validate_static_output(dist) == dist / "index.html"
+
+
 def test_inline_static_output_embeds_relative_css_and_javascript(tmp_path):
     dist = tmp_path / "dist"
     assets = dist / "assets"
@@ -64,6 +80,7 @@ def test_inline_static_output_embeds_relative_css_and_javascript(tmp_path):
         '<script>fetch("./data.json")</script>',
         '<script src="/assets/main.js"></script>',
         '<script>const path = "portfolio.db"</script>',
+        '<script>const path = "/private/.portfolio-maker/reviews"</script>',
     ),
 )
 def test_static_validator_rejects_runtime_or_unsafe_output(tmp_path, html):

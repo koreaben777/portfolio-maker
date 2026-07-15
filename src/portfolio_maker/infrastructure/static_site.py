@@ -34,6 +34,13 @@ _CSS_REFERENCE = re.compile(r"href=\"\./assets/([^\"]+)\"")
 _SCRIPT_REFERENCE = re.compile(
     r"<script(?P<attrs>[^>]*)src=\"\./assets/(?P<name>[^\"]+)\"(?P<tail>[^>]*)></script>"
 )
+_PRIVATE_WORKSPACE_PATH = re.compile(r"(?:^|[\\/])\.portfolio-maker(?:[\\/]|$)")
+_UNSAFE_STATIC_MARKERS = (
+    "fetch(",
+    "xmlhttprequest",
+    "portfolio.db",
+    "file://",
+)
 
 
 def write_generated_data_module(path: Path, manifest: dict[str, object]) -> Path:
@@ -75,17 +82,7 @@ def validate_static_output(dist: Path) -> Path:
             content = path.read_text(encoding="utf-8")
         except UnicodeDecodeError as error:
             raise StaticSiteError(f"static asset is not UTF-8 text: {path.name}") from error
-        lowered = content.casefold()
-        if any(
-            marker in lowered
-            for marker in (
-                "fetch(",
-                "xmlhttprequest",
-                "portfolio.db",
-                ".portfolio-maker",
-                "file://",
-            )
-        ):
+        if _contains_unsafe_reference(content):
             raise StaticSiteError(f"unsafe runtime or private reference in {path.name}")
     return index_path
 
@@ -106,10 +103,16 @@ def inline_static_output(dist: Path) -> str:
     html = _SCRIPT_REFERENCE.sub(replace_script, html)
     if _RELATIVE_ASSET_REFERENCE.search(html):
         raise StaticSiteError("canonical portfolio HTML still references an external asset")
-    lowered = html.casefold()
-    if any(marker in lowered for marker in ("fetch(", "xmlhttprequest", "portfolio.db", ".portfolio-maker", "file://")):
+    if _contains_unsafe_reference(html):
         raise StaticSiteError("canonical portfolio HTML contains an unsafe reference")
     return html
+
+
+def _contains_unsafe_reference(content: str) -> bool:
+    lowered = content.casefold()
+    return any(marker in lowered for marker in _UNSAFE_STATIC_MARKERS) or bool(
+        _PRIVATE_WORKSPACE_PATH.search(lowered)
+    )
 
 
 def _read_asset(path: Path) -> str:
