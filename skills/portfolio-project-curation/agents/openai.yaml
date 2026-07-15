@@ -1,0 +1,4 @@
+interface:
+  display_name: "Portfolio Project Curation"
+  short_description: "Infer meaningful portfolio project boundaries"
+  default_prompt: "$portfolio-project-curation으로 프로젝트 후보를 분석하고 묶어줘"

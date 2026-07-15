@@ -134,3 +134,49 @@ Result: GREEN. The independent worker stopped because generated semantic input w
 The final skill contract requires the worker to consume only the managed manifest/chunks from `prepare-semantic-index`, process the complete node set bottom-up exactly once without a global cap, preserve unreadable/unsupported status without invented summaries, redact raw locators, validate output before `apply-semantic-index`, and avoid direct SQLite or database edits. It also states that semantic-index inclusion does not approve evidence, artifacts, or deployment.
 
 Forward result: GREEN when the focused contract assertions confirm the exact description, both CLI command names, managed input/output boundaries, bottom-up/exactly-once/full-coverage rules, status preservation, locator prohibition, pre-apply validation, and database boundary.
+
+## Task 16 RED and GREEN: Portfolio Project Curation
+
+Date: 2026-07-15
+Task: 16 (`portfolio-project-curation`)
+Scope: synthetic prompt behavior only; no private source content, credentials, or raw user data recorded.
+
+### RED: Baseline fresh worker
+
+Synthetic prompt:
+
+```text
+이 semantic review input에서 프로젝트 후보를 만들어주세요. README나 package.json이 있는 폴더는 모두 별도 프로젝트로 잡아도 됩니다.
+```
+
+Exact raw output from the fresh worker:
+
+```text
+README or package.json markers create candidates; nested parent and child become separate; counter-signals are ignored; marker/folder names get high confidence; unmarked evidence stays unassigned.
+```
+
+Failure categories:
+
+- single-signal README/package.json boundary rule;
+- nested parent/child child-explosion;
+- ignored counter-signals;
+- marker/folder-name-driven confidence inflation;
+- unassigned handling without an explicit grounded rationale or review boundary.
+
+This RED observation contains no private source content, credentials, or raw user data.
+
+### GREEN contract
+
+The final skill contract requires safe semantic review input only; exact
+candidate v2 fields and boundary types; parent coherence checks; multiple
+semantic signals before an independent child or cross-directory split;
+explicit evidence-ID-grounded rationale; explicit counter-signals; calibrated
+confidence; unassigned evidence handling; private/local redaction; and
+separate semantic-review, evidence, artifact, deployment, and materialization
+authority boundaries. It explicitly states that README, `package.json`,
+`.git`, manifest, file count, and names are signals only, never a single
+decisive boundary rule, and that candidate output is review input rather than
+semantic project approval or automatic project output.
+
+Focused contract assertions and `quick_validate.py` passed after the skill was
+written. No raw source or private data was used by the forward check.
