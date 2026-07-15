@@ -40,6 +40,13 @@ class ActiveSemanticRevisionMissing(ProjectBoundaryError):
     pass
 
 
+@dataclass(frozen=True)
+class _BoundaryNode:
+    parent_node_id: str | None
+    relative_hierarchy: str
+    topics: tuple[str, ...]
+
+
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _IDENTIFIER = re.compile(r"[A-Za-z0-9:_-]+")
 _PROJECT_ID = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
@@ -170,6 +177,7 @@ def parse_candidate_payload_v2(
         expected_fingerprint = boundary_fingerprint(boundary_type, boundary_node_ids)
         if raw_candidate.get("boundary_fingerprint") != expected_fingerprint:
             raise ProjectBoundaryError("candidate boundary fingerprint is invalid")
+        _validate_boundary_coherence(boundary_type, boundary_node_ids, nodes)
         _reject_prohibited_broad_root(boundary_node_ids, nodes)
         evidence_ids = _candidate_evidence_ids(
             raw_candidate.get("evidence_ids"), available_evidence_ids
@@ -201,7 +209,7 @@ def parse_candidate_payload_v2(
 
 def _validate_review_input_v2(
     review_input: dict[str, Any],
-) -> tuple[str, dict[str, dict[str, object]], set[int]]:
+) -> tuple[str, dict[str, _BoundaryNode], set[int]]:
     if not isinstance(review_input, dict) or review_input.get("version") != 2:
         raise ProjectBoundaryError("project review input version is invalid")
     review_hash = _safe_sha256(review_input.get("input_sha256"), "review input SHA-256")
@@ -213,7 +221,7 @@ def _validate_review_input_v2(
     if not isinstance(raw_nodes, list):
         raise ProjectBoundaryError("project review input nodes are invalid")
 
-    nodes: dict[str, dict[str, object]] = {}
+    nodes: dict[str, _BoundaryNode] = {}
     available_evidence_ids: set[int] = set()
     for raw_node in raw_nodes:
         if not isinstance(raw_node, dict):
@@ -226,10 +234,11 @@ def _validate_review_input_v2(
             parent_node_id = _safe_identifier(parent_node_id, "candidate parent node ID")
         topics = _candidate_text_list(raw_node.get("topics"), "candidate node topics", required=False)
         evidence_ids = _candidate_evidence_ids(raw_node.get("evidence_ids"), None)
-        nodes[node_id] = {
-            "parent_node_id": parent_node_id,
-            "topics": topics,
-        }
+        nodes[node_id] = _BoundaryNode(
+            parent_node_id=parent_node_id,
+            relative_hierarchy=_safe_relative_hierarchy(raw_node.get("relative_hierarchy")),
+            topics=topics,
+        )
         available_evidence_ids.update(evidence_ids)
 
     raw_github_evidence = review_input.get("github_evidence")
@@ -250,7 +259,7 @@ def _safe_project_id(value: object, field: str) -> str:
 
 
 def _candidate_boundary_node_ids(
-    value: object, nodes: dict[str, dict[str, object]]
+    value: object, nodes: dict[str, _BoundaryNode]
 ) -> tuple[str, ...]:
     if not isinstance(value, list) or not value or any(not isinstance(item, str) for item in value):
         raise ProjectBoundaryError("candidate boundary node IDs are invalid")
@@ -288,18 +297,73 @@ def _candidate_text_list(value: object, field: str, *, required: bool) -> tuple[
     return values
 
 
+def _validate_boundary_coherence(
+    boundary_type: str,
+    boundary_node_ids: tuple[str, ...],
+    nodes: dict[str, _BoundaryNode],
+) -> None:
+    if boundary_type == "directory_root":
+        if len(boundary_node_ids) != 1:
+            raise ProjectBoundaryError("directory root boundary must contain one node")
+        _boundary_ancestry(boundary_node_ids[0], nodes, "directory root")
+        return
+    if boundary_type == "independent_child":
+        if len(boundary_node_ids) != 1 or nodes[boundary_node_ids[0]].parent_node_id is None:
+            raise ProjectBoundaryError("independent child boundary must contain one child node")
+        _boundary_ancestry(boundary_node_ids[0], nodes, "independent child")
+        return
+    if boundary_type == "cross_directory_cluster":
+        if len(boundary_node_ids) < 2:
+            raise ProjectBoundaryError("cross-directory boundary must contain multiple nodes")
+        shared_ancestors = set(_boundary_ancestry(boundary_node_ids[0], nodes, "cross-directory"))
+        for node_id in boundary_node_ids[1:]:
+            shared_ancestors.intersection_update(
+                _boundary_ancestry(node_id, nodes, "cross-directory")
+            )
+        if not any(nodes[node_id].relative_hierarchy != "." for node_id in shared_ancestors):
+            raise ProjectBoundaryError("cross-directory boundary has no shared explainable ancestor")
+
+
+def _boundary_ancestry(
+    node_id: str, nodes: dict[str, _BoundaryNode], boundary_name: str
+) -> tuple[str, ...]:
+    ancestry: list[str] = []
+    current_node_id = node_id
+    while True:
+        if current_node_id in ancestry:
+            raise ProjectBoundaryError(f"{boundary_name} boundary contains a parent cycle")
+        node = nodes.get(current_node_id)
+        if node is None:
+            raise ProjectBoundaryError(f"{boundary_name} boundary contains a dangling parent")
+        ancestry.append(current_node_id)
+        if node.parent_node_id is None:
+            if node.relative_hierarchy != ".":
+                raise ProjectBoundaryError(f"{boundary_name} boundary contains a dangling parent")
+            return tuple(ancestry)
+        parent = nodes.get(node.parent_node_id)
+        if parent is None or parent.relative_hierarchy != _parent_hierarchy(node.relative_hierarchy):
+            raise ProjectBoundaryError(f"{boundary_name} boundary contains a dangling parent")
+        current_node_id = node.parent_node_id
+
+
+def _parent_hierarchy(relative_hierarchy: str) -> str:
+    if "/" not in relative_hierarchy:
+        return "."
+    return relative_hierarchy.rsplit("/", 1)[0]
+
+
 def _reject_prohibited_broad_root(
     boundary_node_ids: tuple[str, ...],
-    nodes: dict[str, dict[str, object]],
+    nodes: dict[str, _BoundaryNode],
 ) -> None:
     for node_id in boundary_node_ids:
         node = nodes[node_id]
-        if node["parent_node_id"] is not None:
+        if node.parent_node_id is not None:
             continue
         child_topics = [
-            set(child["topics"])
+            set(child.topics)
             for child in nodes.values()
-            if child["parent_node_id"] == node_id and child["topics"]
+            if child.parent_node_id == node_id and child.topics
         ]
         if any(
             first.isdisjoint(second)
@@ -477,6 +541,12 @@ def _contains_unsafe_locator(value: str) -> bool:
         or ".portfolio-maker" in folded
         or "portfolio.db" in folded
         or re.search(r"(?i)https?://", value)
+        or re.search(
+            r"(?i)(?<![A-Za-z0-9_.-])[A-Za-z0-9][A-Za-z0-9._-]*@"
+            r"(?:[A-Za-z0-9-]+\.)+[A-Za-z0-9-]+:"
+            r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+(?:\.git)?\b",
+            value,
+        )
         or re.search(r"(?<![A-Za-z0-9_.-])(?:/|~[/\\]|[A-Za-z]:[/\\]|\\\\)", value)
         or re.search(r"(?i)(?:^|[/\\])(?:raw|snapshots?)(?:[/\\]|$)", value)
     )

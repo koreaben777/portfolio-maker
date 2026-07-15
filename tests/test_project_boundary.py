@@ -50,38 +50,86 @@ def review_input_v2() -> dict[str, object]:
         "index_revision": "revision-v2",
         "nodes": [
             {
+                "node_id": "node-source",
+                "parent_node_id": None,
+                "relative_hierarchy": ".",
+                "topics": ["workspace"],
+                "evidence_ids": [],
+            },
+            {
                 "node_id": "node-parent",
                 "parent_node_id": "node-source",
+                "relative_hierarchy": "portfolio",
                 "topics": ["portfolio"],
                 "evidence_ids": [101],
             },
             {
                 "node_id": "node-child-a",
                 "parent_node_id": "node-parent",
+                "relative_hierarchy": "portfolio/app",
                 "topics": ["portfolio"],
                 "evidence_ids": [102],
             },
             {
                 "node_id": "node-child-b",
                 "parent_node_id": "node-parent",
+                "relative_hierarchy": "portfolio/docs",
                 "topics": ["portfolio"],
                 "evidence_ids": [],
             },
             {
                 "node_id": "node-broad-root",
                 "parent_node_id": None,
+                "relative_hierarchy": ".",
                 "topics": ["workspace"],
                 "evidence_ids": [],
             },
             {
                 "node_id": "node-unrelated-a",
                 "parent_node_id": "node-broad-root",
+                "relative_hierarchy": "mobile",
                 "topics": ["mobile"],
                 "evidence_ids": [],
             },
             {
                 "node_id": "node-unrelated-b",
                 "parent_node_id": "node-broad-root",
+                "relative_hierarchy": "finance",
+                "topics": ["finance"],
+                "evidence_ids": [],
+            },
+            {
+                "node_id": "node-mobile-root",
+                "parent_node_id": None,
+                "relative_hierarchy": "mobile",
+                "topics": ["mobile"],
+                "evidence_ids": [],
+            },
+            {
+                "node_id": "node-finance-root",
+                "parent_node_id": None,
+                "relative_hierarchy": "finance",
+                "topics": ["finance"],
+                "evidence_ids": [],
+            },
+            {
+                "node_id": "node-cluster-parent",
+                "parent_node_id": "node-source",
+                "relative_hierarchy": "product",
+                "topics": ["product"],
+                "evidence_ids": [],
+            },
+            {
+                "node_id": "node-cluster-mobile",
+                "parent_node_id": "node-cluster-parent",
+                "relative_hierarchy": "product/mobile",
+                "topics": ["mobile"],
+                "evidence_ids": [],
+            },
+            {
+                "node_id": "node-cluster-finance",
+                "parent_node_id": "node-cluster-parent",
+                "relative_hierarchy": "product/finance",
                 "topics": ["finance"],
                 "evidence_ids": [],
             },
@@ -294,6 +342,52 @@ def test_candidate_v2_rejects_broad_root_with_unrelated_child_topics(
     )
 
     with pytest.raises(ProjectBoundaryError, match="broad root"):
+        parse_candidate_payload_v2(candidate, review_input_v2)
+
+
+def test_candidate_v2_rejects_cross_directory_cluster_without_shared_ancestor(
+    review_input_v2: dict[str, object],
+) -> None:
+    candidate = valid_candidate_v2(
+        review_input_v2,
+        boundary_type="cross_directory_cluster",
+        boundary_node_ids=["node-mobile-root", "node-finance-root"],
+        evidence_ids=[],
+    )
+
+    with pytest.raises(ProjectBoundaryError, match="cross-directory"):
+        parse_candidate_payload_v2(candidate, review_input_v2)
+
+
+def test_candidate_v2_accepts_cross_directory_cluster_with_shared_ancestor(
+    review_input_v2: dict[str, object],
+) -> None:
+    candidate = valid_candidate_v2(
+        review_input_v2,
+        boundary_type="cross_directory_cluster",
+        boundary_node_ids=["node-cluster-mobile", "node-cluster-finance"],
+        evidence_ids=[],
+    )
+
+    parsed = parse_candidate_payload_v2(candidate, review_input_v2)
+
+    assert parsed[0].boundary_node_ids == ("node-cluster-mobile", "node-cluster-finance")
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["title", "overview", "grouping_rationale", "counter_signals", "review_reasons"],
+)
+def test_candidate_v2_rejects_ssh_private_git_locator_in_safe_text(
+    field: str, review_input_v2: dict[str, object]
+) -> None:
+    candidate = valid_candidate_v2(review_input_v2)
+    locator = "git@github.com:private/repository.git"
+    candidate["candidates"][0][field] = (  # type: ignore[index]
+        locator if field in {"title", "overview"} else [locator]
+    )
+
+    with pytest.raises(ProjectBoundaryError, match="unsafe locator"):
         parse_candidate_payload_v2(candidate, review_input_v2)
 
 
