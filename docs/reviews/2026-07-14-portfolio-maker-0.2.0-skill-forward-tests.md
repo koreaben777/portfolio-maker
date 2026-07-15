@@ -233,7 +233,7 @@ This is retained as a safety-stop probe only. It did not exercise parent
 coherence, component retention, independent-child/manual handling, fingerprint
 validation, or unassigned evidence coverage.
 
-## Independent Task 16 GREEN: Corrected Boundary Fixture
+## Independent Task 16 GREEN: Final Corrected Boundary Fixture
 
 Date: 2026-07-15
 Task: 16 (`portfolio-project-curation`)
@@ -244,11 +244,13 @@ credentials, raw user data, or legacy-directory content.
 
 ### Exact synthetic fixture summary
 
-The corrected synthetic fixture contains a coherent parent `n-parent` with
-child component nodes `n-api` and `n-ui`, an independent node
-`n-independent`, evidence IDs `101` through `104`, and no raw locators. The
-expected judgment retains the parent, keeps API/UI as components, emits the
-independent node as a manual candidate, and leaves evidence `104` unassigned.
+The final synthetic fixture contains coherent parent node `n-parent` with
+component children `n-api` and `n-ui`, a separate recipe-calculator node
+`n-independent`, numeric evidence IDs `101` through `104`, and no raw
+locators. The expected judgment retains the parent boundary at `n-parent`,
+keeps API/UI as components despite README/package markers, emits Recipe
+Calculator as a separate manual candidate, and leaves evidence `104`
+unassigned.
 
 ### Exact raw output
 
@@ -268,7 +270,7 @@ The fresh worker returned this valid payload with exactly these top-level keys:
       "overview": "Deployment Dashboard retains its API and UI components.",
       "boundary_type": "directory_root",
       "boundary_node_ids": ["n-parent"],
-      "boundary_fingerprint": "sha256:64c426206aa5b64b32a5a64f98346b24d0cdb673b95d154d268bfce09ffaaead",
+      "boundary_fingerprint": "sha256:6f359ad6e992fed154b0ebda9c4294360ca77e29b1e675f7cd593cc039efcd27",
       "evidence_ids": [101, 102],
       "grouping_rationale": [
         "[evidence_id=101] The parent evidence supports the Deployment Dashboard product.",
@@ -285,18 +287,18 @@ The fresh worker returned this valid payload with exactly these top-level keys:
     {
       "id": "n-independent",
       "project_id": "n-independent",
-      "title": "Independent Candidate",
-      "overview": "An independently reviewed project candidate.",
+      "title": "Recipe Calculator",
+      "overview": "Recipe Calculator is retained as a separate manual candidate.",
       "boundary_type": "manual",
       "boundary_node_ids": ["n-independent"],
       "boundary_fingerprint": "sha256:3427fed97f7ce81222bf6c292a9c98d714e25aaa1637956cc12de29b8173a265",
       "evidence_ids": [103],
       "grouping_rationale": [
-        "[evidence_id=103] The evidence supports an independent manually reviewed candidate."
+        "[evidence_id=103] The evidence supports Recipe Calculator as an independent candidate."
       ],
       "counter_signals": [],
       "review_reasons": [
-        "Independent manual candidate retained for review."
+        "Recipe Calculator is a separate manual candidate for review."
       ],
       "confidence": "high"
     }
@@ -305,8 +307,11 @@ The fresh worker returned this valid payload with exactly these top-level keys:
 }
 ```
 
-The worker explicitly stated: parent retained; API/UI are components; an
-independent manual candidate is present; evidence `104` is unassigned; the
-top-level keys are exact; and the result has no auto-approval/materialization.
-This corrected probe closes the boundary-coverage finding left open by the
-earlier zero-input safety-stop probe.
+The raw response stated: parent retained; API/UI remain components despite
+README/package markers; Recipe Calculator is a separate manual candidate;
+evidence `104` is unassigned; evidence references use numeric IDs only; and
+there is no auto approval/materialization. The earlier child-inclusive
+fingerprint attempt (`sha256:64c426206aa5b64b32a5a64f98346b24d0cdb673b95d154d268bfce09ffaaead`)
+was discarded as invalid, not retained as a candidate or evidence. This final
+canonical fingerprint observation closes the boundary-coverage review finding
+left open by the earlier probes.
