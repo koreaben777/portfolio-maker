@@ -7,6 +7,8 @@ import stat
 from dataclasses import dataclass
 
 from portfolio_maker.domain.semantic_models import AnalysisStatus, SemanticNodeKind
+from portfolio_maker.infrastructure.extractors import _open_regular_file
+from portfolio_maker.infrastructure.policy import SourcePathPolicyError
 from portfolio_maker.infrastructure.policy import mask_secrets
 from portfolio_maker.infrastructure.semantic_crawler import StructuralEntry
 
@@ -45,24 +47,21 @@ def analyze_file_input(
     if entry.kind != SemanticNodeKind.FILE:
         return _metadata_only(entry, AnalysisStatus.UNSUPPORTED)
 
-    try:
-        path_stat = entry.absolute_path.lstat()
-    except OSError:
-        return _metadata_only(entry, AnalysisStatus.UNREADABLE)
-
-    if not stat.S_ISREG(path_stat.st_mode):
-        return _metadata_only(entry, AnalysisStatus.UNSUPPORTED)
+    if entry.status != AnalysisStatus.PENDING:
+        return _metadata_only(entry, entry.status)
 
     no_follow = getattr(os, "O_NOFOLLOW", None)
     if no_follow is None:
         return _metadata_only(entry, AnalysisStatus.UNSUPPORTED)
 
     try:
-        descriptor = os.open(entry.absolute_path, os.O_RDONLY | no_follow)
+        descriptor = _open_regular_file(entry.absolute_path)
+    except SourcePathPolicyError:
+        return _metadata_only(entry, AnalysisStatus.UNSUPPORTED)
     except OSError as error:
         status = (
             AnalysisStatus.UNSUPPORTED
-            if error.errno == errno.ELOOP
+            if error.errno in {errno.ELOOP, errno.ENOTDIR}
             else AnalysisStatus.UNREADABLE
         )
         return _metadata_only(entry, status)

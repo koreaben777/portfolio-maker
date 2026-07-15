@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+import os
+from dataclasses import replace
 from pathlib import Path
+
+import pytest
 
 from portfolio_maker.domain.semantic_models import AnalysisStatus, SemanticNodeKind
 from portfolio_maker.infrastructure.semantic_analyzers import analyze_file_input
@@ -70,6 +74,63 @@ def test_analysis_does_not_follow_symbolic_links(tmp_path: Path) -> None:
 
     result = analyze_file_input(entry_for(link))
 
+    assert result.status == AnalysisStatus.UNSUPPORTED
+    assert result.masked_excerpt == ""
+    assert result.content_fingerprint is None
+
+
+def test_unsupported_regular_file_is_not_opened_for_analysis(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "excluded.py"
+    path.write_text("API_TOKEN=synthetic-placeholder\n", encoding="utf-8")
+
+    def fail_if_opened(*args: object, **kwargs: object) -> int:
+        raise AssertionError("unsupported file must not be opened")
+
+    monkeypatch.setattr(
+        "portfolio_maker.infrastructure.semantic_analyzers.os.open", fail_if_opened
+    )
+
+    result = analyze_file_input(
+        replace(entry_for(path), status=AnalysisStatus.UNSUPPORTED)
+    )
+
+    assert result.status == AnalysisStatus.UNSUPPORTED
+    assert result.masked_excerpt == ""
+    assert result.content_fingerprint is None
+
+
+def test_analysis_does_not_follow_ancestor_symlink_replaced_after_capture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    captured_parent = root / "captured"
+    captured_parent.mkdir(parents=True)
+    path = captured_parent / "note.py"
+    path.write_text("API_TOKEN=synthetic-placeholder\n", encoding="utf-8")
+    entry = entry_for(path)
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    os.link(path, outside / path.name)
+    captured_parent.rename(tmp_path / "captured-original")
+    captured_parent.symlink_to(outside, target_is_directory=True)
+
+    original_read = os.read
+    reads: list[int] = []
+
+    def record_read(descriptor: int, max_bytes: int) -> bytes:
+        reads.append(descriptor)
+        return original_read(descriptor, max_bytes)
+
+    monkeypatch.setattr(
+        "portfolio_maker.infrastructure.semantic_analyzers.os.read", record_read
+    )
+
+    result = analyze_file_input(entry)
+
+    assert reads == []
     assert result.status == AnalysisStatus.UNSUPPORTED
     assert result.masked_excerpt == ""
     assert result.content_fingerprint is None
