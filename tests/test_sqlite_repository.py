@@ -196,6 +196,164 @@ def test_sqlite_repository_adds_evidence_origin_columns(workspace):
     } <= column_names(repository, "evidence_items")
 
 
+def test_legacy_approved_project_migrates_to_manually_approved(workspace) -> None:
+    paths = WorkspacePaths.from_root(workspace)
+    paths.ensure()
+    with sqlite3.connect(paths.db_path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE portfolio_projects (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                overview TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status = 'approved'),
+                approval_sha256 TEXT NOT NULL,
+                review_input_sha256 TEXT NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE portfolio_project_evidence (
+                project_id TEXT NOT NULL REFERENCES portfolio_projects(id) ON DELETE CASCADE,
+                evidence_id INTEGER NOT NULL,
+                support_level TEXT NOT NULL CHECK(support_level IN ('direct', 'contextual')),
+                PRIMARY KEY (project_id, evidence_id),
+                UNIQUE (evidence_id)
+            );
+            INSERT INTO portfolio_projects
+                (id, title, overview, status, approval_sha256, review_input_sha256)
+            VALUES ('insurance-rag', 'Insurance RAG', 'Grounded overview', 'approved', 'a', 'b');
+            """
+        )
+
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+
+    assert repository.list_portfolio_projects()[0]["decision_status"] == "manually_approved"
+    assert repository.list_portfolio_projects()[0]["decision_origin"] == "manual"
+
+
+def test_excluded_project_keeps_links_but_disappears_from_active_list(tmp_path: Path) -> None:
+    repository, evidence_id = populated_portfolio_project_repository(tmp_path)
+
+    repository.set_project_decision_state("insurance-rag", "excluded")
+
+    assert repository.list_portfolio_projects(active_only=True) == []
+    excluded = repository.list_portfolio_projects(active_only=False)
+    assert excluded[0]["decision_status"] == "excluded"
+    assert excluded[0]["evidence"] == [
+        {"evidence_id": evidence_id, "support_level": "direct"}
+    ]
+
+    repository.set_project_decision_state("insurance-rag", "included")
+
+    assert [project["id"] for project in repository.list_portfolio_projects()] == [
+        "insurance-rag"
+    ]
+
+
+def test_replacing_decisions_marks_missing_automatic_project_inactive(tmp_path: Path) -> None:
+    repository, _ = populated_portfolio_project_repository(tmp_path)
+    repository.replace_portfolio_project_decisions(
+        (),
+        candidate_input_sha256="c" * 64,
+        index_revision="revision-2",
+    )
+
+    projects = repository.list_portfolio_projects(active_only=False)
+    assert projects[0]["decision_status"] == "inactive"
+    assert repository.list_portfolio_projects(active_only=True) == []
+
+
+def test_replacing_decisions_preserves_manual_exclusion_for_same_boundary(tmp_path: Path) -> None:
+    repository, evidence_id = populated_portfolio_project_repository(tmp_path)
+    repository.set_project_decision_state("insurance-rag", "excluded")
+
+    repository.replace_portfolio_project_decisions(
+        (
+            decision_project(
+                "insurance-rag",
+                evidence_id,
+                boundary_fingerprint="sha256:insurance-rag",
+            ),
+        ),
+        candidate_input_sha256="c" * 64,
+        index_revision="revision-2",
+    )
+
+    project = repository.list_portfolio_projects(active_only=False)[0]
+    assert project["decision_status"] == "excluded"
+    assert project["decision_origin"] == "manual"
+
+
+def test_replacing_decisions_requires_review_when_existing_identity_changes_boundary(
+    tmp_path: Path,
+) -> None:
+    repository, evidence_id = populated_portfolio_project_repository(tmp_path)
+    repository.set_project_decision_state("insurance-rag", "excluded")
+
+    repository.replace_portfolio_project_decisions(
+        (
+            decision_project(
+                "insurance-rag",
+                evidence_id,
+                boundary_fingerprint="sha256:split-boundary",
+            ),
+        ),
+        candidate_input_sha256="c" * 64,
+        index_revision="revision-2",
+    )
+
+    project = repository.list_portfolio_projects(active_only=False)[0]
+    assert project["decision_status"] == "review_required"
+    assert repository.list_portfolio_projects(active_only=True) == []
+
+
+def populated_portfolio_project_repository(tmp_path: Path) -> tuple[SQLiteRepository, int]:
+    repository = SQLiteRepository(tmp_path / ".portfolio-maker" / "portfolio.db")
+    repository.initialize()
+    with repository._connection() as connection:
+        connection.execute(
+            "INSERT INTO sources (type, uri, display_name, status) VALUES ('local_file', ?, 'README.md', 'ingested')",
+            ("file:///tmp/README.md",),
+        )
+        source_id = connection.execute("SELECT id FROM sources").fetchone()[0]
+    evidence_id = repository.upsert_evidence_item(
+        source_id=source_id,
+        snapshot_id=None,
+        github_activity_id=None,
+        locator="file:///tmp/README.md",
+        stable_id="source-snapshot:insurance-rag",
+        content_hash="abc",
+        public_safe=False,
+    )
+    repository.replace_portfolio_project_decisions(
+        (decision_project("insurance-rag", evidence_id),),
+        candidate_input_sha256="c" * 64,
+        index_revision="revision-1",
+    )
+    return repository, evidence_id
+
+
+def decision_project(
+    project_id: str,
+    evidence_id: int,
+    *,
+    boundary_fingerprint: str = "sha256:insurance-rag",
+) -> dict[str, object]:
+    return {
+        "id": project_id,
+        "title": "Insurance RAG",
+        "overview": "Grounded overview",
+        "evidence_ids": (evidence_id,),
+        "decision_status": "auto_included_high",
+        "decision_origin": "automatic",
+        "confidence": "high",
+        "boundary_fingerprint": boundary_fingerprint,
+        "approval_sha256": "a" * 64,
+        "review_input_sha256": "b" * 64,
+    }
+
+
 def test_sqlite_repository_evidence_relationships_enforce_foreign_keys(workspace):
     paths = WorkspacePaths.from_root(workspace)
     repository = SQLiteRepository(paths.db_path)

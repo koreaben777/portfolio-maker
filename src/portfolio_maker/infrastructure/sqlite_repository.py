@@ -103,6 +103,13 @@ CREATE TABLE IF NOT EXISTS portfolio_projects (
     status TEXT NOT NULL CHECK(status = 'approved'),
     approval_sha256 TEXT NOT NULL,
     review_input_sha256 TEXT NOT NULL,
+    decision_status TEXT NOT NULL DEFAULT 'manually_approved',
+    decision_origin TEXT NOT NULL DEFAULT 'manual',
+    confidence TEXT,
+    boundary_fingerprint TEXT,
+    candidate_input_sha256 TEXT,
+    index_revision TEXT,
+    decision_updated_at TEXT,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
@@ -196,6 +203,23 @@ class RepositoryError(RuntimeError):
 _DATABASE_SIDECARS = ("-journal", "-wal", "-shm")
 _REPOSITORY_OPERATION_LOCK = threading.RLock()
 _REPOSITORY_OPERATION_STATE = threading.local()
+_ACTIVE_PORTFOLIO_PROJECT_DECISION_STATUSES = (
+    "manually_approved",
+    "auto_included_high",
+    "auto_included_medium",
+)
+_PORTFOLIO_PROJECT_DECISION_STATUSES = frozenset(
+    {
+        "manually_approved",
+        "auto_included_high",
+        "auto_included_medium",
+        "excluded",
+        "inactive",
+        "review_required",
+    }
+)
+_PORTFOLIO_PROJECT_DECISION_ORIGINS = frozenset({"manual", "automatic"})
+_PORTFOLIO_PROJECT_CONFIDENCE_LEVELS = frozenset({"low", "medium", "high"})
 
 
 @dataclass(frozen=True)
@@ -530,6 +554,7 @@ class SQLiteRepository:
             self._ensure_github_activity_current_column(conn)
             self._ensure_legacy_normalized_columns(conn)
             self._ensure_origin_columns(conn)
+            self._ensure_portfolio_project_decision_columns(conn)
 
     @staticmethod
     def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
@@ -697,6 +722,45 @@ class SQLiteRepository:
                     ELSE 'private'
                 END
             WHERE origin_visibility = 'unknown'
+            """
+        )
+
+    @classmethod
+    def _ensure_portfolio_project_decision_columns(cls, conn: sqlite3.Connection) -> None:
+        columns = cls._table_columns(conn, "portfolio_projects")
+        definitions = (
+            ("decision_status", "TEXT NOT NULL DEFAULT 'manually_approved'"),
+            ("decision_origin", "TEXT NOT NULL DEFAULT 'manual'"),
+            ("confidence", "TEXT"),
+            ("boundary_fingerprint", "TEXT"),
+            ("candidate_input_sha256", "TEXT"),
+            ("index_revision", "TEXT"),
+            ("decision_updated_at", "TEXT"),
+        )
+        for column, definition in definitions:
+            if column not in columns:
+                conn.execute(
+                    f"ALTER TABLE portfolio_projects ADD COLUMN {column} {definition}"
+                )
+        conn.execute(
+            """
+            UPDATE portfolio_projects
+            SET decision_status = CASE
+                    WHEN decision_status IS NULL OR trim(decision_status) = ''
+                        THEN 'manually_approved'
+                    ELSE decision_status
+                END,
+                decision_origin = CASE
+                    WHEN decision_origin IS NULL OR trim(decision_origin) = ''
+                        THEN 'manual'
+                    ELSE decision_origin
+                END,
+                decision_updated_at = COALESCE(decision_updated_at, updated_at, created_at, CURRENT_TIMESTAMP)
+            WHERE decision_status IS NULL
+               OR trim(decision_status) = ''
+               OR decision_origin IS NULL
+               OR trim(decision_origin) = ''
+               OR decision_updated_at IS NULL
             """
         )
 
@@ -1547,15 +1611,284 @@ class SQLiteRepository:
                         (project_id, evidence_id),
                     )
 
-    def list_portfolio_projects(self) -> list[dict[str, object]]:
+    def replace_portfolio_project_decisions(
+        self,
+        projects: tuple[dict[str, object], ...],
+        *,
+        candidate_input_sha256: str,
+        index_revision: str,
+    ) -> None:
+        """Upsert current v2 decisions without reinterpreting legacy projects."""
+        normalized = self._normalize_portfolio_project_decisions(
+            projects,
+            candidate_input_sha256=candidate_input_sha256,
+            index_revision=index_revision,
+        )
+        with self._connection() as conn:
+            existing_rows = conn.execute(
+                """
+                SELECT id, decision_status, decision_origin, boundary_fingerprint
+                FROM portfolio_projects
+                """
+            ).fetchall()
+            existing = {
+                self._required_text(row, "id"): {
+                    "decision_status": self._required_text(row, "decision_status"),
+                    "decision_origin": self._required_text(row, "decision_origin"),
+                    "boundary_fingerprint": self._optional_text(row, "boundary_fingerprint"),
+                }
+                for row in existing_rows
+            }
+            manual_exclusions_by_boundary = {
+                state["boundary_fingerprint"]
+                for state in existing.values()
+                if state["decision_status"] == "excluded"
+                and state["decision_origin"] == "manual"
+                and state["boundary_fingerprint"] is not None
+            }
+
+            for project in normalized:
+                project_id = project["id"]
+                current = existing.get(project_id)
+                state = self._resolved_portfolio_project_decision_state(
+                    project,
+                    current=current,
+                    existing=existing,
+                    manual_exclusions_by_boundary=manual_exclusions_by_boundary,
+                )
+                conn.execute(
+                    """
+                    INSERT INTO portfolio_projects (
+                        id, title, overview, status, approval_sha256, review_input_sha256,
+                        decision_status, decision_origin, confidence, boundary_fingerprint,
+                        candidate_input_sha256, index_revision, decision_updated_at
+                    )
+                    VALUES (?, ?, ?, 'approved', ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(id) DO UPDATE SET
+                        title = excluded.title,
+                        overview = excluded.overview,
+                        approval_sha256 = excluded.approval_sha256,
+                        review_input_sha256 = excluded.review_input_sha256,
+                        decision_status = excluded.decision_status,
+                        decision_origin = excluded.decision_origin,
+                        confidence = excluded.confidence,
+                        boundary_fingerprint = excluded.boundary_fingerprint,
+                        candidate_input_sha256 = excluded.candidate_input_sha256,
+                        index_revision = excluded.index_revision,
+                        decision_updated_at = CURRENT_TIMESTAMP,
+                        updated_at = CURRENT_TIMESTAMP
+                    """,
+                    (
+                        project_id,
+                        project["title"],
+                        project["overview"],
+                        project["approval_sha256"],
+                        project["review_input_sha256"],
+                        state["decision_status"],
+                        state["decision_origin"],
+                        project["confidence"],
+                        project["boundary_fingerprint"],
+                        candidate_input_sha256,
+                        index_revision,
+                    ),
+                )
+                conn.execute(
+                    "DELETE FROM portfolio_project_evidence WHERE project_id = ?",
+                    (project_id,),
+                )
+                for evidence_id in project["evidence_ids"]:
+                    conn.execute(
+                        """
+                        INSERT INTO portfolio_project_evidence
+                            (project_id, evidence_id, support_level)
+                        VALUES (?, ?, 'direct')
+                        """,
+                        (project_id, evidence_id),
+                    )
+
+            current_ids = tuple(project["id"] for project in normalized)
+            if current_ids:
+                placeholders = ", ".join("?" for _ in current_ids)
+                conn.execute(
+                    f"""
+                    UPDATE portfolio_projects
+                    SET decision_status = 'inactive',
+                        decision_updated_at = CURRENT_TIMESTAMP,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE decision_origin = 'automatic'
+                      AND decision_status != 'inactive'
+                      AND id NOT IN ({placeholders})
+                    """,
+                    current_ids,
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE portfolio_projects
+                    SET decision_status = 'inactive',
+                        decision_updated_at = CURRENT_TIMESTAMP,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE decision_origin = 'automatic'
+                      AND decision_status != 'inactive'
+                    """
+                )
+
+    def set_project_decision_state(self, project_id: str, state: str) -> None:
+        if not isinstance(project_id, str) or not project_id:
+            raise RepositoryError("portfolio project ID is invalid")
+        if state not in {"excluded", "included"}:
+            raise RepositoryError("portfolio project decision state is invalid")
+        decision_status = "excluded" if state == "excluded" else "manually_approved"
+        with self._connection() as conn:
+            result = conn.execute(
+                """
+                UPDATE portfolio_projects
+                SET decision_status = ?,
+                    decision_origin = 'manual',
+                    decision_updated_at = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (decision_status, project_id),
+            )
+            if result.rowcount != 1:
+                raise RepositoryError("portfolio project is unknown")
+
+    @classmethod
+    def _normalize_portfolio_project_decisions(
+        cls,
+        projects: tuple[dict[str, object], ...],
+        *,
+        candidate_input_sha256: str,
+        index_revision: str,
+    ) -> tuple[dict[str, object], ...]:
+        if not isinstance(candidate_input_sha256, str) or not candidate_input_sha256:
+            raise RepositoryError("candidate input hash is invalid")
+        if not isinstance(index_revision, str) or not index_revision:
+            raise RepositoryError("semantic index revision is invalid")
+
+        normalized: list[dict[str, object]] = []
+        project_ids: set[str] = set()
+        for project in projects:
+            if not isinstance(project, dict):
+                raise RepositoryError("portfolio project decision is invalid")
+            values = {
+                field: project.get(field)
+                for field in (
+                    "id",
+                    "title",
+                    "overview",
+                    "approval_sha256",
+                    "review_input_sha256",
+                    "decision_status",
+                    "decision_origin",
+                    "boundary_fingerprint",
+                )
+            }
+            if not all(isinstance(value, str) and value for value in values.values()):
+                raise RepositoryError("portfolio project decision is invalid")
+            project_id = values["id"]
+            if project_id in project_ids:
+                raise RepositoryError("portfolio project decisions must be unique")
+            project_ids.add(project_id)
+
+            decision_status = values["decision_status"]
+            decision_origin = values["decision_origin"]
+            if decision_status not in _PORTFOLIO_PROJECT_DECISION_STATUSES:
+                raise RepositoryError("portfolio project decision status is invalid")
+            if decision_origin not in _PORTFOLIO_PROJECT_DECISION_ORIGINS:
+                raise RepositoryError("portfolio project decision origin is invalid")
+            confidence = project.get("confidence")
+            if confidence is not None and confidence not in _PORTFOLIO_PROJECT_CONFIDENCE_LEVELS:
+                raise RepositoryError("portfolio project confidence is invalid")
+            evidence_ids = project.get("evidence_ids")
+            if (
+                not isinstance(evidence_ids, (tuple, list))
+                or any(
+                    not isinstance(evidence_id, int)
+                    or isinstance(evidence_id, bool)
+                    or evidence_id <= 0
+                    for evidence_id in evidence_ids
+                )
+                or len(set(evidence_ids)) != len(evidence_ids)
+            ):
+                raise RepositoryError("portfolio project evidence is invalid")
+            lineage_project_ids = project.get("lineage_project_ids", ())
+            if (
+                not isinstance(lineage_project_ids, (tuple, list))
+                or any(not isinstance(value, str) or not value for value in lineage_project_ids)
+                or len(set(lineage_project_ids)) != len(lineage_project_ids)
+            ):
+                raise RepositoryError("portfolio project lineage is invalid")
+            normalized.append(
+                {
+                    **values,
+                    "confidence": confidence,
+                    "evidence_ids": tuple(evidence_ids),
+                    "lineage_project_ids": tuple(lineage_project_ids),
+                }
+            )
+        return tuple(normalized)
+
+    @staticmethod
+    def _resolved_portfolio_project_decision_state(
+        project: dict[str, object],
+        *,
+        current: dict[str, str | None] | None,
+        existing: dict[str, dict[str, str | None]],
+        manual_exclusions_by_boundary: set[str | None],
+    ) -> dict[str, str]:
+        incoming_status = str(project["decision_status"])
+        incoming_origin = str(project["decision_origin"])
+        boundary_fingerprint = str(project["boundary_fingerprint"])
+        lineage_project_ids = project["lineage_project_ids"]
+        if not isinstance(lineage_project_ids, tuple):
+            raise RepositoryError("portfolio project lineage is invalid")
+        lineage = [existing.get(project_id) for project_id in lineage_project_ids]
+        identity_changed = (
+            current is not None
+            and current["decision_origin"] == "manual"
+            and current["boundary_fingerprint"] != boundary_fingerprint
+        ) or any(
+            state is not None
+            and state["decision_origin"] == "manual"
+            and state["boundary_fingerprint"] != boundary_fingerprint
+            for state in lineage
+        )
+        if identity_changed:
+            return {"decision_status": "review_required", "decision_origin": "automatic"}
+        if (
+            current is not None
+            and current["decision_origin"] == "manual"
+            and current["decision_status"] in {"excluded", "manually_approved"}
+        ):
+            return {
+                "decision_status": str(current["decision_status"]),
+                "decision_origin": "manual",
+            }
+        if boundary_fingerprint in manual_exclusions_by_boundary:
+            return {"decision_status": "excluded", "decision_origin": "manual"}
+        return {"decision_status": incoming_status, "decision_origin": incoming_origin}
+
+    def list_portfolio_projects(self, *, active_only: bool = True) -> list[dict[str, object]]:
+        active_clause = ""
+        parameters: tuple[str, ...] = ()
+        if active_only:
+            placeholders = ", ".join("?" for _ in _ACTIVE_PORTFOLIO_PROJECT_DECISION_STATUSES)
+            active_clause = f"WHERE decision_status IN ({placeholders})"
+            parameters = _ACTIVE_PORTFOLIO_PROJECT_DECISION_STATUSES
         with self._read_connection() as conn:
             rows = conn.execute(
-                """
+                f"""
                 SELECT id, title, overview, status, approval_sha256,
-                       review_input_sha256, created_at, updated_at
+                       review_input_sha256, decision_status, decision_origin,
+                       confidence, boundary_fingerprint, candidate_input_sha256,
+                       index_revision, decision_updated_at, created_at, updated_at
                 FROM portfolio_projects
+                {active_clause}
                 ORDER BY id
-                """
+                """,
+                parameters,
             ).fetchall()
             links = conn.execute(
                 """
@@ -1582,6 +1915,13 @@ class SQLiteRepository:
                     "status": self._required_text(row, "status"),
                     "approval_sha256": self._required_text(row, "approval_sha256"),
                     "review_input_sha256": self._required_text(row, "review_input_sha256"),
+                    "decision_status": self._required_text(row, "decision_status"),
+                    "decision_origin": self._required_text(row, "decision_origin"),
+                    "confidence": self._optional_text(row, "confidence"),
+                    "boundary_fingerprint": self._optional_text(row, "boundary_fingerprint"),
+                    "candidate_input_sha256": self._optional_text(row, "candidate_input_sha256"),
+                    "index_revision": self._optional_text(row, "index_revision"),
+                    "decision_updated_at": self._optional_text(row, "decision_updated_at"),
                     "evidence": grouped.get(self._required_text(row, "id"), []),
                 }
                 for row in rows
