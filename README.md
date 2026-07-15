@@ -209,16 +209,18 @@ $portfolio-maker
 
 Codex는 `.portfolio-maker/reviews/project-review-input-v2.json`만 읽어
 `project-candidates.json`과 `project-candidates.md`를 작성할 수 있습니다. candidate는
-검토 보조물일 뿐 database truth가 아니며, 사용자가 직접 작성한 approval도 허용됩니다.
-후보를 검토한 뒤 approval 예시를 만들고 `project-approval.json`을 수정합니다. 새 예시는 모든
-근거를 unassigned로 시작하므로, 승인할 project의 `id`, `title`, `overview`, `evidence_ids`와
-`status: "approved"`를 직접 확정해야 합니다. 검토·수정한 approval을 materialize하려면 다음을
-실행합니다.
+검토 보조물일 뿐 database truth가 아닙니다. v2에서는 후보를 검토한 뒤 다음 명령으로
+`review_required` 결정을 materialize하고, 사용자가 `set-project-state`로 각 project를
+`included` 또는 `excluded`로 결정합니다.
 
 ```bash
-portfolio-maker approve --workspace . --write-sample-project-approval
-portfolio-maker compose-projects --workspace .
+portfolio-maker compose-projects --workspace . --mode review
+portfolio-maker set-project-state --workspace . --project-id ID --state included
 ```
+
+`approve --write-sample-project-approval`은 0.1.0 호환 경로의 빈 v1 template만 만드는
+명령이며 v2 materialization에 사용하지 않습니다. v2는 후보 없이 `project-approval.json`을
+읽지 않으며, 직접 결정할 project가 없으면 정직한 zero-project 상태를 유지합니다.
 
 모든 후보를 사용자 결정으로 materialize하려면 `--mode review`를 사용합니다. `high`와 `medium`을
 명시적으로 자동 포함하려면 사용자가 선택한 경우에만 다음 명령을 사용합니다.
@@ -234,8 +236,8 @@ portfolio-maker set-project-state --workspace . --project-id ID --state included
 `automatic`은 evidence·artifact approval을 대신하지 않으며, `excluded` project를 삭제하지 않습니다.
 재포함 후에도 현재 policy와 approved evidence link를 다시 통과해야 합니다.
 
-승인된 semantic project만 profile summary, draft, manifest, HTML의 project로 표시됩니다.
-project approval이 없으면 evidence inventory는 유지되지만 project 목록은 빈 상태입니다.
+활성 상태로 결정된 semantic project만 profile summary, draft, manifest, HTML의 project로 표시됩니다.
+활성 project decision이 없으면 evidence inventory는 유지되지만 project 목록은 빈 상태입니다.
 각 artifact는 자기 policy로 evidence를 다시 선택한 뒤 승인 project link와 교차하며,
 candidate·rejected·unassigned·stale evidence는 project output에 포함되지 않습니다.
 
@@ -298,7 +300,7 @@ portfolio-maker approve --workspace . --write-sample --force
 
 0.2.0에서는 승인된 로컬 자료, 명시 승인된 공개 GitHub activity, 조건을 충족한 private GitHub activity를 공통 evidence pool로 관리합니다. 모든 생성물은 artifact별 `EvidenceSelectionService`를 거치며, `portfolio-public.json`과 `portfolio.html`도 기본 `restricted` 결과입니다. HTML은 build-time manifest를 번들한 정적 결과이며 SQLite, 원본, snapshot, credential을 runtime에 읽지 않습니다.
 
-현재 HTML의 `projects` 배열은 사용자가 승인한 semantic portfolio project만 표시합니다. local file, repository, activity 하나는 자동 project가 되지 않습니다. `portfolio-maker prepare-project-review`가 현재 artifact policy를 통과한 안전한 evidence bundle을 만들고, Codex candidate는 검토 보조물로만 사용됩니다. 사용자가 `project-approval.json`을 승인한 뒤 `compose-projects`를 실행해야만 project가 materialize됩니다.
+현재 HTML의 `projects` 배열은 사용자가 승인한 semantic portfolio project만 표시합니다. local file, repository, activity 하나는 자동 project가 되지 않습니다. `portfolio-maker prepare-project-review`가 현재 artifact policy를 통과한 안전한 evidence bundle을 만들고, Codex candidate는 검토 보조물로만 사용됩니다. v2에서 사용자가 review/automatic decision을 확정한 뒤 `compose-projects`를 실행해야만 project가 materialize됩니다.
 
 승인된 project가 없으면 master profile의 evidence inventory는 유지하면서 draft, manifest, HTML은 정직한 zero-project 상태를 생성합니다. 승인된 project의 effective evidence는 각 artifact policy의 선택 결과와 semantic link의 교집합이며, candidate·rejected·unassigned·stale evidence는 project output에 포함되지 않습니다. project approval에는 merge, split, reassign, reject, unassigned 결정을 직접 반영할 수 있고, 외부 LLM API나 token 저장은 사용하지 않습니다.
 

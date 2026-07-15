@@ -100,19 +100,22 @@ portfolio-maker prepare-project-review --workspace . --version v2
 ```
 
 Only `.portfolio-maker/reviews/project-review-input-v2.json` is supplied to Codex. Codex may write
-`project-candidates.json` and `project-candidates.md` using only that bundle. Review and edit the
-candidate file, or write `project-approval.json` directly, then create the sample approval shape
-when needed:
+`project-candidates.json` and `project-candidates.md` using only that bundle. In v2, review the
+candidate file, materialize review decisions, and persist the user's state with `set-project-state`:
 
 ```bash
-portfolio-maker approve --workspace . --write-sample-project-approval
-portfolio-maker compose-projects --workspace .
+portfolio-maker compose-projects --workspace . --mode review
+portfolio-maker set-project-state --workspace . --project-id ID --state included
 ```
 
-Candidate output is not database truth. Only the user's `status: approved` projects are materialized;
-rejected, unassigned, stale, policy-excluded, or unknown evidence is not a project. Without project
-approval, generated project sections use an honest zero-project state while the evidence inventory
-remains available for review.
+`approve --write-sample-project-approval` is a legacy v1 empty template only. It is not a v2
+approval step, and v2 does not use `project-approval.json` as its decision source.
+
+Candidate output is not database truth. Only active v2 decision states (`manually_approved`,
+`auto_included_high`, or `auto_included_medium`) are materialized; rejected, unassigned, stale,
+policy-excluded, or unknown evidence is not a project. Without an active project decision,
+generated project sections use an honest zero-project state while the evidence inventory remains
+available for review.
 
 12. After source, artifact, and project approval, run the following commands from the repository root:
 
