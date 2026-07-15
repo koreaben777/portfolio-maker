@@ -123,3 +123,19 @@ class ComposeProjectsRequest:
 class ComposeProjectsResult:
     project_count: int
     unassigned_evidence_count: int
+
+
+@dataclass(frozen=True)
+class PrepareSemanticIndexRequest:
+    workspace: Path
+    root: Path
+    chunk_size: int = 100
+
+
+@dataclass(frozen=True)
+class PrepareSemanticIndexResult:
+    manifest_path: Path
+    revision_id: str
+    node_count: int
+    chunk_count: int
+    partial_count: int
