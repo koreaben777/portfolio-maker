@@ -28,15 +28,26 @@ Run every gate against the current workspace state. Do not reuse an old policy h
 
    `prepare-project-review` re-reads current source approval and artifact policy, performs current evidence selection, records the resulting policy hash, and writes only safe review fields. Stop on an approval or policy error. Do not read raw sources, snapshots, the database, private GitHub URLs, or review files outside the safe review input while composing projects.
 
-3. Require active approved semantic projects before building. Review the safe input, create candidates with `review_required: true`, and have the user approve the project grouping. Materialize the approval with:
+3. Require active approved semantic projects before building. Use the v2 review path after policy revalidation:
 
    ```bash
-   portfolio-maker approve --workspace . --write-sample-project-approval
-   portfolio-maker compose-projects --workspace .
-   portfolio-maker list-projects --workspace . --format table
+   portfolio-maker prepare-project-review --workspace . --version v2
    ```
 
-   Use `compose-projects --mode review` or `--mode automatic` when the v2 review interface is active. Only active decision states (`manually_approved`, `auto_included_high`, `auto_included_medium`) are eligible for artifact projections. `review_required`, `excluded`, `inactive`, rejected, unassigned, stale, or policy-excluded evidence is not a project input. Zero approved projects is a valid empty state; do not invent a project from one file, repository, or activity.
+   Then use `$portfolio-project-curation` to read the safe v2 review input and produce the validated candidate payload at `.portfolio-maker/reviews/project-candidates.json`. Do not replace this handoff with raw source, snapshot, database, or private locator reads.
+
+   For human decisions, use the review mode, inspect the candidates, and persist each decision explicitly:
+
+   ```bash
+   portfolio-maker compose-projects --workspace . --mode review
+   portfolio-maker set-project-state --project-id ID --state included --workspace .
+   portfolio-maker set-project-state --project-id ID --state excluded --workspace .
+   portfolio-maker list-projects --format table --workspace .
+   ```
+
+   Use the actual command `portfolio-maker compose-projects --workspace . --mode automatic` only when the user explicitly chooses automatic decisions. After either mode, verify that `list-projects --format table` has at least one active decision state: `manually_approved`, `auto_included_high`, or `auto_included_medium`. Only those active states are eligible for artifact projections. `review_required`, `excluded`, `inactive`, rejected, unassigned, stale, or policy-excluded evidence is not a project input.
+
+   `approve --write-sample-project-approval` is a legacy v1 empty approval template only. It writes an empty project list and unassigned evidence; it is not a v2 approval and must not be used for v2 materialization. If an existing v1 template is overwritten, `--force` resets/overwrites it, so never use `--force` as a v2 approval step. Zero active projects remains a valid empty state: do not invent a project or claim populated project output, and preserve the builders' honest zero-project output.
 
 ## Build And Validate
 
