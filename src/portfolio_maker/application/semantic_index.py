@@ -19,6 +19,8 @@ from portfolio_maker.domain.semantic_models import (
 )
 from portfolio_maker.infrastructure.managed_files import (
     ensure_managed_directory,
+    read_managed_bytes,
+    remove_managed_file,
     write_managed_text,
 )
 from portfolio_maker.infrastructure.policy import mask_public_value
@@ -46,6 +48,7 @@ _CREDENTIAL_VALUE = re.compile(
 _LOCATOR_TOKEN = re.compile(
     r"(?i)(?:file://|https?://|(?<![A-Za-z0-9_.-])(?:/|~[/\\\\]|[A-Za-z]:[/\\\\]|\\\\\\\\))[^\s'\"`<>)}\]]+"
 )
+_CHUNK_FILENAME = re.compile(r"chunk-\d{4}\.json")
 
 
 @dataclass(frozen=True)
@@ -107,13 +110,7 @@ def prepare_semantic_index(
         ),
     )
 
-    ensure_managed_directory(paths.semantic_index_dir)
-    ensure_managed_directory(paths.semantic_index_input_dir)
-    for index, chunk_text in enumerate(chunk_texts, start=1):
-        write_managed_text(
-            paths.semantic_index_input_dir / f"chunk-{index:04}.json", chunk_text
-        )
-    write_managed_text(paths.semantic_index_manifest_path, _canonical_json(manifest))
+    _publish_semantic_input(paths, chunk_texts, _canonical_json(manifest))
 
     return PrepareSemanticIndexResult(
         manifest_path=paths.semantic_index_manifest_path,
@@ -214,6 +211,90 @@ def _redact_locators(value: str) -> str:
     value = _LOCATOR_VALUE.sub(r"\1[REDACTED]", value)
     value = _CREDENTIAL_VALUE.sub(r"\1[REDACTED]", value)
     return _LOCATOR_TOKEN.sub("[REDACTED]", value)
+
+
+@dataclass(frozen=True)
+class _PublishedSemanticInput:
+    manifest_text: str | None
+    chunk_texts: dict[Path, str]
+
+
+def _publish_semantic_input(
+    paths: WorkspacePaths, chunk_texts: tuple[str, ...], manifest_text: str
+) -> None:
+    ensure_managed_directory(paths.semantic_index_dir)
+    ensure_managed_directory(paths.semantic_index_input_dir)
+    previous = _read_published_semantic_input(paths)
+    current = {
+        paths.semantic_index_input_dir / f"chunk-{index:04}.json": chunk_text
+        for index, chunk_text in enumerate(chunk_texts, start=1)
+    }
+
+    try:
+        for path, chunk_text in current.items():
+            write_managed_text(path, chunk_text)
+        for path in previous.chunk_texts.keys() - current.keys():
+            remove_managed_file(path)
+        write_managed_text(paths.semantic_index_manifest_path, manifest_text)
+    except Exception:
+        _restore_published_semantic_input(paths, previous, current)
+        raise
+
+
+def _read_published_semantic_input(paths: WorkspacePaths) -> _PublishedSemanticInput:
+    try:
+        manifest_text = read_managed_bytes(paths.semantic_index_manifest_path).decode("utf-8")
+    except FileNotFoundError:
+        if tuple(paths.semantic_index_input_dir.glob("chunk-*.json")):
+            raise SemanticIndexError("semantic index input has unverified managed chunks")
+        return _PublishedSemanticInput(manifest_text=None, chunk_texts={})
+
+    try:
+        manifest = json.loads(manifest_text)
+        chunk_sha256s = manifest["chunk_sha256s"]
+    except (KeyError, TypeError, json.JSONDecodeError) as error:
+        raise SemanticIndexError("semantic index manifest is invalid") from error
+    if not isinstance(chunk_sha256s, list) or not all(
+        isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value)
+        for value in chunk_sha256s
+    ):
+        raise SemanticIndexError("semantic index manifest is invalid")
+
+    chunk_paths = tuple(
+        paths.semantic_index_input_dir / f"chunk-{index:04}.json"
+        for index in range(1, len(chunk_sha256s) + 1)
+    )
+    existing_chunk_paths = tuple(paths.semantic_index_input_dir.glob("chunk-*.json"))
+    if set(existing_chunk_paths) != set(chunk_paths) or any(
+        _CHUNK_FILENAME.fullmatch(path.name) is None for path in existing_chunk_paths
+    ):
+        raise SemanticIndexError("semantic index input has unverified managed chunks")
+
+    chunk_texts: dict[Path, str] = {}
+    for path, digest in zip(chunk_paths, chunk_sha256s, strict=True):
+        try:
+            chunk_text = read_managed_bytes(path).decode("utf-8")
+        except (FileNotFoundError, UnicodeDecodeError) as error:
+            raise SemanticIndexError("semantic index input has unverified managed chunks") from error
+        if hashlib.sha256(chunk_text.encode("utf-8")).hexdigest() != digest:
+            raise SemanticIndexError("semantic index input has unverified managed chunks")
+        chunk_texts[path] = chunk_text
+    return _PublishedSemanticInput(manifest_text=manifest_text, chunk_texts=chunk_texts)
+
+
+def _restore_published_semantic_input(
+    paths: WorkspacePaths,
+    previous: _PublishedSemanticInput,
+    current: dict[Path, str],
+) -> None:
+    for path, chunk_text in previous.chunk_texts.items():
+        write_managed_text(path, chunk_text)
+    for path in current.keys() - previous.chunk_texts.keys():
+        remove_managed_file(path, missing_ok=True)
+    if previous.manifest_text is None:
+        remove_managed_file(paths.semantic_index_manifest_path, missing_ok=True)
+    else:
+        write_managed_text(paths.semantic_index_manifest_path, previous.manifest_text)
 
 
 def _canonical_json(payload: dict[str, object]) -> str:
