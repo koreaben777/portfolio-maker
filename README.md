@@ -1,9 +1,9 @@
 # Portfolio Maker
 
-> 현재 공개 버전: `0.1.0`
+> 현재 버전: `0.2.0`
 >
-> 다음 개발 완료 목표: `0.2.0` — 계층형 의미 인덱스, Project Boundary Detection,
-> medium 이상 자동 구성과 가역적 제외, multi-skill Codex plugin
+> 계층형 의미 인덱스, Project Boundary Detection, 명시적 automatic 모드,
+> 가역적 제외·재포함, multi-skill Codex plugin을 제공합니다.
 
 승인한 내 작업 자료를 바탕으로, **근거를 확인할 수 있는 커리어 프로필**과 **검토용 포트폴리오 초안**, **public-safe 정적 HTML 포트폴리오**를 만드는 로컬 우선 도구입니다.
 
@@ -20,19 +20,24 @@ Portfolio Maker는 원본 파일을 자동으로 업로드하거나 공개하지
 - 마스터 프로필을 JSON·Markdown으로 만들기
 - 승인 자료 목록을 바탕으로 검토용 포트폴리오 초안 골격 만들기
 - public-safe claim/evidence manifest와 프로젝트별 timeline이 있는 정적 HTML 만들기
+- 승인한 scan root의 전체 허용 구조를 전역 파일 개수 상한 없이 계층형 의미 인덱스로 만들기
+- 파일·폴더 요약에서 parent/child/cross-directory 프로젝트 경계 후보 만들기
+- 모든 후보를 검토하는 review 모드 또는 `high`·`medium`을 포함하는 explicit automatic 모드 사용하기
+- 자동 포함 프로젝트를 source·evidence·index 삭제 없이 제외하고 다시 포함하기
+- source governance, semantic index, project curation/review, artifact 생성을 분리한 Codex plugin 사용하기
 
 > 현재 버전은 **근거 기반 마스터 프로필**, **검토가 필요한 포트폴리오 뼈대**, **일반형 public-safe HTML 포트폴리오**를 제공합니다. 회사·채용공고별 맞춤 문장과 서술 생성은 다음 단계입니다. 일반형 HTML 구현 세부 사항은 [구현 계획](https://github.com/koreaben777/portfolio-maker/blob/main/docs/superpowers/plans/2026-07-13-portfolio-maker-general-interactive-html-sites.md)에 기록합니다.
 
 ## 이렇게 동작합니다
 
 ```text
-후보 탐색 → 사용자 승인 → 자료 수집 → 마스터 프로필 생성 → 포트폴리오 초안 골격 생성
+scope 승인 → 후보 탐색·근거 승인 → 의미 인덱스 → 프로젝트 검토·결정 → artifact 생성
 ```
 
 1. 로컬 파일과 GitHub 활동을 후보로 탐색합니다.
 2. 사용자가 승인 파일에서 처리할 로컬 소스를 직접 선택합니다.
-3. 승인된 자료만 로컬 작업 공간에 수집하고, 마스터 프로필을 생성합니다.
-4. 마지막으로 검토·편집할 포트폴리오 Markdown 초안을 만듭니다.
+3. 승인한 scan root의 안전한 chunk로 계층형 의미 인덱스를 만들고 프로젝트 경계 후보를 검토합니다.
+4. 현재 source/artifact policy와 활성 프로젝트의 교집합만 profile, Markdown, manifest, HTML로 만듭니다.
 
 ## 빠른 시작
 
@@ -58,9 +63,7 @@ pytest
 workspace의 Sites 의존성을 먼저 설치합니다.
 
 ```bash
-cd web/portfolio
-npm ci
-cd ../..
+(cd web/portfolio && npm ci)
 ```
 
 그 다음 일반 실행 순서에서 `portfolio-maker render-html --workspace .`를 실행합니다.
@@ -68,11 +71,23 @@ cd ../..
 
 ### Codex app에서 실행
 
-이 저장소를 열고 다음 스킬을 호출합니다.
+Portfolio Maker plugin이 설치된 Codex 환경에서는 새 task에서 다음 router를 호출합니다.
 
 ```text
 $portfolio-maker
 ```
+
+plugin은 Python package나 Sites 의존성을 대신 설치하지 않습니다. 배포 marketplace에서 설치할 때는
+해당 marketplace가 먼저 구성되어 있어야 하며, 설치 후 새 task를 엽니다.
+
+```bash
+codex plugin add portfolio-maker@<configured-local-marketplace>
+```
+
+marketplace 설치 경로를 사용하지 않는 source checkout에서는 repository root를 Codex app으로 열고
+`.agents/skills/portfolio-maker/SKILL.md`의 호환 entrypoint를 사용할 수 있습니다. plugin router는
+다섯 child skill을 순서대로 호출하지만, source scope·project 결정·artifact delivery 승인은 서로
+대체하지 않습니다.
 
 ### 첫 포트폴리오 튜토리얼
 
@@ -104,7 +119,7 @@ pip install -e ".[dev]"
 ```
 
 그 다음 Codex app에서 repository root를 열고 새 task에 `$portfolio-maker`를 입력합니다.
-스킬이 목록에 바로 보이지 않으면 새 task를 열거나 Codex app을 다시 시작합니다. GitHub 활동을
+plugin 또는 repository skill이 목록에 바로 보이지 않으면 새 task를 열거나 Codex app을 다시 시작합니다. GitHub 활동을
 탐색할 때만 `gh auth login`이 필요하며, 로컬 파일만 사용할 때는 GitHub 인증 없이 진행할 수 있습니다.
 
 #### 2. 탐색 제외 규칙을 먼저 승인하기
@@ -258,7 +273,7 @@ portfolio-maker approve --workspace . --write-sample --force
 
 ## 현재 범위와 로드맵
 
-0.1.0에서는 승인된 로컬 자료, 명시 승인된 공개 GitHub activity, 조건을 충족한 private GitHub activity를 공통 evidence pool로 관리합니다. 모든 생성물은 artifact별 `EvidenceSelectionService`를 거치며, `portfolio-public.json`과 `portfolio.html`도 기본 `restricted` 결과입니다. HTML은 build-time manifest를 번들한 정적 결과이며 SQLite, 원본, snapshot, credential을 runtime에 읽지 않습니다.
+0.2.0에서는 승인된 로컬 자료, 명시 승인된 공개 GitHub activity, 조건을 충족한 private GitHub activity를 공통 evidence pool로 관리합니다. 모든 생성물은 artifact별 `EvidenceSelectionService`를 거치며, `portfolio-public.json`과 `portfolio.html`도 기본 `restricted` 결과입니다. HTML은 build-time manifest를 번들한 정적 결과이며 SQLite, 원본, snapshot, credential을 runtime에 읽지 않습니다.
 
 현재 HTML의 `projects` 배열은 사용자가 승인한 semantic portfolio project만 표시합니다. local file, repository, activity 하나는 자동 project가 되지 않습니다. `portfolio-maker prepare-project-review`가 현재 artifact policy를 통과한 안전한 evidence bundle을 만들고, Codex candidate는 검토 보조물로만 사용됩니다. 사용자가 `project-approval.json`을 승인한 뒤 `compose-projects`를 실행해야만 project가 materialize됩니다.
 
@@ -268,24 +283,32 @@ portfolio-maker approve --workspace . --write-sample --force
 
 두 파일명의 `public`은 호환성 이름입니다. `restricted`는 자동 인터넷 공개를 뜻하지 않으며 로컬 사용, 검증된 수신자 전달, private hosting을 위한 범위입니다. 누구나 접근 가능한 배포는 별도 `open_public` 선택과 재검증을 거쳐야 하며, 이 구현에서는 local/private origin을 거부합니다.
 
-### 0.2.0 개발 목표
+### 0.2.0 현재 구현
 
-현재 0.1.0의 project composition은 안전한 evidence 목록을 Codex가 검토하는 방식이며, local
-discovery는 최대 500개 후보에서 멈춥니다. 0.2.0에서는 이를 다음 구조로 확장할 계획입니다.
+현재 release는 0.1.0의 승인·근거·산출물 경계를 유지하면서, 다음 기능을 추가로 제공합니다.
 
 - 허용된 전체 폴더·파일 구조를 전역 개수 상한 없이 기록하는 계층형 의미 인덱스
 - 코드·문서·테스트·설정 파일의 역할 요약과 하위에서 상위로 합성하는 폴더 요약
 - 상위 폴더의 공통 맥락과 독립 하위 제품·공모전·배포물을 구분하는 Codex Project Boundary Detection
 - 검토 모드와, `high`·`medium` 후보를 포함하는 명시적 자동 모드
 - 자동 포함 project를 원본이나 evidence 삭제 없이 선택 제외하고 다시 포함하는 검토 흐름
-- source governance, semantic indexing, candidate curation, review, artifact 생성을 나눈 multi-skill Codex plugin
+- Codex plugin의 source governance, semantic indexing, candidate curation, project review, artifact 생성을 나눈 multi-skill workflow
 - 향후 개인 근거 지식 그래프와 Google Drive 등 추가 source로 확장할 수 있는 공통 node/provenance model
 
-0.2.0 자동 포함은 evidence 승인, delivery scope 또는 공개 배포 승인을 대신하지 않습니다. 현재
-실행 가능한 0.1.0 명령과 위 계획 기능을 구분하며, 전체 완료 기준은
-[0.2.0 설계 명세](docs/superpowers/specs/2026-07-14-portfolio-maker-0.2.0-semantic-index-plugin-design.md)에서 관리합니다.
-작업 순서, 변경 파일, 테스트와 release gate는
-[0.2.0 구현 계획](docs/superpowers/plans/2026-07-14-portfolio-maker-0.2.0.md)에 구체화되어 있습니다.
+0.2.0 자동 포함은 evidence 승인, delivery scope 또는 공개 배포 승인을 대신하지 않습니다. 의미
+index와 후보는 분석·검토 계층이며, 실제 project와 artifact는 기존 승인 및 현재 policy의 교집합으로
+materialize됩니다. `portfolio-maker prepare-semantic-index`와 `apply-semantic-index` 사이의
+Codex 분석은 외부 LLM API나 token 저장 없이 safe chunk를 통해 수행합니다.
+
+Task 21의 read-only smoke는 보호된 사용자 legacy/runtime 자료를 건드리지 않기 위해 별도 workspace에서
+사용자가 선택한 repository `src` subtree만 대상으로 수행했습니다. 따라서 이 release 기록은 전체 home,
+대규모 외부 project, live GitHub 응답의 성능·내용을 보증하지 않습니다. 검증 수치와 browser 결과는
+[0.2.0 검증 기록](docs/reviews/2026-07-14-portfolio-maker-0.2.0-verification.md)에 고정합니다.
+
+개인 근거 knowledge graph, Google Drive connector, MCP/App UI, 회사·JD별 맞춤 생성, 자동 Sites
+deployment는 0.2.0 후속 범위입니다. 전체 설계와 구현 순서는
+[0.2.0 설계 명세](docs/superpowers/specs/2026-07-14-portfolio-maker-0.2.0-semantic-index-plugin-design.md)와
+[0.2.0 구현 계획](docs/superpowers/plans/2026-07-14-portfolio-maker-0.2.0.md)에서 관리합니다.
 
 ## 버그와 제안
 

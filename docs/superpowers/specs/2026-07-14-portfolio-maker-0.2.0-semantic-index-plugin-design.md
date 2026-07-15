@@ -1,8 +1,8 @@
 # Portfolio Maker 0.2.0 계층형 의미 인덱스·플러그인 설계
 
 날짜: 2026-07-14
-상태: 사용자 승인 설계, 0.2.0 개발 완료 기준
-추적 범위: Issue #13 후속 확장 및 0.2.0 릴리스 목표
+상태: 0.2.0 현재 구현·검증 계약
+추적 범위: Issue #13 후속 확장 및 현재 0.2.0 릴리스
 
 ## 1. 기획 요약
 
@@ -18,7 +18,9 @@ Portfolio Maker 0.1.0의 Codex 기반 semantic project composition은 승인된 
 6. 단일 repo skill을 책임별 여러 skill을 포함하는 Codex plugin으로 확장한다.
 7. 계층형 의미 인덱스를 향후 개인 근거 지식 그래프와 Google Drive 등 외부 파일 소스로 확장할 수 있게 한다.
 
-이 문서는 아직 구현되지 않은 0.2.0 목표를 설명한다. 현재 공개 버전과 실행 가능한 명령은 README의 0.1.0 설명과 현재 코드·테스트를 기준으로 한다.
+이 문서는 현재 구현된 0.2.0 semantic index·plugin 계약과 후속 확장 경계를 설명한다. 실행 가능한 명령과
+현재 공개 동작은 README, 현재 코드·테스트, 그리고 [검증 기록](../../reviews/2026-07-14-portfolio-maker-0.2.0-verification.md)을
+함께 기준으로 삼는다. 0.1.0은 additive migration과 기존 CLI/artifact 경로를 위한 호환 기준선이다.
 
 ## 2. 제품 정의와 범위
 

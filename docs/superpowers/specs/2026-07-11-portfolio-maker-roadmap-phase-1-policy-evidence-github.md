@@ -1,19 +1,19 @@
 # Portfolio Maker 로드맵 Phase 1 구현 명세
 
 날짜: 2026-07-11
-상태: 현재 0.1.0 구현 slice는 #13 semantic project composition까지 포함하며, 0.2.0 계층형 의미 인덱스·plugin 확장이 승인된 다음 release 목표다. 아래 #4 → #2 → #1 설명은 역사적 Phase 1 기준선이다.
+상태: #4 → #2 → #1은 역사적 Phase 1 기준선이며, 현재 공개 runtime은 0.2.0 semantic index·plugin release다. 0.1.0 workspace와 CLI/artifact 경로는 호환 기준선으로 보존한다.
 역사적 기준선 대상 Issue: #4 → #2 → #1
-현재 구현 slice: #12 통합 근거 정책, 일반형 #11 renderer, #13 Codex 기반 semantic project composition
-다음 release 목표: 0.2.0 계층형 의미 인덱스, Project Boundary Detection, multi-skill Codex plugin
-후속 제품 단계: #3 회사/JD별 맞춤 생성 (`@sites`는 presentation/hosting 계층)
+현재 구현 slice: #12 통합 근거 정책, 일반형 #11 renderer, #13 semantic project composition, 0.2.0 계층형 semantic index/plugin
+현재 release: 0.2.0 계층형 의미 인덱스, Project Boundary Detection, multi-skill Codex plugin
+후속 제품 단계: #3 회사/JD별 맞춤 생성과 추가 source/graph adapter (`@sites`는 presentation/hosting 계층)
 
-2026-07-13 정렬 메모: #4, #2, #1 기준선, 일반형 #11 renderer, #12 통합 근거 정책이 현재 worktree에 구현되어 있다. 파일·repository 기반 technical grouping이 semantic portfolio project로 잘못 노출되지 않도록 #13 composition 계층을 추가했다.
+2026-07-13 정렬 메모: #4, #2, #1 기준선, 일반형 #11 renderer, #12 통합 근거 정책, #13 composition 계층은 현재 runtime의 기반이다. 0.2.0은 이 승인 경계 위에 계층형 semantic index와 plugin workflow를 추가한다.
 
-2026-07-14 0.2.0 결정: #13의 현재 flat review bundle을 계층형 의미 인덱스로 확장하고, 책임별 skill을 하나의 installable Codex plugin으로 묶는다. 0.2.0 전체 설계는 [계층형 의미 인덱스·플러그인 설계](2026-07-14-portfolio-maker-0.2.0-semantic-index-plugin-design.md)를 따른다. 이 기능은 승인된 개발 목표이며 현재 0.1.0 runtime으로 표현하지 않는다.
+2026-07-14 0.2.0 결정 및 구현: #13의 flat review bundle을 계층형 의미 인덱스로 확장하고, 책임별 skill을 하나의 installable Codex plugin으로 묶었다. 0.2.0 전체 계약은 [계층형 의미 인덱스·플러그인 설계](2026-07-14-portfolio-maker-0.2.0-semantic-index-plugin-design.md)와 [검증 기록](../../reviews/2026-07-14-portfolio-maker-0.2.0-verification.md)을 따른다.
 
 ## 1. 목적과 범위
 
-Portfolio Maker 0.1.0은 승인된 로컬 파일에서 근거 기반 master profile과 검토용 Markdown 포트폴리오 골격을 생성한다. GitHub repository와 activity는 기본적으로 discovery metadata다. 다만 policy 재검증을 통과한 confirmed public repository의 activity 중 `approved_github_activity_urls`에 정확히 있는 URL만 profile과 portfolio draft의 public-safe evidence로 사용할 수 있다. 이는 자동 project narrative를 만들지 않는다.
+역사적 Phase 1 기준선인 Portfolio Maker 0.1.0은 승인된 로컬 파일에서 근거 기반 master profile과 검토용 Markdown 포트폴리오 골격을 생성했다. GitHub repository와 activity는 기본적으로 discovery metadata다. 현재 0.2.0도 같은 승인 경계를 유지하며, policy 재검증을 통과한 confirmed public repository의 activity 중 `approved_github_activity_urls`에 정확히 있는 URL만 profile과 portfolio draft의 public-safe evidence로 사용할 수 있다. 이는 자동 project narrative를 만들지 않는다.
 
 이번 Phase 1의 목적은 다음 두 가지다.
 
@@ -62,9 +62,9 @@ Portfolio Maker 0.1.0은 승인된 로컬 파일에서 근거 기반 master prof
   ↓
 #12 통합 근거 풀·생성물별 선택 정책     구현 완료
   ↓
-#13 Codex 기반 프로젝트 식별·구성·선정  0.1.0 구현 기준선
+#13 Codex 기반 프로젝트 식별·구성·선정  0.2.0 승인 경계의 기준선
   ↓
-0.2.0 계층형 의미 인덱스·Project Boundary Detection·Codex plugin
+0.2.0 계층형 의미 인덱스·Project Boundary Detection·Codex plugin  현재 구현
   ↓
 #3 회사/JD별 맞춤 포트폴리오
 ```
