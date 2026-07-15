@@ -35,14 +35,24 @@ After scope confirmation, use the existing approval and discovery flow from the 
 3. Run discovery only within the confirmed scope:
 
    ```bash
-   portfolio-maker discover --workspace .
+   portfolio-maker discover --workspace . --home <confirmed-root>
    ```
 
    Review `.portfolio-maker/reviews/discovery-report.md` before selecting evidence. Approve only exact, current activity URLs in the matching public or private approval list.
 
-4. Keep `private_sources_allowed` false unless the user explicitly opts in. Private discovery also requires the approved repository allowlist and the tool's own authentication check. Never infer private permission from an authenticated session, repository visibility, or a vague request. Do not inspect credentials to satisfy this gate.
+4. After reviewing the report, copy the approved local root/source URIs into `approved_source_uris` in `.portfolio-maker/reviews/source-approval.json`. Include the canonical URI for `<confirmed-root>` itself when preparing its semantic index; do not approve an unconfirmed path.
 
-5. Create and review the artifact policy separately:
+5. Prepare the semantic index with the same explicitly confirmed root:
+
+   ```bash
+   portfolio-maker prepare-semantic-index --workspace . --root <confirmed-root>
+   ```
+
+   The command records a `policy_hash` derived from the approval inputs. Before applying or consuming the prepared index, recheck that the approval file still describes the confirmed root, exclusions, and source URIs. If any approval changes, reconfirm the scope and rerun preparation; applying an index with a stale policy hash must be rejected.
+
+6. Keep `private_sources_allowed` false unless the user explicitly opts in. Private discovery also requires the approved repository allowlist and the tool's own authentication check. Never infer private permission from an authenticated session, repository visibility, or a vague request. Do not inspect credentials to satisfy this gate.
+
+7. Create and review the artifact policy separately:
 
    ```bash
    portfolio-maker approve --workspace . --write-sample-artifact-policy
