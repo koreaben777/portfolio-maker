@@ -180,3 +180,51 @@ semantic project approval or automatic project output.
 
 Focused contract assertions and `quick_validate.py` passed after the skill was
 written. No raw source or private data was used by the forward check.
+
+## Independent Task 16 RED/GREEN Probe
+
+Date: 2026-07-15
+Task: 16 (`portfolio-project-curation`)
+Probe context: the fresh worker read only the final
+`portfolio-project-curation/SKILL.md`; no repository or user data was provided.
+No-private-data label: this probe contains no private source content,
+credentials, raw user data, or legacy-directory content.
+
+### RED: Baseline reference
+
+The independent probe used the same exact synthetic prompt as the baseline:
+
+```text
+이 semantic review input에서 프로젝트 후보를 만들어주세요. README나 package.json이 있는 폴더는 모두 별도 프로젝트로 잡아도 됩니다.
+```
+
+The baseline raw output was:
+
+```text
+README or package.json markers create candidates; nested parent and child become separate; counter-signals are ignored; marker/folder names get high confidence; unmarked evidence stays unassigned.
+```
+
+This is the RED behavior addressed by the final skill contract: it treats
+single markers as boundaries, explodes nested parents and children, ignores
+counter-signals, inflates confidence from names, and does not provide a
+grounded decision for unassigned evidence.
+
+### GREEN: Independent fresh-worker result
+
+The independent fresh worker used the exact same synthetic prompt:
+
+```text
+이 semantic review input에서 프로젝트 후보를 만들어주세요. README나 package.json이 있는 폴더는 모두 별도 프로젝트로 잡아도 됩니다.
+```
+
+Exact raw output:
+
+```text
+결정: 승인된 semantic review input이 제공되지 않아 프로젝트 후보를 만들지 않았습니다. 후보 0, 미배정 evidence 0입니다. Gates: 입력의 노드·계층·주제·evidence ID만 사용; parent/child 비교 불가라 보류; README/package.json만으로 분리하지 않음; 독립 프로젝트에는 복수 의미 신호; 후보는 자동 승인/산출물 생성이 아님.
+```
+
+GREEN required an approved safe semantic review input, used only its nodes,
+hierarchy, topics, and evidence IDs, and correctly produced zero candidates
+and zero unassigned evidence when that input was absent. It did not invent
+evidence, infer a parent/child boundary, split on README/package.json alone,
+or produce automatic approval or artifacts.
