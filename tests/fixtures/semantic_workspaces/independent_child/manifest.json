@@ -1,0 +1,19 @@
+{
+  "fixture": "independent_child",
+  "artifact_scope": "restricted",
+  "files": {
+    "README.md": "Synthetic multi-project workspace overview.",
+    "workspace/README.md": "Synthetic shared workspace context.",
+    "workspace/playmcp/README.md": "Synthetic PlayMCP contest project.",
+    "workspace/other/README.md": "Synthetic unrelated project."
+  },
+  "candidate": {
+    "id": "candidate-playmcp-contest",
+    "project_id": "playmcp-contest",
+    "title": "PlayMCP Contest",
+    "overview": "Synthetic contest work is an independent child project.",
+    "boundary_type": "independent_child",
+    "boundary_hierarchies": ["workspace/playmcp"],
+    "confidence": "high"
+  }
+}

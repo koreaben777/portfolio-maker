@@ -1,0 +1,18 @@
+{
+  "fixture": "cross_directory",
+  "artifact_scope": "open_public",
+  "files": {
+    "README.md": "Synthetic cross-directory workspace overview.",
+    "portfolio/backend/README.md": "Synthetic backend implementation.",
+    "portfolio/frontend/README.md": "Synthetic frontend implementation."
+  },
+  "candidate": {
+    "id": "candidate-cross-directory",
+    "project_id": "cross-directory-project",
+    "title": "Cross Directory Project",
+    "overview": "Synthetic backend and frontend directories form one project.",
+    "boundary_type": "cross_directory_cluster",
+    "boundary_hierarchies": ["portfolio/backend", "portfolio/frontend"],
+    "confidence": "high"
+  }
+}

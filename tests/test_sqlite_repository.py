@@ -232,6 +232,126 @@ def test_legacy_approved_project_migrates_to_manually_approved(workspace) -> Non
     assert repository.list_portfolio_projects()[0]["decision_origin"] == "manual"
 
 
+def test_copied_010_schema_migration_preserves_legacy_project_and_evidence(workspace) -> None:
+    paths = WorkspacePaths.from_root(workspace)
+    paths.ensure()
+    with sqlite3.connect(paths.db_path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE sources (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                type TEXT NOT NULL,
+                uri TEXT NOT NULL UNIQUE,
+                display_name TEXT NOT NULL,
+                owner TEXT,
+                status TEXT NOT NULL,
+                discovered_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                approved_at TEXT
+            );
+            CREATE TABLE source_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_id INTEGER NOT NULL,
+                snapshot_path TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                extractor TEXT NOT NULL,
+                extracted_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE github_activities (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_id INTEGER,
+                repo TEXT NOT NULL,
+                activity_type TEXT NOT NULL,
+                url TEXT NOT NULL,
+                title TEXT NOT NULL,
+                state TEXT NOT NULL,
+                author TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                merged_at TEXT,
+                UNIQUE(repo, activity_type, url)
+            );
+            CREATE TABLE evidence_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_id INTEGER,
+                snapshot_id INTEGER,
+                github_activity_id INTEGER,
+                locator TEXT NOT NULL
+            );
+            CREATE TABLE projects (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE
+            );
+            CREATE TABLE career_claims (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER,
+                text TEXT NOT NULL
+            );
+            CREATE TABLE claim_evidence (
+                claim_id INTEGER NOT NULL,
+                evidence_id INTEGER NOT NULL,
+                support_level TEXT NOT NULL,
+                PRIMARY KEY (claim_id, evidence_id)
+            );
+            CREATE TABLE artifacts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                type TEXT NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE portfolio_projects (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                overview TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status = 'approved'),
+                approval_sha256 TEXT NOT NULL,
+                review_input_sha256 TEXT NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE portfolio_project_evidence (
+                project_id TEXT NOT NULL,
+                evidence_id INTEGER NOT NULL,
+                support_level TEXT NOT NULL,
+                PRIMARY KEY (project_id, evidence_id)
+            );
+            INSERT INTO sources (type, uri, display_name, status)
+            VALUES ('local_file', 'file:///synthetic/legacy/README.md', 'README.md', 'ingested');
+            INSERT INTO evidence_items (source_id, locator)
+            VALUES (1, 'file:///synthetic/legacy/README.md');
+            INSERT INTO portfolio_projects
+                (id, title, overview, status, approval_sha256, review_input_sha256)
+            VALUES
+                ('legacy-insurance', 'Legacy Insurance', 'Legacy grounded overview',
+                 'approved', 'legacy-approval', 'legacy-review');
+            INSERT INTO portfolio_project_evidence (project_id, evidence_id, support_level)
+            VALUES ('legacy-insurance', 1, 'direct');
+            """
+        )
+
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+
+    projects = repository.list_portfolio_projects(active_only=False)
+    with repository._read_connection() as connection:
+        evidence = connection.execute(
+            "SELECT id, locator, stable_id FROM evidence_items"
+        ).fetchall()
+        links = connection.execute(
+            "SELECT project_id, evidence_id, support_level FROM portfolio_project_evidence"
+        ).fetchall()
+
+    assert projects[0]["id"] == "legacy-insurance"
+    assert projects[0]["title"] == "Legacy Insurance"
+    assert projects[0]["overview"] == "Legacy grounded overview"
+    assert projects[0]["decision_status"] == "manually_approved"
+    assert projects[0]["decision_origin"] == "manual"
+    assert [(row["id"], row["locator"]) for row in evidence] == [
+        (1, "file:///synthetic/legacy/README.md")
+    ]
+    assert evidence[0]["stable_id"] == "legacy-evidence:1"
+    assert [(row["project_id"], row["evidence_id"], row["support_level"]) for row in links] == [
+        ("legacy-insurance", 1, "direct")
+    ]
+
+
 def test_excluded_project_keeps_links_but_disappears_from_active_list(tmp_path: Path) -> None:
     repository, evidence_id = populated_portfolio_project_repository(tmp_path)
 
