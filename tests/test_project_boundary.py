@@ -20,7 +20,12 @@ from portfolio_maker.application.project_boundary import (
     ProjectBoundaryError,
     build_project_review_input_v2,
 )
-from portfolio_maker.application.project_composition import prepare_project_review
+from portfolio_maker.application.project_boundary import prepare_project_review_v2
+from portfolio_maker.application.project_composition import (
+    prepare_project_review,
+    write_sample_project_approval,
+)
+from portfolio_maker.adapters import cli
 from portfolio_maker.application.semantic_index import (
     apply_semantic_index,
     prepare_semantic_index,
@@ -174,6 +179,25 @@ def test_v2_review_input_rejects_managed_path_hierarchy(
         build_project_review_input_v2(workspace)
 
 
+def test_prepare_project_review_keeps_v1_approval_compatibility_with_active_semantic_revision(
+    workspace: Path, tmp_path: Path
+) -> None:
+    paths = _write_active_semantic_revision(workspace, tmp_path)
+
+    review = prepare_project_review(PrepareProjectReviewRequest(workspace=workspace))
+    legacy_payload = json.loads(review.input_path.read_text(encoding="utf-8"))
+    approval_path = write_sample_project_approval(paths)
+
+    assert legacy_payload["version"] == 1
+    assert legacy_payload["evidence"]
+    assert json.loads(approval_path.read_text(encoding="utf-8"))["review_input_sha256"] == legacy_payload[
+        "input_sha256"
+    ]
+
+    v2_review = prepare_project_review_v2(PrepareProjectReviewRequest(workspace=workspace))
+    assert json.loads(v2_review.input_path.read_text(encoding="utf-8"))["version"] == 2
+
+
 def test_prepare_project_review_keeps_v1_without_active_semantic_revision(
     workspace: Path, tmp_path: Path
 ) -> None:
@@ -204,3 +228,25 @@ def test_prepare_project_review_keeps_v1_without_active_semantic_revision(
     payload = json.loads(review.input_path.read_text(encoding="utf-8"))
     assert payload["version"] == 1
     assert payload["evidence"]
+
+
+def test_cli_handles_malformed_v2_boundary_without_traceback(
+    workspace: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    paths = _write_active_semantic_revision(workspace, tmp_path)
+    payload = build_project_review_input_v2(workspace)
+    node_id = payload["nodes"][0]["node_id"]
+    with sqlite3.connect(paths.db_path) as connection:
+        connection.execute(
+            "UPDATE semantic_nodes SET relative_hierarchy = ? WHERE revision_id = ? AND node_id = ?",
+            ("raw/snapshot.md", payload["index_revision"], node_id),
+        )
+    monkeypatch.setattr(cli, "prepare_project_review", prepare_project_review_v2)
+
+    exit_code = cli.main(["prepare-project-review", "--workspace", str(workspace)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "unsafe locator" in captured.err
+    assert "Traceback" not in captured.err
+    assert str(workspace) not in captured.err

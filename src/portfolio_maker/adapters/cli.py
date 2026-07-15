@@ -24,6 +24,7 @@ from portfolio_maker.application.project_composition import (
     prepare_project_review,
     write_sample_project_approval,
 )
+from portfolio_maker.application.project_boundary import ProjectBoundaryError
 from portfolio_maker.application.models import (
     BuildProfileRequest,
     DiscoverSourcesRequest,
@@ -106,6 +107,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         GitHubDiscoveryError,
         HtmlRenderError,
         ProfileFormatError,
+        ProjectBoundaryError,
         ProjectCompositionError,
         RepositoryError,
         SemanticIndexError,

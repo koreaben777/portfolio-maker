@@ -223,15 +223,6 @@ def parse_candidate_payload(payload: Any, review_input: dict[str, Any]) -> tuple
 
 
 def prepare_project_review(request: PrepareProjectReviewRequest) -> PrepareProjectReviewResult:
-    from portfolio_maker.application.project_boundary import (
-        ActiveSemanticRevisionMissing,
-        prepare_project_review_v2,
-    )
-
-    try:
-        return prepare_project_review_v2(request)
-    except ActiveSemanticRevisionMissing:
-        pass
     paths = WorkspacePaths.from_root(request.workspace)
     paths.ensure()
     current = _collect_review_input(paths)
