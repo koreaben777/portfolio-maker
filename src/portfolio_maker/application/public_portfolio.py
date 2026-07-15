@@ -12,16 +12,17 @@ from portfolio_maker.application.evidence_selection import (
     EvidenceSelectionResult,
     EvidenceSelectionService,
 )
+from portfolio_maker.application.project_composition import (
+    build_project_projections,
+    project_provenance_manifest,
+)
 from portfolio_maker.application.models import (
     ArtifactKind,
     BuildProfileRequest,
     PublicPortfolioRequest,
     PublicPortfolioResult,
 )
-from portfolio_maker.domain.models import PublicEvidenceRecord
 from portfolio_maker.infrastructure.artifacts import write_json
-from portfolio_maker.infrastructure.policy import mask_public_value
-from portfolio_maker.infrastructure.presentation import normalize_label, safe_local_public_label
 from portfolio_maker.infrastructure.sqlite_repository import SQLiteRepository
 from portfolio_maker.workspace import WorkspacePaths
 
@@ -35,6 +36,7 @@ class PublicPortfolioBuild:
     payload: dict[str, object]
     selection: EvidenceSelectionResult
     result: PublicPortfolioResult
+    selection_manifest: dict[str, object]
 
 
 def build_public_portfolio(request: PublicPortfolioRequest) -> PublicPortfolioResult:
@@ -50,7 +52,7 @@ def build_public_portfolio(request: PublicPortfolioRequest) -> PublicPortfolioRe
         1,
         json.dumps(
             {
-                **selection.input_manifest("portfolio_public_manifest"),
+                **build.selection_manifest,
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -90,7 +92,18 @@ def build_public_portfolio_payload(
             current_approval=load_approval(paths),
         ),
     )
-    payload, claim_ids, evidence_ids = _assemble_payload(selection, artifact_kind)
+    projects = build_project_projections(
+        repository.list_portfolio_projects(),
+        selection.records,
+        set(selection.included_evidence_ids),
+    )
+    selection_manifest = _project_selection_manifest(selection, projects, artifact_kind)
+    payload, claim_ids, evidence_ids = _assemble_payload(
+        selection,
+        artifact_kind,
+        projects,
+        selection_manifest,
+    )
     return PublicPortfolioBuild(
         payload=payload,
         selection=selection,
@@ -102,150 +115,101 @@ def build_public_portfolio_payload(
             claim_ids=tuple(sorted(set(claim_ids))),
             evidence_ids=tuple(sorted(set(evidence_ids))),
         ),
+        selection_manifest=selection_manifest,
     )
 
 
 def _assemble_payload(
     selection: EvidenceSelectionResult,
     artifact_kind: ArtifactKind,
+    projects: list[dict[str, object]],
+    selection_manifest: dict[str, object],
 ) -> tuple[dict[str, object], list[int], list[int]]:
-    projects: dict[str, dict[str, object]] = {}
     claim_ids: list[int] = []
     evidence_ids: list[int] = []
-    for record in selection.records:
-        item = _public_record(record)
-        if item is None:
-            continue
-        project_key = str(item["project_key"])
-        project = projects.setdefault(
-            project_key,
-            {
-                "id": project_key,
-                "name": item["project_name"],
-                "repository": item.get("repository"),
-                "public_safe": True,
-                "claims": [],
-                "timeline": [],
-            },
-        )
-        claims = project["claims"]
-        if not isinstance(claims, list):
-            raise PublicPortfolioError("public manifest claim collection is invalid")
-        claim = next(
-            (candidate for candidate in claims if candidate["id"] == item["claim_id"]),
-            None,
-        )
-        if claim is None:
-            claim = {
-                "id": item["claim_id"],
-                "text": item["claim_text"],
-                "public_safe": True,
-                "evidence": [],
-            }
-            claims.append(claim)
-            claim_ids.append(int(item["claim_id"]))
-        evidence = item["evidence"]
-        claim_evidence = claim["evidence"]
-        if not isinstance(claim_evidence, list) or not isinstance(evidence, dict):
-            raise PublicPortfolioError("public manifest evidence collection is invalid")
-        if not any(candidate["id"] == evidence["id"] for candidate in claim_evidence):
-            claim_evidence.append(evidence)
-            evidence_ids.append(int(evidence["id"]))
-            timeline = project["timeline"]
-            if not isinstance(timeline, list):
-                raise PublicPortfolioError("public manifest timeline is invalid")
-            timeline.append(item["timeline"])
-
-    for project in projects.values():
-        claims = project["claims"]
-        timeline = project["timeline"]
+    for project in projects:
+        claims = project.get("claims")
+        project_evidence_ids = project.get("evidence_ids")
         if isinstance(claims, list):
-            claims.sort(key=lambda claim: int(claim["id"]))
-        if isinstance(timeline, list):
-            timeline.sort(key=lambda entry: str(entry["created_at"]), reverse=True)
+            claim_ids.extend(
+                int(claim["id"])
+                for claim in claims
+                if isinstance(claim, dict) and isinstance(claim.get("id"), int)
+            )
+            for claim in claims:
+                if isinstance(claim, dict) and isinstance(claim.get("evidence"), list):
+                    evidence_ids.extend(
+                        int(evidence["id"])
+                        for evidence in claim["evidence"]
+                        if isinstance(evidence, dict) and isinstance(evidence.get("id"), int)
+                    )
+        if isinstance(project_evidence_ids, list):
+            evidence_ids.extend(
+                int(evidence_id)
+                for evidence_id in project_evidence_ids
+                if isinstance(evidence_id, int)
+            )
 
     payload = {
         "version": 1,
         "delivery_scope": selection.delivery_scope,
         "policy_hash": selection.policy_hash,
-        "selection": selection.input_manifest(artifact_kind),
+        "selection": selection_manifest,
         "generated_at": datetime.now(timezone.utc)
         .replace(microsecond=0)
         .isoformat()
         .replace("+00:00", "Z"),
         "profile": {},
-        "projects": list(projects.values()),
+        "projects": projects,
         "skills": [],
         "links": [],
     }
     return payload, claim_ids, evidence_ids
 
 
-def _public_record(record: PublicEvidenceRecord) -> dict[str, object] | None:
-    if record.activity_id is None:
-        label = safe_local_public_label(mask_public_value(record.source_display_name or ""))
-        if not label:
-            return None
-        return {
-            "project_key": f"local:{record.source_id}",
-            "project_name": label,
-            "repository": None,
-            "claim_id": record.claim_id,
-            "claim_text": f"Approved local evidence: {label}",
-            "evidence": {
-                "id": record.evidence_id,
-                "kind": "local_evidence",
-                "public_safe": True,
-                "source_label": label,
-                "provenance": "Approved local evidence",
-            },
-            "timeline": {
-                "evidence_id": record.evidence_id,
-                "activity_type": "local_evidence",
-                "title": label,
-                "created_at": "",
-                "provenance": "Approved local evidence",
-            },
+def _project_selection_manifest(
+    selection: EvidenceSelectionResult,
+    projects: list[dict[str, object]],
+    artifact_kind: ArtifactKind,
+) -> dict[str, object]:
+    manifest = selection.input_manifest(artifact_kind)
+    evidence_ids = sorted(
+        {
+            int(evidence_id)
+            for project in projects
+            for evidence_id in project.get("evidence_ids", [])
+            if isinstance(evidence_id, int)
         }
-
-    title = normalize_label(mask_public_value(record.activity_title or ""))
-    author = normalize_label(mask_public_value(record.activity_author or ""))
-    state = normalize_label(mask_public_value(record.activity_state or ""))
-    if not title or not author or not state:
-        return None
-    if record.activity_is_private:
-        project_key = "github:private"
-        project_name = "Private GitHub evidence"
-        claim_text = f"Private GitHub activity: {title}"
-        safe_url = "Private GitHub activity (URL withheld)"
-    else:
-        project_key = f"github:{record.activity_repo}"
-        project_name = str(record.activity_repo)
-        claim_text = f"{record.activity_repo}: {title}"
-        safe_url = record.activity_url
-    evidence = {
-        "id": record.evidence_id,
-        "kind": "github_activity",
-        "public_safe": True,
-        "activity_type": record.activity_type,
-        "title": title,
-        "author": author,
-        "state": state,
-        "created_at": record.activity_created_at,
-        "url": safe_url,
-    }
-    return {
-        "project_key": project_key,
-        "project_name": project_name,
-        "repository": None if record.activity_is_private else record.activity_repo,
-        "claim_id": record.claim_id,
-        "claim_text": claim_text,
-        "evidence": evidence,
-        "timeline": {
-            "evidence_id": record.evidence_id,
-            "activity_type": record.activity_type,
-            "title": title,
-            "created_at": record.activity_created_at,
-            "url": safe_url,
-        },
-    }
+    )
+    claim_ids = sorted(
+        {
+            int(claim["id"])
+            for project in projects
+            for claim in project.get("claims", [])
+            if isinstance(claim, dict) and isinstance(claim.get("id"), int)
+        }
+    )
+    records_by_id = {record.evidence_id: record for record in selection.records}
+    source_ids = sorted(
+        {
+            records_by_id[evidence_id].source_id
+            for evidence_id in evidence_ids
+            if evidence_id in records_by_id and records_by_id[evidence_id].source_id is not None
+        }
+    )
+    manifest.update(
+        {
+            "included_source_ids": source_ids,
+            "included_evidence_ids": evidence_ids,
+            "included_claim_ids": claim_ids,
+            "source_ids": source_ids,
+            "evidence_ids": evidence_ids,
+            "claim_ids": claim_ids,
+            "portfolio_project_ids": [
+                project["id"] for project in projects if isinstance(project.get("id"), str)
+            ],
+            "portfolio_project_evidence_ids": evidence_ids,
+            **project_provenance_manifest(projects),
+        }
+    )
+    return manifest

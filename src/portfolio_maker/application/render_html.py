@@ -99,7 +99,7 @@ def render_html(request: RenderHtmlRequest) -> RenderHtmlResult:
         "portfolio_html",
         1,
         json.dumps(
-            _html_input_manifest(html_build.selection, html_build.payload),
+            _html_input_manifest(html_build.selection_manifest, html_build.payload),
             sort_keys=True,
             separators=(",", ":"),
         ),
@@ -110,8 +110,8 @@ def render_html(request: RenderHtmlRequest) -> RenderHtmlResult:
     )
 
 
-def _html_input_manifest(selection, payload: dict[str, object]) -> dict[str, object]:
-    input_manifest = selection.input_manifest("portfolio_html")
+def _html_input_manifest(selection_manifest: dict[str, object], payload: dict[str, object]) -> dict[str, object]:
+    input_manifest = dict(selection_manifest)
     payload_bytes = json.dumps(
         payload,
         sort_keys=True,

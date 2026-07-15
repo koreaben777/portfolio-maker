@@ -1,0 +1,4 @@
+interface:
+  display_name: "Portfolio Artifacts"
+  short_description: "Generate and validate portfolio profile, Markdown, and HTML"
+  default_prompt: "Use $portfolio-artifacts: 승인 프로젝트로 포트폴리오 산출물을 만들어줘"

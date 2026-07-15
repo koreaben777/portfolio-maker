@@ -1,0 +1,18 @@
+{
+  "fixture": "coherent_parent",
+  "artifact_scope": "restricted",
+  "files": {
+    "README.md": "Synthetic insurance portfolio workspace overview.",
+    "services/api/README.md": "Synthetic insurance retrieval service.",
+    "services/graph/README.md": "Synthetic insurance graph service."
+  },
+  "synthetic_codex_candidate": {
+    "id": "candidate-insurance-rag-chatbot",
+    "project_id": "insurance-rag-chatbot",
+    "title": "Insurance RAG Chatbot",
+    "overview": "Synthetic retrieval and graph services form one coherent project.",
+    "boundary_type": "directory_root",
+    "boundary_hierarchies": ["services"],
+    "confidence": "high"
+  }
+}

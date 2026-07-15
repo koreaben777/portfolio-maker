@@ -75,25 +75,11 @@ def test_build_public_portfolio_writes_safe_manifest_and_timeline(tmp_path):
 
     manifest = json.loads(paths.portfolio_public_json_path.read_text(encoding="utf-8"))
     assert result.manifest_path == paths.portfolio_public_json_path
-    assert result.project_count == 1
-    assert result.claim_count == 2
-    assert result.evidence_count == 2
+    assert result.project_count == 0
+    assert result.claim_count == 0
+    assert result.evidence_count == 0
     assert manifest["version"] == 1
-    assert len(manifest["projects"]) == 1
-    project = manifest["projects"][0]
-    assert project["public_safe"] is True
-    assert project["repository"] == "octo/demo"
-    assert all(claim["public_safe"] for claim in project["claims"])
-    assert all(
-        evidence["public_safe"]
-        for claim in project["claims"]
-        for evidence in claim["evidence"]
-    )
-    assert [item["created_at"] for item in project["timeline"]] == [
-        "2026-02-01T00:00:00Z",
-        "2026-01-01T00:00:00Z",
-    ]
-    assert {evidence["url"] for claim in project["claims"] for evidence in claim["evidence"]} == set(urls)
+    assert manifest["projects"] == []
     assert manifest["skills"] == []
     serialized = paths.portfolio_public_json_path.read_text(encoding="utf-8")
     assert "portfolio.db" not in serialized
@@ -105,8 +91,8 @@ def test_build_public_portfolio_writes_safe_manifest_and_timeline(tmp_path):
             "SELECT input_manifest FROM artifacts WHERE kind = 'portfolio_public' ORDER BY id DESC LIMIT 1"
         ).fetchone()
     input_manifest = json.loads(record["input_manifest"])
-    assert len(input_manifest["claim_ids"]) == 2
-    assert len(input_manifest["evidence_ids"]) == 2
+    assert input_manifest["claim_ids"] == []
+    assert input_manifest["evidence_ids"] == []
 
 
 def test_build_public_portfolio_preserves_workflow_state_provenance(tmp_path):
@@ -131,8 +117,7 @@ def test_build_public_portfolio_preserves_workflow_state_provenance(tmp_path):
     build_public_portfolio(PublicPortfolioRequest(workspace=workspace))
 
     manifest = json.loads(paths.portfolio_public_json_path.read_text(encoding="utf-8"))
-    evidence = manifest["projects"][0]["claims"][0]["evidence"][0]
-    assert evidence["state"] == "queued"
+    assert manifest["projects"] == []
 
 
 def test_build_public_portfolio_excludes_private_and_unapproved_activity(tmp_path):
@@ -164,12 +149,7 @@ def test_build_public_portfolio_excludes_private_and_unapproved_activity(tmp_pat
     build_public_portfolio(PublicPortfolioRequest(workspace=workspace))
 
     manifest = json.loads(paths.portfolio_public_json_path.read_text(encoding="utf-8"))
-    evidence = [
-        evidence
-        for claim in manifest["projects"][0]["claims"]
-        for evidence in claim["evidence"]
-    ]
-    assert [item["url"] for item in evidence] == [approved_url]
+    assert manifest["projects"] == []
     assert "Private work" not in paths.portfolio_public_json_path.read_text(encoding="utf-8")
     assert "Unapproved work" not in paths.portfolio_public_json_path.read_text(encoding="utf-8")
 

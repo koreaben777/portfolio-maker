@@ -25,7 +25,7 @@ artifact별 restricted/open_public 선택을 포함한다. Issue #12는 실제 p
 - 일반 로컬 discovery는 사용자가 선택한 scan root에서 사용자가 지정한 제외 폴더만 제외한다.
 - `.portfolio-maker` workspace, non-regular file, unsafe symlink는 운영상 하드 제외로 유지한다.
 - `forbidden_paths`는 기존 approval 호환 alias로 유지하고 `excluded_directories`와 합쳐 적용한다.
-- private GitHub discovery는 `gh auth status`, `private_sources_allowed=true`, repository allowlist, source/activity approval을 모두 요구한다.
+- private GitHub discovery는 `gh auth status`, `private_sources_allowed=true`, repository allowlist를 요구한다. exact activity approval은 discovery report에서 사용자가 선택한 뒤 artifact evidence가 되기 위한 별도 gate다.
 - private repository 파일의 clone/raw ingestion은 이번 범위에 포함하지 않는다. 현재 GitHub metadata/activity connector만 확장한다.
 - 모든 생성물은 공통 EvidenceSelectionService를 사용한다.
 - 기본 `restricted` 산출물은 승인된 local, public GitHub, exact-approved private GitHub를 포함할 수 있다. 이는 자동 공개 허가가 아니다.
@@ -147,7 +147,7 @@ Cover:
 - `gh auth status` failure is a controlled private discovery status without credential output;
 - private repositories are skipped unless opt-in and allowlist pass;
 - excluded repositories override allowlist and private opt-in;
-- private activity URLs cannot be approved through the public activity field.
+- private activity URLs cannot be approved through the public activity field. 허용된 private activity의 정확한 URL은 discovery report라는 로컬 승인 표면에만 표시될 수 있고, 생성 artifact와 safe semantic review bundle에는 표시하지 않는다.
 
 - [x] **Step 2: Run focused tests before implementation**
 
@@ -271,7 +271,7 @@ git commit -m "feat: centralize evidence delivery selection"
 - All four builders call `select_evidence_for_artifact` before writing output.
 - Every `artifacts.input_manifest` records delivery scope, policy hash, included IDs, excluded IDs, reasons, and origin counts.
 - `render_html` consumes its manifest policy only; it introduces no separate public/private origin filter.
-- Restricted private repository provenance uses an approved/safe label. Any private URL display requires a separately approved shared locator.
+- Automatic restricted private repository provenance uses an approved/safe label. A user-approved semantic project title/overview may contain the private repository name as display text, but any private URL/raw locator display remains prohibited and would require a separate locator-sharing boundary.
 
 - [x] **Step 1: Add cross-artifact regressions**
 
@@ -281,7 +281,7 @@ Create a fixture with local, public GitHub, and private GitHub evidence. Assert:
 - an excluded source disappears from one selected artifact but remains in the common pool;
 - `portfolio-public.json` and `portfolio.html` carry `delivery_scope: "restricted"` provenance;
 - open-public manifest/HTML reject local/private origins;
-- raw local paths, tokens, credentials, secret-shaped text, and unapproved private repository names never appear in output;
+- raw local paths, tokens, credentials, secret-shaped text, and private repository URLs/locators never appear in output; a private repository name may appear only as user-approved semantic project display text in restricted output;
 - repeated builds are deterministic and reference the same source/evidence/claim IDs.
 
 - [x] **Step 2: Run focused builder tests before implementation**

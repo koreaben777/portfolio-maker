@@ -1,0 +1,641 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import sqlite3
+from pathlib import Path
+
+import pytest
+
+from portfolio_maker.application.approval import write_sample_approval
+from portfolio_maker.application.artifact_approval import write_sample_artifact_policy
+from portfolio_maker.application.ingestion import ingest_sources
+from portfolio_maker.application.models import (
+    ApplySemanticIndexRequest,
+    ComposeProjectsRequest,
+    IngestSourcesRequest,
+    PrepareProjectReviewRequest,
+    PrepareSemanticIndexRequest,
+)
+from portfolio_maker.application.project_boundary import (
+    ProjectBoundaryError,
+    ProjectCandidateV2,
+    build_project_review_input_v2,
+    parse_candidate_payload_v2,
+)
+from portfolio_maker.application.project_boundary import prepare_project_review_v2
+from portfolio_maker.application.project_composition import (
+    compose_projects,
+    prepare_project_review,
+    write_sample_project_approval,
+)
+from portfolio_maker.adapters import cli
+from portfolio_maker.application.semantic_index import (
+    apply_semantic_index,
+    prepare_semantic_index,
+)
+from portfolio_maker.domain.models import Source, SourceStatus, SourceType
+from portfolio_maker.domain.semantic_models import boundary_fingerprint
+from portfolio_maker.infrastructure.sqlite_repository import SQLiteRepository
+from portfolio_maker.workspace import WorkspacePaths
+
+
+@pytest.fixture
+def review_input_v2() -> dict[str, object]:
+    payload: dict[str, object] = {
+        "version": 2,
+        "artifact_kind": "master_profile",
+        "delivery_scope": "restricted",
+        "policy_hash": "a" * 64,
+        "index_revision": "revision-v2",
+        "nodes": [
+            {
+                "node_id": "node-source",
+                "parent_node_id": None,
+                "relative_hierarchy": ".",
+                "topics": ["workspace"],
+                "evidence_ids": [],
+            },
+            {
+                "node_id": "node-parent",
+                "parent_node_id": "node-source",
+                "relative_hierarchy": "portfolio",
+                "topics": ["portfolio"],
+                "evidence_ids": [101],
+            },
+            {
+                "node_id": "node-child-a",
+                "parent_node_id": "node-parent",
+                "relative_hierarchy": "portfolio/app",
+                "topics": ["portfolio"],
+                "evidence_ids": [102],
+            },
+            {
+                "node_id": "node-child-b",
+                "parent_node_id": "node-parent",
+                "relative_hierarchy": "portfolio/docs",
+                "topics": ["portfolio"],
+                "evidence_ids": [],
+            },
+            {
+                "node_id": "node-broad-root",
+                "parent_node_id": None,
+                "relative_hierarchy": ".",
+                "topics": ["workspace"],
+                "evidence_ids": [],
+            },
+            {
+                "node_id": "node-unrelated-a",
+                "parent_node_id": "node-broad-root",
+                "relative_hierarchy": "mobile",
+                "topics": ["mobile"],
+                "evidence_ids": [],
+            },
+            {
+                "node_id": "node-unrelated-b",
+                "parent_node_id": "node-broad-root",
+                "relative_hierarchy": "finance",
+                "topics": ["finance"],
+                "evidence_ids": [],
+            },
+            {
+                "node_id": "node-mobile-root",
+                "parent_node_id": None,
+                "relative_hierarchy": "mobile",
+                "topics": ["mobile"],
+                "evidence_ids": [],
+            },
+            {
+                "node_id": "node-finance-root",
+                "parent_node_id": None,
+                "relative_hierarchy": "finance",
+                "topics": ["finance"],
+                "evidence_ids": [],
+            },
+            {
+                "node_id": "node-cluster-parent",
+                "parent_node_id": "node-source",
+                "relative_hierarchy": "product",
+                "topics": ["product"],
+                "evidence_ids": [],
+            },
+            {
+                "node_id": "node-cluster-mobile",
+                "parent_node_id": "node-cluster-parent",
+                "relative_hierarchy": "product/mobile",
+                "topics": ["mobile"],
+                "evidence_ids": [],
+            },
+            {
+                "node_id": "node-cluster-finance",
+                "parent_node_id": "node-cluster-parent",
+                "relative_hierarchy": "product/finance",
+                "topics": ["finance"],
+                "evidence_ids": [],
+            },
+        ],
+        "github_evidence": [{"evidence_id": 103}],
+    }
+    payload["input_sha256"] = hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+    return payload
+
+
+def valid_candidate_v2(
+    review_input: dict[str, object],
+    **candidate_changes: object,
+) -> dict[str, object]:
+    boundary_type = candidate_changes.pop("boundary_type", "directory_root")
+    boundary_node_ids = candidate_changes.pop("boundary_node_ids", ["node-parent"])
+    assert isinstance(boundary_type, str)
+    assert isinstance(boundary_node_ids, list)
+    candidate: dict[str, object] = {
+        "id": "candidate-project-boundary",
+        "project_id": "project-boundary",
+        "title": "Project boundary review",
+        "overview": "A grounded project candidate.",
+        "boundary_type": boundary_type,
+        "boundary_node_ids": boundary_node_ids,
+        "boundary_fingerprint": boundary_fingerprint(
+            boundary_type, tuple(boundary_node_ids)
+        ),
+        "evidence_ids": [101],
+        "grouping_rationale": ["The parent coordinates related components."],
+        "counter_signals": [],
+        "review_reasons": [],
+        "confidence": "high",
+    }
+    candidate.update(candidate_changes)
+    return {
+        "version": 2,
+        "review_input_sha256": review_input["input_sha256"],
+        "candidates": [candidate],
+    }
+
+
+def test_candidate_v2_accepts_grounded_parent_boundary(
+    review_input_v2: dict[str, object],
+) -> None:
+    candidate = valid_candidate_v2(
+        review_input_v2,
+        confidence="medium",
+        boundary_node_ids=["node-parent"],
+    )
+
+    parsed = parse_candidate_payload_v2(candidate, review_input_v2)
+
+    assert parsed == (
+        ProjectCandidateV2(
+            id="candidate-project-boundary",
+            project_id="project-boundary",
+            title="Project boundary review",
+            overview="A grounded project candidate.",
+            boundary_type="directory_root",
+            boundary_node_ids=("node-parent",),
+            boundary_fingerprint=boundary_fingerprint("directory_root", ("node-parent",)),
+            evidence_ids=(101,),
+            grouping_rationale=("The parent coordinates related components.",),
+            counter_signals=(),
+            review_reasons=(),
+            confidence="medium",
+        ),
+    )
+
+
+@pytest.mark.parametrize("field", ["boundary_node_ids", "grouping_rationale"])
+def test_candidate_v2_rejects_empty_required_lists(
+    field: str, review_input_v2: dict[str, object]
+) -> None:
+    candidate = valid_candidate_v2(review_input_v2)
+    candidate["candidates"][0][field] = []  # type: ignore[index]
+
+    with pytest.raises(ProjectBoundaryError):
+        parse_candidate_payload_v2(candidate, review_input_v2)
+
+
+@pytest.mark.parametrize("field", ["counter_signals", "review_reasons"])
+def test_candidate_v2_requires_optional_reason_lists(
+    field: str, review_input_v2: dict[str, object]
+) -> None:
+    candidate = valid_candidate_v2(review_input_v2)
+    del candidate["candidates"][0][field]  # type: ignore[index]
+
+    with pytest.raises(ProjectBoundaryError):
+        parse_candidate_payload_v2(candidate, review_input_v2)
+
+
+@pytest.mark.parametrize("field", ["id", "project_id"])
+def test_candidate_v2_rejects_unsafe_identifiers(
+    field: str, review_input_v2: dict[str, object]
+) -> None:
+    candidate = valid_candidate_v2(review_input_v2)
+    candidate["candidates"][0][field] = "unsafe/id"  # type: ignore[index]
+
+    with pytest.raises(ProjectBoundaryError):
+        parse_candidate_payload_v2(candidate, review_input_v2)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("title", "https://private.example/project"),
+        ("overview", "/Users/private/project"),
+        ("grouping_rationale", ["file:///private/project"]),
+        ("counter_signals", ["sk-abcdefghijklmnopqrstuvwxyz"]),
+        ("review_reasons", ["https://private.example/review"]),
+    ],
+)
+def test_candidate_v2_rejects_unsafe_text(
+    field: str, value: object, review_input_v2: dict[str, object]
+) -> None:
+    candidate = valid_candidate_v2(review_input_v2)
+    candidate["candidates"][0][field] = value  # type: ignore[index]
+
+    with pytest.raises(ProjectBoundaryError):
+        parse_candidate_payload_v2(candidate, review_input_v2)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("boundary_type", "folder"),
+        ("confidence", "certain"),
+    ],
+)
+def test_candidate_v2_rejects_unknown_enum_values(
+    field: str, value: str, review_input_v2: dict[str, object]
+) -> None:
+    candidate = valid_candidate_v2(review_input_v2)
+    candidate["candidates"][0][field] = value  # type: ignore[index]
+
+    with pytest.raises(ProjectBoundaryError):
+        parse_candidate_payload_v2(candidate, review_input_v2)
+
+
+def test_candidate_v2_requires_exact_review_input_hash(
+    review_input_v2: dict[str, object],
+) -> None:
+    candidate = valid_candidate_v2(review_input_v2)
+    candidate["review_input_sha256"] = "0" * 64
+
+    with pytest.raises(ProjectBoundaryError, match="review input"):
+        parse_candidate_payload_v2(candidate, review_input_v2)
+
+
+def test_candidate_v2_rejects_tampered_review_input(
+    review_input_v2: dict[str, object],
+) -> None:
+    candidate = valid_candidate_v2(review_input_v2)
+    tampered_review = json.loads(json.dumps(review_input_v2))
+    tampered_review["nodes"][0]["topics"] = ["different-topic"]
+
+    with pytest.raises(ProjectBoundaryError, match="review input hash"):
+        parse_candidate_payload_v2(candidate, tampered_review)
+
+
+def test_candidate_v2_rejects_unknown_boundary_nodes_and_evidence(
+    review_input_v2: dict[str, object]
+) -> None:
+    candidate = valid_candidate_v2(review_input_v2)
+    candidate["candidates"][0]["boundary_node_ids"] = ["node-missing"]  # type: ignore[index]
+    candidate["candidates"][0]["boundary_fingerprint"] = boundary_fingerprint(  # type: ignore[index]
+        "directory_root", ("node-missing",)
+    )
+
+    with pytest.raises(ProjectBoundaryError, match="boundary node"):
+        parse_candidate_payload_v2(candidate, review_input_v2)
+
+    candidate = valid_candidate_v2(review_input_v2, evidence_ids=[999])
+    with pytest.raises(ProjectBoundaryError, match="evidence"):
+        parse_candidate_payload_v2(candidate, review_input_v2)
+
+
+def test_candidate_v2_recomputes_boundary_fingerprint(
+    review_input_v2: dict[str, object]
+) -> None:
+    candidate = valid_candidate_v2(review_input_v2)
+    candidate["candidates"][0]["boundary_fingerprint"] = "sha256:" + "0" * 64  # type: ignore[index]
+
+    with pytest.raises(ProjectBoundaryError, match="fingerprint"):
+        parse_candidate_payload_v2(candidate, review_input_v2)
+
+
+def test_candidate_v2_allows_empty_evidence_without_inferring_from_boundary(
+    review_input_v2: dict[str, object]
+) -> None:
+    candidate = valid_candidate_v2(review_input_v2, evidence_ids=[])
+
+    parsed = parse_candidate_payload_v2(candidate, review_input_v2)
+
+    assert parsed[0].evidence_ids == ()
+
+
+def test_candidate_v2_rejects_broad_root_with_unrelated_child_topics(
+    review_input_v2: dict[str, object]
+) -> None:
+    candidate = valid_candidate_v2(
+        review_input_v2,
+        boundary_node_ids=["node-broad-root"],
+    )
+
+    with pytest.raises(ProjectBoundaryError, match="broad root"):
+        parse_candidate_payload_v2(candidate, review_input_v2)
+
+
+def test_candidate_v2_rejects_cross_directory_cluster_without_shared_ancestor(
+    review_input_v2: dict[str, object],
+) -> None:
+    candidate = valid_candidate_v2(
+        review_input_v2,
+        boundary_type="cross_directory_cluster",
+        boundary_node_ids=["node-mobile-root", "node-finance-root"],
+        evidence_ids=[],
+    )
+
+    with pytest.raises(ProjectBoundaryError, match="cross-directory"):
+        parse_candidate_payload_v2(candidate, review_input_v2)
+
+
+def test_candidate_v2_accepts_cross_directory_cluster_with_shared_ancestor(
+    review_input_v2: dict[str, object],
+) -> None:
+    candidate = valid_candidate_v2(
+        review_input_v2,
+        boundary_type="cross_directory_cluster",
+        boundary_node_ids=["node-cluster-mobile", "node-cluster-finance"],
+        evidence_ids=[],
+    )
+
+    parsed = parse_candidate_payload_v2(candidate, review_input_v2)
+
+    assert parsed[0].boundary_node_ids == ("node-cluster-mobile", "node-cluster-finance")
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["title", "overview", "grouping_rationale", "counter_signals", "review_reasons"],
+)
+def test_candidate_v2_rejects_ssh_private_git_locator_in_safe_text(
+    field: str, review_input_v2: dict[str, object]
+) -> None:
+    candidate = valid_candidate_v2(review_input_v2)
+    locator = "git@github.com:private/repository.git"
+    candidate["candidates"][0][field] = (  # type: ignore[index]
+        locator if field in {"title", "overview"} else [locator]
+    )
+
+    with pytest.raises(ProjectBoundaryError, match="unsafe locator"):
+        parse_candidate_payload_v2(candidate, review_input_v2)
+
+
+def test_candidate_v2_rejects_v1_review_input(
+    review_input_v2: dict[str, object]
+) -> None:
+    candidate = valid_candidate_v2(review_input_v2)
+    legacy_review = dict(review_input_v2)
+    legacy_review["version"] = 1
+
+    with pytest.raises(ProjectBoundaryError, match="version"):
+        parse_candidate_payload_v2(candidate, legacy_review)
+
+
+def _write_active_semantic_revision(workspace: Path, tmp_path: Path) -> WorkspacePaths:
+    root = tmp_path / "approved-root"
+    nested = root / "docs"
+    nested.mkdir(parents=True)
+    source_path = root / "README.md"
+    source_path.write_text("Project overview", encoding="utf-8")
+    (nested / "setup.md").write_text("Setup guidance", encoding="utf-8")
+
+    paths = WorkspacePaths.from_root(workspace)
+    write_sample_approval(paths)
+    approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    approval["approved_source_uris"] = [root.resolve().as_uri(), source_path.resolve().as_uri()]
+    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+    write_sample_artifact_policy(paths)
+
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    repository.upsert_source(
+        Source(
+            None,
+            SourceType.LOCAL_FILE,
+            source_path.resolve().as_uri(),
+            "README.md",
+            None,
+            SourceStatus.APPROVED,
+        )
+    )
+    ingest_sources(IngestSourcesRequest(workspace=workspace))
+
+    prepared = prepare_semantic_index(
+        PrepareSemanticIndexRequest(workspace=workspace, root=root, chunk_size=1)
+    )
+    input_dir = prepared.manifest_path.parent / "input"
+    output_dir = prepared.manifest_path.parent / "output"
+    output_dir.mkdir()
+    for input_path in sorted(input_dir.glob("chunk-*.json")):
+        input_text = input_path.read_text(encoding="utf-8")
+        input_payload = json.loads(input_text)
+        output = {
+            "version": 1,
+            "revision_id": prepared.revision_id,
+            "input_sha256": hashlib.sha256(input_text.encode("utf-8")).hexdigest(),
+            "nodes": [
+                {
+                    "node_id": node["node_id"],
+                    "semantic_summary": f"Summary for {node['display_name']}",
+                    "semantic_roles": node["roles"],
+                    "topics": ["project-boundary"],
+                    "analysis_status": node["analysis_status"],
+                    "child_node_ids": node["child_node_ids"],
+                }
+                for node in input_payload["nodes"]
+            ],
+        }
+        output["output_sha256"] = hashlib.sha256(
+            json.dumps(output, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
+                "utf-8"
+            )
+        ).hexdigest()
+        (output_dir / input_path.name).write_text(
+            json.dumps(output, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+            encoding="utf-8",
+        )
+    apply_semantic_index(ApplySemanticIndexRequest(workspace=workspace))
+    return paths
+
+
+def test_v2_review_input_contains_hierarchy_without_locator(
+    workspace: Path, tmp_path: Path
+) -> None:
+    paths = _write_active_semantic_revision(workspace, tmp_path)
+
+    payload = build_project_review_input_v2(workspace)
+
+    assert payload["version"] == 2
+    assert payload["artifact_kind"] == "master_profile"
+    assert payload["delivery_scope"] == "restricted"
+    assert payload["index_revision"]
+    assert payload["nodes"][0]["relative_hierarchy"]
+    assert "locator" not in json.dumps(payload).casefold()
+    assert str(paths.workspace) not in json.dumps(payload)
+    canonical = dict(payload)
+    input_sha256 = canonical.pop("input_sha256")
+    assert input_sha256 == hashlib.sha256(
+        json.dumps(canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+
+
+def test_unapproved_index_node_can_be_candidate_context_but_not_evidence(
+    workspace: Path, tmp_path: Path
+) -> None:
+    _write_active_semantic_revision(workspace, tmp_path)
+
+    payload = build_project_review_input_v2(workspace)
+
+    node = next(item for item in payload["nodes"] if item["evidence_ids"] == [])
+    assert node["semantic_summary"]
+    assert payload["github_evidence"] == []
+
+
+def test_v2_review_input_filters_node_evidence_to_current_artifact_selection(
+    workspace: Path, tmp_path: Path
+) -> None:
+    paths = _write_active_semantic_revision(workspace, tmp_path)
+    repository = SQLiteRepository(paths.db_path)
+    initial_payload = build_project_review_input_v2(workspace)
+    selected_evidence_id = repository.list_evidence_selection_records()[0].evidence_id
+    file_node_id = next(
+        node["node_id"]
+        for node in repository.list_semantic_nodes(
+            initial_payload["index_revision"]
+        )
+        if node["node_kind"] == "file"
+    )
+    with sqlite3.connect(paths.db_path) as connection:
+        connection.execute(
+            "UPDATE semantic_nodes SET evidence_ids_json = ? WHERE revision_id = ? AND node_id = ?",
+            (json.dumps([selected_evidence_id, 999_999]), initial_payload["index_revision"], file_node_id),
+        )
+
+    payload = build_project_review_input_v2(workspace)
+
+    node = next(item for item in payload["nodes"] if item["node_id"] == file_node_id)
+    assert node["evidence_ids"] == [selected_evidence_id]
+
+
+def test_v2_review_input_rejects_managed_path_hierarchy(
+    workspace: Path, tmp_path: Path
+) -> None:
+    paths = _write_active_semantic_revision(workspace, tmp_path)
+    payload = build_project_review_input_v2(workspace)
+    node_id = payload["nodes"][0]["node_id"]
+    with sqlite3.connect(paths.db_path) as connection:
+        connection.execute(
+            "UPDATE semantic_nodes SET relative_hierarchy = ? WHERE revision_id = ? AND node_id = ?",
+            ("raw/snapshot.md", payload["index_revision"], node_id),
+        )
+
+    with pytest.raises(ProjectBoundaryError, match="unsafe locator"):
+        build_project_review_input_v2(workspace)
+
+
+def test_prepare_project_review_keeps_v1_approval_compatibility_with_active_semantic_revision(
+    workspace: Path, tmp_path: Path
+) -> None:
+    paths = _write_active_semantic_revision(workspace, tmp_path)
+
+    review = prepare_project_review(PrepareProjectReviewRequest(workspace=workspace))
+    legacy_payload = json.loads(review.input_path.read_text(encoding="utf-8"))
+    approval_path = write_sample_project_approval(paths)
+
+    assert legacy_payload["version"] == 1
+    assert legacy_payload["evidence"]
+    assert json.loads(approval_path.read_text(encoding="utf-8"))["review_input_sha256"] == legacy_payload[
+        "input_sha256"
+    ]
+
+    v2_review = prepare_project_review_v2(PrepareProjectReviewRequest(workspace=workspace))
+    assert json.loads(v2_review.input_path.read_text(encoding="utf-8"))["version"] == 2
+
+
+def test_prepare_project_review_v2_preserves_stored_v1_review_for_approval_and_composition(
+    workspace: Path, tmp_path: Path
+) -> None:
+    paths = _write_active_semantic_revision(workspace, tmp_path)
+    legacy_review = prepare_project_review(PrepareProjectReviewRequest(workspace=workspace))
+    legacy_bytes = legacy_review.input_path.read_bytes()
+
+    v2_review = prepare_project_review_v2(PrepareProjectReviewRequest(workspace=workspace))
+
+    assert legacy_review.input_path == paths.project_review_input_path
+    assert legacy_review.input_path.read_bytes() == legacy_bytes
+    assert v2_review.input_path != paths.project_review_input_path
+    assert v2_review.input_path == paths.reviews_dir / "project-review-input-v2.json"
+    assert json.loads(v2_review.input_path.read_text(encoding="utf-8"))["version"] == 2
+
+    approval_path = write_sample_project_approval(paths)
+    composition = compose_projects(ComposeProjectsRequest(workspace=workspace))
+
+    assert approval_path == paths.project_approval_path
+    assert composition.project_count == 0
+
+
+def test_prepare_project_review_keeps_v1_without_active_semantic_revision(
+    workspace: Path, tmp_path: Path
+) -> None:
+    source_path = tmp_path / "README.md"
+    source_path.write_text("Local evidence", encoding="utf-8")
+    paths = WorkspacePaths.from_root(workspace)
+    write_sample_approval(paths)
+    approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    approval["approved_source_uris"] = [source_path.resolve().as_uri()]
+    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+    write_sample_artifact_policy(paths)
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    repository.upsert_source(
+        Source(
+            None,
+            SourceType.LOCAL_FILE,
+            source_path.resolve().as_uri(),
+            "README.md",
+            None,
+            SourceStatus.APPROVED,
+        )
+    )
+    ingest_sources(IngestSourcesRequest(workspace=workspace))
+
+    review = prepare_project_review(PrepareProjectReviewRequest(workspace=workspace))
+
+    payload = json.loads(review.input_path.read_text(encoding="utf-8"))
+    assert payload["version"] == 1
+    assert payload["evidence"]
+
+
+def test_cli_handles_malformed_v2_boundary_without_traceback(
+    workspace: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    paths = _write_active_semantic_revision(workspace, tmp_path)
+    payload = build_project_review_input_v2(workspace)
+    node_id = payload["nodes"][0]["node_id"]
+    with sqlite3.connect(paths.db_path) as connection:
+        connection.execute(
+            "UPDATE semantic_nodes SET relative_hierarchy = ? WHERE revision_id = ? AND node_id = ?",
+            ("raw/snapshot.md", payload["index_revision"], node_id),
+        )
+    monkeypatch.setattr(cli, "prepare_project_review", prepare_project_review_v2)
+
+    exit_code = cli.main(["prepare-project-review", "--workspace", str(workspace)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "unsafe locator" in captured.err
+    assert "Traceback" not in captured.err
+    assert str(workspace) not in captured.err

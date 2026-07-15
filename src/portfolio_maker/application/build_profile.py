@@ -13,6 +13,10 @@ from portfolio_maker.application.evidence_selection import (
     EvidenceSelectionService,
 )
 from portfolio_maker.application.models import BuildProfileRequest, BuildProfileResult
+from portfolio_maker.application.project_composition import (
+    build_project_projections,
+    project_provenance_manifest,
+)
 from portfolio_maker.domain.models import Source, SourceStatus, SourceType
 from portfolio_maker.infrastructure.artifacts import write_json, write_markdown
 from portfolio_maker.infrastructure.extractors import extract_approved_text
@@ -217,6 +221,11 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
         )
 
     selection = selection_service.select(repository, selection_request)
+    semantic_projects = build_project_projections(
+        repository.list_portfolio_projects(),
+        selection.records,
+        set(selection.included_evidence_ids),
+    )
 
     if artifact_policy.legacy_compatibility:
         for claim in claims:
@@ -232,11 +241,14 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
         ],
         "claims": claims,
     }
+    if not artifact_policy.legacy_compatibility or semantic_projects:
+        payload["projects"] = semantic_projects
     if not artifact_policy.legacy_compatibility:
         payload["delivery_scope"] = selection.delivery_scope
         payload["policy_hash"] = selection.policy_hash
 
-    write_json(paths.master_profile_json_path, payload)
+    if request.write_artifacts:
+        write_json(paths.master_profile_json_path, payload)
     source_lines = []
     for source in sources:
         source_payload = _public_source_payload(source, github_source_repositories)
@@ -249,30 +261,52 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
         f"\n  Evidence: {markdown_text(str(claim['evidence_uri']))}"
         for claim in claims
     ]
-    write_markdown(
-        paths.master_profile_md_path,
-        "\n\n".join(
-            [
-                "# Master Profile",
-                "## Sources\n" + "\n".join(source_lines),
-                "## Claims\n" + "\n".join(claim_lines),
-            ]
+    project_lines = []
+    for project in semantic_projects:
+        project_lines.append(
+            "\n".join(
+                [
+                    f"### {markdown_text(str(project['title']))}",
+                    markdown_text(str(project["overview"])),
+                    f"- Linked evidence: {len(project['evidence_ids'])}",
+                ]
+            )
         )
-        + "\n",
-    )
-    repository.record_artifact(
-        "master_profile",
-        1,
-        json.dumps(
-            (
-                {"claim_ids": claim_ids, "evidence_ids": evidence_ids}
-                if artifact_policy.legacy_compatibility
-                else selection.input_manifest("master_profile")
+    if request.write_artifacts:
+        write_markdown(
+            paths.master_profile_md_path,
+            "\n\n".join(
+                [
+                    "# Master Profile",
+                    "## Sources\n" + "\n".join(source_lines),
+                    "## Claims\n" + "\n".join(claim_lines),
+                    "## Approved Projects\n" + ("\n\n".join(project_lines) or "No approved portfolio projects."),
+                ]
+            )
+            + "\n",
+        )
+        repository.record_artifact(
+            "master_profile",
+            1,
+            json.dumps(
+                (
+                    {"claim_ids": claim_ids, "evidence_ids": evidence_ids}
+                    if artifact_policy.legacy_compatibility
+                    else {
+                        **selection.input_manifest("master_profile"),
+                        "portfolio_project_ids": [project["id"] for project in semantic_projects],
+                        "portfolio_project_evidence_ids": [
+                            evidence_id
+                            for project in semantic_projects
+                            for evidence_id in project["evidence_ids"]
+                        ],
+                        **project_provenance_manifest(semantic_projects),
+                    }
+                ),
+                sort_keys=True,
+                separators=(",", ":"),
             ),
-            sort_keys=True,
-            separators=(",", ":"),
-        ),
-    )
+        )
     if request.invalidate_portfolio_draft:
         remove_managed_file(paths.portfolio_draft_path, missing_ok=True)
     return BuildProfileResult(

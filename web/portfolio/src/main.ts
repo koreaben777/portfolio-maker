@@ -21,8 +21,9 @@ type Claim = {
 
 type Project = {
   id: string;
-  name: string;
-  repository?: string | null;
+  title: string;
+  overview: string;
+  name?: string;
   claims: Claim[];
   timeline: Array<{
     evidence_id: number;
@@ -96,7 +97,7 @@ function renderWorkSection(): HTMLElement {
   const heading = element("div", "section-heading");
   heading.append(
     element("p", "eyebrow", "SELECTED WORK / " + String(data.projects.length).padStart(2, "0")),
-    element("h2", undefined, "Projects with a visible source trail."),
+    element("h2", undefined, "Approved projects with a visible source trail."),
   );
   const filters = renderFilters();
   heading.append(filters);
@@ -112,7 +113,7 @@ function renderWorkSection(): HTMLElement {
       element(
         "div",
         "empty-state",
-        "No public-safe projects are available in this manifest yet. Build or approve evidence before publishing.",
+        "Evidence is available for review, but no semantic portfolio project has been approved yet.",
       ),
     );
   } else {
@@ -128,7 +129,7 @@ function renderWorkSection(): HTMLElement {
 function renderFilters(): HTMLElement {
   const nav = element("nav", "filters");
   nav.setAttribute("aria-label", "Project filters");
-  const options = [{ id: "all", label: "All work" }, ...data.projects.map((project) => ({ id: project.id, label: project.name }))];
+  const options = [{ id: "all", label: "All work" }, ...data.projects.map((project) => ({ id: project.id, label: project.title }))];
   options.forEach((option) => {
     const button = element("button", "filter-button", option.label);
     button.type = "button";
@@ -147,7 +148,7 @@ function renderProjectRow(project: Project, index: number): HTMLElement {
   const button = element("button", "project-row");
   button.type = "button";
   button.setAttribute("aria-pressed", String(selectedProjectId === project.id));
-  button.setAttribute("aria-label", `View details for ${project.name}`);
+  button.setAttribute("aria-label", `View details for ${project.title}`);
   button.addEventListener("click", () => {
     selectedProjectId = project.id;
     render();
@@ -162,8 +163,8 @@ function renderProjectRow(project: Project, index: number): HTMLElement {
   const indexLabel = element("span", "project-index", String(index + 1).padStart(2, "0"));
   const content = element("span", "project-content");
   content.append(
-    element("span", "project-kicker", project.repository ? "PUBLIC REPOSITORY" : "PUBLIC SOURCE"),
-    element("strong", "project-name", project.name),
+    element("span", "project-kicker", "APPROVED PROJECT"),
+    element("strong", "project-name", project.title),
     element("span", "project-summary", `${project.claims.length} verified claim${project.claims.length === 1 ? "" : "s"} / ${project.timeline.length} timeline record${project.timeline.length === 1 ? "" : "s"}`),
   );
   const marker = element("span", "project-marker", "View");
@@ -186,8 +187,8 @@ function renderDetailPanel(visibleProjects: Project[]): HTMLElement {
   selectedProjectId = selected.id;
   panel.append(
     element("p", "eyebrow", "EVIDENCE DETAIL"),
-    element("h3", undefined, selected.name),
-    element("p", "detail-copy", "Claims stay connected to their provenance. This view contains only the public-safe records in the build-time manifest."),
+    element("h3", undefined, selected.title),
+    element("p", "detail-copy", selected.overview),
   );
   const timeline = element("ol", "timeline");
   selected.timeline.forEach((entry) => {

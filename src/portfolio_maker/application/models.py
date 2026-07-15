@@ -54,6 +54,7 @@ class IngestSourcesResult:
 class BuildProfileRequest:
     workspace: Path
     invalidate_portfolio_draft: bool = True
+    write_artifacts: bool = True
 
 
 @dataclass(frozen=True)
@@ -100,3 +101,71 @@ class RenderHtmlRequest:
 class RenderHtmlResult:
     manifest_path: Path
     html_path: Path
+
+
+@dataclass(frozen=True)
+class PrepareProjectReviewRequest:
+    workspace: Path
+
+
+@dataclass(frozen=True)
+class PrepareProjectReviewResult:
+    input_path: Path
+    evidence_count: int
+
+
+@dataclass(frozen=True)
+class ComposeProjectsRequest:
+    workspace: Path
+
+
+@dataclass(frozen=True)
+class ComposeProjectsResult:
+    project_count: int
+    unassigned_evidence_count: int
+
+
+@dataclass(frozen=True)
+class ComposeProjectsV2Request:
+    workspace: Path
+    mode: Literal["review", "automatic"] = "review"
+    manual_include_ids: tuple[str, ...] = ()
+    manual_exclude_ids: tuple[str, ...] = ()
+    manual_review_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ComposeProjectsV2Result:
+    project_count: int
+    review_required_count: int
+    excluded_project_count: int
+
+
+@dataclass(frozen=True)
+class PrepareSemanticIndexRequest:
+    workspace: Path
+    root: Path
+    chunk_size: int = 100
+
+
+@dataclass(frozen=True)
+class PrepareSemanticIndexResult:
+    manifest_path: Path
+    revision_id: str
+    node_count: int
+    chunk_count: int
+    partial_count: int
+
+
+@dataclass(frozen=True)
+class ApplySemanticIndexRequest:
+    workspace: Path
+
+
+@dataclass(frozen=True)
+class ApplySemanticIndexResult:
+    revision_id: str
+    active: bool
+    complete_count: int
+    partial_count: int
+    failed_count: int

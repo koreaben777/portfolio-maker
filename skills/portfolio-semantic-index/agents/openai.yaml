@@ -1,0 +1,4 @@
+interface:
+  display_name: "Portfolio Semantic Index"
+  short_description: "Build and refresh a hierarchical semantic index"
+  default_prompt: "$portfolio-semantic-index로 계층형 의미 인덱스를 생성해줘"

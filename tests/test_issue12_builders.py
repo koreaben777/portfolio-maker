@@ -81,13 +81,12 @@ def test_restricted_private_activity_reaches_profile_draft_and_manifest_without_
     manifest_text = paths.portfolio_public_json_path.read_text(encoding="utf-8")
 
     assert "Approved private work" in profile_text
-    assert "Approved private work" in draft_text
-    assert "Approved private work" in manifest_text
+    assert "No approved portfolio projects" in draft_text
     assert PRIVATE_URL not in profile_text + draft_text + manifest_text
     assert "private-github" in profile_text.casefold() + draft_text.casefold()
     manifest = json.loads(manifest_text)
     assert manifest["delivery_scope"] == "restricted"
-    assert manifest["projects"]
+    assert manifest["projects"] == []
 
     with SQLiteRepository(paths.db_path)._read_connection() as connection:
         records = connection.execute(
@@ -98,7 +97,10 @@ def test_restricted_private_activity_reaches_profile_draft_and_manifest_without_
         input_manifest = json.loads(record["input_manifest"])
         assert input_manifest["delivery_scope"] == "restricted"
         assert input_manifest["policy_hash"]
-        assert input_manifest["included_evidence_ids"]
+        if record["kind"] == "master_profile":
+            assert input_manifest["included_evidence_ids"]
+        else:
+            assert input_manifest["included_evidence_ids"] == []
 
 
 def test_restricted_local_evidence_uses_safe_label_not_raw_uri(tmp_path):
@@ -129,5 +131,5 @@ def test_restricted_local_evidence_uses_safe_label_not_raw_uri(tmp_path):
     build_public_portfolio(PublicPortfolioRequest(workspace=workspace))
 
     manifest_text = paths.portfolio_public_json_path.read_text(encoding="utf-8")
-    assert "Approved local evidence" in manifest_text
+    assert json.loads(manifest_text)["projects"] == []
     assert source_path.resolve().as_uri() not in manifest_text

@@ -4,6 +4,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 import fcntl
+import json
 import os
 import sqlite3
 import threading
@@ -17,6 +18,7 @@ from portfolio_maker.domain.models import (
     SourceStatus,
     SourceType,
 )
+from portfolio_maker.domain.semantic_models import SemanticEdge, SemanticNode
 from portfolio_maker.infrastructure.github_connector import (
     canonical_public_github_activity_url,
     canonical_repository_name,
@@ -68,6 +70,7 @@ CREATE TABLE IF NOT EXISTS github_activities (
     state_field TEXT CHECK(state_field IS NULL OR state_field IN ('conclusion', 'status')),
     origin_type TEXT NOT NULL DEFAULT 'public_github',
     origin_visibility TEXT NOT NULL DEFAULT 'unknown',
+    is_current INTEGER NOT NULL DEFAULT 1 CHECK(is_current IN (0, 1)),
     UNIQUE(repo, activity_type, url)
 );
 
@@ -93,6 +96,32 @@ CREATE TABLE IF NOT EXISTS projects (
     created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS portfolio_projects (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    overview TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status = 'approved'),
+    approval_sha256 TEXT NOT NULL,
+    review_input_sha256 TEXT NOT NULL,
+    decision_status TEXT NOT NULL DEFAULT 'manually_approved',
+    decision_origin TEXT NOT NULL DEFAULT 'manual',
+    confidence TEXT,
+    boundary_fingerprint TEXT,
+    candidate_input_sha256 TEXT,
+    index_revision TEXT,
+    decision_updated_at TEXT,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS portfolio_project_evidence (
+    project_id TEXT NOT NULL REFERENCES portfolio_projects(id) ON DELETE CASCADE,
+    evidence_id INTEGER NOT NULL REFERENCES evidence_items(id),
+    support_level TEXT NOT NULL CHECK(support_level IN ('direct', 'contextual')),
+    PRIMARY KEY (project_id, evidence_id),
+    UNIQUE (evidence_id)
+);
+
 CREATE TABLE IF NOT EXISTS career_claims (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     project_id INTEGER REFERENCES projects(id),
@@ -116,6 +145,54 @@ CREATE TABLE IF NOT EXISTS artifacts (
     created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS semantic_index_revisions (
+    id TEXT PRIMARY KEY,
+    source_id TEXT NOT NULL,
+    policy_hash TEXT NOT NULL,
+    analyzer_version TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('staging','active','superseded','failed')),
+    started_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    completed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS semantic_nodes (
+    revision_id TEXT NOT NULL REFERENCES semantic_index_revisions(id) ON DELETE CASCADE,
+    node_id TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    node_kind TEXT NOT NULL,
+    parent_node_id TEXT,
+    display_name TEXT NOT NULL,
+    relative_hierarchy TEXT NOT NULL,
+    content_fingerprint TEXT,
+    semantic_summary TEXT NOT NULL DEFAULT '',
+    semantic_roles_json TEXT NOT NULL DEFAULT '[]',
+    topics_json TEXT NOT NULL DEFAULT '[]',
+    evidence_ids_json TEXT NOT NULL DEFAULT '[]',
+    analysis_status TEXT NOT NULL,
+    analyzer_version TEXT NOT NULL,
+    PRIMARY KEY (revision_id, node_id)
+);
+
+CREATE TABLE IF NOT EXISTS semantic_node_locators (
+    revision_id TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    locator TEXT NOT NULL,
+    device INTEGER,
+    inode INTEGER,
+    PRIMARY KEY (revision_id, node_id),
+    FOREIGN KEY (revision_id, node_id)
+      REFERENCES semantic_nodes(revision_id, node_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS semantic_edges (
+    revision_id TEXT NOT NULL,
+    from_node_id TEXT NOT NULL,
+    relation TEXT NOT NULL,
+    to_node_id TEXT NOT NULL,
+    confidence TEXT,
+    PRIMARY KEY (revision_id, from_node_id, relation, to_node_id)
+);
+
 """
 
 
@@ -126,6 +203,23 @@ class RepositoryError(RuntimeError):
 _DATABASE_SIDECARS = ("-journal", "-wal", "-shm")
 _REPOSITORY_OPERATION_LOCK = threading.RLock()
 _REPOSITORY_OPERATION_STATE = threading.local()
+_ACTIVE_PORTFOLIO_PROJECT_DECISION_STATUSES = (
+    "manually_approved",
+    "auto_included_high",
+    "auto_included_medium",
+)
+_PORTFOLIO_PROJECT_DECISION_STATUSES = frozenset(
+    {
+        "manually_approved",
+        "auto_included_high",
+        "auto_included_medium",
+        "excluded",
+        "inactive",
+        "review_required",
+    }
+)
+_PORTFOLIO_PROJECT_DECISION_ORIGINS = frozenset({"manual", "automatic"})
+_PORTFOLIO_PROJECT_CONFIDENCE_LEVELS = frozenset({"low", "medium", "high"})
 
 
 @dataclass(frozen=True)
@@ -457,8 +551,10 @@ class SQLiteRepository:
                     conn.execute(statement)
             self._ensure_github_activity_visibility_column(conn)
             self._ensure_github_activity_state_field_column(conn)
+            self._ensure_github_activity_current_column(conn)
             self._ensure_legacy_normalized_columns(conn)
             self._ensure_origin_columns(conn)
+            self._ensure_portfolio_project_decision_columns(conn)
 
     @staticmethod
     def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
@@ -551,6 +647,16 @@ class SQLiteRepository:
             )
 
     @staticmethod
+    def _ensure_github_activity_current_column(conn: sqlite3.Connection) -> None:
+        columns = SQLiteRepository._table_columns(conn, "github_activities")
+        if "is_current" not in columns:
+            conn.execute(
+                "ALTER TABLE github_activities "
+                "ADD COLUMN is_current INTEGER NOT NULL DEFAULT 1 "
+                "CHECK(is_current IN (0, 1))"
+            )
+
+    @staticmethod
     def _ensure_origin_columns(conn: sqlite3.Connection) -> None:
         table_defaults = (
             ("sources", "origin_type", "local"),
@@ -619,12 +725,332 @@ class SQLiteRepository:
             """
         )
 
+    @classmethod
+    def _ensure_portfolio_project_decision_columns(cls, conn: sqlite3.Connection) -> None:
+        columns = cls._table_columns(conn, "portfolio_projects")
+        definitions = (
+            ("decision_status", "TEXT NOT NULL DEFAULT 'manually_approved'"),
+            ("decision_origin", "TEXT NOT NULL DEFAULT 'manual'"),
+            ("confidence", "TEXT"),
+            ("boundary_fingerprint", "TEXT"),
+            ("candidate_input_sha256", "TEXT"),
+            ("index_revision", "TEXT"),
+            ("decision_updated_at", "TEXT"),
+        )
+        for column, definition in definitions:
+            if column not in columns:
+                conn.execute(
+                    f"ALTER TABLE portfolio_projects ADD COLUMN {column} {definition}"
+                )
+        conn.execute(
+            """
+            UPDATE portfolio_projects
+            SET decision_status = CASE
+                    WHEN decision_status IS NULL OR trim(decision_status) = ''
+                        THEN 'manually_approved'
+                    ELSE decision_status
+                END,
+                decision_origin = CASE
+                    WHEN decision_origin IS NULL OR trim(decision_origin) = ''
+                        THEN 'manual'
+                    ELSE decision_origin
+                END,
+                decision_updated_at = COALESCE(decision_updated_at, updated_at, created_at, CURRENT_TIMESTAMP)
+            WHERE decision_status IS NULL
+               OR trim(decision_status) = ''
+               OR decision_origin IS NULL
+               OR trim(decision_origin) = ''
+               OR decision_updated_at IS NULL
+            """
+        )
+
     def table_names(self) -> set[str]:
         with self._read_connection() as conn:
             rows = conn.execute(
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         return {row["name"] for row in rows}
+
+    def create_semantic_revision(
+        self,
+        revision_id: str,
+        source_id: str,
+        policy_hash: str,
+        analyzer_version: str,
+    ) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO semantic_index_revisions
+                    (id, source_id, policy_hash, analyzer_version, status)
+                VALUES (?, ?, ?, ?, 'staging')
+                """,
+                (revision_id, source_id, policy_hash, analyzer_version),
+            )
+
+    def replace_semantic_revision_graph(
+        self,
+        revision_id: str,
+        nodes: tuple[SemanticNode, ...],
+        locators: dict[str, tuple[str, int | None, int | None]],
+        edges: tuple[SemanticEdge, ...],
+    ) -> None:
+        with self._connection() as conn:
+            revision = conn.execute(
+                """
+                SELECT source_id FROM semantic_index_revisions
+                WHERE id = ? AND status = 'staging'
+                """,
+                (revision_id,),
+            ).fetchone()
+            if revision is None:
+                raise RepositoryError("semantic revision is not staging")
+            source_id = self._required_text(revision, "source_id")
+            node_ids = {node.node_id for node in nodes}
+            if len(node_ids) != len(nodes) or set(locators) != node_ids:
+                raise RepositoryError("semantic revision graph is invalid")
+            if any(node.source_id != source_id for node in nodes):
+                raise RepositoryError("semantic revision graph is invalid")
+            if any(
+                edge.revision_id != revision_id
+                or edge.from_node_id not in node_ids
+                or edge.to_node_id not in node_ids
+                for edge in edges
+            ):
+                raise RepositoryError("semantic revision graph is invalid")
+
+            conn.execute("DELETE FROM semantic_edges WHERE revision_id = ?", (revision_id,))
+            conn.execute("DELETE FROM semantic_node_locators WHERE revision_id = ?", (revision_id,))
+            conn.execute("DELETE FROM semantic_nodes WHERE revision_id = ?", (revision_id,))
+            for node in nodes:
+                conn.execute(
+                    """
+                    INSERT INTO semantic_nodes (
+                        revision_id, node_id, source_id, node_kind, parent_node_id,
+                        display_name, relative_hierarchy, content_fingerprint,
+                        semantic_summary, semantic_roles_json, topics_json,
+                        evidence_ids_json, analysis_status, analyzer_version
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        revision_id,
+                        node.node_id,
+                        node.source_id,
+                        node.node_kind.value,
+                        node.parent_node_id,
+                        node.display_name,
+                        node.relative_hierarchy,
+                        node.content_fingerprint,
+                        node.semantic_summary,
+                        json.dumps(node.semantic_roles),
+                        json.dumps(node.topics),
+                        json.dumps(node.evidence_ids),
+                        node.analysis_status.value,
+                        node.analyzer_version,
+                    ),
+                )
+                locator, device, inode = locators[node.node_id]
+                if (
+                    not isinstance(locator, str)
+                    or (device is not None and type(device) is not int)
+                    or (inode is not None and type(inode) is not int)
+                ):
+                    raise RepositoryError("semantic node locator is invalid")
+                conn.execute(
+                    """
+                    INSERT INTO semantic_node_locators
+                        (revision_id, node_id, locator, device, inode)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (revision_id, node.node_id, locator, device, inode),
+                )
+            for edge in edges:
+                conn.execute(
+                    """
+                    INSERT INTO semantic_edges
+                        (revision_id, from_node_id, relation, to_node_id, confidence)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        revision_id,
+                        edge.from_node_id,
+                        edge.relation,
+                        edge.to_node_id,
+                        edge.confidence,
+                    ),
+                )
+
+    def activate_semantic_revision(self, revision_id: str) -> None:
+        with self._connection() as conn:
+            revision = conn.execute(
+                """
+                SELECT source_id FROM semantic_index_revisions
+                WHERE id = ? AND status = 'staging'
+                """,
+                (revision_id,),
+            ).fetchone()
+            if revision is None:
+                raise RepositoryError("semantic revision is not staging")
+            source_id = self._required_text(revision, "source_id")
+            conn.execute(
+                """
+                UPDATE semantic_index_revisions
+                SET status = 'superseded'
+                WHERE source_id = ? AND status = 'active'
+                """,
+                (source_id,),
+            )
+            conn.execute(
+                """
+                UPDATE semantic_index_revisions
+                SET status = 'active', completed_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND status = 'staging'
+                """,
+                (revision_id,),
+            )
+
+    def replace_and_activate_semantic_revision(
+        self, revision_id: str, nodes: tuple[SemanticNode, ...]
+    ) -> None:
+        """Atomically replace staged semantic annotations and activate the revision."""
+        with self._connection() as conn:
+            revision = conn.execute(
+                """
+                SELECT source_id FROM semantic_index_revisions
+                WHERE id = ? AND status = 'staging'
+                """,
+                (revision_id,),
+            ).fetchone()
+            if revision is None:
+                raise RepositoryError("semantic revision is not staging")
+            source_id = self._required_text(revision, "source_id")
+            existing_rows = conn.execute(
+                "SELECT node_id FROM semantic_nodes WHERE revision_id = ?",
+                (revision_id,),
+            ).fetchall()
+            existing_node_ids = {self._required_text(row, "node_id") for row in existing_rows}
+            node_ids = {node.node_id for node in nodes}
+            if (
+                len(nodes) != len(node_ids)
+                or node_ids != existing_node_ids
+                or any(node.source_id != source_id for node in nodes)
+            ):
+                raise RepositoryError("semantic revision graph is invalid")
+
+            for node in nodes:
+                result = conn.execute(
+                    """
+                    UPDATE semantic_nodes
+                    SET semantic_summary = ?, semantic_roles_json = ?, topics_json = ?,
+                        evidence_ids_json = ?, analysis_status = ?, analyzer_version = ?
+                    WHERE revision_id = ? AND node_id = ?
+                    """,
+                    (
+                        node.semantic_summary,
+                        json.dumps(node.semantic_roles),
+                        json.dumps(node.topics),
+                        json.dumps(node.evidence_ids),
+                        node.analysis_status.value,
+                        node.analyzer_version,
+                        revision_id,
+                        node.node_id,
+                    ),
+                )
+                if result.rowcount != 1:
+                    raise RepositoryError("semantic revision graph is invalid")
+
+            conn.execute(
+                """
+                UPDATE semantic_index_revisions
+                SET status = 'superseded'
+                WHERE source_id = ? AND status = 'active'
+                """,
+                (source_id,),
+            )
+            result = conn.execute(
+                """
+                UPDATE semantic_index_revisions
+                SET status = 'active', completed_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND status = 'staging'
+                """,
+                (revision_id,),
+            )
+            if result.rowcount != 1:
+                raise RepositoryError("semantic revision is not staging")
+
+    def fail_semantic_revision(self, revision_id: str) -> None:
+        with self._connection() as conn:
+            result = conn.execute(
+                """
+                UPDATE semantic_index_revisions
+                SET status = 'failed', completed_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND status = 'staging'
+                """,
+                (revision_id,),
+            )
+            if result.rowcount != 1:
+                raise RepositoryError("semantic revision is not staging")
+
+    def get_active_semantic_revision(self, source_id: str) -> dict[str, str | None] | None:
+        with self._read_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT id, source_id, policy_hash, analyzer_version, status, started_at, completed_at
+                FROM semantic_index_revisions
+                WHERE source_id = ? AND status = 'active'
+                """,
+                (source_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            return {
+                "id": self._required_text(row, "id"),
+                "source_id": self._required_text(row, "source_id"),
+                "policy_hash": self._required_text(row, "policy_hash"),
+                "analyzer_version": self._required_text(row, "analyzer_version"),
+                "status": self._required_text(row, "status"),
+                "started_at": self._optional_text(row, "started_at"),
+                "completed_at": self._optional_text(row, "completed_at"),
+            }
+        except (KeyError, TypeError, ValueError) as error:
+            raise self._semantic_error() from error
+
+    def list_semantic_nodes(self, revision_id: str) -> list[dict[str, object]]:
+        with self._read_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT node_id, source_id, node_kind, parent_node_id, display_name,
+                       relative_hierarchy, content_fingerprint, semantic_summary,
+                       semantic_roles_json, topics_json, evidence_ids_json,
+                       analysis_status, analyzer_version
+                FROM semantic_nodes
+                WHERE revision_id = ?
+                ORDER BY relative_hierarchy, node_id
+                """,
+                (revision_id,),
+            ).fetchall()
+        try:
+            return [
+                {
+                    "node_id": self._required_text(row, "node_id"),
+                    "source_id": self._required_text(row, "source_id"),
+                    "node_kind": self._required_text(row, "node_kind"),
+                    "parent_node_id": self._optional_text(row, "parent_node_id"),
+                    "display_name": self._required_text(row, "display_name"),
+                    "relative_hierarchy": self._required_text(row, "relative_hierarchy"),
+                    "content_fingerprint": self._optional_text(row, "content_fingerprint"),
+                    "semantic_summary": self._required_text(row, "semantic_summary"),
+                    "semantic_roles": self._required_text_list(row, "semantic_roles_json"),
+                    "topics": self._required_text_list(row, "topics_json"),
+                    "evidence_ids": self._required_int_list(row, "evidence_ids_json"),
+                    "analysis_status": self._required_text(row, "analysis_status"),
+                    "analyzer_version": self._required_text(row, "analyzer_version"),
+                }
+                for row in rows
+            ]
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise self._semantic_error() from error
 
     def upsert_source(self, source: Source) -> int:
         with self._connection() as conn:
@@ -734,7 +1160,7 @@ class SQLiteRepository:
                 activity.state_field,
             )
             if {"origin_type", "origin_visibility"} <= columns:
-                values = (*values, origin_type, origin_visibility)
+                values = (*values, origin_type, origin_visibility, int(activity.is_current))
                 if activity.source_id is not None:
                     conn.execute(
                         """
@@ -784,7 +1210,7 @@ class SQLiteRepository:
                             source_id = ?, repo = ?, activity_type = ?, url = ?,
                             title = ?, state = ?, author = ?, created_at = ?,
                             merged_at = ?, is_private = ?, state_field = ?,
-                            origin_type = ?, origin_visibility = ?
+                            origin_type = ?, origin_visibility = ?, is_current = ?
                         WHERE id = ?
                         """,
                         (*values, survivor_id),
@@ -807,8 +1233,8 @@ class SQLiteRepository:
                         INSERT INTO github_activities
                             (source_id, repo, activity_type, url, title, state, author,
                              created_at, merged_at, is_private, state_field,
-                             origin_type, origin_visibility)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                             origin_type, origin_visibility, is_current)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         values,
                     )
@@ -834,6 +1260,76 @@ class SQLiteRepository:
     def invalidate_github_activity_visibility(self) -> None:
         with self._connection() as conn:
             conn.execute("UPDATE github_activities SET is_private = 1")
+
+    def invalidate_unobserved_github_activities(
+        self,
+        observed_activities: tuple[tuple[str, str, str], ...],
+    ) -> None:
+        with self._connection() as conn:
+            conn.execute("DROP TABLE IF EXISTS temp.observed_github_activity_keys")
+            conn.execute(
+                """
+                CREATE TEMP TABLE observed_github_activity_keys (
+                    repo TEXT COLLATE NOCASE NOT NULL,
+                    activity_type TEXT NOT NULL,
+                    url TEXT COLLATE NOCASE NOT NULL,
+                    PRIMARY KEY (repo, activity_type, url)
+                )
+                """
+            )
+            try:
+                conn.executemany(
+                    """
+                    INSERT OR IGNORE INTO observed_github_activity_keys
+                        (repo, activity_type, url)
+                    VALUES (?, ?, ?)
+                    """,
+                    observed_activities,
+                )
+                stale_clause = """
+                    NOT EXISTS (
+                        SELECT 1
+                        FROM temp.observed_github_activity_keys AS observed
+                        WHERE observed.repo = github_activities.repo
+                          AND observed.activity_type = github_activities.activity_type
+                          AND observed.url = github_activities.url
+                    )
+                """
+                conn.execute(
+                    f"""
+                    UPDATE github_activities
+                    SET is_private = 1,
+                        is_current = 0
+                    WHERE {stale_clause}
+                    """
+                )
+                conn.execute(
+                    f"""
+                    UPDATE evidence_items
+                    SET public_safe = 0
+                    WHERE github_activity_id IN (
+                        SELECT id FROM github_activities
+                        WHERE {stale_clause}
+                    )
+                    """
+                )
+                conn.execute(
+                    f"""
+                    UPDATE career_claims
+                    SET public_safe = 0
+                    WHERE id IN (
+                        SELECT claim_evidence.claim_id
+                        FROM claim_evidence
+                        JOIN evidence_items
+                          ON evidence_items.id = claim_evidence.evidence_id
+                        JOIN github_activities
+                          ON github_activities.id = evidence_items.github_activity_id
+                        WHERE {stale_clause}
+                    )
+                    """
+                )
+            finally:
+                conn.execute("DROP TABLE temp.observed_github_activity_keys")
 
     def invalidate_unconfirmed_github_activity_visibility(
         self,
@@ -878,7 +1374,38 @@ class SQLiteRepository:
         )
         with self._connection() as conn:
             conn.execute(
-                f"UPDATE github_activities SET is_private = 1 WHERE {predicates}",
+                f"""
+                UPDATE github_activities
+                SET is_private = 1,
+                    is_current = 0
+                WHERE {predicates}
+                """,
+                parameters,
+            )
+            conn.execute(
+                f"""
+                UPDATE evidence_items
+                SET public_safe = 0
+                WHERE github_activity_id IN (
+                    SELECT id FROM github_activities WHERE {predicates}
+                )
+                """,
+                parameters,
+            )
+            conn.execute(
+                f"""
+                UPDATE career_claims
+                SET public_safe = 0
+                WHERE id IN (
+                    SELECT claim_evidence.claim_id
+                    FROM claim_evidence
+                    JOIN evidence_items
+                      ON evidence_items.id = claim_evidence.evidence_id
+                    JOIN github_activities
+                      ON github_activities.id = evidence_items.github_activity_id
+                    WHERE {predicates}
+                )
+                """,
                 parameters,
             )
 
@@ -893,7 +1420,8 @@ class SQLiteRepository:
                 f"""
                 SELECT id, source_id, repo, activity_type, url, title, state, author,
                        created_at, merged_at, is_private, state_field,
-                       {origin_type} AS origin_type, {origin_visibility} AS origin_visibility
+                       {origin_type} AS origin_type, {origin_visibility} AS origin_visibility,
+                       is_current
                 FROM github_activities
                 ORDER BY id
                 """
@@ -918,6 +1446,7 @@ class SQLiteRepository:
                         state_field=self._optional_text(row, "state_field"),
                         origin_type=self._required_text(row, "origin_type"),
                         origin_visibility=self._required_text(row, "origin_visibility"),
+                        is_current=bool(self._required_boolean(row, "is_current")),
                     )
                 )
             return activities
@@ -962,6 +1491,7 @@ class SQLiteRepository:
                     github_activities.author AS activity_author,
                     github_activities.created_at AS activity_created_at,
                     github_activities.is_private AS activity_is_private,
+                    github_activities.is_current AS activity_is_current,
                     github_activities.origin_type AS activity_origin_type,
                     github_activities.origin_visibility AS activity_origin_visibility
                 FROM projects
@@ -991,6 +1521,11 @@ class SQLiteRepository:
                     if activity_id is None
                     else self._required_boolean(row, "activity_is_private")
                 )
+                activity_is_current = (
+                    None
+                    if activity_id is None
+                    else bool(self._required_boolean(row, "activity_is_current"))
+                )
                 records.append(
                     PublicEvidenceRecord(
                         project_id=self._required_int(row, "project_id"),
@@ -1015,6 +1550,7 @@ class SQLiteRepository:
                         activity_author=self._optional_text(row, "activity_author"),
                         activity_created_at=self._optional_text(row, "activity_created_at"),
                         activity_is_private=activity_is_private,
+                        activity_is_current=activity_is_current,
                         evidence_origin_type=self._required_text(row, "evidence_origin_type"),
                         evidence_origin_visibility=self._required_text(
                             row, "evidence_origin_visibility"
@@ -1035,6 +1571,375 @@ class SQLiteRepository:
 
     def list_evidence_selection_records(self) -> list[PublicEvidenceRecord]:
         return self.list_public_evidence_records(include_unsafe=True)
+
+    def replace_portfolio_projects(
+        self,
+        projects: tuple[dict[str, object], ...],
+        approval_sha256: str,
+        review_input_sha256: str,
+    ) -> None:
+        """Replace only the user-approved semantic project graph atomically."""
+        with self._connection() as conn:
+            conn.execute("DELETE FROM portfolio_project_evidence")
+            conn.execute("DELETE FROM portfolio_projects")
+            for project in projects:
+                project_id = project.get("id")
+                title = project.get("title")
+                overview = project.get("overview")
+                evidence_ids = project.get("evidence_ids")
+                if not all(isinstance(value, str) for value in (project_id, title, overview)):
+                    raise RepositoryError("semantic project values are invalid")
+                if not isinstance(evidence_ids, (tuple, list)):
+                    raise RepositoryError("semantic project evidence is invalid")
+                conn.execute(
+                    """
+                    INSERT INTO portfolio_projects
+                        (id, title, overview, status, approval_sha256, review_input_sha256)
+                    VALUES (?, ?, ?, 'approved', ?, ?)
+                    """,
+                    (project_id, title, overview, approval_sha256, review_input_sha256),
+                )
+                for evidence_id in evidence_ids:
+                    if not isinstance(evidence_id, int) or isinstance(evidence_id, bool):
+                        raise RepositoryError("semantic project evidence is invalid")
+                    conn.execute(
+                        """
+                        INSERT INTO portfolio_project_evidence
+                            (project_id, evidence_id, support_level)
+                        VALUES (?, ?, 'direct')
+                        """,
+                        (project_id, evidence_id),
+                    )
+
+    def replace_portfolio_project_decisions(
+        self,
+        projects: tuple[dict[str, object], ...],
+        *,
+        candidate_input_sha256: str,
+        index_revision: str,
+    ) -> None:
+        """Upsert current v2 decisions without reinterpreting legacy projects."""
+        normalized = self._normalize_portfolio_project_decisions(
+            projects,
+            candidate_input_sha256=candidate_input_sha256,
+            index_revision=index_revision,
+        )
+        with self._connection() as conn:
+            existing_rows = conn.execute(
+                """
+                SELECT id, decision_status, decision_origin, boundary_fingerprint
+                FROM portfolio_projects
+                """
+            ).fetchall()
+            existing = {
+                self._required_text(row, "id"): {
+                    "decision_status": self._required_text(row, "decision_status"),
+                    "decision_origin": self._required_text(row, "decision_origin"),
+                    "boundary_fingerprint": self._optional_text(row, "boundary_fingerprint"),
+                }
+                for row in existing_rows
+            }
+            manual_exclusions_by_boundary = {
+                state["boundary_fingerprint"]
+                for state in existing.values()
+                if state["decision_status"] == "excluded"
+                and state["decision_origin"] == "manual"
+                and state["boundary_fingerprint"] is not None
+            }
+
+            for project in normalized:
+                project_id = project["id"]
+                current = existing.get(project_id)
+                state = self._resolved_portfolio_project_decision_state(
+                    project,
+                    current=current,
+                    existing=existing,
+                    manual_exclusions_by_boundary=manual_exclusions_by_boundary,
+                )
+                conn.execute(
+                    """
+                    INSERT INTO portfolio_projects (
+                        id, title, overview, status, approval_sha256, review_input_sha256,
+                        decision_status, decision_origin, confidence, boundary_fingerprint,
+                        candidate_input_sha256, index_revision, decision_updated_at
+                    )
+                    VALUES (?, ?, ?, 'approved', ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(id) DO UPDATE SET
+                        title = excluded.title,
+                        overview = excluded.overview,
+                        approval_sha256 = excluded.approval_sha256,
+                        review_input_sha256 = excluded.review_input_sha256,
+                        decision_status = excluded.decision_status,
+                        decision_origin = excluded.decision_origin,
+                        confidence = excluded.confidence,
+                        boundary_fingerprint = excluded.boundary_fingerprint,
+                        candidate_input_sha256 = excluded.candidate_input_sha256,
+                        index_revision = excluded.index_revision,
+                        decision_updated_at = CURRENT_TIMESTAMP,
+                        updated_at = CURRENT_TIMESTAMP
+                    """,
+                    (
+                        project_id,
+                        project["title"],
+                        project["overview"],
+                        project["approval_sha256"],
+                        project["review_input_sha256"],
+                        state["decision_status"],
+                        state["decision_origin"],
+                        project["confidence"],
+                        project["boundary_fingerprint"],
+                        candidate_input_sha256,
+                        index_revision,
+                    ),
+                )
+                conn.execute(
+                    "DELETE FROM portfolio_project_evidence WHERE project_id = ?",
+                    (project_id,),
+                )
+                for evidence_id in project["evidence_ids"]:
+                    conn.execute(
+                        """
+                        DELETE FROM portfolio_project_evidence
+                        WHERE evidence_id = ? AND project_id != ?
+                        """,
+                        (evidence_id, project_id),
+                    )
+                    conn.execute(
+                        """
+                        INSERT INTO portfolio_project_evidence
+                            (project_id, evidence_id, support_level)
+                        VALUES (?, ?, 'direct')
+                        """,
+                        (project_id, evidence_id),
+                    )
+
+            current_ids = tuple(project["id"] for project in normalized)
+            if current_ids:
+                placeholders = ", ".join("?" for _ in current_ids)
+                conn.execute(
+                    f"""
+                    UPDATE portfolio_projects
+                    SET decision_status = 'inactive',
+                        decision_updated_at = CURRENT_TIMESTAMP,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE decision_origin = 'automatic'
+                      AND decision_status != 'inactive'
+                      AND id NOT IN ({placeholders})
+                    """,
+                    current_ids,
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE portfolio_projects
+                    SET decision_status = 'inactive',
+                        decision_updated_at = CURRENT_TIMESTAMP,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE decision_origin = 'automatic'
+                      AND decision_status != 'inactive'
+                    """
+                )
+
+    def set_project_decision_state(self, project_id: str, state: str) -> None:
+        if not isinstance(project_id, str) or not project_id:
+            raise RepositoryError("portfolio project ID is invalid")
+        if state not in {"excluded", "included"}:
+            raise RepositoryError("portfolio project decision state is invalid")
+        decision_status = "excluded" if state == "excluded" else "manually_approved"
+        with self._connection() as conn:
+            result = conn.execute(
+                """
+                UPDATE portfolio_projects
+                SET decision_status = ?,
+                    decision_origin = 'manual',
+                    decision_updated_at = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (decision_status, project_id),
+            )
+            if result.rowcount != 1:
+                raise RepositoryError("portfolio project is unknown")
+
+    @classmethod
+    def _normalize_portfolio_project_decisions(
+        cls,
+        projects: tuple[dict[str, object], ...],
+        *,
+        candidate_input_sha256: str,
+        index_revision: str,
+    ) -> tuple[dict[str, object], ...]:
+        if not isinstance(candidate_input_sha256, str) or not candidate_input_sha256:
+            raise RepositoryError("candidate input hash is invalid")
+        if not isinstance(index_revision, str) or not index_revision:
+            raise RepositoryError("semantic index revision is invalid")
+
+        normalized: list[dict[str, object]] = []
+        project_ids: set[str] = set()
+        evidence_project_ids: dict[int, str] = {}
+        for project in projects:
+            if not isinstance(project, dict):
+                raise RepositoryError("portfolio project decision is invalid")
+            values = {
+                field: project.get(field)
+                for field in (
+                    "id",
+                    "title",
+                    "overview",
+                    "approval_sha256",
+                    "review_input_sha256",
+                    "decision_status",
+                    "decision_origin",
+                    "boundary_fingerprint",
+                )
+            }
+            if not all(isinstance(value, str) and value for value in values.values()):
+                raise RepositoryError("portfolio project decision is invalid")
+            project_id = values["id"]
+            if project_id in project_ids:
+                raise RepositoryError("portfolio project decisions must be unique")
+            project_ids.add(project_id)
+
+            decision_status = values["decision_status"]
+            decision_origin = values["decision_origin"]
+            if decision_status not in _PORTFOLIO_PROJECT_DECISION_STATUSES:
+                raise RepositoryError("portfolio project decision status is invalid")
+            if decision_origin not in _PORTFOLIO_PROJECT_DECISION_ORIGINS:
+                raise RepositoryError("portfolio project decision origin is invalid")
+            confidence = project.get("confidence")
+            if confidence is not None and confidence not in _PORTFOLIO_PROJECT_CONFIDENCE_LEVELS:
+                raise RepositoryError("portfolio project confidence is invalid")
+            evidence_ids = project.get("evidence_ids")
+            if (
+                not isinstance(evidence_ids, (tuple, list))
+                or any(
+                    not isinstance(evidence_id, int)
+                    or isinstance(evidence_id, bool)
+                    or evidence_id <= 0
+                    for evidence_id in evidence_ids
+                )
+                or len(set(evidence_ids)) != len(evidence_ids)
+            ):
+                raise RepositoryError("portfolio project evidence is invalid")
+            for evidence_id in evidence_ids:
+                if evidence_id in evidence_project_ids:
+                    raise RepositoryError("portfolio project evidence must be unique")
+                evidence_project_ids[evidence_id] = project_id
+            lineage_project_ids = project.get("lineage_project_ids", ())
+            if (
+                not isinstance(lineage_project_ids, (tuple, list))
+                or any(not isinstance(value, str) or not value for value in lineage_project_ids)
+                or len(set(lineage_project_ids)) != len(lineage_project_ids)
+            ):
+                raise RepositoryError("portfolio project lineage is invalid")
+            normalized.append(
+                {
+                    **values,
+                    "confidence": confidence,
+                    "evidence_ids": tuple(evidence_ids),
+                    "lineage_project_ids": tuple(lineage_project_ids),
+                }
+            )
+        return tuple(normalized)
+
+    @staticmethod
+    def _resolved_portfolio_project_decision_state(
+        project: dict[str, object],
+        *,
+        current: dict[str, str | None] | None,
+        existing: dict[str, dict[str, str | None]],
+        manual_exclusions_by_boundary: set[str | None],
+    ) -> dict[str, str]:
+        incoming_status = str(project["decision_status"])
+        incoming_origin = str(project["decision_origin"])
+        boundary_fingerprint = str(project["boundary_fingerprint"])
+        lineage_project_ids = project["lineage_project_ids"]
+        if not isinstance(lineage_project_ids, tuple):
+            raise RepositoryError("portfolio project lineage is invalid")
+        lineage = [existing.get(project_id) for project_id in lineage_project_ids]
+        states = [state for state in (current, *lineage) if state is not None]
+        boundary_changed = any(
+            state is not None
+            and state["boundary_fingerprint"] != boundary_fingerprint
+            for state in states
+        )
+        if boundary_changed:
+            return {"decision_status": "review_required", "decision_origin": "automatic"}
+        if (
+            current is not None
+            and current["decision_origin"] == "manual"
+            and current["decision_status"] in {"excluded", "manually_approved"}
+        ):
+            return {
+                "decision_status": str(current["decision_status"]),
+                "decision_origin": "manual",
+            }
+        if boundary_fingerprint in manual_exclusions_by_boundary:
+            return {"decision_status": "excluded", "decision_origin": "manual"}
+        if current is not None and current["decision_status"] == "review_required":
+            return {"decision_status": "review_required", "decision_origin": "automatic"}
+        if lineage_project_ids:
+            return {"decision_status": "review_required", "decision_origin": "automatic"}
+        return {"decision_status": incoming_status, "decision_origin": incoming_origin}
+
+    def list_portfolio_projects(self, *, active_only: bool = True) -> list[dict[str, object]]:
+        active_clause = ""
+        parameters: tuple[str, ...] = ()
+        if active_only:
+            placeholders = ", ".join("?" for _ in _ACTIVE_PORTFOLIO_PROJECT_DECISION_STATUSES)
+            active_clause = f"WHERE decision_status IN ({placeholders})"
+            parameters = _ACTIVE_PORTFOLIO_PROJECT_DECISION_STATUSES
+        with self._read_connection() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT id, title, overview, status, approval_sha256,
+                       review_input_sha256, decision_status, decision_origin,
+                       confidence, boundary_fingerprint, candidate_input_sha256,
+                       index_revision, decision_updated_at, created_at, updated_at
+                FROM portfolio_projects
+                {active_clause}
+                ORDER BY id
+                """,
+                parameters,
+            ).fetchall()
+            links = conn.execute(
+                """
+                SELECT project_id, evidence_id, support_level
+                FROM portfolio_project_evidence
+                ORDER BY project_id, evidence_id
+                """
+            ).fetchall()
+        grouped: dict[str, list[dict[str, object]]] = {}
+        for link in links:
+            project_id = self._required_text(link, "project_id")
+            grouped.setdefault(project_id, []).append(
+                {
+                    "evidence_id": self._required_int(link, "evidence_id"),
+                    "support_level": self._required_text(link, "support_level"),
+                }
+            )
+        try:
+            return [
+                {
+                    "id": self._required_text(row, "id"),
+                    "title": self._required_text(row, "title"),
+                    "overview": self._required_text(row, "overview"),
+                    "status": self._required_text(row, "status"),
+                    "approval_sha256": self._required_text(row, "approval_sha256"),
+                    "review_input_sha256": self._required_text(row, "review_input_sha256"),
+                    "decision_status": self._required_text(row, "decision_status"),
+                    "decision_origin": self._required_text(row, "decision_origin"),
+                    "confidence": self._optional_text(row, "confidence"),
+                    "boundary_fingerprint": self._optional_text(row, "boundary_fingerprint"),
+                    "candidate_input_sha256": self._optional_text(row, "candidate_input_sha256"),
+                    "index_revision": self._optional_text(row, "index_revision"),
+                    "decision_updated_at": self._optional_text(row, "decision_updated_at"),
+                    "evidence": grouped.get(self._required_text(row, "id"), []),
+                }
+                for row in rows
+            ]
+        except (KeyError, TypeError, ValueError) as error:
+            raise self._semantic_error() from error
 
     def upsert_evidence_item(
         self,
@@ -1457,6 +2362,20 @@ class SQLiteRepository:
         value = row[name]
         if not isinstance(value, str):
             raise TypeError(f"{name} must be text")
+        return value
+
+    @classmethod
+    def _required_text_list(cls, row: sqlite3.Row, name: str) -> list[str]:
+        value = json.loads(cls._required_text(row, name))
+        if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+            raise TypeError(f"{name} must be a text list")
+        return value
+
+    @classmethod
+    def _required_int_list(cls, row: sqlite3.Row, name: str) -> list[int]:
+        value = json.loads(cls._required_text(row, name))
+        if not isinstance(value, list) or not all(type(item) is int for item in value):
+            raise TypeError(f"{name} must be an integer list")
         return value
 
     @staticmethod

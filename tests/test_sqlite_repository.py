@@ -9,6 +9,12 @@ from stat import S_IMODE
 import pytest
 
 from portfolio_maker.domain.models import GitHubActivity, Source, SourceStatus, SourceType
+from portfolio_maker.domain.semantic_models import (
+    AnalysisStatus,
+    SemanticEdge,
+    SemanticNode,
+    SemanticNodeKind,
+)
 import portfolio_maker.infrastructure.sqlite_repository as sqlite_repository_module
 from portfolio_maker.infrastructure.sqlite_repository import RepositoryError, SQLiteRepository
 from portfolio_maker.workspace import WorkspacePaths
@@ -46,6 +52,88 @@ def test_sqlite_repository_initialize_creates_schema_tables(workspace):
         "source_snapshots",
         "github_activities",
     } <= repository.table_names()
+
+
+def test_semantic_revision_activation_is_atomic_and_supersedes_previous(workspace) -> None:
+    repository = SQLiteRepository(WorkspacePaths.from_root(workspace).db_path)
+    repository.initialize()
+
+    repository.create_semantic_revision("rev-1", "source-1", "a" * 64, "semantic-v1")
+    repository.activate_semantic_revision("rev-1")
+    repository.create_semantic_revision("rev-2", "source-1", "a" * 64, "semantic-v1")
+    repository.activate_semantic_revision("rev-2")
+
+    active = repository.get_active_semantic_revision("source-1")
+
+    assert {
+        "semantic_index_revisions",
+        "semantic_nodes",
+        "semantic_node_locators",
+        "semantic_edges",
+    } <= repository.table_names()
+    assert active is not None
+    assert active["id"] == "rev-2"
+
+
+def test_failed_staging_semantic_revision_keeps_previous_active(workspace) -> None:
+    repository = SQLiteRepository(WorkspacePaths.from_root(workspace).db_path)
+    repository.initialize()
+    repository.create_semantic_revision("rev-1", "source-1", "a" * 64, "semantic-v1")
+    repository.activate_semantic_revision("rev-1")
+    repository.create_semantic_revision("rev-2", "source-1", "a" * 64, "semantic-v1")
+
+    repository.fail_semantic_revision("rev-2")
+
+    active = repository.get_active_semantic_revision("source-1")
+    assert active is not None
+    assert active["id"] == "rev-1"
+
+
+def test_semantic_revision_graph_persists_locator_separately_from_listed_nodes(workspace) -> None:
+    repository = SQLiteRepository(WorkspacePaths.from_root(workspace).db_path)
+    repository.initialize()
+    repository.create_semantic_revision("rev-1", "source-1", "a" * 64, "semantic-v1")
+    node = SemanticNode(
+        node_id="node-1",
+        source_id="source-1",
+        node_kind=SemanticNodeKind.FILE,
+        parent_node_id=None,
+        display_name="README.md",
+        relative_hierarchy="README.md",
+        content_fingerprint="sha256:content",
+        semantic_summary="Project overview",
+        semantic_roles=("documentation",),
+        topics=("portfolio",),
+        evidence_ids=(1,),
+        analysis_status=AnalysisStatus.COMPLETE,
+        analyzer_version="semantic-v1",
+        updated_at="2026-07-14T00:00:00Z",
+    )
+
+    repository.replace_semantic_revision_graph(
+        "rev-1",
+        (node,),
+        {"node-1": ("/private/workspace/README.md", 10, 20)},
+        (SemanticEdge("rev-1", "node-1", "relates_to", "node-1", "high"),),
+    )
+
+    assert repository.list_semantic_nodes("rev-1") == [
+        {
+            "node_id": "node-1",
+            "source_id": "source-1",
+            "node_kind": "file",
+            "parent_node_id": None,
+            "display_name": "README.md",
+            "relative_hierarchy": "README.md",
+            "content_fingerprint": "sha256:content",
+            "semantic_summary": "Project overview",
+            "semantic_roles": ["documentation"],
+            "topics": ["portfolio"],
+            "evidence_ids": [1],
+            "analysis_status": "complete",
+            "analyzer_version": "semantic-v1",
+        }
+    ]
 
 
 def test_sqlite_repository_keeps_schema_creation_inside_guarded_transaction(
@@ -106,6 +194,451 @@ def test_sqlite_repository_adds_evidence_origin_columns(workspace):
         "origin_type",
         "origin_visibility",
     } <= column_names(repository, "evidence_items")
+
+
+def test_legacy_approved_project_migrates_to_manually_approved(workspace) -> None:
+    paths = WorkspacePaths.from_root(workspace)
+    paths.ensure()
+    with sqlite3.connect(paths.db_path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE portfolio_projects (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                overview TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status = 'approved'),
+                approval_sha256 TEXT NOT NULL,
+                review_input_sha256 TEXT NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE portfolio_project_evidence (
+                project_id TEXT NOT NULL REFERENCES portfolio_projects(id) ON DELETE CASCADE,
+                evidence_id INTEGER NOT NULL,
+                support_level TEXT NOT NULL CHECK(support_level IN ('direct', 'contextual')),
+                PRIMARY KEY (project_id, evidence_id),
+                UNIQUE (evidence_id)
+            );
+            INSERT INTO portfolio_projects
+                (id, title, overview, status, approval_sha256, review_input_sha256)
+            VALUES ('insurance-rag', 'Insurance RAG', 'Grounded overview', 'approved', 'a', 'b');
+            """
+        )
+
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+
+    assert repository.list_portfolio_projects()[0]["decision_status"] == "manually_approved"
+    assert repository.list_portfolio_projects()[0]["decision_origin"] == "manual"
+
+
+def test_copied_010_schema_migration_preserves_legacy_project_and_evidence(workspace) -> None:
+    paths = WorkspacePaths.from_root(workspace)
+    paths.ensure()
+    with sqlite3.connect(paths.db_path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE sources (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                type TEXT NOT NULL,
+                uri TEXT NOT NULL UNIQUE,
+                display_name TEXT NOT NULL,
+                owner TEXT,
+                status TEXT NOT NULL,
+                discovered_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                approved_at TEXT
+            );
+            CREATE TABLE source_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_id INTEGER NOT NULL,
+                snapshot_path TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                extractor TEXT NOT NULL,
+                extracted_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE github_activities (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_id INTEGER,
+                repo TEXT NOT NULL,
+                activity_type TEXT NOT NULL,
+                url TEXT NOT NULL,
+                title TEXT NOT NULL,
+                state TEXT NOT NULL,
+                author TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                merged_at TEXT,
+                UNIQUE(repo, activity_type, url)
+            );
+            CREATE TABLE evidence_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_id INTEGER,
+                snapshot_id INTEGER,
+                github_activity_id INTEGER,
+                locator TEXT NOT NULL
+            );
+            CREATE TABLE projects (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE
+            );
+            CREATE TABLE career_claims (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER,
+                text TEXT NOT NULL
+            );
+            CREATE TABLE claim_evidence (
+                claim_id INTEGER NOT NULL,
+                evidence_id INTEGER NOT NULL,
+                support_level TEXT NOT NULL,
+                PRIMARY KEY (claim_id, evidence_id)
+            );
+            CREATE TABLE artifacts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                type TEXT NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE portfolio_projects (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                overview TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status = 'approved'),
+                approval_sha256 TEXT NOT NULL,
+                review_input_sha256 TEXT NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE portfolio_project_evidence (
+                project_id TEXT NOT NULL,
+                evidence_id INTEGER NOT NULL,
+                support_level TEXT NOT NULL,
+                PRIMARY KEY (project_id, evidence_id)
+            );
+            INSERT INTO sources (type, uri, display_name, status)
+            VALUES ('local_file', 'file:///synthetic/legacy/README.md', 'README.md', 'ingested');
+            INSERT INTO evidence_items (source_id, locator)
+            VALUES (1, 'file:///synthetic/legacy/README.md');
+            INSERT INTO portfolio_projects
+                (id, title, overview, status, approval_sha256, review_input_sha256)
+            VALUES
+                ('legacy-insurance', 'Legacy Insurance', 'Legacy grounded overview',
+                 'approved', 'legacy-approval', 'legacy-review');
+            INSERT INTO portfolio_project_evidence (project_id, evidence_id, support_level)
+            VALUES ('legacy-insurance', 1, 'direct');
+            """
+        )
+
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+
+    projects = repository.list_portfolio_projects(active_only=False)
+    with repository._read_connection() as connection:
+        evidence = connection.execute(
+            "SELECT id, locator, stable_id FROM evidence_items"
+        ).fetchall()
+        links = connection.execute(
+            "SELECT project_id, evidence_id, support_level FROM portfolio_project_evidence"
+        ).fetchall()
+
+    assert projects[0]["id"] == "legacy-insurance"
+    assert projects[0]["title"] == "Legacy Insurance"
+    assert projects[0]["overview"] == "Legacy grounded overview"
+    assert projects[0]["decision_status"] == "manually_approved"
+    assert projects[0]["decision_origin"] == "manual"
+    assert [(row["id"], row["locator"]) for row in evidence] == [
+        (1, "file:///synthetic/legacy/README.md")
+    ]
+    assert evidence[0]["stable_id"] == "legacy-evidence:1"
+    assert [(row["project_id"], row["evidence_id"], row["support_level"]) for row in links] == [
+        ("legacy-insurance", 1, "direct")
+    ]
+
+
+def test_excluded_project_keeps_links_but_disappears_from_active_list(tmp_path: Path) -> None:
+    repository, evidence_id = populated_portfolio_project_repository(tmp_path)
+
+    repository.set_project_decision_state("insurance-rag", "excluded")
+
+    assert repository.list_portfolio_projects(active_only=True) == []
+    excluded = repository.list_portfolio_projects(active_only=False)
+    assert excluded[0]["decision_status"] == "excluded"
+    assert excluded[0]["evidence"] == [
+        {"evidence_id": evidence_id, "support_level": "direct"}
+    ]
+
+    repository.set_project_decision_state("insurance-rag", "included")
+
+    assert [project["id"] for project in repository.list_portfolio_projects()] == [
+        "insurance-rag"
+    ]
+
+
+def test_replacing_decisions_marks_missing_automatic_project_inactive(tmp_path: Path) -> None:
+    repository, _ = populated_portfolio_project_repository(tmp_path)
+    repository.replace_portfolio_project_decisions(
+        (),
+        candidate_input_sha256="c" * 64,
+        index_revision="revision-2",
+    )
+
+    projects = repository.list_portfolio_projects(active_only=False)
+    assert projects[0]["decision_status"] == "inactive"
+    assert repository.list_portfolio_projects(active_only=True) == []
+
+
+def test_replacing_decisions_preserves_manual_exclusion_for_same_boundary(tmp_path: Path) -> None:
+    repository, evidence_id = populated_portfolio_project_repository(tmp_path)
+    repository.set_project_decision_state("insurance-rag", "excluded")
+
+    repository.replace_portfolio_project_decisions(
+        (
+            decision_project(
+                "insurance-rag",
+                evidence_id,
+                boundary_fingerprint="sha256:insurance-rag",
+            ),
+        ),
+        candidate_input_sha256="c" * 64,
+        index_revision="revision-2",
+    )
+
+    project = repository.list_portfolio_projects(active_only=False)[0]
+    assert project["decision_status"] == "excluded"
+    assert project["decision_origin"] == "manual"
+
+
+def test_replacing_decisions_requires_review_when_existing_identity_changes_boundary(
+    tmp_path: Path,
+) -> None:
+    repository, evidence_id = populated_portfolio_project_repository(tmp_path)
+    repository.set_project_decision_state("insurance-rag", "excluded")
+
+    repository.replace_portfolio_project_decisions(
+        (
+            decision_project(
+                "insurance-rag",
+                evidence_id,
+                boundary_fingerprint="sha256:split-boundary",
+            ),
+        ),
+        candidate_input_sha256="c" * 64,
+        index_revision="revision-2",
+    )
+
+    project = repository.list_portfolio_projects(active_only=False)[0]
+    assert project["decision_status"] == "review_required"
+    assert repository.list_portfolio_projects(active_only=True) == []
+
+
+def test_replacing_decisions_keeps_automatic_split_lineage_review_required_on_repeat(
+    tmp_path: Path,
+) -> None:
+    repository, evidence_id = populated_portfolio_project_repository(tmp_path)
+    split_project = decision_project(
+        "insurance-rag-child",
+        evidence_id,
+        boundary_fingerprint="sha256:insurance-rag-child",
+    )
+    split_project["evidence_ids"] = ()
+    split_project["lineage_project_ids"] = ("insurance-rag",)
+
+    repository.replace_portfolio_project_decisions(
+        (split_project,),
+        candidate_input_sha256="c" * 64,
+        index_revision="revision-2",
+    )
+    repository.replace_portfolio_project_decisions(
+        (split_project,),
+        candidate_input_sha256="c" * 64,
+        index_revision="revision-2",
+    )
+
+    project = next(
+        project
+        for project in repository.list_portfolio_projects(active_only=False)
+        if project["id"] == "insurance-rag-child"
+    )
+    assert project["decision_status"] == "review_required"
+    assert project["decision_origin"] == "automatic"
+    assert repository.list_portfolio_projects(active_only=True) == []
+
+
+def test_replacing_decisions_keeps_automatic_merge_lineage_review_required_on_repeat(
+    tmp_path: Path,
+) -> None:
+    repository, evidence_id = populated_portfolio_project_repository(tmp_path)
+    second_evidence_id = additional_evidence_item(repository, "second")
+    repository.replace_portfolio_project_decisions(
+        (
+            decision_project("insurance-rag", evidence_id),
+            decision_project("insurance-rag-second", second_evidence_id),
+        ),
+        candidate_input_sha256="c" * 64,
+        index_revision="revision-2",
+    )
+    merged_project = decision_project(
+        "insurance-rag-merged",
+        evidence_id,
+        boundary_fingerprint="sha256:insurance-rag-merged",
+    )
+    merged_project["evidence_ids"] = ()
+    merged_project["lineage_project_ids"] = (
+        "insurance-rag",
+        "insurance-rag-second",
+    )
+
+    repository.replace_portfolio_project_decisions(
+        (merged_project,),
+        candidate_input_sha256="c" * 64,
+        index_revision="revision-3",
+    )
+    repository.replace_portfolio_project_decisions(
+        (merged_project,),
+        candidate_input_sha256="c" * 64,
+        index_revision="revision-3",
+    )
+
+    project = next(
+        project
+        for project in repository.list_portfolio_projects(active_only=False)
+        if project["id"] == "insurance-rag-merged"
+    )
+    assert project["decision_status"] == "review_required"
+    assert project["decision_origin"] == "automatic"
+    assert repository.list_portfolio_projects(active_only=True) == []
+
+
+def test_replacing_decisions_reassigns_predecessor_evidence_to_merged_project(
+    tmp_path: Path,
+) -> None:
+    repository, evidence_id = populated_portfolio_project_repository(tmp_path)
+    second_evidence_id = additional_evidence_item(repository, "second")
+    repository.replace_portfolio_project_decisions(
+        (
+            decision_project("insurance-rag", evidence_id),
+            decision_project("insurance-rag-second", second_evidence_id),
+        ),
+        candidate_input_sha256="c" * 64,
+        index_revision="revision-2",
+    )
+    merged_project = decision_project(
+        "insurance-rag-merged",
+        evidence_id,
+        boundary_fingerprint="sha256:insurance-rag-merged",
+    )
+    merged_project["evidence_ids"] = (evidence_id, second_evidence_id)
+    merged_project["lineage_project_ids"] = (
+        "insurance-rag",
+        "insurance-rag-second",
+    )
+
+    repository.replace_portfolio_project_decisions(
+        (merged_project,),
+        candidate_input_sha256="c" * 64,
+        index_revision="revision-3",
+    )
+
+    projects = {
+        project["id"]: project
+        for project in repository.list_portfolio_projects(active_only=False)
+    }
+    assert projects["insurance-rag"]["evidence"] == []
+    assert projects["insurance-rag-second"]["evidence"] == []
+    assert projects["insurance-rag-merged"]["evidence"] == [
+        {"evidence_id": evidence_id, "support_level": "direct"},
+        {"evidence_id": second_evidence_id, "support_level": "direct"},
+    ]
+    with repository._read_connection() as connection:
+        owners = connection.execute(
+            """
+            SELECT evidence_id, project_id
+            FROM portfolio_project_evidence
+            WHERE evidence_id IN (?, ?)
+            ORDER BY evidence_id
+            """,
+            (evidence_id, second_evidence_id),
+        ).fetchall()
+    assert [(row["evidence_id"], row["project_id"]) for row in owners] == [
+        (evidence_id, "insurance-rag-merged"),
+        (second_evidence_id, "insurance-rag-merged"),
+    ]
+
+
+def test_replacing_decisions_rejects_duplicate_current_evidence_without_mutation(
+    tmp_path: Path,
+) -> None:
+    repository, evidence_id = populated_portfolio_project_repository(tmp_path)
+    before = repository.list_portfolio_projects(active_only=False)
+
+    with pytest.raises(RepositoryError, match="portfolio project evidence must be unique"):
+        repository.replace_portfolio_project_decisions(
+            (
+                decision_project("insurance-rag-child-a", evidence_id),
+                decision_project("insurance-rag-child-b", evidence_id),
+            ),
+            candidate_input_sha256="c" * 64,
+            index_revision="revision-2",
+        )
+
+    assert repository.list_portfolio_projects(active_only=False) == before
+
+
+def populated_portfolio_project_repository(tmp_path: Path) -> tuple[SQLiteRepository, int]:
+    repository = SQLiteRepository(tmp_path / ".portfolio-maker" / "portfolio.db")
+    repository.initialize()
+    with repository._connection() as connection:
+        connection.execute(
+            "INSERT INTO sources (type, uri, display_name, status) VALUES ('local_file', ?, 'README.md', 'ingested')",
+            ("file:///tmp/README.md",),
+        )
+        source_id = connection.execute("SELECT id FROM sources").fetchone()[0]
+    evidence_id = repository.upsert_evidence_item(
+        source_id=source_id,
+        snapshot_id=None,
+        github_activity_id=None,
+        locator="file:///tmp/README.md",
+        stable_id="source-snapshot:insurance-rag",
+        content_hash="abc",
+        public_safe=False,
+    )
+    repository.replace_portfolio_project_decisions(
+        (decision_project("insurance-rag", evidence_id),),
+        candidate_input_sha256="c" * 64,
+        index_revision="revision-1",
+    )
+    return repository, evidence_id
+
+
+def additional_evidence_item(repository: SQLiteRepository, suffix: str) -> int:
+    with repository._read_connection() as connection:
+        source_id = connection.execute("SELECT id FROM sources").fetchone()[0]
+    return repository.upsert_evidence_item(
+        source_id=source_id,
+        snapshot_id=None,
+        github_activity_id=None,
+        locator=f"file:///tmp/{suffix}.md",
+        stable_id=f"source-snapshot:insurance-rag:{suffix}",
+        content_hash=suffix,
+        public_safe=False,
+    )
+
+
+def decision_project(
+    project_id: str,
+    evidence_id: int,
+    *,
+    boundary_fingerprint: str = "sha256:insurance-rag",
+) -> dict[str, object]:
+    return {
+        "id": project_id,
+        "title": "Insurance RAG",
+        "overview": "Grounded overview",
+        "evidence_ids": (evidence_id,),
+        "decision_status": "auto_included_high",
+        "decision_origin": "automatic",
+        "confidence": "high",
+        "boundary_fingerprint": boundary_fingerprint,
+        "approval_sha256": "a" * 64,
+        "review_input_sha256": "b" * 64,
+    }
 
 
 def test_sqlite_repository_evidence_relationships_enforce_foreign_keys(workspace):
@@ -350,6 +883,45 @@ def test_sqlite_repository_upserts_github_activity_by_repo_type_and_url(workspac
         rows = conn.execute("SELECT id, title FROM github_activities").fetchall()
     assert second_id == first_id
     assert [(row["id"], row["title"]) for row in rows] == [(first_id, "Updated title")]
+
+
+def test_sqlite_repository_reconciles_large_complete_activity_snapshot(workspace):
+    paths = WorkspacePaths.from_root(workspace)
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    activity_count = 10_001
+    rows = [
+        (
+            "octo/demo",
+            "issue",
+            f"https://github.com/octo/demo/issues/{index}",
+            f"Issue {index}",
+            "OPEN",
+            "octo",
+            "2026-01-01T00:00:00Z",
+            0,
+        )
+        for index in range(1, activity_count + 1)
+    ]
+    with repository._connection() as conn:
+        conn.executemany(
+            """
+            INSERT INTO github_activities
+                (repo, activity_type, url, title, state, author, created_at, is_private)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+
+    repository.invalidate_unobserved_github_activities(
+        tuple((repo, activity_type, url) for repo, activity_type, url, *_ in rows)
+    )
+
+    with repository._read_connection() as conn:
+        stale_count = conn.execute(
+            "SELECT COUNT(*) AS count FROM github_activities WHERE is_current = 0"
+        ).fetchone()["count"]
+    assert stale_count == 0
 
 
 def test_sqlite_repository_legacy_alias_lookup_does_not_scan_unrelated_rows(

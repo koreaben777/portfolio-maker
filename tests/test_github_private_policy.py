@@ -11,7 +11,7 @@ from portfolio_maker.infrastructure.github_connector import (
 )
 
 
-def test_private_discovery_requires_auth_and_exact_activity_approval(monkeypatch):
+def test_private_discovery_reports_allowlisted_activity_without_prior_approval(monkeypatch):
     auth_calls = []
     json_calls = []
     approved_url = "https://github.com/octo/private/pull/7"
@@ -62,13 +62,16 @@ def test_private_discovery_requires_auth_and_exact_activity_approval(monkeypatch
         excluded_repositories=("octo/excluded",),
         allowed_repositories=("octo/private", "octo/excluded"),
         private_sources_allowed=True,
-        approved_private_github_activity_urls=(approved_url,),
+        approved_private_github_activity_urls=(),
     )
 
     assert auth_calls == [True]
     assert [repo.name_with_owner for repo in result.repositories] == ["octo/private"]
-    assert [activity.url for activity in result.activities] == [approved_url]
-    assert result.activities[0].is_private is True
+    assert [activity.url for activity in result.activities] == [
+        approved_url,
+        "https://github.com/octo/private/pull/8",
+    ]
+    assert all(activity.is_private is True for activity in result.activities)
     assert all("octo/excluded" not in " ".join(call) for call in json_calls)
 
 
@@ -86,3 +89,37 @@ def test_private_discovery_auth_failure_is_controlled_without_credentials(monkey
 
     assert "token" not in str(error.value).casefold()
     assert "Bearer" not in str(error.value)
+
+
+def test_private_discovery_requires_nonempty_allowlist_before_activity_calls(monkeypatch):
+    auth_calls = []
+    activity_calls = []
+
+    def fake_auth_status():
+        auth_calls.append(True)
+
+    def fake_run_gh_json(args):
+        if args[:2] == ["repo", "list"]:
+            return [
+                {
+                    "nameWithOwner": "octo/private",
+                    "url": "https://github.com/octo/private",
+                    "isPrivate": True,
+                }
+            ]
+        activity_calls.append(args)
+        return []
+
+    monkeypatch.setattr(github_connector, "run_gh_auth_status", fake_auth_status)
+    monkeypatch.setattr(github_connector, "run_gh_json", fake_run_gh_json)
+
+    result = discover_github_candidates(
+        private_sources_allowed=True,
+        allowed_repositories=(),
+        approved_private_github_activity_urls=(),
+    )
+
+    assert auth_calls == [True]
+    assert result.repositories == []
+    assert result.activities == []
+    assert activity_calls == []

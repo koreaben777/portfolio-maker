@@ -74,6 +74,22 @@ def test_inline_static_output_embeds_relative_css_and_javascript(tmp_path):
     assert "fetch(" not in html
 
 
+def test_inline_static_output_replaces_vite_stylesheet_link_with_attributes(tmp_path):
+    dist = tmp_path / "dist"
+    assets = dist / "assets"
+    assets.mkdir(parents=True)
+    (dist / "index.html").write_text(
+        '<link rel="stylesheet" crossorigin href="./assets/index.css">',
+        encoding="utf-8",
+    )
+    (assets / "index.css").write_text("body { color: #111; }", encoding="utf-8")
+
+    html = inline_static_output(dist)
+
+    assert "<style>\nbody { color: #111; }\n</style>" in html
+    assert "<link" not in html
+
+
 @pytest.mark.parametrize(
     "html",
     (

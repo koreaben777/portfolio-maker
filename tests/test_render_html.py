@@ -11,19 +11,30 @@ import pytest
 from portfolio_maker.application.approval import write_sample_approval
 from portfolio_maker.application.artifact_approval import write_sample_artifact_policy
 from portfolio_maker.application.build_profile import build_profile
+from portfolio_maker.application.discovery import discover_sources
 from portfolio_maker.application.draft_portfolio import draft_portfolio
 from portfolio_maker.application.models import (
     BuildProfileRequest,
+    DiscoverSourcesRequest,
     DraftPortfolioRequest,
     PublicPortfolioRequest,
     RenderHtmlRequest,
+    ComposeProjectsRequest,
+    PrepareProjectReviewRequest,
 )
+from portfolio_maker.application.project_composition import compose_projects, prepare_project_review
 from portfolio_maker.application.public_portfolio import build_public_portfolio
 from portfolio_maker.application.render_html import HtmlRenderError, render_html
 import portfolio_maker.application.render_html as render_html_module
 from portfolio_maker.domain.models import GitHubActivity, Source, SourceStatus, SourceType
 from portfolio_maker.infrastructure.extractors import extract_text
+from portfolio_maker.infrastructure.github_connector import (
+    GitHubActivityCandidate,
+    GitHubDiscoveryResult,
+    GitHubRepositoryCandidate,
+)
 from portfolio_maker.infrastructure.sqlite_repository import SQLiteRepository
+from portfolio_maker.infrastructure.managed_files import write_managed_text
 from portfolio_maker.workspace import WorkspacePaths
 
 
@@ -322,6 +333,280 @@ def test_render_html_success_publishes_without_mutating_template_or_draft(
     assert "fetch(" not in result.html_path.read_text(encoding="utf-8")
 
 
+def test_render_html_projects_use_one_approved_multi_origin_semantic_project(
+    tmp_path,
+    monkeypatch,
+):
+    workspace, paths, _, _, local_uri, public_url, private_url = _setup_multi_origin_render_workspace(tmp_path)
+    review = prepare_project_review(PrepareProjectReviewRequest(workspace=workspace))
+    review_payload = json.loads(review.input_path.read_text(encoding="utf-8"))
+    evidence_ids = [item["evidence_id"] for item in review_payload["evidence"]]
+    evidence_by_origin = {
+        item["origin"]: item["evidence_id"] for item in review_payload["evidence"]
+    }
+    write_managed_text(
+        paths.project_approval_path,
+        json.dumps(
+            {
+                "version": 1,
+                "review_input_sha256": review_payload["input_sha256"],
+                "projects": [
+                    {
+                        "id": "multi-origin-project",
+                        "title": "Multi-origin project",
+                        "overview": "A reviewed project with local and GitHub evidence",
+                        "evidence_ids": evidence_ids,
+                        "status": "approved",
+                    }
+                ],
+                "rejected_candidate_ids": [],
+                "unassigned_evidence_ids": [],
+            },
+            indent=2,
+        )
+        + "\n",
+    )
+    compose_projects(ComposeProjectsRequest(workspace=workspace))
+    artifact_policy = json.loads(paths.artifact_approval_path.read_text(encoding="utf-8"))
+    artifact_policy["artifacts"]["master_profile"] = {
+        "delivery_scope": "restricted",
+        "include_local": False,
+        "include_public_github": False,
+        "include_private_github": False,
+    }
+    artifact_policy["artifacts"]["portfolio_html"] = {
+        "delivery_scope": "open_public",
+        "include_local": False,
+        "include_public_github": True,
+        "include_private_github": False,
+    }
+    paths.artifact_approval_path.write_text(json.dumps(artifact_policy), encoding="utf-8")
+    monkeypatch.setattr(render_html_module.subprocess, "run", _fake_build_with_generated_data)
+
+    render_html(RenderHtmlRequest(workspace=workspace))
+
+    manifest_text = paths.portfolio_public_json_path.read_text(encoding="utf-8")
+    html_text = paths.portfolio_html_path.read_text(encoding="utf-8")
+    manifest = json.loads(manifest_text)
+    profile = json.loads(paths.master_profile_json_path.read_text(encoding="utf-8"))
+    assert profile["projects"] == []
+    assert [project["id"] for project in manifest["projects"]] == ["multi-origin-project"]
+    assert manifest["projects"][0]["title"] == "Multi-origin project"
+    assert len(manifest["projects"][0]["timeline"]) == 3
+    assert "Multi-origin project" in html_text
+    assert "Public activity" in html_text
+    assert "Private activity" not in html_text
+    assert "Local notes" not in html_text
+    with SQLiteRepository(paths.db_path)._read_connection() as connection:
+        html_artifact = connection.execute(
+            "SELECT input_manifest FROM artifacts WHERE kind = 'portfolio_html' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    html_manifest = json.loads(html_artifact["input_manifest"])
+    assert html_manifest["included_evidence_ids"] == [evidence_by_origin["public_github"]]
+    assert html_manifest["portfolio_project_ids"] == ["multi-origin-project"]
+    assert html_manifest["project_approval_sha256"]
+    assert html_manifest["project_review_input_sha256"] == review_payload["input_sha256"]
+    assert len(html_manifest["manifest_sha256"]) == 64
+    assert local_uri not in manifest_text + html_text
+    assert private_url not in manifest_text + html_text
+    assert public_url in manifest_text + html_text
+
+
+def test_unapproved_private_activity_stays_out_of_all_review_and_artifacts(
+    tmp_path,
+    monkeypatch,
+):
+    workspace, paths, _, _, local_uri, public_url, private_url = (
+        _setup_multi_origin_render_workspace(tmp_path)
+    )
+    approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    approval["approved_private_github_activity_urls"] = []
+    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+
+    profile = build_profile(BuildProfileRequest(workspace=workspace))
+    draft = draft_portfolio(DraftPortfolioRequest(workspace=workspace))
+    manifest = build_public_portfolio(PublicPortfolioRequest(workspace=workspace))
+    review = prepare_project_review(PrepareProjectReviewRequest(workspace=workspace))
+    monkeypatch.setattr(render_html_module.subprocess, "run", _fake_build_with_generated_data)
+    render_html(RenderHtmlRequest(workspace=workspace))
+
+    output_text = "\n".join(
+        (
+            profile.json_path.read_text(encoding="utf-8"),
+            profile.markdown_path.read_text(encoding="utf-8"),
+            draft.markdown_path.read_text(encoding="utf-8"),
+            manifest.manifest_path.read_text(encoding="utf-8"),
+            review.input_path.read_text(encoding="utf-8"),
+            paths.portfolio_html_path.read_text(encoding="utf-8"),
+        )
+    )
+    assert private_url not in output_text
+    assert "Private activity" not in output_text
+    assert local_uri not in output_text
+    assert public_url in output_text
+
+
+def test_stale_private_activity_stays_out_after_repository_reinitialization(
+    tmp_path,
+    monkeypatch,
+):
+    workspace, paths, _, _, local_uri, public_url, private_url = (
+        _setup_multi_origin_render_workspace(tmp_path)
+    )
+    repository = SQLiteRepository(paths.db_path)
+    assert build_profile(BuildProfileRequest(workspace=workspace)).claim_count == 3
+    repository.invalidate_unobserved_github_activities(())
+    repository.initialize()
+
+    draft = draft_portfolio(DraftPortfolioRequest(workspace=workspace))
+    manifest = build_public_portfolio(PublicPortfolioRequest(workspace=workspace))
+    review = prepare_project_review(PrepareProjectReviewRequest(workspace=workspace))
+    monkeypatch.setattr(render_html_module.subprocess, "run", _fake_build_with_generated_data)
+    render_html(RenderHtmlRequest(workspace=workspace))
+
+    output_text = "\n".join(
+        (
+            paths.master_profile_json_path.read_text(encoding="utf-8"),
+            draft.markdown_path.read_text(encoding="utf-8"),
+            manifest.manifest_path.read_text(encoding="utf-8"),
+            review.input_path.read_text(encoding="utf-8"),
+            paths.portfolio_html_path.read_text(encoding="utf-8"),
+        )
+    )
+    assert private_url not in output_text
+    assert "Private activity" not in output_text
+    assert local_uri not in output_text
+    assert public_url not in output_text
+
+
+def test_partial_private_rediscovery_revokes_completed_empty_endpoint_everywhere(
+    tmp_path,
+    monkeypatch,
+):
+    workspace, paths, _ = _setup_render_workspace(tmp_path)
+    write_sample_artifact_policy(paths)
+    activity = GitHubActivityCandidate(
+        repo="octo/private",
+        activity_type="pull_request",
+        url="https://github.com/octo/private/pull/2",
+        title="Private activity",
+        state="MERGED",
+        author="octo",
+        created_at="2026-01-01T00:00:00Z",
+        merged_at="2026-01-02T00:00:00Z",
+    )
+    private_repo = GitHubRepositoryCandidate(
+        "octo/private", "https://github.com/octo/private", True
+    )
+    responses = [
+        GitHubDiscoveryResult(
+            [private_repo],
+            [activity],
+            [],
+            (("octo/private", "pull_request"),),
+        ),
+        GitHubDiscoveryResult(
+            [private_repo],
+            [],
+            ["GitHub workflow runs discovery failed for octo/private"],
+            (("octo/private", "pull_request"),),
+        ),
+    ]
+    monkeypatch.setattr(
+        "portfolio_maker.application.discovery.discover_github_candidates",
+        lambda **kwargs: responses.pop(0),
+    )
+    request = DiscoverSourcesRequest(
+        workspace=workspace,
+        home=tmp_path,
+        include_github=True,
+    )
+    discover_sources(request)
+
+    approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    approval.update(
+        {
+            "private_sources_allowed": True,
+            "allowed_repositories": ["octo/private"],
+            "approved_private_github_activity_urls": [activity.url],
+        }
+    )
+    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+    assert build_profile(BuildProfileRequest(workspace=workspace)).claim_count == 1
+
+    discover_sources(request)
+
+    assert build_profile(BuildProfileRequest(workspace=workspace)).claim_count == 0
+    draft = draft_portfolio(DraftPortfolioRequest(workspace=workspace))
+    manifest = build_public_portfolio(PublicPortfolioRequest(workspace=workspace))
+    review = prepare_project_review(PrepareProjectReviewRequest(workspace=workspace))
+    monkeypatch.setattr(render_html_module.subprocess, "run", _fake_build_with_generated_data)
+    render_html(RenderHtmlRequest(workspace=workspace))
+    output_text = "\n".join(
+        (
+            paths.master_profile_json_path.read_text(encoding="utf-8"),
+            paths.master_profile_md_path.read_text(encoding="utf-8"),
+            draft.markdown_path.read_text(encoding="utf-8"),
+            manifest.manifest_path.read_text(encoding="utf-8"),
+            review.input_path.read_text(encoding="utf-8"),
+            paths.portfolio_html_path.read_text(encoding="utf-8"),
+        )
+    )
+    assert activity.title not in output_text
+    assert activity.url not in output_text
+
+
+def test_restricted_approved_private_repository_name_is_display_text_only(
+    tmp_path,
+    monkeypatch,
+):
+    workspace, paths, _, _, _, _, private_url = _setup_multi_origin_render_workspace(tmp_path)
+    review = prepare_project_review(PrepareProjectReviewRequest(workspace=workspace))
+    review_payload = json.loads(review.input_path.read_text(encoding="utf-8"))
+    write_managed_text(
+        paths.project_approval_path,
+        json.dumps(
+            {
+                "version": 1,
+                "review_input_sha256": review_payload["input_sha256"],
+                "projects": [
+                    {
+                        "id": "private-display-project",
+                        "title": "octo/private-project",
+                        "overview": "User-approved work for octo/private-project",
+                        "evidence_ids": [
+                            item["evidence_id"] for item in review_payload["evidence"]
+                        ],
+                        "status": "approved",
+                    }
+                ],
+                "rejected_candidate_ids": [],
+                "unassigned_evidence_ids": [],
+            },
+            indent=2,
+        )
+        + "\n",
+    )
+    compose_projects(ComposeProjectsRequest(workspace=workspace))
+    profile = build_profile(BuildProfileRequest(workspace=workspace))
+    draft = draft_portfolio(DraftPortfolioRequest(workspace=workspace))
+    manifest = build_public_portfolio(PublicPortfolioRequest(workspace=workspace))
+    monkeypatch.setattr(render_html_module.subprocess, "run", _fake_build_with_generated_data)
+    render_html(RenderHtmlRequest(workspace=workspace))
+
+    output_text = "\n".join(
+        (
+            profile.json_path.read_text(encoding="utf-8"),
+            profile.markdown_path.read_text(encoding="utf-8"),
+            draft.markdown_path.read_text(encoding="utf-8"),
+            manifest.manifest_path.read_text(encoding="utf-8"),
+            paths.portfolio_html_path.read_text(encoding="utf-8"),
+        )
+    )
+    assert "octo/private-project" in output_text
+    assert private_url not in output_text
+
+
 def test_render_html_failure_removes_stale_html_but_preserves_draft_and_template(
     tmp_path,
     monkeypatch,
@@ -398,7 +683,7 @@ def test_legacy_schema_approved_github_activity_reaches_profile_and_html(
     assert profile_result.claim_count == 1
     assert render_result.html_path.is_file()
     manifest = json.loads(paths.portfolio_public_json_path.read_text(encoding="utf-8"))
-    assert manifest["projects"][0]["timeline"][0]["title"] == "Legacy approved activity"
+    assert manifest["projects"] == []
 
 
 def test_render_html_uses_its_own_policy_without_overwriting_manifest_policy(
@@ -447,11 +732,9 @@ def test_render_html_uses_its_own_policy_without_overwriting_manifest_policy(
     assert manifests["portfolio_html"]["manifest_sha256"] != hashlib.sha256(
         paths.portfolio_public_json_path.read_bytes()
     ).hexdigest()
-    assert manifests["portfolio_html"]["included_evidence_ids"] == [
-        activity_evidence[public_url]
-    ]
+    assert manifests["portfolio_html"]["included_evidence_ids"] == []
     assert manifests["portfolio_html"]["policy_hash"]
-    assert "Public activity" in html_text
+    assert "Public activity" not in html_text
     assert "Private activity" not in html_text
     assert private_url not in html_text
     assert local_uri not in html_text
@@ -501,11 +784,83 @@ def test_artifact_policies_share_approved_pool_but_select_independently(
     assert profile["sources"] == []
     assert profile["claims"] == []
     assert len(expected_evidence_ids) == 3
-    assert set(public_manifest["selection"]["included_evidence_ids"]) == expected_evidence_ids
-    assert set(artifact_manifests["portfolio_public"]["included_evidence_ids"]) == expected_evidence_ids
-    assert set(artifact_manifests["portfolio_html"]["included_evidence_ids"]) == expected_evidence_ids
+    assert set(public_manifest["selection"]["included_evidence_ids"]) == set()
+    assert set(artifact_manifests["portfolio_public"]["included_evidence_ids"]) == set()
+    assert set(artifact_manifests["portfolio_html"]["included_evidence_ids"]) == set()
     assert local_uri not in html_text
     assert private_url not in html_text
+
+
+def test_excluded_v2_project_is_absent_until_reincluded_and_html_uses_selected_evidence_only(
+    tmp_path,
+    monkeypatch,
+):
+    workspace, paths, _, _, _, public_url, _ = _setup_multi_origin_render_workspace(tmp_path)
+    build_profile(BuildProfileRequest(workspace=workspace))
+    repository = SQLiteRepository(paths.db_path)
+    evidence_rows = repository.list_evidence_selection_records()
+    evidence_ids = tuple(record.evidence_id for record in evidence_rows)
+    public_evidence_id = next(
+        record.evidence_id for record in evidence_rows if record.activity_url == public_url
+    )
+    repository.replace_portfolio_project_decisions(
+        (
+            {
+                "id": "insurance-rag",
+                "title": "Insurance RAG",
+                "overview": "Grounded project evidence.",
+                "evidence_ids": evidence_ids,
+                "approval_sha256": "a" * 64,
+                "review_input_sha256": "b" * 64,
+                "decision_status": "auto_included_medium",
+                "decision_origin": "automatic",
+                "confidence": "medium",
+                "boundary_fingerprint": "boundary-v2",
+                "lineage_project_ids": (),
+            },
+        ),
+        candidate_input_sha256="c" * 64,
+        index_revision="revision-v2",
+    )
+    policy = json.loads(paths.artifact_approval_path.read_text(encoding="utf-8"))
+    policy["artifacts"]["portfolio_html"] = {
+        "delivery_scope": "open_public",
+        "include_local": False,
+        "include_public_github": True,
+        "include_private_github": False,
+    }
+    paths.artifact_approval_path.write_text(json.dumps(policy), encoding="utf-8")
+    monkeypatch.setattr(render_html_module.subprocess, "run", _fake_build_with_generated_data)
+
+    repository.set_project_decision_state("insurance-rag", "excluded")
+    assert json.loads(build_profile(BuildProfileRequest(workspace=workspace)).json_path.read_text(encoding="utf-8"))["projects"] == []
+    assert draft_portfolio(DraftPortfolioRequest(workspace=workspace)).project_count == 0
+    assert build_public_portfolio(PublicPortfolioRequest(workspace=workspace)).project_count == 0
+    render_html(RenderHtmlRequest(workspace=workspace))
+    assert json.loads(paths.portfolio_public_json_path.read_text(encoding="utf-8"))["projects"] == []
+    assert "Insurance RAG" not in paths.portfolio_html_path.read_text(encoding="utf-8")
+
+    repository.set_project_decision_state("insurance-rag", "included")
+    profile = json.loads(build_profile(BuildProfileRequest(workspace=workspace)).json_path.read_text(encoding="utf-8"))
+    draft = draft_portfolio(DraftPortfolioRequest(workspace=workspace))
+    manifest = build_public_portfolio(PublicPortfolioRequest(workspace=workspace))
+    render_html(RenderHtmlRequest(workspace=workspace))
+    html_text = paths.portfolio_html_path.read_text(encoding="utf-8")
+    with SQLiteRepository(paths.db_path)._read_connection() as connection:
+        html_artifact = connection.execute(
+            "SELECT input_manifest FROM artifacts "
+            "WHERE kind = 'portfolio_html' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    html_manifest = json.loads(html_artifact["input_manifest"])
+
+    assert [project["id"] for project in profile["projects"]] == ["insurance-rag"]
+    assert draft.project_count == 1
+    assert json.loads(manifest.manifest_path.read_text(encoding="utf-8"))["projects"][0]["id"] == "insurance-rag"
+    assert public_evidence_id in html_manifest["included_evidence_ids"]
+    assert len(html_manifest["included_evidence_ids"]) == 1
+    assert "auto_included_medium" not in html_text
+    assert '"confidence"' not in html_text
+    assert '"decision_origin"' not in html_text
 
 
 def test_draft_uses_its_own_selection_when_master_excludes_all_origins(
@@ -552,12 +907,10 @@ def test_draft_uses_its_own_selection_when_master_excludes_all_origins(
     assert len(expected_source_ids) == 3
     assert len(expected_evidence_ids) == 3
     assert len(expected_claim_ids) == 3
-    assert set(input_manifest["included_source_ids"]) == expected_source_ids
-    assert set(input_manifest["included_evidence_ids"]) == expected_evidence_ids
-    assert set(input_manifest["included_claim_ids"]) == expected_claim_ids
-    assert "Local notes" in draft_text
-    assert "Public activity" in draft_text
-    assert "Private activity" in draft_text
+    assert set(input_manifest["included_source_ids"]) == set()
+    assert set(input_manifest["included_evidence_ids"]) == set()
+    assert set(input_manifest["included_claim_ids"]) == set()
+    assert "No approved portfolio projects" in draft_text
     assert local_uri not in draft_text
     assert str(source_path) not in draft_text
     assert str(snapshot_path) not in draft_text

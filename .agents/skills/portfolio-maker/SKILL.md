@@ -5,11 +5,16 @@ description: Use when generating local evidence-based career artifacts from appr
 
 # Portfolio Maker Workflow
 
+> Plugin users should invoke the `$portfolio-maker` plugin router for the
+> end-to-end 0.2.0 workflow. This repository-local file remains the compatible
+> repository entrypoint when plugin installation is unavailable; its existing
+> CLI commands and 0.1.0 approval gates are intentionally retained below.
+
 Use this skill to run Portfolio Maker safely from Codex app.
 
-GitHub repositories and activities are discovery metadata by default. Only exact URLs in `approved_github_activity_urls` or `approved_private_github_activity_urls` can enter artifacts, after the matching origin and current policy checks pass. GitHub activity appears as reviewable evidence, never as an automatic project narrative.
+GitHub repositories and activities are discovery metadata by default. Only exact URLs in `approved_github_activity_urls` or `approved_private_github_activity_urls` can enter artifacts, after the matching origin and current policy checks pass. GitHub activity appears as reviewable evidence, never as an automatic project narrative or project.
 
-The generated portfolio draft is a review-required portfolio skeleton. Narrative role, technical approach, and outcome writing remains deferred; the static HTML surface renders only evidence selected by its artifact policy. Raw local paths and private GitHub URLs remain withheld.
+The generated portfolio draft is a review-required portfolio skeleton. Narrative role, technical approach, and outcome writing remains deferred; the static HTML surface renders only evidence selected by its artifact policy. Raw local paths and private GitHub URLs remain withheld. In restricted output, a private repository name is allowed only when it is user-approved display text in a semantic project title or overview; automatic source labels remain safe/generic.
 
 ## Safety Rules
 
@@ -52,7 +57,7 @@ persist the resulting policy before ingest, profile, or draft generation.
 .portfolio-maker/reviews/discovery-report.md
 ```
 
-7. In `GitHub Activities`, find each candidate URL only after confirming its matching entry in `GitHub Repositories` is marked `(public)` or is an explicitly allowed private repository. Copy selected exact public URLs into `approved_github_activity_urls` and exact private URLs into `approved_private_github_activity_urls`. Do not approve excluded, missing, or stale activities.
+7. In `GitHub Activities`, find each candidate URL only after confirming its matching entry in `GitHub Repositories` is marked `(public)` or is an explicitly allowed private repository. Copy selected exact public URLs into `approved_github_activity_urls` and exact private URLs into `approved_private_github_activity_urls`. A private URL may appear on this local discovery/approval surface so the user can make that explicit selection; it must not enter generated artifacts or the safe semantic review bundle. Do not approve excluded, missing, or stale activities.
 
 8. Legacy workflow activities without persisted provenance remain ineligible for profile and portfolio artifacts. Recover them by completing a successful rediscovery:
 
@@ -85,7 +90,34 @@ The artifact policy is required for per-artifact selection and is reloaded by
 (cd web/portfolio && npm ci)
 ```
 
-11. After approval only, run the following commands from the repository root:
+11. For the current 0.2.0 workflow, prepare and apply the semantic index from the same confirmed root
+used for discovery, then prepare the v2 safe review bundle from the repository root:
+
+```bash
+portfolio-maker prepare-semantic-index --workspace . --root <confirmed-root>
+portfolio-maker apply-semantic-index --workspace .
+portfolio-maker prepare-project-review --workspace . --version v2
+```
+
+Only `.portfolio-maker/reviews/project-review-input-v2.json` is supplied to Codex. Codex may write
+`project-candidates.json` and `project-candidates.md` using only that bundle. In v2, review the
+candidate file, materialize review decisions, and persist the user's state with `set-project-state`:
+
+```bash
+portfolio-maker compose-projects --workspace . --mode review
+portfolio-maker set-project-state --workspace . --project-id ID --state included
+```
+
+`approve --write-sample-project-approval` is a legacy v1 empty template only. It is not a v2
+approval step, and v2 does not use `project-approval.json` as its decision source.
+
+Candidate output is not database truth. Only active v2 decision states (`manually_approved`,
+`auto_included_high`, or `auto_included_medium`) are materialized; rejected, unassigned, stale,
+policy-excluded, or unknown evidence is not a project. Without an active project decision,
+generated project sections use an honest zero-project state while the evidence inventory remains
+available for review.
+
+12. After source, artifact, and project approval, run the following commands from the repository root:
 
 ```bash
 portfolio-maker ingest --workspace .
@@ -99,7 +131,7 @@ private Sites path after static validation. Do not infer public deployment permi
 `portfolio-public.json` or `portfolio.html` filenames; public deployment requires an explicit
 `open_public` policy and separate validation, and is not run by this workflow.
 
-12. Review generated artifacts:
+13. Review generated artifacts:
 
 ```text
 .portfolio-maker/artifacts/master-profile.json
@@ -109,7 +141,7 @@ private Sites path after static validation. Do not infer public deployment permi
 .portfolio-maker/artifacts/portfolio.html
 ```
 
-13. Report:
+14. Report:
    - what was generated
    - which commands were run
    - whether public artifacts avoided secrets and private raw paths
