@@ -126,6 +126,22 @@ class ComposeProjectsResult:
 
 
 @dataclass(frozen=True)
+class ComposeProjectsV2Request:
+    workspace: Path
+    mode: Literal["review", "automatic"] = "review"
+    manual_include_ids: tuple[str, ...] = ()
+    manual_exclude_ids: tuple[str, ...] = ()
+    manual_review_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ComposeProjectsV2Result:
+    project_count: int
+    review_required_count: int
+    excluded_project_count: int
+
+
+@dataclass(frozen=True)
 class PrepareSemanticIndexRequest:
     workspace: Path
     root: Path
