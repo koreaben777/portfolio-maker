@@ -1,0 +1,4 @@
+interface:
+  display_name: "Portfolio Project Review"
+  short_description: "Review, include, exclude, merge, or split portfolio projects"
+  default_prompt: "$portfolio-project-review로 자동 구성된 프로젝트를 검토해줘"

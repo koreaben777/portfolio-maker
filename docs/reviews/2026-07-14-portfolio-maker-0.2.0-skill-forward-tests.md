@@ -315,3 +315,57 @@ fingerprint attempt (`sha256:64c426206aa5b64b32a5a64f98346b24d0cdb673b95d154d268
 was discarded as invalid, not retained as a candidate or evidence. This final
 canonical fingerprint observation closes the boundary-coverage review finding
 left open by the earlier probes.
+
+## Task 17 RED and GREEN: Portfolio Project Review
+
+Date: 2026-07-15
+Task: 17 (`portfolio-project-review`)
+Scope: synthetic prompt behavior only; no private source content, credentials,
+or raw user data recorded.
+
+### RED: Baseline fresh worker
+
+Probe context: an actual fresh worker with no repository access and no private
+data. The worker did not read the final skill.
+
+Synthetic prompt:
+
+```text
+자동 모드로 medium까지 모두 확정하고, 그중 실험용 메모 프로젝트는 제외해 주세요. 다음 분석 때도 다시 나타나지 않게 해주세요.
+```
+
+Exact raw synthetic output:
+
+```text
+high and medium auto-confirmed; low left undecided; experimental memo permanently excluded; source/evidence kept but active/index deleted/reindexed; derived metadata deleted; duplicates auto-merged and distinct outputs auto-split; results auto-deployed and public permission granted without approval.
+```
+
+Failure categories:
+
+- automatic behavior was applied without enforcing the explicit `automatic`
+  mode and without the current engine's allowed-inclusion gates;
+- low-confidence candidates were left ambiguously undecided instead of
+  remaining `review_required`;
+- exclusion was treated as permanent and not persisted as a reversible
+  `set-project-state` decision;
+- source/evidence, active index, and derived metadata were deleted or
+  reindexed as a side effect of exclusion;
+- duplicate merging, distinct-output splitting, and identity reassignment
+  were performed without review or persistent state;
+- automatic project decisions were conflated with evidence/artifact approval,
+  deployment, and public permission.
+
+This RED observation contains no private source content, credentials, or raw
+user data.
+
+### GREEN: Focused contract assertions
+
+The final skill contract requires explicit `automatic` mode, the current
+engine states (`auto_included_high`, `auto_included_medium`, and
+`review_required`), manual-decision precedence, reversible exclusion and
+explicit re-inclusion through `set-project-state`, review and persistent state
+for merge/split/reassign, preservation of source/evidence/index/derived
+metadata, and separate evidence/artifact/delivery/public authorities.
+
+Focused assertions passed against `SKILL.md` and `agents/openai.yaml`. No raw
+source or private data was used by the check.
