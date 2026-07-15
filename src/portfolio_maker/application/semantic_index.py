@@ -55,6 +55,9 @@ _CREDENTIAL_VALUE = re.compile(
 _LOCATOR_TOKEN = re.compile(
     r"(?i)(?:file://|https?://|(?<![A-Za-z0-9_.-])(?:/|~[/\\\\]|[A-Za-z]:[/\\\\]|\\\\\\\\))[^\s'\"`<>)}\]]+"
 )
+_RELATIVE_FILE_LOCATOR = re.compile(
+    r"(?i)(?<![\w.-])(?:\.{1,2}[/\\\\][^\s'\"`<>)}\]]+|(?:[\w-]+[/\\\\])+[\w-]+\.[a-z][a-z0-9_-]*)"
+)
 _CHUNK_FILENAME = re.compile(r"chunk-\d{4}\.json")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 
@@ -498,6 +501,7 @@ def _contains_unsafe_locator(value: str) -> bool:
     return bool(
         _LOCATOR_VALUE.search(value)
         or _LOCATOR_TOKEN.search(value)
+        or _RELATIVE_FILE_LOCATOR.search(value)
         or "file://" in folded
         or ".portfolio-maker" in folded
         or "portfolio.db" in folded

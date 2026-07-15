@@ -158,6 +158,51 @@ def test_apply_semantic_index_invalid_output_keeps_previous_active_revision(
     assert active["id"] == first.revision_id
 
 
+@pytest.mark.parametrize("field", ["semantic_summary", "semantic_roles", "topics"])
+def test_apply_semantic_index_rejects_relative_file_locator_and_keeps_previous_active_revision(
+    workspace: Path, tmp_path: Path, field: str
+) -> None:
+    first = prepare_fixture_revision(workspace, tmp_path)
+    write_valid_outputs(first)
+    apply_semantic_index(ApplySemanticIndexRequest(workspace=workspace))
+
+    root = tmp_path / "approved-root"
+    (root / "CHANGELOG.md").write_text("Second revision", encoding="utf-8")
+    second = prepare_semantic_index(
+        PrepareSemanticIndexRequest(workspace=workspace, root=root, chunk_size=1)
+    )
+    write_valid_outputs(second)
+    output_path = next((second.manifest_path.parent / "output").glob("chunk-*.json"))
+    payload = json.loads(output_path.read_text(encoding="utf-8"))
+    output_node = payload["nodes"][0]
+    if field == "semantic_summary":
+        output_node[field] = "See docs/private-plan.md for details"
+    else:
+        output_node[field] = ["See docs/private-plan.md for details"]
+    payload["output_sha256"] = hashlib.sha256(
+        json.dumps(
+            {key: value for key, value in payload.items() if key != "output_sha256"},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    output_path.write_text(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SemanticIndexError, match="unsafe text"):
+        apply_semantic_index(ApplySemanticIndexRequest(workspace=workspace))
+
+    source_id = json.loads(first.manifest_path.read_text(encoding="utf-8"))["source_id"]
+    active = SQLiteRepository(WorkspacePaths.from_root(workspace).db_path).get_active_semantic_revision(
+        source_id
+    )
+    assert active is not None
+    assert active["id"] == first.revision_id
+
+
 def test_apply_semantic_index_rejects_malformed_output_without_activation(
     workspace: Path, tmp_path: Path
 ) -> None:
