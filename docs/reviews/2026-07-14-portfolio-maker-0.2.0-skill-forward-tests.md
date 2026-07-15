@@ -209,7 +209,7 @@ single markers as boundaries, explodes nested parents and children, ignores
 counter-signals, inflates confidence from names, and does not provide a
 grounded decision for unassigned evidence.
 
-### GREEN: Independent fresh-worker result
+### GREEN: Safety-stop probe only (not boundary coverage)
 
 The independent fresh worker used the exact same synthetic prompt:
 
@@ -228,3 +228,85 @@ hierarchy, topics, and evidence IDs, and correctly produced zero candidates
 and zero unassigned evidence when that input was absent. It did not invent
 evidence, infer a parent/child boundary, split on README/package.json alone,
 or produce automatic approval or artifacts.
+
+This is retained as a safety-stop probe only. It did not exercise parent
+coherence, component retention, independent-child/manual handling, fingerprint
+validation, or unassigned evidence coverage.
+
+## Independent Task 16 GREEN: Corrected Boundary Fixture
+
+Date: 2026-07-15
+Task: 16 (`portfolio-project-curation`)
+Probe context: the fresh worker read only the final
+`portfolio-project-curation/SKILL.md`; no repository or user data was provided.
+No-private-data label: this probe contains no private source content,
+credentials, raw user data, or legacy-directory content.
+
+### Exact synthetic fixture summary
+
+The corrected synthetic fixture contains a coherent parent `n-parent` with
+child component nodes `n-api` and `n-ui`, an independent node
+`n-independent`, evidence IDs `101` through `104`, and no raw locators. The
+expected judgment retains the parent, keeps API/UI as components, emits the
+independent node as a manual candidate, and leaves evidence `104` unassigned.
+
+### Exact raw output
+
+The fresh worker returned this valid payload with exactly these top-level keys:
+`version`, `review_input_sha256`, `candidates`, and
+`unassigned_evidence_ids`.
+
+```json
+{
+  "version": 2,
+  "review_input_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "candidates": [
+    {
+      "id": "n-parent",
+      "project_id": "n-parent",
+      "title": "Deployment Dashboard",
+      "overview": "Deployment Dashboard retains its API and UI components.",
+      "boundary_type": "directory_root",
+      "boundary_node_ids": ["n-parent"],
+      "boundary_fingerprint": "sha256:64c426206aa5b64b32a5a64f98346b24d0cdb673b95d154d268bfce09ffaaead",
+      "evidence_ids": [101, 102],
+      "grouping_rationale": [
+        "[evidence_id=101] The parent evidence supports the Deployment Dashboard product.",
+        "[evidence_id=102] API and UI evidence describes components of the retained parent."
+      ],
+      "counter_signals": [
+        "README/package.json markers are signals only and do not make API or UI separate projects."
+      ],
+      "review_reasons": [
+        "Parent retained; n-api and n-ui remain coherent components."
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "n-independent",
+      "project_id": "n-independent",
+      "title": "Independent Candidate",
+      "overview": "An independently reviewed project candidate.",
+      "boundary_type": "manual",
+      "boundary_node_ids": ["n-independent"],
+      "boundary_fingerprint": "sha256:3427fed97f7ce81222bf6c292a9c98d714e25aaa1637956cc12de29b8173a265",
+      "evidence_ids": [103],
+      "grouping_rationale": [
+        "[evidence_id=103] The evidence supports an independent manually reviewed candidate."
+      ],
+      "counter_signals": [],
+      "review_reasons": [
+        "Independent manual candidate retained for review."
+      ],
+      "confidence": "high"
+    }
+  ],
+  "unassigned_evidence_ids": [104]
+}
+```
+
+The worker explicitly stated: parent retained; API/UI are components; an
+independent manual candidate is present; evidence `104` is unassigned; the
+top-level keys are exact; and the result has no auto-approval/materialization.
+This corrected probe closes the boundary-coverage finding left open by the
+earlier zero-input safety-stop probe.
