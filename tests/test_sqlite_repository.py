@@ -308,6 +308,159 @@ def test_replacing_decisions_requires_review_when_existing_identity_changes_boun
     assert repository.list_portfolio_projects(active_only=True) == []
 
 
+def test_replacing_decisions_keeps_automatic_split_lineage_review_required_on_repeat(
+    tmp_path: Path,
+) -> None:
+    repository, evidence_id = populated_portfolio_project_repository(tmp_path)
+    split_project = decision_project(
+        "insurance-rag-child",
+        evidence_id,
+        boundary_fingerprint="sha256:insurance-rag-child",
+    )
+    split_project["evidence_ids"] = ()
+    split_project["lineage_project_ids"] = ("insurance-rag",)
+
+    repository.replace_portfolio_project_decisions(
+        (split_project,),
+        candidate_input_sha256="c" * 64,
+        index_revision="revision-2",
+    )
+    repository.replace_portfolio_project_decisions(
+        (split_project,),
+        candidate_input_sha256="c" * 64,
+        index_revision="revision-2",
+    )
+
+    project = next(
+        project
+        for project in repository.list_portfolio_projects(active_only=False)
+        if project["id"] == "insurance-rag-child"
+    )
+    assert project["decision_status"] == "review_required"
+    assert project["decision_origin"] == "automatic"
+    assert repository.list_portfolio_projects(active_only=True) == []
+
+
+def test_replacing_decisions_keeps_automatic_merge_lineage_review_required_on_repeat(
+    tmp_path: Path,
+) -> None:
+    repository, evidence_id = populated_portfolio_project_repository(tmp_path)
+    second_evidence_id = additional_evidence_item(repository, "second")
+    repository.replace_portfolio_project_decisions(
+        (
+            decision_project("insurance-rag", evidence_id),
+            decision_project("insurance-rag-second", second_evidence_id),
+        ),
+        candidate_input_sha256="c" * 64,
+        index_revision="revision-2",
+    )
+    merged_project = decision_project(
+        "insurance-rag-merged",
+        evidence_id,
+        boundary_fingerprint="sha256:insurance-rag-merged",
+    )
+    merged_project["evidence_ids"] = ()
+    merged_project["lineage_project_ids"] = (
+        "insurance-rag",
+        "insurance-rag-second",
+    )
+
+    repository.replace_portfolio_project_decisions(
+        (merged_project,),
+        candidate_input_sha256="c" * 64,
+        index_revision="revision-3",
+    )
+    repository.replace_portfolio_project_decisions(
+        (merged_project,),
+        candidate_input_sha256="c" * 64,
+        index_revision="revision-3",
+    )
+
+    project = next(
+        project
+        for project in repository.list_portfolio_projects(active_only=False)
+        if project["id"] == "insurance-rag-merged"
+    )
+    assert project["decision_status"] == "review_required"
+    assert project["decision_origin"] == "automatic"
+    assert repository.list_portfolio_projects(active_only=True) == []
+
+
+def test_replacing_decisions_reassigns_predecessor_evidence_to_merged_project(
+    tmp_path: Path,
+) -> None:
+    repository, evidence_id = populated_portfolio_project_repository(tmp_path)
+    second_evidence_id = additional_evidence_item(repository, "second")
+    repository.replace_portfolio_project_decisions(
+        (
+            decision_project("insurance-rag", evidence_id),
+            decision_project("insurance-rag-second", second_evidence_id),
+        ),
+        candidate_input_sha256="c" * 64,
+        index_revision="revision-2",
+    )
+    merged_project = decision_project(
+        "insurance-rag-merged",
+        evidence_id,
+        boundary_fingerprint="sha256:insurance-rag-merged",
+    )
+    merged_project["evidence_ids"] = (evidence_id, second_evidence_id)
+    merged_project["lineage_project_ids"] = (
+        "insurance-rag",
+        "insurance-rag-second",
+    )
+
+    repository.replace_portfolio_project_decisions(
+        (merged_project,),
+        candidate_input_sha256="c" * 64,
+        index_revision="revision-3",
+    )
+
+    projects = {
+        project["id"]: project
+        for project in repository.list_portfolio_projects(active_only=False)
+    }
+    assert projects["insurance-rag"]["evidence"] == []
+    assert projects["insurance-rag-second"]["evidence"] == []
+    assert projects["insurance-rag-merged"]["evidence"] == [
+        {"evidence_id": evidence_id, "support_level": "direct"},
+        {"evidence_id": second_evidence_id, "support_level": "direct"},
+    ]
+    with repository._read_connection() as connection:
+        owners = connection.execute(
+            """
+            SELECT evidence_id, project_id
+            FROM portfolio_project_evidence
+            WHERE evidence_id IN (?, ?)
+            ORDER BY evidence_id
+            """,
+            (evidence_id, second_evidence_id),
+        ).fetchall()
+    assert [(row["evidence_id"], row["project_id"]) for row in owners] == [
+        (evidence_id, "insurance-rag-merged"),
+        (second_evidence_id, "insurance-rag-merged"),
+    ]
+
+
+def test_replacing_decisions_rejects_duplicate_current_evidence_without_mutation(
+    tmp_path: Path,
+) -> None:
+    repository, evidence_id = populated_portfolio_project_repository(tmp_path)
+    before = repository.list_portfolio_projects(active_only=False)
+
+    with pytest.raises(RepositoryError, match="portfolio project evidence must be unique"):
+        repository.replace_portfolio_project_decisions(
+            (
+                decision_project("insurance-rag-child-a", evidence_id),
+                decision_project("insurance-rag-child-b", evidence_id),
+            ),
+            candidate_input_sha256="c" * 64,
+            index_revision="revision-2",
+        )
+
+    assert repository.list_portfolio_projects(active_only=False) == before
+
+
 def populated_portfolio_project_repository(tmp_path: Path) -> tuple[SQLiteRepository, int]:
     repository = SQLiteRepository(tmp_path / ".portfolio-maker" / "portfolio.db")
     repository.initialize()
@@ -332,6 +485,20 @@ def populated_portfolio_project_repository(tmp_path: Path) -> tuple[SQLiteReposi
         index_revision="revision-1",
     )
     return repository, evidence_id
+
+
+def additional_evidence_item(repository: SQLiteRepository, suffix: str) -> int:
+    with repository._read_connection() as connection:
+        source_id = connection.execute("SELECT id FROM sources").fetchone()[0]
+    return repository.upsert_evidence_item(
+        source_id=source_id,
+        snapshot_id=None,
+        github_activity_id=None,
+        locator=f"file:///tmp/{suffix}.md",
+        stable_id=f"source-snapshot:insurance-rag:{suffix}",
+        content_hash=suffix,
+        public_safe=False,
+    )
 
 
 def decision_project(

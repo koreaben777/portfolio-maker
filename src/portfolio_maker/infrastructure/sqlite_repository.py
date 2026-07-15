@@ -1699,6 +1699,13 @@ class SQLiteRepository:
                 for evidence_id in project["evidence_ids"]:
                     conn.execute(
                         """
+                        DELETE FROM portfolio_project_evidence
+                        WHERE evidence_id = ? AND project_id != ?
+                        """,
+                        (evidence_id, project_id),
+                    )
+                    conn.execute(
+                        """
                         INSERT INTO portfolio_project_evidence
                             (project_id, evidence_id, support_level)
                         VALUES (?, ?, 'direct')
@@ -1769,6 +1776,7 @@ class SQLiteRepository:
 
         normalized: list[dict[str, object]] = []
         project_ids: set[str] = set()
+        evidence_project_ids: dict[int, str] = {}
         for project in projects:
             if not isinstance(project, dict):
                 raise RepositoryError("portfolio project decision is invalid")
@@ -1813,6 +1821,10 @@ class SQLiteRepository:
                 or len(set(evidence_ids)) != len(evidence_ids)
             ):
                 raise RepositoryError("portfolio project evidence is invalid")
+            for evidence_id in evidence_ids:
+                if evidence_id in evidence_project_ids:
+                    raise RepositoryError("portfolio project evidence must be unique")
+                evidence_project_ids[evidence_id] = project_id
             lineage_project_ids = project.get("lineage_project_ids", ())
             if (
                 not isinstance(lineage_project_ids, (tuple, list))
@@ -1845,17 +1857,13 @@ class SQLiteRepository:
         if not isinstance(lineage_project_ids, tuple):
             raise RepositoryError("portfolio project lineage is invalid")
         lineage = [existing.get(project_id) for project_id in lineage_project_ids]
-        identity_changed = (
-            current is not None
-            and current["decision_origin"] == "manual"
-            and current["boundary_fingerprint"] != boundary_fingerprint
-        ) or any(
+        states = [state for state in (current, *lineage) if state is not None]
+        boundary_changed = any(
             state is not None
-            and state["decision_origin"] == "manual"
             and state["boundary_fingerprint"] != boundary_fingerprint
-            for state in lineage
+            for state in states
         )
-        if identity_changed:
+        if boundary_changed:
             return {"decision_status": "review_required", "decision_origin": "automatic"}
         if (
             current is not None
@@ -1868,6 +1876,10 @@ class SQLiteRepository:
             }
         if boundary_fingerprint in manual_exclusions_by_boundary:
             return {"decision_status": "excluded", "decision_origin": "manual"}
+        if current is not None and current["decision_status"] == "review_required":
+            return {"decision_status": "review_required", "decision_origin": "automatic"}
+        if lineage_project_ids:
+            return {"decision_status": "review_required", "decision_origin": "automatic"}
         return {"decision_status": incoming_status, "decision_origin": incoming_origin}
 
     def list_portfolio_projects(self, *, active_only: bool = True) -> list[dict[str, object]]:
