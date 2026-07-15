@@ -7,6 +7,37 @@
 
 승인한 내 작업 자료를 바탕으로, **근거를 확인할 수 있는 커리어 프로필**과 **검토용 포트폴리오 초안**, **public-safe 정적 HTML 포트폴리오**를 만드는 로컬 우선 도구입니다.
 
+## 라이선스 / License
+
+Portfolio Maker의 소스 코드는 [Portfolio Maker Personal Non-Commercial
+License 1.0](LICENSE)에 따라 제공됩니다. 이 저장소는 소스가 공개되어 있지만,
+OSI 승인 오픈소스 프로젝트는 아닙니다.
+
+개인은 개인 학습, 연구, 테스트, 개인 포트폴리오 작성 및 개인 취업 준비를
+위해 소프트웨어를 다운로드·설치·실행하고 자신의 기기에서 비공개로 수정할 수
+있습니다. 수정본의 공개·재배포·판매·서브라이선스, SaaS·호스팅 제공, 회사 업무나
+그 밖의 상업적 이용은 허용되지 않습니다. 상업적 이용은 저작권자와 별도 라이선스
+계약이 필요합니다.
+
+The source code of Portfolio Maker is provided under the [Portfolio Maker Personal
+Non-Commercial License 1.0](LICENSE). The repository is source-available, but it is
+not an OSI-approved Open Source project.
+
+Individuals may download, install, run, and privately modify the Software for personal
+study, research, testing, personal portfolio creation, and personal job preparation.
+Public or private redistribution of modified versions, sale, sublicensing, SaaS or
+hosting for others, company use, and other Commercial Use are prohibited. Commercial
+use requires a separate license from the copyright holder.
+
+이 라이선스는 소프트웨어 자체에 적용됩니다. 사용자가 입력한 파일, 개인정보 및
+소프트웨어로 생성한 포트폴리오 산출물은 이 저장소 라이선스의 자동 적용 대상이
+아니며, 해당 자료에 필요한 권리와 별도 라이선스는 사용자가 확인해야 합니다.
+
+This license applies to the Software itself. Your input files, personal data, and
+portfolio artifacts generated with the Software are not automatically covered by this
+repository license; you remain responsible for the rights and third-party licenses
+applicable to those materials.
+
 Portfolio Maker는 원본 파일을 자동으로 업로드하거나 공개하지 않습니다. 먼저 후보를 확인하고, 사용자가 명시적으로 승인한 로컬 자료만 처리합니다. 공개 GitHub 활동도 `approved_github_activity_urls`에서 URL 단위로 명시 승인한 항목만 profile과 portfolio draft의 검토 근거로 반영하며, 자동 프로젝트 서술은 만들지 않습니다.
 
 ## 지금 할 수 있는 일
