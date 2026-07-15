@@ -7,7 +7,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 
-from portfolio_maker.application.approval import load_approval
+from portfolio_maker.application.approval import (
+    ApprovalFormatError,
+    ApprovalMissingError,
+    SourceApproval,
+    load_approval,
+)
 from portfolio_maker.application.models import (
     ApplySemanticIndexRequest,
     ApplySemanticIndexResult,
@@ -28,6 +33,7 @@ from portfolio_maker.infrastructure.managed_files import (
 )
 from portfolio_maker.infrastructure.github_connector import contains_unicode_control
 from portfolio_maker.infrastructure.policy import (
+    FilePolicy,
     contains_hidden_secret_shaped_public_value,
     mask_public_value,
 )
@@ -82,6 +88,7 @@ def prepare_semantic_index(
     paths = WorkspacePaths.from_root(request.workspace)
     paths.ensure()
     approval = load_approval(paths)
+    _validate_approved_root(request.root, approval)
     try:
         crawl = crawl_local_structure(request.root, approval)
     except StructuralCrawlRootError as error:
@@ -157,6 +164,8 @@ def apply_semantic_index(
     with repository._repository_critical_section():
         published = _read_published_semantic_input_unlocked(paths)
         manifest = _parse_input_manifest(published.manifest_text)
+        if manifest["policy_hash"] != _current_policy_hash(paths):
+            raise SemanticIndexError("semantic index approval policy has changed")
         input_nodes = _parse_input_chunks(published, manifest)
         staged_nodes = repository.list_semantic_nodes(manifest["revision_id"])
         _validate_staged_structure(input_nodes, staged_nodes, manifest)
@@ -611,6 +620,33 @@ def _policy_hash(approval: object) -> str:
         ),
     }
     return hashlib.sha256(_canonical_json(policy).encode("utf-8")).hexdigest()
+
+
+def _validate_approved_root(root: Path, approval: SourceApproval) -> None:
+    try:
+        canonical_root = root.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise SemanticIndexError("semantic index root is invalid") from error
+    if not canonical_root.is_dir():
+        raise SemanticIndexError("semantic index root is invalid")
+
+    policy = FilePolicy(
+        forbidden_paths=approval.excluded_directories,
+        excluded_file_patterns=approval.excluded_file_patterns,
+    )
+    if (
+        policy.classify_path(canonical_root) != "candidate"
+        or canonical_root.as_uri() not in approval.approved_source_uris
+    ):
+        raise SemanticIndexError("semantic index root is not approved")
+
+
+def _current_policy_hash(paths: WorkspacePaths) -> str:
+    try:
+        approval = load_approval(paths)
+    except (ApprovalMissingError, ApprovalFormatError) as error:
+        raise SemanticIndexError("semantic index approval is unavailable") from error
+    return _policy_hash(approval)
 
 
 def _redact_locators(value: str) -> str:

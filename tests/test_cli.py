@@ -9,6 +9,14 @@ from portfolio_maker.infrastructure.sqlite_repository import SQLiteRepository
 from portfolio_maker.workspace import WorkspacePaths
 
 
+def approve_semantic_root(workspace, root) -> None:
+    paths = WorkspacePaths.from_root(workspace)
+    write_sample_approval(paths)
+    approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    approval["approved_source_uris"] = [root.resolve().as_uri()]
+    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+
+
 def test_cli_discover_command_creates_report(workspace, tmp_path):
     (tmp_path / "project").mkdir()
     (tmp_path / "project" / "README.md").write_text("# Demo\n", encoding="utf-8")
@@ -76,7 +84,7 @@ def test_cli_prepare_semantic_index_reports_chunks_without_locator_values(
     root.mkdir()
     for index in range(501):
         (root / f"item-{index:03}.md").write_text("evidence", encoding="utf-8")
-    write_sample_approval(WorkspacePaths.from_root(workspace))
+    approve_semantic_root(workspace, root)
 
     exit_code = main(
         [
@@ -115,7 +123,7 @@ def test_cli_apply_semantic_index_is_controlled_when_output_missing(
     root = tmp_path / "approved-root"
     root.mkdir()
     (root / "README.md").write_text("evidence", encoding="utf-8")
-    write_sample_approval(WorkspacePaths.from_root(workspace))
+    approve_semantic_root(workspace, root)
     assert main(
         [
             "prepare-semantic-index",
@@ -158,6 +166,40 @@ def test_cli_prepare_semantic_index_invalid_root_is_controlled_without_locator(
     assert "Traceback" not in captured.err
     assert str(workspace) not in captured.err
     assert str(missing_root) not in captured.err
+
+
+def test_cli_prepare_semantic_index_rejects_unapproved_root_without_writing_index_or_report(
+    workspace, tmp_path, capsys
+):
+    approved_root = tmp_path / "approved-root"
+    approved_root.mkdir()
+    root = tmp_path / "unapproved-root"
+    root.mkdir()
+    (root / "README.md").write_text("evidence", encoding="utf-8")
+    paths = WorkspacePaths.from_root(workspace)
+    write_sample_approval(paths)
+    approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    approval["approved_source_uris"] = [approved_root.resolve().as_uri()]
+    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+
+    exit_code = main(
+        [
+            "prepare-semantic-index",
+            "--workspace",
+            str(workspace),
+            "--root",
+            str(root),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "semantic index root is not approved" in captured.err
+    assert "Traceback" not in captured.err
+    assert str(workspace) not in captured.err
+    assert str(root) not in captured.err
+    assert not paths.semantic_index_manifest_path.exists()
+    assert not paths.semantic_index_report_path.exists()
 
 
 def test_cli_prepare_semantic_index_missing_approval_is_controlled_without_locator(

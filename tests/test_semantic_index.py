@@ -27,6 +27,7 @@ def approve_root(workspace: Path, root: Path, *, excluded: tuple[Path, ...] = ()
     paths = WorkspacePaths.from_root(workspace)
     write_sample_approval(paths)
     approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    approval["approved_source_uris"] = [root.resolve().as_uri()]
     approval["excluded_directories"] = [str(path) for path in excluded]
     paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
 
@@ -154,6 +155,43 @@ def test_apply_semantic_index_invalid_output_keeps_previous_active_revision(
     active = SQLiteRepository(WorkspacePaths.from_root(workspace).db_path).get_active_semantic_revision(
         source_id
     )
+    assert active is not None
+    assert active["id"] == first.revision_id
+
+
+@pytest.mark.parametrize(
+    "change",
+    ("approved_source", "excluded_directory", "excluded_file_pattern"),
+)
+def test_apply_semantic_index_rejects_changed_approval_policy_and_keeps_previous_active_revision(
+    workspace: Path, tmp_path: Path, change: str
+) -> None:
+    first = prepare_fixture_revision(workspace, tmp_path)
+    write_valid_outputs(first)
+    apply_semantic_index(ApplySemanticIndexRequest(workspace=workspace))
+
+    root = tmp_path / "approved-root"
+    (root / "CHANGELOG.md").write_text("Second revision", encoding="utf-8")
+    second = prepare_semantic_index(
+        PrepareSemanticIndexRequest(workspace=workspace, root=root, chunk_size=1)
+    )
+    write_valid_outputs(second)
+
+    paths = WorkspacePaths.from_root(workspace)
+    approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    if change == "approved_source":
+        approval["approved_source_uris"] = []
+    elif change == "excluded_directory":
+        approval["excluded_directories"] = [str(root / "excluded")]
+    else:
+        approval["excluded_file_patterns"] = ["*.private"]
+    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+
+    with pytest.raises(SemanticIndexError, match="semantic index approval policy has changed"):
+        apply_semantic_index(ApplySemanticIndexRequest(workspace=workspace))
+
+    source_id = json.loads(first.manifest_path.read_text(encoding="utf-8"))["source_id"]
+    active = SQLiteRepository(paths.db_path).get_active_semantic_revision(source_id)
     assert active is not None
     assert active["id"] == first.revision_id
 
@@ -357,7 +395,7 @@ def test_prepare_semantic_index_scans_only_the_requested_root(
     root = tmp_path / "selected-root"
     root.mkdir()
     (root / "README.md").write_text("evidence", encoding="utf-8")
-    write_sample_approval(WorkspacePaths.from_root(workspace))
+    approve_root(workspace, root)
     outside = tmp_path / "outside-root"
     outside.mkdir()
     (outside / "not-in-scope.md").write_text("outside", encoding="utf-8")
