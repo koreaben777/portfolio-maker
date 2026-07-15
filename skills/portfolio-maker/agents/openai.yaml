@@ -1,0 +1,4 @@
+interface:
+  display_name: "Portfolio Maker"
+  short_description: "Orchestrate the complete evidence-based portfolio workflow"
+  default_prompt: "$portfolio-maker로 내 기본 포트폴리오를 처음부터 만들어줘"

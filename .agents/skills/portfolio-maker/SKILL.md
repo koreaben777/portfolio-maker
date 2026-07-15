@@ -5,6 +5,11 @@ description: Use when generating local evidence-based career artifacts from appr
 
 # Portfolio Maker Workflow
 
+> Plugin users should invoke the `$portfolio-maker` plugin router for the
+> end-to-end workflow. This repository-local file remains the 0.1.0 legacy
+> compatibility shim until plugin installation is available; its existing CLI
+> commands and approval gates are intentionally retained below.
+
 Use this skill to run Portfolio Maker safely from Codex app.
 
 GitHub repositories and activities are discovery metadata by default. Only exact URLs in `approved_github_activity_urls` or `approved_private_github_activity_urls` can enter artifacts, after the matching origin and current policy checks pass. GitHub activity appears as reviewable evidence, never as an automatic project narrative or project.
