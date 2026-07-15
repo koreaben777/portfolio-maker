@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import hashlib
 
 from portfolio_maker.application.approval import write_sample_approval
+from portfolio_maker.application.artifact_approval import write_sample_artifact_policy
 from portfolio_maker.adapters.cli import main
+from portfolio_maker.domain.semantic_models import boundary_fingerprint
+from portfolio_maker.domain.models import Source, SourceStatus, SourceType
 from portfolio_maker.infrastructure.sqlite_repository import SQLiteRepository
 from portfolio_maker.workspace import WorkspacePaths
 
@@ -15,6 +19,93 @@ def approve_semantic_root(workspace, root) -> None:
     approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
     approval["approved_source_uris"] = [root.resolve().as_uri()]
     paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+
+
+def seed_v2_candidate(workspace, *, confidence="medium") -> tuple[WorkspacePaths, str]:
+    paths = WorkspacePaths.from_root(workspace)
+    evidence_path = workspace / "approved-evidence.md"
+    evidence_path.write_text("Approved evidence", encoding="utf-8")
+    write_sample_approval(paths)
+    approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    approval["approved_source_uris"] = [evidence_path.resolve().as_uri()]
+    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+    write_sample_artifact_policy(paths)
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    source_id = repository.upsert_source(
+        Source(
+            None,
+            SourceType.LOCAL_FILE,
+            evidence_path.resolve().as_uri(),
+            "Approved evidence",
+            None,
+            SourceStatus.INGESTED,
+        )
+    )
+    evidence_id = repository.upsert_evidence_item(
+        source_id=source_id,
+        snapshot_id=None,
+        github_activity_id=None,
+        locator=evidence_path.resolve().as_uri(),
+        stable_id="source-snapshot:v2:approved",
+        content_hash="approved",
+        public_safe=False,
+    )
+    technical_project_id = repository.upsert_project("technical:v2", public_safe=False)
+    claim_id = repository.upsert_career_claim(
+        technical_project_id, "Approved evidence", public_safe=False
+    )
+    repository.link_claim_evidence(claim_id, evidence_id, "direct")
+    review_input = {
+        "version": 2,
+        "artifact_kind": "master_profile",
+        "delivery_scope": "restricted",
+        "policy_hash": "a" * 64,
+        "index_revision": "revision-v2",
+        "nodes": [
+            {
+                "node_id": "node-approved",
+                "parent_node_id": None,
+                "relative_hierarchy": ".",
+                "topics": ["portfolio"],
+                "evidence_ids": [evidence_id],
+            }
+        ],
+        "github_evidence": [],
+    }
+    review_input["input_sha256"] = hashlib.sha256(
+        json.dumps(
+            review_input, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
+    paths.ensure()
+    paths.project_review_input_v2_path.write_text(
+        json.dumps(review_input), encoding="utf-8"
+    )
+    candidates = {
+        "version": 2,
+        "review_input_sha256": review_input["input_sha256"],
+        "candidates": [
+            {
+                "id": "candidate-insurance-rag",
+                "project_id": "insurance-rag",
+                "title": "Insurance RAG",
+                "overview": "Grounded project evidence.",
+                "boundary_type": "directory_root",
+                "boundary_node_ids": ["node-approved"],
+                "boundary_fingerprint": boundary_fingerprint(
+                    "directory_root", ("node-approved",)
+                ),
+                "evidence_ids": [evidence_id],
+                "grouping_rationale": ["One approved work unit."],
+                "counter_signals": [],
+                "review_reasons": [],
+                "confidence": confidence,
+            }
+        ],
+    }
+    paths.project_candidates_path.write_text(json.dumps(candidates), encoding="utf-8")
+    return paths, "insurance-rag"
 
 
 def test_cli_discover_command_creates_report(workspace, tmp_path):
@@ -299,6 +390,76 @@ def test_cli_compose_projects_missing_approval_is_controlled(workspace, capsys):
     captured = capsys.readouterr()
     assert exit_code == 1
     assert "project review input is missing" in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_cli_compose_projects_automatic_materializes_medium_candidate(workspace, capsys):
+    paths, project_id = seed_v2_candidate(workspace)
+
+    exit_code = main(
+        [
+            "compose-projects",
+            "--workspace",
+            str(workspace),
+            "--mode",
+            "automatic",
+        ]
+    )
+
+    assert exit_code == 0
+    assert "Composed projects: 1" in capsys.readouterr().out
+    assert [project["id"] for project in SQLiteRepository(paths.db_path).list_portfolio_projects()] == [
+        project_id
+    ]
+
+
+def test_cli_review_mode_keeps_candidate_inactive_until_manual_include(workspace, capsys):
+    paths, project_id = seed_v2_candidate(workspace)
+
+    assert main(["compose-projects", "--workspace", str(workspace), "--mode", "review"]) == 0
+    assert SQLiteRepository(paths.db_path).list_portfolio_projects() == []
+
+    assert main(
+        [
+            "set-project-state",
+            "--workspace",
+            str(workspace),
+            "--project-id",
+            project_id,
+            "--state",
+            "included",
+        ]
+    ) == 0
+    assert main(
+        [
+            "list-projects",
+            "--workspace",
+            str(workspace),
+            "--decision-status",
+            "manually_approved",
+            "--format",
+            "ids",
+        ]
+    ) == 0
+    assert capsys.readouterr().out.splitlines()[-1] == project_id
+
+
+def test_cli_set_project_state_reports_unknown_project_without_traceback(workspace, capsys):
+    exit_code = main(
+        [
+            "set-project-state",
+            "--workspace",
+            str(workspace),
+            "--project-id",
+            "missing-project",
+            "--state",
+            "excluded",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "unknown" in captured.err
     assert "Traceback" not in captured.err
 
 

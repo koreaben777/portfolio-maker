@@ -17,6 +17,8 @@ from portfolio_maker.application.models import (
     BuildProfileRequest,
     ComposeProjectsRequest,
     ComposeProjectsResult,
+    ComposeProjectsV2Request,
+    ComposeProjectsV2Result,
     PrepareProjectReviewRequest,
     PrepareProjectReviewResult,
 )
@@ -349,6 +351,110 @@ def compose_projects(request: ComposeProjectsRequest) -> ComposeProjectsResult:
     return ComposeProjectsResult(
         project_count=len(approval.projects),
         unassigned_evidence_count=len(computed_unassigned),
+    )
+
+
+def compose_projects_v2(request: ComposeProjectsV2Request) -> ComposeProjectsV2Result:
+    """Materialize only candidate projects with currently selected evidence."""
+    from portfolio_maker.application.project_boundary import parse_candidate_payload_v2
+    from portfolio_maker.application.project_decisions import (
+        ACTIVE_PROJECT_STATES,
+        ProjectDecisionSet,
+        resolve_project_decisions,
+    )
+
+    paths = WorkspacePaths.from_root(request.workspace)
+    paths.ensure()
+    review_input = _read_json(paths.project_review_input_v2_path, "project review input v2")
+    candidate_payload = _read_json(paths.project_candidates_path, "project candidates")
+    candidates = parse_candidate_payload_v2(candidate_payload, review_input)
+
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    selection = EvidenceSelectionService().select(
+        repository,
+        EvidenceSelectionRequest(
+            artifact_kind="master_profile",
+            policy=load_artifact_policy(paths),
+            current_approval=load_approval(paths),
+        ),
+    )
+    selected_evidence_ids = set(selection.included_evidence_ids)
+    evidence_conflicts = tuple(
+        candidate.id
+        for candidate in candidates
+        if not candidate.evidence_ids or not set(candidate.evidence_ids).issubset(selected_evidence_ids)
+    )
+    resolved = resolve_project_decisions(
+        candidates,
+        ProjectDecisionSet(
+            mode=request.mode,
+            manual_include_ids=request.manual_include_ids,
+            manual_exclude_ids=request.manual_exclude_ids,
+            manual_review_ids=request.manual_review_ids,
+            evidence_conflict_candidate_ids=evidence_conflicts,
+        ),
+    )
+    resolved_by_id = {project.project_id: project for project in resolved.projects}
+    review_required_ids = set(resolved.review_required_ids)
+    excluded_ids = set(resolved.excluded_project_ids)
+    candidate_hash = hashlib.sha256(_canonical_bytes(candidate_payload)).hexdigest()
+    index_revision = review_input.get("index_revision")
+    if not isinstance(index_revision, str) or not index_revision:
+        raise ProjectCompositionError("project review input v2 index revision is invalid")
+
+    projects: list[dict[str, object]] = []
+    for candidate in candidates:
+        resolved_project = resolved_by_id.get(candidate.project_id)
+        if resolved_project is not None:
+            decision_status = resolved_project.status
+            decision_origin = (
+                "manual" if decision_status == "manually_approved" else "automatic"
+            )
+        elif candidate.project_id in excluded_ids:
+            decision_status = "excluded"
+            decision_origin = "manual"
+        else:
+            decision_status = "review_required"
+            decision_origin = "automatic"
+            review_required_ids.add(candidate.project_id)
+
+        # A decision may remain reviewable, but it can never activate without
+        # evidence that survives the current artifact selection.
+        if candidate.id in evidence_conflicts:
+            decision_status = "review_required"
+            decision_origin = "automatic"
+            review_required_ids.add(candidate.project_id)
+
+        projects.append(
+            {
+                "id": candidate.project_id,
+                "title": candidate.title,
+                "overview": candidate.overview,
+                "evidence_ids": candidate.evidence_ids,
+                "approval_sha256": candidate_hash,
+                "review_input_sha256": review_input["input_sha256"],
+                "decision_status": decision_status,
+                "decision_origin": decision_origin,
+                "confidence": candidate.confidence,
+                "boundary_fingerprint": candidate.boundary_fingerprint,
+                "lineage_project_ids": (),
+            }
+        )
+
+    repository.replace_portfolio_project_decisions(
+        tuple(projects),
+        candidate_input_sha256=candidate_hash,
+        index_revision=index_revision,
+    )
+    active_count = sum(
+        project["decision_status"] in ACTIVE_PROJECT_STATES
+        for project in repository.list_portfolio_projects(active_only=False)
+    )
+    return ComposeProjectsV2Result(
+        project_count=active_count,
+        review_required_count=len(review_required_ids),
+        excluded_project_count=len(excluded_ids),
     )
 
 

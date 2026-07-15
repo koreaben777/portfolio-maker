@@ -791,6 +791,78 @@ def test_artifact_policies_share_approved_pool_but_select_independently(
     assert private_url not in html_text
 
 
+def test_excluded_v2_project_is_absent_until_reincluded_and_html_uses_selected_evidence_only(
+    tmp_path,
+    monkeypatch,
+):
+    workspace, paths, _, _, _, public_url, _ = _setup_multi_origin_render_workspace(tmp_path)
+    build_profile(BuildProfileRequest(workspace=workspace))
+    repository = SQLiteRepository(paths.db_path)
+    evidence_rows = repository.list_evidence_selection_records()
+    evidence_ids = tuple(record.evidence_id for record in evidence_rows)
+    public_evidence_id = next(
+        record.evidence_id for record in evidence_rows if record.activity_url == public_url
+    )
+    repository.replace_portfolio_project_decisions(
+        (
+            {
+                "id": "insurance-rag",
+                "title": "Insurance RAG",
+                "overview": "Grounded project evidence.",
+                "evidence_ids": evidence_ids,
+                "approval_sha256": "a" * 64,
+                "review_input_sha256": "b" * 64,
+                "decision_status": "auto_included_medium",
+                "decision_origin": "automatic",
+                "confidence": "medium",
+                "boundary_fingerprint": "boundary-v2",
+                "lineage_project_ids": (),
+            },
+        ),
+        candidate_input_sha256="c" * 64,
+        index_revision="revision-v2",
+    )
+    policy = json.loads(paths.artifact_approval_path.read_text(encoding="utf-8"))
+    policy["artifacts"]["portfolio_html"] = {
+        "delivery_scope": "open_public",
+        "include_local": False,
+        "include_public_github": True,
+        "include_private_github": False,
+    }
+    paths.artifact_approval_path.write_text(json.dumps(policy), encoding="utf-8")
+    monkeypatch.setattr(render_html_module.subprocess, "run", _fake_build_with_generated_data)
+
+    repository.set_project_decision_state("insurance-rag", "excluded")
+    assert json.loads(build_profile(BuildProfileRequest(workspace=workspace)).json_path.read_text(encoding="utf-8"))["projects"] == []
+    assert draft_portfolio(DraftPortfolioRequest(workspace=workspace)).project_count == 0
+    assert build_public_portfolio(PublicPortfolioRequest(workspace=workspace)).project_count == 0
+    render_html(RenderHtmlRequest(workspace=workspace))
+    assert json.loads(paths.portfolio_public_json_path.read_text(encoding="utf-8"))["projects"] == []
+    assert "Insurance RAG" not in paths.portfolio_html_path.read_text(encoding="utf-8")
+
+    repository.set_project_decision_state("insurance-rag", "included")
+    profile = json.loads(build_profile(BuildProfileRequest(workspace=workspace)).json_path.read_text(encoding="utf-8"))
+    draft = draft_portfolio(DraftPortfolioRequest(workspace=workspace))
+    manifest = build_public_portfolio(PublicPortfolioRequest(workspace=workspace))
+    render_html(RenderHtmlRequest(workspace=workspace))
+    html_text = paths.portfolio_html_path.read_text(encoding="utf-8")
+    with SQLiteRepository(paths.db_path)._read_connection() as connection:
+        html_artifact = connection.execute(
+            "SELECT input_manifest FROM artifacts "
+            "WHERE kind = 'portfolio_html' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    html_manifest = json.loads(html_artifact["input_manifest"])
+
+    assert [project["id"] for project in profile["projects"]] == ["insurance-rag"]
+    assert draft.project_count == 1
+    assert json.loads(manifest.manifest_path.read_text(encoding="utf-8"))["projects"][0]["id"] == "insurance-rag"
+    assert public_evidence_id in html_manifest["included_evidence_ids"]
+    assert len(html_manifest["included_evidence_ids"]) == 1
+    assert "auto_included_medium" not in html_text
+    assert '"confidence"' not in html_text
+    assert '"decision_origin"' not in html_text
+
+
 def test_draft_uses_its_own_selection_when_master_excludes_all_origins(
     tmp_path,
 ):

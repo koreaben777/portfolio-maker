@@ -21,10 +21,14 @@ from portfolio_maker.application.semantic_index import (
 from portfolio_maker.application.project_composition import (
     ProjectCompositionError,
     compose_projects,
+    compose_projects_v2,
     prepare_project_review,
     write_sample_project_approval,
 )
-from portfolio_maker.application.project_boundary import ProjectBoundaryError
+from portfolio_maker.application.project_boundary import (
+    ProjectBoundaryError,
+    prepare_project_review_v2,
+)
 from portfolio_maker.application.models import (
     BuildProfileRequest,
     DiscoverSourcesRequest,
@@ -32,6 +36,7 @@ from portfolio_maker.application.models import (
     IngestSourcesRequest,
     RenderHtmlRequest,
     ComposeProjectsRequest,
+    ComposeProjectsV2Request,
     PrepareProjectReviewRequest,
     ApplySemanticIndexRequest,
     PrepareSemanticIndexRequest,
@@ -76,9 +81,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     review = subparsers.add_parser("prepare-project-review")
     review.add_argument("--workspace", type=Path, default=Path("."))
+    review.add_argument("--version", choices=("v1", "v2"), default="v1")
 
     compose = subparsers.add_parser("compose-projects")
     compose.add_argument("--workspace", type=Path, default=Path("."))
+    compose.add_argument("--mode", choices=("review", "automatic"))
+
+    set_state = subparsers.add_parser("set-project-state")
+    set_state.add_argument("--workspace", type=Path, default=Path("."))
+    set_state.add_argument("--project-id", required=True)
+    set_state.add_argument("--state", choices=("excluded", "included"), required=True)
+
+    list_projects = subparsers.add_parser("list-projects")
+    list_projects.add_argument("--workspace", type=Path, default=Path("."))
+    list_projects.add_argument("--decision-status")
+    list_projects.add_argument("--format", choices=("table", "ids"), default="table")
 
     prepare_index = subparsers.add_parser("prepare-semantic-index")
     prepare_index.add_argument("--workspace", type=Path, default=Path("."))
@@ -177,17 +194,67 @@ def _main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     if args.command == "prepare-project-review":
-        result = prepare_project_review(
-            PrepareProjectReviewRequest(workspace=args.workspace)
-        )
+        if args.version == "v2":
+            result = prepare_project_review_v2(
+                PrepareProjectReviewRequest(workspace=args.workspace)
+            )
+        else:
+            result = prepare_project_review(
+                PrepareProjectReviewRequest(workspace=args.workspace)
+            )
         print(f"Project review input: {result.input_path}")
         print(f"Evidence: {result.evidence_count}")
         return 0
 
     if args.command == "compose-projects":
+        paths = WorkspacePaths.from_root(args.workspace)
+        if args.mode is not None or paths.project_review_input_v2_path.exists():
+            result = compose_projects_v2(
+                ComposeProjectsV2Request(
+                    workspace=args.workspace,
+                    mode=args.mode or "review",
+                )
+            )
+            print(f"Composed projects: {result.project_count}")
+            print(f"Review required: {result.review_required_count}")
+            print(f"Excluded projects: {result.excluded_project_count}")
+            return 0
         result = compose_projects(ComposeProjectsRequest(workspace=args.workspace))
         print(f"Composed projects: {result.project_count}")
         print(f"Unassigned evidence: {result.unassigned_evidence_count}")
+        return 0
+
+    if args.command == "set-project-state":
+        repository = SQLiteRepository(WorkspacePaths.from_root(args.workspace).db_path)
+        repository.initialize()
+        repository.set_project_decision_state(args.project_id, args.state)
+        print(f"Project state: {args.project_id} -> {args.state}")
+        return 0
+
+    if args.command == "list-projects":
+        repository = SQLiteRepository(WorkspacePaths.from_root(args.workspace).db_path)
+        repository.initialize()
+        projects = repository.list_portfolio_projects(active_only=False)
+        if args.decision_status is not None:
+            projects = [
+                project
+                for project in projects
+                if project.get("decision_status") == args.decision_status
+            ]
+        if args.format == "ids":
+            for project in projects:
+                print(project["id"])
+        else:
+            for project in projects:
+                print(
+                    "\t".join(
+                        (
+                            str(project["id"]),
+                            str(project["decision_status"]),
+                            str(project["decision_origin"]),
+                        )
+                    )
+                )
         return 0
 
     if args.command == "prepare-semantic-index":
