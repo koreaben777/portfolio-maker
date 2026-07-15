@@ -6,7 +6,7 @@
     "portfolio/backend/README.md": "Synthetic backend implementation.",
     "portfolio/frontend/README.md": "Synthetic frontend implementation."
   },
-  "candidate": {
+  "synthetic_codex_candidate": {
     "id": "candidate-cross-directory",
     "project_id": "cross-directory-project",
     "title": "Cross Directory Project",
@@ -14,5 +14,19 @@
     "boundary_type": "cross_directory_cluster",
     "boundary_hierarchies": ["portfolio/backend", "portfolio/frontend"],
     "confidence": "high"
+  },
+  "synthetic_public_activity": {
+    "repository": "synthetic-owner/cross-directory",
+    "source_uri": "https://github.com/synthetic-owner/cross-directory",
+    "display_name": "synthetic-owner/cross-directory",
+    "owner": "synthetic-owner",
+    "activity_type": "pull_request",
+    "url": "https://github.com/synthetic-owner/cross-directory/pull/101",
+    "title": "Synthetic public cross-directory delivery",
+    "state": "OPEN",
+    "author": "synthetic-owner",
+    "created_at": "2026-01-01T00:00:00Z",
+    "stable_id": "synthetic-public-github:cross-directory-pull-101",
+    "claim_text": "Synthetic public GitHub activity"
   }
 }

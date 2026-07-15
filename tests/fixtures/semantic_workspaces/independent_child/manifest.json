@@ -7,7 +7,7 @@
     "workspace/playmcp/README.md": "Synthetic PlayMCP contest project.",
     "workspace/other/README.md": "Synthetic unrelated project."
   },
-  "candidate": {
+  "synthetic_codex_candidate": {
     "id": "candidate-playmcp-contest",
     "project_id": "playmcp-contest",
     "title": "PlayMCP Contest",

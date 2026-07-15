@@ -6,7 +6,7 @@
     "services/api/README.md": "Synthetic insurance retrieval service.",
     "services/graph/README.md": "Synthetic insurance graph service."
   },
-  "candidate": {
+  "synthetic_codex_candidate": {
     "id": "candidate-insurance-rag-chatbot",
     "project_id": "insurance-rag-chatbot",
     "title": "Insurance RAG Chatbot",

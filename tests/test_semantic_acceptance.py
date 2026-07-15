@@ -34,10 +34,15 @@ from portfolio_maker.application.semantic_index import (
     apply_semantic_index,
     prepare_semantic_index,
 )
-from portfolio_maker.domain.models import Source, SourceStatus, SourceType
+from portfolio_maker.domain.models import GitHubActivity, Source, SourceStatus, SourceType
 from portfolio_maker.domain.semantic_models import boundary_fingerprint
 from portfolio_maker.infrastructure.sqlite_repository import SQLiteRepository
 from portfolio_maker.workspace import WorkspacePaths
+
+
+SYNTHETIC_PUBLIC_ACTIVITY_URL = (
+    "https://github.com/synthetic-owner/cross-directory/pull/101"
+)
 
 
 @dataclass(frozen=True)
@@ -47,6 +52,14 @@ class SemanticAcceptanceResult:
     restricted_evidence_count: int
     open_public_evidence_count: int
     open_public_local_evidence_count: int
+    composition_project_count: int
+    composition_review_required_count: int
+    composition_excluded_project_count: int
+    candidate_evidence_ids: tuple[int, ...]
+    portfolio_projects: tuple[dict[str, object], ...]
+    restricted_activity_urls: tuple[str, ...]
+    open_public_activity_urls: tuple[str, ...]
+    restricted_local_evidence_count: int
 
 
 @pytest.fixture
@@ -58,8 +71,9 @@ def semantic_runner(tmp_path: Path) -> Callable[[str, str], SemanticAcceptanceRe
         workspace = tmp_path / f"{name}-workspace"
         source_root = tmp_path / f"{name}-source"
         source_files = _write_fixture_source(source_root, manifest)
+        public_activity = _fixture_public_activity(manifest)
         paths = WorkspacePaths.from_root(workspace)
-        _write_fixture_approval(paths, source_root, source_files)
+        _write_fixture_approval(paths, source_root, source_files, public_activity)
         _write_fixture_artifact_policy(paths, manifest["artifact_scope"])
 
         repository = SQLiteRepository(paths.db_path)
@@ -93,10 +107,12 @@ def semantic_runner(tmp_path: Path) -> Callable[[str, str], SemanticAcceptanceRe
             )
         )
         _link_file_nodes_to_source_evidence(repository, prepared.revision_id, source_root)
+        if public_activity is not None:
+            _insert_synthetic_public_activity_evidence(repository, public_activity)
 
         review = prepare_project_review_v2(PrepareProjectReviewRequest(workspace=workspace))
         review_payload = json.loads(review.input_path.read_text(encoding="utf-8"))
-        candidate_payload = _candidate_payload(manifest, review_payload)
+        candidate_payload = _safe_synthetic_codex_candidate_input(manifest, review_payload)
         paths.project_candidates_path.write_text(
             _canonical_json(candidate_payload), encoding="utf-8"
         )
@@ -135,6 +151,31 @@ def semantic_runner(tmp_path: Path) -> Callable[[str, str], SemanticAcceptanceRe
             open_public_local_evidence_count=sum(
                 record.activity_id is None for record in open_public.records
             ),
+            composition_project_count=composition.project_count,
+            composition_review_required_count=composition.review_required_count,
+            composition_excluded_project_count=composition.excluded_project_count,
+            candidate_evidence_ids=tuple(candidate_payload["candidates"][0]["evidence_ids"]),
+            portfolio_projects=tuple(
+                _project_assertion_payload(project)
+                for project in repository.list_portfolio_projects()
+            ),
+            restricted_activity_urls=tuple(
+                sorted(
+                    record.activity_url
+                    for record in restricted.records
+                    if record.activity_url is not None
+                )
+            ),
+            open_public_activity_urls=tuple(
+                sorted(
+                    record.activity_url
+                    for record in open_public.records
+                    if record.activity_url is not None
+                )
+            ),
+            restricted_local_evidence_count=sum(
+                record.activity_id is None for record in restricted.records
+            ),
         )
 
     return run
@@ -148,7 +189,7 @@ def _read_fixture_manifest(fixtures_root: Path, name: str) -> dict[str, object]:
         or payload.get("fixture") != name
         or payload.get("artifact_scope") not in {"restricted", "open_public"}
         or not isinstance(payload.get("files"), dict)
-        or not isinstance(payload.get("candidate"), dict)
+        or not isinstance(payload.get("synthetic_codex_candidate"), dict)
     ):
         raise AssertionError(f"invalid semantic fixture: {name}")
     return payload
@@ -169,8 +210,36 @@ def _write_fixture_source(source_root: Path, manifest: dict[str, object]) -> tup
     return tuple(paths)
 
 
+def _fixture_public_activity(manifest: dict[str, object]) -> dict[str, str] | None:
+    raw_activity = manifest.get("synthetic_public_activity")
+    if raw_activity is None:
+        return None
+    if not isinstance(raw_activity, dict):
+        raise AssertionError("synthetic public activity must be an object")
+    required_fields = (
+        "repository",
+        "source_uri",
+        "display_name",
+        "owner",
+        "activity_type",
+        "url",
+        "title",
+        "state",
+        "author",
+        "created_at",
+        "stable_id",
+        "claim_text",
+    )
+    if not all(isinstance(raw_activity.get(field), str) for field in required_fields):
+        raise AssertionError("synthetic public activity fields must be strings")
+    return {field: raw_activity[field] for field in required_fields}
+
+
 def _write_fixture_approval(
-    paths: WorkspacePaths, source_root: Path, source_files: tuple[Path, ...]
+    paths: WorkspacePaths,
+    source_root: Path,
+    source_files: tuple[Path, ...],
+    public_activity: dict[str, str] | None,
 ) -> None:
     write_sample_approval(paths)
     approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
@@ -178,6 +247,9 @@ def _write_fixture_approval(
         source_root.resolve().as_uri(),
         *(path.resolve().as_uri() for path in source_files),
     ]
+    if public_activity is not None:
+        approval["allowed_repositories"] = [public_activity["repository"]]
+        approval["approved_github_activity_urls"] = [public_activity["url"]]
     paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
 
 
@@ -246,8 +318,55 @@ def _link_file_nodes_to_source_evidence(
             )
 
 
-def _candidate_payload(manifest: dict[str, object], review_input: dict[str, object]) -> dict[str, object]:
-    candidate = manifest["candidate"]
+def _insert_synthetic_public_activity_evidence(
+    repository: SQLiteRepository, activity: dict[str, str]
+) -> None:
+    source_id = repository.upsert_source(
+        Source(
+            id=None,
+            type=SourceType.GITHUB_REPOSITORY,
+            uri=activity["source_uri"],
+            display_name=activity["display_name"],
+            owner=activity["owner"],
+            status=SourceStatus.INGESTED,
+            origin_type="public_github",
+            origin_visibility="public",
+        )
+    )
+    activity_id = repository.insert_github_activity(
+        GitHubActivity(
+            id=None,
+            source_id=source_id,
+            repo=activity["repository"],
+            activity_type=activity["activity_type"],
+            url=activity["url"],
+            title=activity["title"],
+            state=activity["state"],
+            author=activity["author"],
+            created_at=activity["created_at"],
+            merged_at=None,
+        )
+    )
+    evidence_id = repository.upsert_evidence_item(
+        source_id=source_id,
+        snapshot_id=None,
+        github_activity_id=activity_id,
+        locator=activity["url"],
+        stable_id=activity["stable_id"],
+        content_hash=None,
+        public_safe=True,
+    )
+    project_id = repository.upsert_project(
+        "synthetic:cross-directory-public-activity", public_safe=True
+    )
+    repository.upsert_github_activity_claim(evidence_id, project_id, activity["claim_text"])
+
+
+def _safe_synthetic_codex_candidate_input(
+    manifest: dict[str, object], review_input: dict[str, object]
+) -> dict[str, object]:
+    """Write the explicit safe input at the prepare -> Codex -> apply test boundary."""
+    candidate = manifest["synthetic_codex_candidate"]
     assert isinstance(candidate, dict)
     boundary_hierarchies = candidate.get("boundary_hierarchies")
     assert isinstance(boundary_hierarchies, list) and all(
@@ -304,6 +423,26 @@ def _candidate_payload(manifest: dict[str, object], review_input: dict[str, obje
     }
 
 
+def _project_assertion_payload(project: dict[str, object]) -> dict[str, object]:
+    evidence = project["evidence"]
+    assert isinstance(evidence, list)
+    return {
+        "id": project["id"],
+        "title": project["title"],
+        "overview": project["overview"],
+        "status": project["status"],
+        "decision_status": project["decision_status"],
+        "decision_origin": project["decision_origin"],
+        "evidence_ids": tuple(item["evidence_id"] for item in evidence),
+        "evidence_count": len(evidence),
+        "evidence_support_levels": tuple(
+            item["support_level"]
+            for item in evidence
+            if isinstance(item.get("support_level"), str)
+        ),
+    }
+
+
 def _assert_locator_free_outputs(paths: WorkspacePaths, source_root: Path) -> None:
     output_paths = [
         paths.semantic_index_manifest_path,
@@ -327,6 +466,23 @@ def test_coherent_parent_becomes_one_project(semantic_runner) -> None:
     result = semantic_runner("coherent_parent", mode="automatic")
 
     assert result.active_project_ids == ("insurance-rag-chatbot",)
+    assert result.composition_project_count == 1
+    assert result.composition_review_required_count == 0
+    assert result.composition_excluded_project_count == 0
+    assert result.candidate_evidence_ids == (2, 3)
+    assert result.portfolio_projects == (
+        {
+            "id": "insurance-rag-chatbot",
+            "title": "Insurance RAG Chatbot",
+            "overview": "Synthetic retrieval and graph services form one coherent project.",
+            "status": "approved",
+            "decision_status": "auto_included_high",
+            "decision_origin": "automatic",
+            "evidence_ids": result.candidate_evidence_ids,
+            "evidence_count": 2,
+            "evidence_support_levels": ("direct", "direct"),
+        },
+    )
 
 
 def test_independent_contest_child_is_split(semantic_runner) -> None:
@@ -345,3 +501,7 @@ def test_cross_directory_fixture_preserves_artifact_scope_boundary(semantic_runn
     assert result.active_project_ids == ("cross-directory-project",)
     assert result.restricted_evidence_count > result.open_public_evidence_count
     assert result.open_public_local_evidence_count == 0
+    assert SYNTHETIC_PUBLIC_ACTIVITY_URL in result.open_public_activity_urls
+    assert set(result.open_public_activity_urls) == {SYNTHETIC_PUBLIC_ACTIVITY_URL}
+    assert SYNTHETIC_PUBLIC_ACTIVITY_URL in result.restricted_activity_urls
+    assert result.restricted_local_evidence_count == 3
