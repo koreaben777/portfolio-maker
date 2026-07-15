@@ -2,7 +2,9 @@
 
 ## 범위
 
-- Verification HEAD: `c752c58`.
+- Verification release HEAD: `da88741`.
+- The release commit changes only current documentation and package metadata;
+  the runtime/browser surface was rechecked at this HEAD.
 - Task 21의 smoke는 격리된 임시 workspace에서 사용자가 선택한 저장소의
   `src` 하위 트리만 대상으로 수행했다.
 - 저장소 전체와 사용자 홈을 스캔하지 않았다. 보호된 legacy 사용자 데이터와

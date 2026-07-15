@@ -301,7 +301,9 @@ Stage C는 approval schema에 다음 optional 필드를 추가한다.
 - current policy, index revision, candidate input, decision, artifact manifest를 hash chain으로 연결한다.
 - personal evidence knowledge graph와 Google Drive는 0.2.0 node/provenance model의 후속 확장으로 남기며 이번 release에서 구현하지 않는다.
 
-0.2.0은 위 설계의 완료 기준, migration, full test, static build, browser validation, 실제 user-scope smoke test를 모두 통과해야 완료로 표시한다.
+0.2.0은 위 설계의 완료 기준, migration, full test, static build, browser validation, 선택 scan-root
+smoke test를 모두 통과해야 완료로 표시한다. 현재 smoke는 보호된 사용자 자료를 제외한 repository
+`src` subtree에 한정되며, 전체 home이나 live GitHub 응답을 보증하지 않는다.
 
 ### 7.5 #3 회사/JD별 맞춤 포트폴리오 후속 확장
 
@@ -327,17 +329,20 @@ artifact policy가 없는 기존 #11 workspace는 0.1.0 호환 경로로 `portfo
 
 누구나 접근 가능한 배포는 `open_public`을 사용자가 별도로 선택하고 재생성·검증한 결과에만 허용한다. 초기 `open_public` 구현은 공개 GitHub 근거만 허용하고 local/private origin 요청을 validation error로 거부한다. `@sites` public deployment는 restricted output을 거부하며, 사용자의 명시적인 공개 배포 명령 없이는 실행하지 않는다.
 
-## 8. 다음 developer 작업 지시
+## 8. Historical developer 작업 지시 (0.2.0 이전)
+
+다음 항목은 0.2.0 구현 전 release plan의 기록이다. 현재 runtime은 이 순서를 완료했으며,
+새 변경은 별도 Issue와 현재 코드·검증 gate를 기준으로 진행한다.
 
 1. 현재 구현 branch와 dirty/untracked 파일을 먼저 확인하고, 0.1.0 #13 기준선을 재구현하지 않는다.
 2. 다음 implementation plan은 [0.2.0 계층형 의미 인덱스·플러그인 설계](2026-07-14-portfolio-maker-0.2.0-semantic-index-plugin-design.md)의 완료 기준을 독립 task로 나눈다.
 3. 계층형 의미 인덱스, Project Boundary Detection, automatic review policy, plugin packaging의 순서와 migration checkpoint를 명시한다.
-4. 먼저 전역 500 candidate cap과 flat evidence context로 known project가 누락되는 회귀 fixture를 작성한다.
+4. (historical) 먼저 전역 500 candidate cap과 flat evidence context로 known project가 누락되는 회귀 fixture를 작성한다.
 5. source approval, artifact policy, masking, private GitHub, delivery scope, EvidenceSelectionService를 우회하거나 의미를 넓히지 않는다.
 6. CLI 내부 외부 LLM API, token 저장, raw locator의 Codex review/artifact 전달을 추가하지 않는다.
 7. `high`와 `medium` automatic inclusion은 explicit automatic mode에서만 동작하고, reversible exclusion과 manual-decision precedence를 함께 구현한다.
 8. plugin skill은 권한·workflow 책임별로 분리하고 Python application use case를 복제하지 않는다. MCP/App은 0.2.0 필수 범위에 넣지 않는다.
-9. focused tests, 전체 pytest, plugin/skill validation, TypeScript check, Vite build, static HTML/browser 검증, 실제 user-scope smoke test, `git diff --check`를 통과시킨다.
+9. focused tests, 전체 pytest, plugin/skill validation, TypeScript check, Vite build, static HTML/browser 검증, 선택 scan-root smoke test, `git diff --check`를 통과시킨다.
 10. 각 implementation slice에서 README, plugin skills, sample review files, roadmap, development principles, Issue 상태를 실제 code behavior와 맞춘다.
 11. 최종 보고에는 변경 파일, HEAD, 실행한 검증 명령, index coverage, candidate/auto/manual/excluded/unassigned counts, migration 결과, 남은 위험을 포함한다.
 

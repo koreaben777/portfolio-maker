@@ -90,13 +90,16 @@ The artifact policy is required for per-artifact selection and is reloaded by
 (cd web/portfolio && npm ci)
 ```
 
-11. To compose semantic portfolio projects, prepare the safe review bundle from the repository root:
+11. For the current 0.2.0 workflow, prepare and apply the semantic index from the same confirmed root
+used for discovery, then prepare the v2 safe review bundle from the repository root:
 
 ```bash
-portfolio-maker prepare-project-review --workspace .
+portfolio-maker prepare-semantic-index --workspace . --root <confirmed-root>
+portfolio-maker apply-semantic-index --workspace .
+portfolio-maker prepare-project-review --workspace . --version v2
 ```
 
-Only `.portfolio-maker/reviews/project-review-input.json` is supplied to Codex. Codex may write
+Only `.portfolio-maker/reviews/project-review-input-v2.json` is supplied to Codex. Codex may write
 `project-candidates.json` and `project-candidates.md` using only that bundle. Review and edit the
 candidate file, or write `project-approval.json` directly, then create the sample approval shape
 when needed:

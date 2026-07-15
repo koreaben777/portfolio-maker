@@ -6,9 +6,9 @@
 
 ## 1. 기획 요약
 
-Portfolio Maker 0.1.0의 Codex 기반 semantic project composition은 승인된 evidence를 사람이 이해할 수 있는 프로젝트로 묶는 안전한 검토·승인 계층을 제공한다. 그러나 현재 입력은 평면적인 evidence 목록이며 로컬 discovery는 최대 500개 후보에서 멈춘다. 이 구조에서는 폴더의 상하위 맥락이 사라지고, 보험 RAG 챗봇이나 PlayMCP 공모전 작업처럼 명확한 대형 프로젝트도 후보가 0건이 되거나 지나치게 작은 단위로 분리될 수 있다.
+역사적 0.1.0의 Codex 기반 semantic project composition은 승인된 evidence를 사람이 이해할 수 있는 프로젝트로 묶는 안전한 검토·승인 계층을 제공했다. 당시 입력은 평면적인 evidence 목록이고 local discovery는 최대 500개 후보에서 멈췄기 때문에 폴더의 상하위 맥락이 사라질 수 있었다. 0.2.0 current path는 이 한계를 계층형 semantic index로 보완한다.
 
-0.2.0은 다음 목표를 하나의 개발 완료 기준으로 묶는다.
+0.2.0 current contract는 다음 기능을 제공한다.
 
 1. 전역 파일 개수 상한에 의존하지 않고 승인된 탐색 범위의 전체 구조를 인덱싱한다.
 2. 파일의 역할과 내용을 요약하고, 하위에서 상위로 폴더 의미를 합성한다.
@@ -433,7 +433,9 @@ file 부재는 성공한 complete structural crawl에서 확인된 경우에만 
 - 자동 포함 project를 제외하고 다시 포함할 수 있다.
 - focused Python tests, full pytest, TypeScript check, Vite build, static validator, browser interaction 검증이 통과한다.
 
-실제 사용자 home smoke test는 synthetic fixture와 분리하고, 원본을 변경하지 않는 별도 workspace에서 실행한다.
+read-only smoke는 synthetic fixture와 분리하고, 원본을 변경하지 않는 별도 workspace에서 선택한
+scan root를 대상으로 실행한다. 현재 검증 기록은 보호된 사용자 자료를 제외하기 위해 repository
+`src` subtree를 사용했으며, 전체 home·대규모 외부 project·live GitHub 응답을 보증하지 않는다.
 
 ## 15. 0.2.0 완료 기준
 
@@ -449,7 +451,7 @@ file 부재는 성공한 complete structural crawl에서 확인된 경우에만 
 8. plugin manifest와 책임별 skill이 validation을 통과한다.
 9. 0.1.0 workspace migration과 rollback-safe failure behavior가 검증된다.
 10. README, plugin skills, roadmap, development principles, Issue 상태가 실제 runtime과 일치한다.
-11. 전체 자동 검증과 실제 user-scope smoke test가 모두 통과한다.
+11. 전체 자동 검증과 보호된 사용자 자료를 제외한 선택 scan-root smoke test가 모두 통과한다.
 
 ## 16. 장기 확장
 

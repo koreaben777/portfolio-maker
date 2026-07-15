@@ -184,7 +184,7 @@ review mode에서는 user decision 전 candidate를 materialize하지 않는다.
 - TypeScript check와 Vite build
 - static artifact safety validation
 - browser keyboard/mobile/reduced-motion interaction
-- read-only actual user-scope smoke test
+- read-only selected scan-root smoke test; the current record uses a repository `src` subtree and excludes protected user data
 - `git diff --check`
 
 test count나 과거 PASS를 현재 증거로 재사용하지 않는다. 완료 주장은 current HEAD의 명령과 결과를 기록한다.
