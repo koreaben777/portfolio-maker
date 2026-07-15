@@ -10,15 +10,23 @@ import pytest
 
 import portfolio_maker.application.semantic_index as semantic_index_module
 from portfolio_maker.application.approval import write_sample_approval
+from portfolio_maker.application.artifact_approval import write_sample_artifact_policy
+from portfolio_maker.application.build_profile import build_profile
+from portfolio_maker.application.ingestion import ingest_sources
 from portfolio_maker.application.models import (
     ApplySemanticIndexRequest,
+    BuildProfileRequest,
+    IngestSourcesRequest,
+    PrepareProjectReviewRequest,
     PrepareSemanticIndexRequest,
 )
+from portfolio_maker.application.project_boundary import prepare_project_review_v2
 from portfolio_maker.application.semantic_index import (
     SemanticIndexError,
     apply_semantic_index,
     prepare_semantic_index,
 )
+from portfolio_maker.domain.models import Source, SourceStatus, SourceType
 from portfolio_maker.infrastructure.sqlite_repository import SQLiteRepository
 from portfolio_maker.workspace import WorkspacePaths
 
@@ -81,6 +89,61 @@ def write_valid_outputs(prepared) -> None:
             json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
             encoding="utf-8",
         )
+
+
+def test_prepare_semantic_index_links_current_approved_file_evidence_to_file_nodes(
+    workspace: Path, tmp_path: Path
+) -> None:
+    root = tmp_path / "approved-root"
+    root.mkdir()
+    source_path = root / "README.md"
+    source_path.write_text("Approved project evidence", encoding="utf-8")
+    paths = WorkspacePaths.from_root(workspace)
+    write_sample_approval(paths)
+    approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    approval["approved_source_uris"] = [
+        root.resolve().as_uri(),
+        source_path.resolve().as_uri(),
+    ]
+    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+    write_sample_artifact_policy(paths)
+
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    repository.upsert_source(
+        Source(
+            id=None,
+            type=SourceType.LOCAL_FILE,
+            uri=source_path.resolve().as_uri(),
+            display_name="README.md",
+            owner=None,
+            status=SourceStatus.APPROVED,
+        )
+    )
+    assert ingest_sources(IngestSourcesRequest(workspace=workspace)).ingested_count == 1
+    evidence_id = build_profile(
+        BuildProfileRequest(workspace=workspace, write_artifacts=False)
+    ).evidence_ids[0]
+
+    prepared = prepare_semantic_index(
+        PrepareSemanticIndexRequest(workspace=workspace, root=root, chunk_size=1)
+    )
+
+    staged_nodes = repository.list_semantic_nodes(prepared.revision_id)
+    staged_file = next(
+        node for node in staged_nodes if node["relative_hierarchy"] == "README.md"
+    )
+    assert staged_file["evidence_ids"] == [evidence_id]
+
+    write_valid_outputs(prepared)
+    apply_semantic_index(ApplySemanticIndexRequest(workspace=workspace))
+    review = prepare_project_review_v2(PrepareProjectReviewRequest(workspace=workspace))
+    review_payload = json.loads(review.input_path.read_text(encoding="utf-8"))
+    review_file = next(
+        node for node in review_payload["nodes"] if node["relative_hierarchy"] == "README.md"
+    )
+    assert review.evidence_count == 1
+    assert review_file["evidence_ids"] == [evidence_id]
 
 
 def test_apply_semantic_index_activates_complete_bottom_up_output(

@@ -5,6 +5,7 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 from uuid import uuid4
 
 from portfolio_maker.application.approval import (
@@ -12,6 +13,11 @@ from portfolio_maker.application.approval import (
     ApprovalMissingError,
     SourceApproval,
     load_approval,
+)
+from portfolio_maker.application.artifact_approval import load_artifact_policy
+from portfolio_maker.application.evidence_selection import (
+    EvidenceSelectionRequest,
+    EvidenceSelectionService,
 )
 from portfolio_maker.application.models import (
     ApplySemanticIndexRequest,
@@ -99,7 +105,12 @@ def prepare_semantic_index(
     revision_id = uuid4().hex
     source_id = crawl.entries[0].source_id
     policy_hash = _policy_hash(approval)
-    prepared_nodes = _prepare_nodes(crawl.entries)
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    approved_evidence_by_source_uri = _approved_local_evidence_by_source_uri(
+        paths, repository, approval
+    )
+    prepared_nodes = _prepare_nodes(crawl.entries, approved_evidence_by_source_uri)
     chunk_payloads = _chunk_payloads(
         revision_id,
         tuple(node.chunk_node for node in prepared_nodes),
@@ -119,8 +130,6 @@ def prepare_semantic_index(
         "node_count": len(prepared_nodes),
     }
 
-    repository = SQLiteRepository(paths.db_path)
-    repository.initialize()
     repository.create_semantic_revision(
         revision_id, source_id, policy_hash, ANALYZER_VERSION
     )
@@ -539,7 +548,10 @@ def _is_sha256(value: object) -> bool:
     return isinstance(value, str) and _SHA256.fullmatch(value) is not None
 
 
-def _prepare_nodes(entries: tuple[StructuralEntry, ...]) -> tuple[_PreparedNode, ...]:
+def _prepare_nodes(
+    entries: tuple[StructuralEntry, ...],
+    approved_evidence_by_source_uri: dict[str, tuple[int, ...]],
+) -> tuple[_PreparedNode, ...]:
     structural_entries = entries
     child_node_ids: dict[str, list[str]] = {}
     for entry in structural_entries:
@@ -571,7 +583,11 @@ def _prepare_nodes(entries: tuple[StructuralEntry, ...]) -> tuple[_PreparedNode,
             semantic_summary="",
             semantic_roles=semantic_roles,
             topics=(),
-            evidence_ids=(),
+            evidence_ids=(
+                approved_evidence_by_source_uri.get(_canonical_file_uri(entry.absolute_path), ())
+                if entry.kind is SemanticNodeKind.FILE
+                else ()
+            ),
             analysis_status=status,
             analyzer_version=ANALYZER_VERSION,
             updated_at="",
@@ -595,6 +611,53 @@ def _prepare_nodes(entries: tuple[StructuralEntry, ...]) -> tuple[_PreparedNode,
             )
         )
     return tuple(prepared)
+
+
+def _approved_local_evidence_by_source_uri(
+    paths: WorkspacePaths,
+    repository: SQLiteRepository,
+    approval: SourceApproval,
+) -> dict[str, tuple[int, ...]]:
+    selection = EvidenceSelectionService().select(
+        repository,
+        EvidenceSelectionRequest(
+            artifact_kind="master_profile",
+            policy=load_artifact_policy(paths),
+            current_approval=approval,
+        ),
+    )
+    selected_evidence_ids = set(selection.included_evidence_ids)
+    evidence_by_source_uri: dict[str, set[int]] = {}
+    for record in selection.records:
+        if (
+            record.evidence_id not in selected_evidence_ids
+            or record.source_type != "local_file"
+            or record.source_uri is None
+        ):
+            continue
+        canonical_source_uri = _canonical_file_uri_from_uri(record.source_uri)
+        if canonical_source_uri is not None:
+            evidence_by_source_uri.setdefault(canonical_source_uri, set()).add(
+                record.evidence_id
+            )
+    return {
+        source_uri: tuple(sorted(evidence_ids))
+        for source_uri, evidence_ids in evidence_by_source_uri.items()
+    }
+
+
+def _canonical_file_uri(path: Path) -> str:
+    return path.resolve(strict=True).as_uri()
+
+
+def _canonical_file_uri_from_uri(uri: str) -> str | None:
+    parsed = urlparse(uri)
+    if parsed.scheme != "file" or parsed.netloc not in {"", "localhost"}:
+        return None
+    try:
+        return _canonical_file_uri(Path(unquote(parsed.path)))
+    except (OSError, RuntimeError):
+        return None
 
 
 def _chunk_payloads(
