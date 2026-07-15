@@ -369,3 +369,23 @@ metadata, and separate evidence/artifact/delivery/public authorities.
 
 Focused assertions passed against `SKILL.md` and `agents/openai.yaml`. No raw
 source or private data was used by the check.
+
+## Independent Task 17 GREEN Observation
+
+Probe context: an independent fresh worker read only the final
+`portfolio-project-review/SKILL.md`. The worker had no repository or user data
+access. The probe used generic synthetic project decisions only.
+
+### GREEN raw output
+
+```text
+결정: portfolio-maker compose-projects --mode automatic으로 실행합니다. 엔진이 허용한 high/medium만 auto_included_high/auto_included_medium으로 포함하고, 조건 미충족 medium과 low는 review_required로 둡니다. 실험용 메모 프로젝트는 set-project-state --state excluded로 제외하며 삭제하지 않습니다. 이후 자동 분석에서도 명시적 재포함 전까지 복원하지 않습니다. Gates: explicit automatic; manual/existing exclusions precedence; persistent exclusion with source/evidence/index/derived metadata preserved; merge/split/reassign require review/lineage; no evidence/artifact/delivery/deployment/public permission.
+```
+
+Result: GREEN. The independent worker selected the explicit automatic CLI
+mode, applied only engine-allowed high/medium inclusion states, retained
+ineligible medium and low candidates as `review_required`, used persistent and
+reversible exclusion, preserved source/evidence/index/derived metadata,
+required review and lineage for identity changes, and kept evidence, artifact,
+delivery, deployment, and public permission separate. This observation
+contains no private source content, credentials, or raw user data.
