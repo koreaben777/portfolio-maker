@@ -1,0 +1,149 @@
+Portfolio Maker Personal Non-Commercial License 1.0
+
+Copyright (c) 2026 koreaben777
+
+This license is a custom source-available license. It is not an OSI-approved
+Open Source license.
+
+## 1. Definitions
+
+"Software" means the source code, scripts, configuration, documentation, and
+other materials in this repository that are owned by the copyright holder.
+
+"You" means the individual accepting this license. "Commercial Use" means
+using the Software for a business, employer, paid service, revenue-generating
+activity, sale, resale, SaaS, hosted service, or integration into a commercial
+product or service. "Redistribution" means giving, publishing, sublicensing,
+selling, or otherwise making the Software or a modified version available to a
+third party. A private copy on your own devices for a permitted purpose is not
+Redistribution.
+
+## 2. Personal license grant
+
+The copyright holder grants you a limited, non-exclusive, non-transferable,
+non-sublicensable license to download, install, run, and privately modify the
+Software solely for your own non-commercial purposes, including personal study,
+research, testing, hobby projects, personal portfolio creation, and personal
+job preparation.
+
+## 3. Restrictions
+
+You may not:
+
+1. use the Software for Commercial Use;
+2. redistribute, publish, sell, sublicense, or offer the Software or any
+   modified version to a third party;
+3. operate the Software as a SaaS, hosted, managed, or paid service for others;
+4. remove this license, copyright notices, or required attribution from copies
+   kept for permitted personal use; or
+5. use the Portfolio Maker name, logo, or marks to imply endorsement.
+
+## 4. Generated artifacts and user data
+
+This license covers the Software, not your own input files, personal data, or
+portfolio content that you generate with it. You are responsible for the
+rights, permissions, privacy, and licenses applicable to those inputs and
+outputs. Third-party dependencies, fonts, sample assets, and other materials
+with separate notices remain subject to their own licenses.
+
+## 5. Commercial licensing reserved
+
+The copyright holder retains all rights not expressly granted here, including
+the right to use the Software commercially, develop a commercial edition,
+offer hosted services, and grant separate commercial licenses. A commercial
+license may be requested from the copyright holder.
+
+## 6. Contributions
+
+Submitting code or other material to this repository does not automatically
+grant rights to the copyright holder. Contributions require a separate written
+agreement before acceptance if they are intended to be included in a
+commercial edition or relicensed distribution.
+
+## 7. Termination and warranty
+
+This license terminates automatically if you materially violate its terms. The
+Software is provided "AS IS", without warranties or conditions of any kind, to
+the maximum extent permitted by law. The copyright holder is not liable for
+claims, damages, or losses arising from use of the Software, to the maximum
+extent permitted by law.
+
+## 8. Language
+
+The Korean notice in the repository README is an explanatory translation of
+this license. If the Korean and English texts differ, the English text governs.
+
+---
+
+# Portfolio Maker 개인·비상업·비재배포 라이선스 1.0
+
+저작권 (c) 2026 koreaben777
+
+이 라이선스는 소스 공개형 커스텀 라이선스이며, OSI가 승인한 오픈소스
+라이선스가 아닙니다.
+
+## 1. 정의
+
+"소프트웨어"란 이 저장소에 포함된 자료 중 저작권자가 권리를 보유한
+소스 코드, 스크립트, 설정, 문서 및 기타 자료를 의미합니다.
+
+"사용자"란 이 라이선스에 동의하는 개인을 의미합니다. "상업적 이용"이란
+사업, 고용주를 위한 업무, 유료 서비스, 수익 창출 활동, 판매, 재판매,
+SaaS, 호스팅 서비스 또는 상업적 제품·서비스에 소프트웨어를 통합하는
+행위를 의미합니다. "재배포"란 소프트웨어나 수정본을 제3자에게 제공,
+공개, 서브라이선스, 판매하거나 그 밖의 방법으로 이용 가능하게 하는
+행위를 의미합니다. 허용된 개인적 목적을 위해 본인의 기기에 보관하는
+사본은 재배포로 보지 않습니다.
+
+## 2. 개인 사용 허가
+
+저작권자는 사용자에게 소프트웨어를 개인 학습, 연구, 테스트, 취미,
+개인 포트폴리오 작성 및 개인 취업 준비를 포함한 자신의 비상업적 목적에
+한하여 다운로드, 설치, 실행하고 비공개로 수정할 수 있는 제한적·비독점적·
+양도 불가·서브라이선스 불가 라이선스를 부여합니다.
+
+## 3. 제한 사항
+
+사용자는 다음 행위를 할 수 없습니다.
+
+1. 소프트웨어를 상업적으로 이용하는 행위
+2. 소프트웨어 또는 수정본을 제3자에게 재배포·공개·판매·서브라이선스하는 행위
+3. 소프트웨어를 타인을 위한 SaaS·호스팅·관리형·유료 서비스로 운영하는 행위
+4. 개인적 사용을 위한 사본에서 이 라이선스, 저작권 표시 또는 필수 고지를
+   제거하는 행위
+5. Portfolio Maker 이름, 로고 또는 상표를 이용해 공식 후원·승인을 받은
+   것처럼 표시하는 행위
+
+## 4. 생성 산출물과 사용자 데이터
+
+이 라이선스는 소프트웨어에 적용되며, 사용자가 입력한 파일, 개인 정보 또는
+소프트웨어로 생성한 포트폴리오 내용 자체에는 적용되지 않습니다. 그러한
+입력과 산출물에 필요한 권리, 동의, 개인정보 보호 및 별도 라이선스의
+확인은 사용자의 책임입니다. 별도 고지가 있는 외부 의존성, 폰트, 샘플
+자산 및 기타 자료에는 각자의 라이선스가 적용됩니다.
+
+## 5. 상업적 라이선스 유보
+
+저작권자는 이 라이선스에서 명시적으로 허용하지 않은 모든 권리를 보유하며,
+소프트웨어의 상업적 이용, 상업용 에디션 개발, 호스팅 서비스 제공 및 별도
+상업 라이선스 부여를 할 수 있습니다. 상업적 이용은 저작권자에게 별도로
+문의해야 합니다.
+
+## 6. 기여
+
+이 저장소에 코드나 기타 자료를 제출하는 것만으로 저작권자에게 권리가
+자동으로 이전되지 않습니다. 상업용 에디션 또는 다른 라이선스로 배포할
+목적으로 기여를 반영하려면 수락 전에 별도의 서면 계약이 필요합니다.
+
+## 7. 종료 및 보증 부인
+
+사용자가 이 조건을 중대하게 위반하면 라이선스는 자동으로 종료됩니다.
+법이 허용하는 최대 범위에서 소프트웨어는 어떠한 보증이나 조건 없이
+"있는 그대로" 제공됩니다. 법이 허용하는 최대 범위에서 저작권자는
+소프트웨어 사용으로 발생하는 청구, 손해 또는 손실에 대해 책임을 지지
+않습니다.
+
+## 8. 언어
+
+저장소 README의 한글 안내는 이 라이선스의 설명용 번역입니다. 한글과
+영문 내용이 다를 경우 영문이 우선합니다.
