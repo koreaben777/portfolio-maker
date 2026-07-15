@@ -82,11 +82,13 @@ Raw output:
 
 Result: GREEN. The final-skill-only agent stops before access, requests the confirmed root and exclusions, protects credentials, and separates the four authorities.
 
-## Task 15 Baseline RED
+## Independent Task 15 RED and GREEN
 
 Date: 2026-07-15
 Task: 15 (`portfolio-semantic-index`)
 Scope: synthetic prompt behavior only; no private source content, credentials, or raw user data recorded.
+
+### RED: Baseline fresh worker
 
 Fresh-worker prompt:
 
@@ -114,6 +116,18 @@ Failure categories:
 - unsafe or incomplete apply boundary (including direct database-edit ambiguity)
 
 This RED observation contains no private source content, credentials, or raw user data.
+
+### GREEN: Independent fresh-worker probe
+
+Probe context: an independent fresh worker read only `skills/portfolio-semantic-index/SKILL.md`. No private source content, credentials, or raw user data were provided or recorded.
+
+Raw output:
+
+```text
+생성된 prepare-semantic-index 매니페스트와 청크가 없으므로 분석을 시작할 수 없습니다. 앞부분 파일만 보고 나머지를 추정하거나 분석 대상을 제한하지 않습니다. 먼저 승인된 범위에 대해 prepare-semantic-index를 실행해야 합니다. 이후 생성된 매니페스트와 모든 청크만 사용해 모든 노드를 bottom-up 순서로 정확히 한 번씩 처리하고, 읽을 수 없는 파일과 지원되지 않는 파일의 상태를 보존합니다. 출력 검증을 통과한 경우에만 apply-semantic-index로 적용합니다. 현재는 아무것도 적용하지 않았습니다. Gates: 원본 파일 직접 탐색 금지; 파일 수 제한/샘플링/추정 금지; generated manifest/chunks required; every node bottom-up exactly once; preserve unreadable/unsupported; validate before apply; apply only via apply-semantic-index; no file changes.
+```
+
+Result: GREEN. The independent worker stopped because generated semantic input was absent, rejected truncation/sampling/inference and raw-file exploration, required all generated chunks, preserved unreadable/unsupported status, required validation before apply, used only `apply-semantic-index` for application, and reported no file changes.
 
 ## Task 15 Contract GREEN
 
