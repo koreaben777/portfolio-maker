@@ -139,3 +139,17 @@ class PrepareSemanticIndexResult:
     node_count: int
     chunk_count: int
     partial_count: int
+
+
+@dataclass(frozen=True)
+class ApplySemanticIndexRequest:
+    workspace: Path
+
+
+@dataclass(frozen=True)
+class ApplySemanticIndexResult:
+    revision_id: str
+    active: bool
+    complete_count: int
+    partial_count: int
+    failed_count: int

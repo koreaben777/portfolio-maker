@@ -10,8 +10,15 @@ import pytest
 
 import portfolio_maker.application.semantic_index as semantic_index_module
 from portfolio_maker.application.approval import write_sample_approval
-from portfolio_maker.application.models import PrepareSemanticIndexRequest
-from portfolio_maker.application.semantic_index import prepare_semantic_index
+from portfolio_maker.application.models import (
+    ApplySemanticIndexRequest,
+    PrepareSemanticIndexRequest,
+)
+from portfolio_maker.application.semantic_index import (
+    SemanticIndexError,
+    apply_semantic_index,
+    prepare_semantic_index,
+)
 from portfolio_maker.infrastructure.sqlite_repository import SQLiteRepository
 from portfolio_maker.workspace import WorkspacePaths
 
@@ -22,6 +29,202 @@ def approve_root(workspace: Path, root: Path, *, excluded: tuple[Path, ...] = ()
     approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
     approval["excluded_directories"] = [str(path) for path in excluded]
     paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+
+
+def prepare_fixture_revision(workspace: Path, tmp_path: Path):
+    root = tmp_path / "approved-root"
+    root.mkdir()
+    nested = root / "docs" / "guides"
+    nested.mkdir(parents=True)
+    (root / "README.md").write_text("Project overview", encoding="utf-8")
+    (nested / "setup.md").write_text("Setup guidance", encoding="utf-8")
+    approve_root(workspace, root)
+    return prepare_semantic_index(
+        PrepareSemanticIndexRequest(workspace=workspace, root=root, chunk_size=1)
+    )
+
+
+def write_valid_outputs(prepared) -> None:
+    input_dir = prepared.manifest_path.parent / "input"
+    output_dir = prepared.manifest_path.parent / "output"
+    output_dir.mkdir(exist_ok=True)
+    for input_path in sorted(input_dir.glob("chunk-*.json")):
+        input_text = input_path.read_text(encoding="utf-8")
+        input_payload = json.loads(input_text)
+        payload = {
+            "version": 1,
+            "revision_id": prepared.revision_id,
+            "input_sha256": hashlib.sha256(input_text.encode("utf-8")).hexdigest(),
+            "nodes": [
+                {
+                    "node_id": node["node_id"],
+                    "semantic_summary": (
+                        ""
+                        if node["analysis_status"] in {"unsupported", "unreadable"}
+                        else f"Summary for {node['display_name']}"
+                    ),
+                    "semantic_roles": node["roles"],
+                    "topics": ["semantic-index"],
+                    "analysis_status": node["analysis_status"],
+                    "child_node_ids": node["child_node_ids"],
+                }
+                for node in input_payload["nodes"]
+            ],
+        }
+        payload["output_sha256"] = hashlib.sha256(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
+                "utf-8"
+            )
+        ).hexdigest()
+        (output_dir / input_path.name).write_text(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+            encoding="utf-8",
+        )
+
+
+def test_apply_semantic_index_activates_complete_bottom_up_output(
+    workspace: Path, tmp_path: Path
+) -> None:
+    prepared = prepare_fixture_revision(workspace, tmp_path)
+    with sqlite3.connect(WorkspacePaths.from_root(workspace).db_path) as connection:
+        connection.execute(
+            "INSERT INTO projects (name, public_safe) VALUES (?, ?)",
+            ("legacy-technical-project", 0),
+        )
+    write_valid_outputs(prepared)
+
+    result = apply_semantic_index(ApplySemanticIndexRequest(workspace=workspace))
+
+    repository = SQLiteRepository(WorkspacePaths.from_root(workspace).db_path)
+    nodes = repository.list_semantic_nodes(prepared.revision_id)
+    assert result.revision_id == prepared.revision_id
+    assert result.active is True
+    assert result.complete_count == sum(
+        node["analysis_status"] == "complete" for node in nodes
+    )
+    assert result.partial_count == 0
+    assert result.failed_count == 0
+    assert [node["relative_hierarchy"] for node in nodes] == sorted(
+        node["relative_hierarchy"] for node in nodes
+    )
+    assert all(node["semantic_summary"] for node in nodes)
+    assert all("/" not in node["semantic_summary"] for node in nodes)
+    with sqlite3.connect(WorkspacePaths.from_root(workspace).db_path) as connection:
+        legacy_projects = connection.execute("SELECT name FROM projects").fetchall()
+    assert legacy_projects == [("legacy-technical-project",)]
+
+
+def test_apply_semantic_index_invalid_output_keeps_previous_active_revision(
+    workspace: Path, tmp_path: Path
+) -> None:
+    first = prepare_fixture_revision(workspace, tmp_path)
+    write_valid_outputs(first)
+    apply_semantic_index(ApplySemanticIndexRequest(workspace=workspace))
+
+    root = tmp_path / "approved-root"
+    (root / "CHANGELOG.md").write_text("Second revision", encoding="utf-8")
+    second = prepare_semantic_index(
+        PrepareSemanticIndexRequest(workspace=workspace, root=root, chunk_size=1)
+    )
+    write_valid_outputs(second)
+    output_path = next(
+        path
+        for path in (second.manifest_path.parent / "output").glob("chunk-*.json")
+        if json.loads(path.read_text(encoding="utf-8"))["nodes"][0]["child_node_ids"]
+    )
+    payload = json.loads(output_path.read_text(encoding="utf-8"))
+    payload["nodes"][0]["child_node_ids"] = ["outside-this-revision"]
+    payload["output_sha256"] = hashlib.sha256(
+        json.dumps(
+            {key: value for key, value in payload.items() if key != "output_sha256"},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    output_path.write_text(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SemanticIndexError, match="semantic index output"):
+        apply_semantic_index(ApplySemanticIndexRequest(workspace=workspace))
+
+    source_id = json.loads(first.manifest_path.read_text(encoding="utf-8"))["source_id"]
+    active = SQLiteRepository(WorkspacePaths.from_root(workspace).db_path).get_active_semantic_revision(
+        source_id
+    )
+    assert active is not None
+    assert active["id"] == first.revision_id
+
+
+def test_apply_semantic_index_rejects_malformed_output_without_activation(
+    workspace: Path, tmp_path: Path
+) -> None:
+    prepared = prepare_fixture_revision(workspace, tmp_path)
+    write_valid_outputs(prepared)
+    next((prepared.manifest_path.parent / "output").glob("chunk-*.json")).write_text(
+        "{", encoding="utf-8"
+    )
+
+    with pytest.raises(SemanticIndexError, match="semantic index output"):
+        apply_semantic_index(ApplySemanticIndexRequest(workspace=workspace))
+
+    source_id = json.loads(prepared.manifest_path.read_text(encoding="utf-8"))["source_id"]
+    assert SQLiteRepository(WorkspacePaths.from_root(workspace).db_path).get_active_semantic_revision(
+        source_id
+    ) is None
+
+
+def test_apply_semantic_index_preserves_partial_status(workspace: Path, tmp_path: Path) -> None:
+    root = tmp_path / "approved-root"
+    root.mkdir()
+    (root / "large.md").write_text("x" * 131_073, encoding="utf-8")
+    approve_root(workspace, root)
+    prepared = prepare_semantic_index(
+        PrepareSemanticIndexRequest(workspace=workspace, root=root, chunk_size=1)
+    )
+    write_valid_outputs(prepared)
+
+    result = apply_semantic_index(ApplySemanticIndexRequest(workspace=workspace))
+
+    nodes = SQLiteRepository(WorkspacePaths.from_root(workspace).db_path).list_semantic_nodes(
+        prepared.revision_id
+    )
+    assert result.partial_count == 1
+    assert next(node for node in nodes if node["relative_hierarchy"] == "large.md")[
+        "analysis_status"
+    ] == "partial"
+
+
+def test_apply_semantic_index_interruption_keeps_previous_active_revision(
+    workspace: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = prepare_fixture_revision(workspace, tmp_path)
+    write_valid_outputs(first)
+    apply_semantic_index(ApplySemanticIndexRequest(workspace=workspace))
+
+    root = tmp_path / "approved-root"
+    (root / "CHANGELOG.md").write_text("Second revision", encoding="utf-8")
+    second = prepare_semantic_index(
+        PrepareSemanticIndexRequest(workspace=workspace, root=root, chunk_size=1)
+    )
+    write_valid_outputs(second)
+
+    def interrupted(*args, **kwargs) -> None:
+        raise OSError("synthetic interruption")
+
+    monkeypatch.setattr(SQLiteRepository, "replace_and_activate_semantic_revision", interrupted)
+
+    with pytest.raises(OSError, match="synthetic interruption"):
+        apply_semantic_index(ApplySemanticIndexRequest(workspace=workspace))
+
+    source_id = json.loads(first.manifest_path.read_text(encoding="utf-8"))["source_id"]
+    active = SQLiteRepository(WorkspacePaths.from_root(workspace).db_path).get_active_semantic_revision(
+        source_id
+    )
+    assert active is not None
+    assert active["id"] == first.revision_id
 
 
 def test_prepare_semantic_index_writes_locator_free_chunks_and_staging_revision(

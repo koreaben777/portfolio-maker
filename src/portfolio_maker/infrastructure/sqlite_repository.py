@@ -845,6 +845,75 @@ class SQLiteRepository:
                 (revision_id,),
             )
 
+    def replace_and_activate_semantic_revision(
+        self, revision_id: str, nodes: tuple[SemanticNode, ...]
+    ) -> None:
+        """Atomically replace staged semantic annotations and activate the revision."""
+        with self._connection() as conn:
+            revision = conn.execute(
+                """
+                SELECT source_id FROM semantic_index_revisions
+                WHERE id = ? AND status = 'staging'
+                """,
+                (revision_id,),
+            ).fetchone()
+            if revision is None:
+                raise RepositoryError("semantic revision is not staging")
+            source_id = self._required_text(revision, "source_id")
+            existing_rows = conn.execute(
+                "SELECT node_id FROM semantic_nodes WHERE revision_id = ?",
+                (revision_id,),
+            ).fetchall()
+            existing_node_ids = {self._required_text(row, "node_id") for row in existing_rows}
+            node_ids = {node.node_id for node in nodes}
+            if (
+                len(nodes) != len(node_ids)
+                or node_ids != existing_node_ids
+                or any(node.source_id != source_id for node in nodes)
+            ):
+                raise RepositoryError("semantic revision graph is invalid")
+
+            for node in nodes:
+                result = conn.execute(
+                    """
+                    UPDATE semantic_nodes
+                    SET semantic_summary = ?, semantic_roles_json = ?, topics_json = ?,
+                        evidence_ids_json = ?, analysis_status = ?, analyzer_version = ?
+                    WHERE revision_id = ? AND node_id = ?
+                    """,
+                    (
+                        node.semantic_summary,
+                        json.dumps(node.semantic_roles),
+                        json.dumps(node.topics),
+                        json.dumps(node.evidence_ids),
+                        node.analysis_status.value,
+                        node.analyzer_version,
+                        revision_id,
+                        node.node_id,
+                    ),
+                )
+                if result.rowcount != 1:
+                    raise RepositoryError("semantic revision graph is invalid")
+
+            conn.execute(
+                """
+                UPDATE semantic_index_revisions
+                SET status = 'superseded'
+                WHERE source_id = ? AND status = 'active'
+                """,
+                (source_id,),
+            )
+            result = conn.execute(
+                """
+                UPDATE semantic_index_revisions
+                SET status = 'active', completed_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND status = 'staging'
+                """,
+                (revision_id,),
+            )
+            if result.rowcount != 1:
+                raise RepositoryError("semantic revision is not staging")
+
     def fail_semantic_revision(self, revision_id: str) -> None:
         with self._connection() as conn:
             result = conn.execute(
