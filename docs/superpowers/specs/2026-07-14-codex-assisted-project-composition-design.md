@@ -1,15 +1,15 @@
 # Codex 기반 프로젝트 식별·구성 설계
 
 날짜: 2026-07-14
-상태: 0.1.0 승인 설계 및 구현 기준선
+상태: 역사적 0.1.0 승인 설계 및 구현 기준선
 추적 Issue: #13
 
-> **0.2.0 후속 설계:** 이 문서는 평면적인 safe evidence bundle을 사용한 현재
-> semantic project composition의 구현 계약을 기록한다. 계층형 의미 인덱스, Codex plugin,
-> Project Boundary Detection, `medium` 이상 자동 포함과 가역적 제외를 포함한 0.2.0 목표는
+> **역사적 기준선:** 이 문서는 평면적인 safe evidence bundle을 사용한 0.1.0
+> semantic project composition의 설계·구현 기록이다. 계층형 의미 인덱스, Codex plugin,
+> Project Boundary Detection, `medium` 이상 자동 포함과 가역적 제외를 포함한 현재 0.2.0 계약은
 > [Portfolio Maker 0.2.0 계층형 의미 인덱스·플러그인 설계](2026-07-14-portfolio-maker-0.2.0-semantic-index-plugin-design.md)가
-> 권위 문서다. 0.2.0 구현이 완료되기 전까지 이 문서의 review-required runtime 설명은 현재
-> 동작으로 유지한다.
+> 권위 문서다. 이 문서의 review-required runtime 설명은 0.1.0 호환 경로와 역사적
+> 동작을 설명하며, 현재 공개 runtime의 단독 근거로 사용하지 않는다.
 
 ## 1. 문제 정의
 
