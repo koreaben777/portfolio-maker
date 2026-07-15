@@ -63,3 +63,67 @@ All commands used `PYTHONDONTWRITEBYTECODE=1`.
 ## Concern
 
 No functional concerns found in the requested scope.
+
+## Review Fix Evidence
+
+### Root Cause Confirmation
+
+- Semantic prepare reused `EvidenceSelectionService` with
+  `artifact_kind="master_profile"`, so artifact policy incorrectly controlled
+  node evidence linkage and malformed policy blocked preparation.
+- That selector checked persisted source status but did not compare the current
+  local file extraction with the latest managed snapshot, allowing an old
+  evidence ID to attach after the file changed on disk.
+- URI matching normalized accepted input instead of requiring the original URI
+  to equal the canonical empty-authority file URI.
+
+### Focused RED
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python -m pytest \
+  tests/test_semantic_index.py::test_prepare_semantic_index_does_not_link_evidence_after_profiled_file_changes \
+  tests/test_semantic_index.py::test_prepare_semantic_index_evidence_mapping_ignores_artifact_policy \
+  tests/test_semantic_index.py::test_canonical_file_uri_matching_accepts_empty_authority_and_encoded_path \
+  tests/test_semantic_index.py::test_canonical_file_uri_matching_rejects_noncanonical_variants -v
+```
+
+Result before the fix: `4 failed, 1 passed in 0.16s`. The failures showed the
+stale evidence ID remained linked, changed artifact policy removed the link,
+malformed artifact policy aborted prepare, and noncanonical URI variants were
+accepted.
+
+### Minimal Fix
+
+- Removed artifact-policy and `master_profile` selection from semantic-index
+  preparation.
+- Reused the approved extractor, current source status, latest snapshot
+  metadata, and managed snapshot validator before mapping evidence. A changed
+  file is marked `stale_source`, and only the evidence stable ID for the
+  verified current snapshot can attach.
+- Required file URIs to use an empty authority and to exactly equal the
+  canonical resolved URI, preserving canonical percent-encoded paths while
+  rejecting `localhost`, noncanonical encoding/path forms, query, and fragment.
+- Left source-approval policy hashing/apply checks and locator-free semantic
+  chunks unchanged. Project review remains the artifact-selection authority.
+
+### GREEN and Regression Evidence
+
+All commands used `PYTHONDONTWRITEBYTECODE=1`.
+
+| Command | Result |
+| --- | --- |
+| Focused review regressions above | `5 passed in 0.13s` |
+| `python -m pytest tests/test_semantic_index.py -v` | `22 passed in 0.64s` |
+| `python -m pytest tests/test_semantic_*.py tests/test_project_*.py tests/test_evidence_selection.py -q` | `118 passed in 1.65s` |
+| `python -m pytest -q` | `514 passed in 12.42s` |
+| `git diff --check` | exit 0; no whitespace errors |
+
+### Fix Self-Inspection
+
+- [x] Stale profiled local evidence cannot attach after an on-disk mutation.
+- [x] Semantic prepare does not read or select through artifact policy.
+- [x] Source approval, currentness, stale-state updates, and snapshot identity
+  remain enforced before linkage.
+- [x] Canonical URI edge cases and legitimate encoded file URIs are covered.
+- [x] Source-approval apply checks and locator-free chunks remain covered.
+- [x] No legacy data, docs/reviews, web files, or unrelated files were changed.

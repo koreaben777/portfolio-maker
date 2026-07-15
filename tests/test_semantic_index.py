@@ -91,9 +91,9 @@ def write_valid_outputs(prepared) -> None:
         )
 
 
-def test_prepare_semantic_index_links_current_approved_file_evidence_to_file_nodes(
+def profile_approved_file(
     workspace: Path, tmp_path: Path
-) -> None:
+) -> tuple[Path, Path, WorkspacePaths, SQLiteRepository, int]:
     root = tmp_path / "approved-root"
     root.mkdir()
     source_path = root / "README.md"
@@ -124,6 +124,13 @@ def test_prepare_semantic_index_links_current_approved_file_evidence_to_file_nod
     evidence_id = build_profile(
         BuildProfileRequest(workspace=workspace, write_artifacts=False)
     ).evidence_ids[0]
+    return root, source_path, paths, repository, evidence_id
+
+
+def test_prepare_semantic_index_links_current_approved_file_evidence_to_file_nodes(
+    workspace: Path, tmp_path: Path
+) -> None:
+    root, _, _, repository, evidence_id = profile_approved_file(workspace, tmp_path)
 
     prepared = prepare_semantic_index(
         PrepareSemanticIndexRequest(workspace=workspace, root=root, chunk_size=1)
@@ -144,6 +151,87 @@ def test_prepare_semantic_index_links_current_approved_file_evidence_to_file_nod
     )
     assert review.evidence_count == 1
     assert review_file["evidence_ids"] == [evidence_id]
+
+
+def test_prepare_semantic_index_does_not_link_evidence_after_profiled_file_changes(
+    workspace: Path, tmp_path: Path
+) -> None:
+    root, source_path, _, repository, evidence_id = profile_approved_file(
+        workspace, tmp_path
+    )
+    source_path.write_text("Changed after the evidence snapshot", encoding="utf-8")
+    source = repository.list_sources()[0]
+    assert source.status is SourceStatus.INGESTED
+
+    prepared = prepare_semantic_index(
+        PrepareSemanticIndexRequest(workspace=workspace, root=root, chunk_size=1)
+    )
+
+    staged_file = next(
+        node
+        for node in repository.list_semantic_nodes(prepared.revision_id)
+        if node["relative_hierarchy"] == "README.md"
+    )
+    assert evidence_id not in staged_file["evidence_ids"]
+    assert repository.list_sources()[0].status is SourceStatus.STALE_SOURCE
+
+
+@pytest.mark.parametrize("artifact_policy_state", ("changed", "malformed"))
+def test_prepare_semantic_index_evidence_mapping_ignores_artifact_policy(
+    workspace: Path, tmp_path: Path, artifact_policy_state: str
+) -> None:
+    root, _, paths, repository, evidence_id = profile_approved_file(workspace, tmp_path)
+    if artifact_policy_state == "changed":
+        policy = json.loads(paths.artifact_approval_path.read_text(encoding="utf-8"))
+        policy["artifacts"]["master_profile"]["include_local"] = False
+        paths.artifact_approval_path.write_text(json.dumps(policy), encoding="utf-8")
+    else:
+        paths.artifact_approval_path.write_text("{not-json", encoding="utf-8")
+
+    prepared = prepare_semantic_index(
+        PrepareSemanticIndexRequest(workspace=workspace, root=root, chunk_size=1)
+    )
+
+    staged_file = next(
+        node
+        for node in repository.list_semantic_nodes(prepared.revision_id)
+        if node["relative_hierarchy"] == "README.md"
+    )
+    assert staged_file["evidence_ids"] == [evidence_id]
+
+
+def test_canonical_file_uri_matching_accepts_empty_authority_and_encoded_path(
+    tmp_path: Path,
+) -> None:
+    source_path = tmp_path / "approved evidence.md"
+    source_path.write_text("evidence", encoding="utf-8")
+    canonical_uri = source_path.resolve().as_uri()
+
+    assert canonical_uri.startswith("file:///")
+    assert "%20" in canonical_uri
+    assert semantic_index_module._canonical_file_uri_from_uri(canonical_uri) == canonical_uri
+
+
+def test_canonical_file_uri_matching_rejects_noncanonical_variants(tmp_path: Path) -> None:
+    root = tmp_path / "approved-root"
+    root.mkdir()
+    (root / "nested").mkdir()
+    source_path = root / "README.md"
+    source_path.write_text("evidence", encoding="utf-8")
+    canonical_uri = source_path.resolve().as_uri()
+    uri_path = canonical_uri.removeprefix("file://")
+    invalid_uris = (
+        f"file://localhost{uri_path}",
+        canonical_uri.replace("README.md", "%52EADME.md"),
+        f"{root.resolve().as_uri()}/nested/../README.md",
+        f"{canonical_uri}?download=1",
+        f"{canonical_uri}#section",
+    )
+
+    assert all(
+        semantic_index_module._canonical_file_uri_from_uri(uri) is None
+        for uri in invalid_uris
+    )
 
 
 def test_apply_semantic_index_activates_complete_bottom_up_output(

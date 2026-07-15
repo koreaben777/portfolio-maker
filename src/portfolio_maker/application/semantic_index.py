@@ -14,11 +14,6 @@ from portfolio_maker.application.approval import (
     SourceApproval,
     load_approval,
 )
-from portfolio_maker.application.artifact_approval import load_artifact_policy
-from portfolio_maker.application.evidence_selection import (
-    EvidenceSelectionRequest,
-    EvidenceSelectionService,
-)
 from portfolio_maker.application.models import (
     ApplySemanticIndexRequest,
     ApplySemanticIndexResult,
@@ -31,6 +26,8 @@ from portfolio_maker.domain.semantic_models import (
     SemanticNode,
     SemanticNodeKind,
 )
+from portfolio_maker.domain.models import SourceStatus, SourceType
+from portfolio_maker.infrastructure.extractors import extract_approved_text
 from portfolio_maker.infrastructure.managed_files import (
     ensure_managed_directory,
     read_managed_bytes,
@@ -40,6 +37,7 @@ from portfolio_maker.infrastructure.managed_files import (
 from portfolio_maker.infrastructure.github_connector import contains_unicode_control
 from portfolio_maker.infrastructure.policy import (
     FilePolicy,
+    SourcePathPolicyError,
     contains_hidden_secret_shaped_public_value,
     mask_public_value,
 )
@@ -54,6 +52,7 @@ from portfolio_maker.infrastructure.semantic_crawler import (
     crawl_local_structure,
 )
 from portfolio_maker.infrastructure.sqlite_repository import SQLiteRepository
+from portfolio_maker.infrastructure.snapshots import load_valid_local_snapshot
 from portfolio_maker.workspace import WorkspacePaths
 
 
@@ -108,7 +107,7 @@ def prepare_semantic_index(
     repository = SQLiteRepository(paths.db_path)
     repository.initialize()
     approved_evidence_by_source_uri = _approved_local_evidence_by_source_uri(
-        paths, repository, approval
+        repository, approval
     )
     prepared_nodes = _prepare_nodes(crawl.entries, approved_evidence_by_source_uri)
     chunk_payloads = _chunk_payloads(
@@ -614,28 +613,69 @@ def _prepare_nodes(
 
 
 def _approved_local_evidence_by_source_uri(
-    paths: WorkspacePaths,
     repository: SQLiteRepository,
     approval: SourceApproval,
 ) -> dict[str, tuple[int, ...]]:
-    selection = EvidenceSelectionService().select(
-        repository,
-        EvidenceSelectionRequest(
-            artifact_kind="master_profile",
-            policy=load_artifact_policy(paths),
-            current_approval=approval,
-        ),
+    approved_source_uris = set(approval.approved_source_uris)
+    policy = FilePolicy(
+        forbidden_paths=approval.excluded_directories,
+        excluded_file_patterns=approval.excluded_file_patterns,
     )
-    selected_evidence_ids = set(selection.included_evidence_ids)
-    evidence_by_source_uri: dict[str, set[int]] = {}
-    for record in selection.records:
+    snapshots = repository.latest_snapshot_metadata_by_source_id()
+    current_sources: dict[int, tuple[str, str]] = {}
+    for source in repository.list_sources(status=SourceStatus.INGESTED):
         if (
-            record.evidence_id not in selected_evidence_ids
-            or record.source_type != "local_file"
-            or record.source_uri is None
+            source.id is None
+            or source.type is not SourceType.LOCAL_FILE
+            or source.uri not in approved_source_uris
         ):
             continue
-        canonical_source_uri = _canonical_file_uri_from_uri(record.source_uri)
+        try:
+            source_path, extracted = extract_approved_text(source.uri, policy)
+        except FileNotFoundError:
+            repository.update_source_status(source.id, SourceStatus.STALE_SOURCE)
+            continue
+        except SourcePathPolicyError:
+            repository.update_source_status(source.id, SourceStatus.SKIPPED_POLICY)
+            continue
+        except OSError:
+            repository.update_source_status(source.id, SourceStatus.EXTRACT_FAILED)
+            continue
+
+        snapshot = snapshots.get(source.id)
+        if (
+            snapshot is None
+            or snapshot[2] != extracted.content_hash
+            or snapshot[3] != extracted.extractor
+            or load_valid_local_snapshot(
+                snapshot[1],
+                source.id,
+                source.uri,
+                source_path.name,
+                extracted,
+            )
+            is None
+        ):
+            repository.update_source_status(source.id, SourceStatus.STALE_SOURCE)
+            continue
+        current_sources[source.id] = (source.uri, snapshot[2])
+
+    evidence_by_source_uri: dict[str, set[int]] = {}
+    for record in repository.list_evidence_selection_records():
+        current_source = current_sources.get(record.source_id or -1)
+        if current_source is None:
+            continue
+        source_uri, content_hash = current_source
+        if (
+            record.source_type != SourceType.LOCAL_FILE.value
+            or record.source_uri != source_uri
+            or record.activity_id is not None
+            or record.evidence_locator != source_uri
+            or record.evidence_stable_id
+            != f"source-snapshot:{record.source_id}:{content_hash}"
+        ):
+            continue
+        canonical_source_uri = _canonical_file_uri_from_uri(source_uri)
         if canonical_source_uri is not None:
             evidence_by_source_uri.setdefault(canonical_source_uri, set()).add(
                 record.evidence_id
@@ -652,12 +692,13 @@ def _canonical_file_uri(path: Path) -> str:
 
 def _canonical_file_uri_from_uri(uri: str) -> str | None:
     parsed = urlparse(uri)
-    if parsed.scheme != "file" or parsed.netloc not in {"", "localhost"}:
+    if parsed.scheme != "file" or parsed.netloc:
         return None
     try:
-        return _canonical_file_uri(Path(unquote(parsed.path)))
+        canonical_uri = _canonical_file_uri(Path(unquote(parsed.path)))
     except (OSError, RuntimeError):
         return None
+    return canonical_uri if canonical_uri == uri else None
 
 
 def _chunk_payloads(
