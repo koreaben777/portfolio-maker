@@ -1,6 +1,6 @@
 # Portfolio Maker
 
-> 현재 버전: `0.2.0`
+> 현재 버전: `0.2.1`
 >
 > 계층형 의미 인덱스, Project Boundary Detection, 명시적 automatic 모드,
 > 가역적 제외·재포함, multi-skill Codex plugin을 제공합니다.
@@ -355,6 +355,10 @@ portfolio-maker approve --workspace . --write-sample --force
 index와 후보는 분석·검토 계층이며, 실제 project와 artifact는 기존 승인 및 현재 policy의 교집합으로
 materialize됩니다. `portfolio-maker prepare-semantic-index`와 `apply-semantic-index` 사이의
 Codex 분석은 외부 LLM API나 token 저장 없이 safe chunk를 통해 수행합니다.
+
+`0.2.1`은 정적 HTML 안전성 검사를 보완한 patch release입니다. 근거 텍스트에
+`.portfolio-maker`라는 일반 명칭이 포함돼도 허용하되, 실제 내부 workspace 경로 형태는 계속
+차단합니다.
 
 Task 21의 read-only smoke는 보호된 사용자 legacy/runtime 자료를 건드리지 않기 위해 별도 workspace에서
 사용자가 선택한 repository `src` subtree만 대상으로 수행했습니다. 따라서 이 release 기록은 전체 home,

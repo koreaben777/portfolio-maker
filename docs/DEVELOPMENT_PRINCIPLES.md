@@ -20,7 +20,7 @@ source scope와 제외 정책
 
 현재 동작과 승인된 미래 설계를 구분한다.
 
-- 현재 공개 runtime: 0.2.0
+- 현재 공개 runtime: 0.2.1
 - 호환 기준선: 0.1.0 workspace와 기존 CLI/artifact 경로
 - 다음 제품 확장 목표: 회사·JD 맞춤 artifact와 별도 source/graph adapter
 - 0.2.0 권위 명세: [0.2.0 계층형 의미 인덱스·플러그인 설계](superpowers/specs/2026-07-14-portfolio-maker-0.2.0-semantic-index-plugin-design.md)
@@ -47,9 +47,9 @@ source scope와 제외 정책
 
 구현된 기능은 반드시 현재 code, test, 실제 artifact로 확인한 뒤 설명한다.
 
-### 2.2 현재 0.2.0 runtime
+### 2.2 현재 0.2.1 runtime
 
-현재 0.2.0 runtime은 다음 기능을 제공한다.
+현재 0.2.1 runtime은 다음 기능을 제공한다.
 
 - global local file-count cap을 대체하는 hierarchical semantic index
 - file semantic extraction과 bottom-up directory summary
@@ -61,7 +61,7 @@ source scope와 제외 정책
 - responsibility-based multi-skill Codex plugin
 - full automated validation과 보호된 사용자 자료를 제외한 선택 scan-root smoke test
 
-0.2.0의 semantic index, project composition, plugin, artifact projection은 현재 release의 기능이다.
+0.2.0에서 도입한 semantic index, project composition, plugin, artifact projection은 현재 release의 기능이다.
 다만 smoke는 선택한 repository subtree에 한정되므로 전체 사용자 home이나 live GitHub 데이터의
 성능 보증으로 확대하지 않는다. 회사·JD 맞춤 artifact와 외부 source/graph adapter는 별도 release다.
 

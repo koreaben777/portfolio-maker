@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "portfolio-maker"
-version = "0.2.0"
+version = "0.2.1"
 description = "Codex-guided local career knowledge base and portfolio draft generator"
 license = {file = "LICENSE"}
 requires-python = ">=3.11"
