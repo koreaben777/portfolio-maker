@@ -91,7 +91,7 @@ def prepare_project_review_v2(
 ) -> PrepareProjectReviewResult:
     paths = WorkspacePaths.from_root(request.workspace)
     current = build_project_review_input_v2(paths.workspace)
-    write_json(paths.project_review_input_path, current)
+    write_json(paths.project_review_input_v2_path, current)
     evidence_ids = {
         evidence_id
         for node in current["nodes"]
@@ -99,7 +99,7 @@ def prepare_project_review_v2(
     }
     evidence_ids.update(item["evidence_id"] for item in current["github_evidence"])
     return PrepareProjectReviewResult(
-        input_path=paths.project_review_input_path,
+        input_path=paths.project_review_input_v2_path,
         evidence_count=len(evidence_ids),
     )
 

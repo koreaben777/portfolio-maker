@@ -12,6 +12,7 @@ from portfolio_maker.application.artifact_approval import write_sample_artifact_
 from portfolio_maker.application.ingestion import ingest_sources
 from portfolio_maker.application.models import (
     ApplySemanticIndexRequest,
+    ComposeProjectsRequest,
     IngestSourcesRequest,
     PrepareProjectReviewRequest,
     PrepareSemanticIndexRequest,
@@ -22,6 +23,7 @@ from portfolio_maker.application.project_boundary import (
 )
 from portfolio_maker.application.project_boundary import prepare_project_review_v2
 from portfolio_maker.application.project_composition import (
+    compose_projects,
     prepare_project_review,
     write_sample_project_approval,
 )
@@ -196,6 +198,28 @@ def test_prepare_project_review_keeps_v1_approval_compatibility_with_active_sema
 
     v2_review = prepare_project_review_v2(PrepareProjectReviewRequest(workspace=workspace))
     assert json.loads(v2_review.input_path.read_text(encoding="utf-8"))["version"] == 2
+
+
+def test_prepare_project_review_v2_preserves_stored_v1_review_for_approval_and_composition(
+    workspace: Path, tmp_path: Path
+) -> None:
+    paths = _write_active_semantic_revision(workspace, tmp_path)
+    legacy_review = prepare_project_review(PrepareProjectReviewRequest(workspace=workspace))
+    legacy_bytes = legacy_review.input_path.read_bytes()
+
+    v2_review = prepare_project_review_v2(PrepareProjectReviewRequest(workspace=workspace))
+
+    assert legacy_review.input_path == paths.project_review_input_path
+    assert legacy_review.input_path.read_bytes() == legacy_bytes
+    assert v2_review.input_path != paths.project_review_input_path
+    assert v2_review.input_path == paths.reviews_dir / "project-review-input-v2.json"
+    assert json.loads(v2_review.input_path.read_text(encoding="utf-8"))["version"] == 2
+
+    approval_path = write_sample_project_approval(paths)
+    composition = compose_projects(ComposeProjectsRequest(workspace=workspace))
+
+    assert approval_path == paths.project_approval_path
+    assert composition.project_count == 0
 
 
 def test_prepare_project_review_keeps_v1_without_active_semantic_revision(
