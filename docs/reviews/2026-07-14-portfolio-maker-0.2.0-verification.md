@@ -2,11 +2,13 @@
 
 ## 범위
 
+- Verification HEAD: `c752c58`.
 - Task 21의 smoke는 격리된 임시 workspace에서 사용자가 선택한 저장소의
   `src` 하위 트리만 대상으로 수행했다.
 - 저장소 전체와 사용자 홈을 스캔하지 않았다. 보호된 legacy 사용자 데이터와
   기존 runtime workspace는 읽거나 변경하지 않았다.
-- 모든 검증 값과 후보 내용은 합성 fixture에서 얻었으며, 이 보고서에는 원본
+- 파일 discovery/ingest 수치는 실제 선택된 repository subtree에서 얻었고,
+  semantic chunk와 Codex candidate payload는 합성 fixture로 작성했다. 이 보고서에는 원본
   경로, snapshot/database locator, credential, private URL, source text를
   기록하지 않는다.
 
@@ -16,12 +18,14 @@
 | --- | --- |
 | local discovery | 41 discovered, 37 skipped |
 | local ingest | 41 ingested, 0 skipped |
-| semantic index | 1 safe chunk applied |
-| project review input | 35 evidence records |
-| candidate / linked evidence | 1 candidate, 31 linked evidence records |
+| semantic index | 1 safe chunk, 90 indexed nodes, 270 persisted semantic nodes |
+| project review input | 34 evidence records, restricted scope |
+| candidate / linked evidence | 1 candidate, 30 linked evidence records |
 | automatic composition | 1 project, 0 review-required, 0 excluded |
 | medium exclusion / re-inclusion | 1 / 1; evidence and semantic-node counts unchanged |
-| final persisted counts | 270 semantic nodes, 36 evidence items, 36 claims, 1 project, 31 project links |
+| candidate confidence | 0 high, 1 medium, 0 low |
+| project decisions | 1 manually approved, 0 excluded, 0 unassigned |
+| final persisted counts | 270 semantic nodes, 36 evidence items, 36 claims, 1 project, 30 project links |
 | master profile | 1 approved project, 34 claims |
 | draft | 1 approved project |
 | HTML / public manifest | generated successfully with restricted delivery scope |
@@ -57,5 +61,13 @@ candidate and approval boundary.
 
 ## Verification commands
 
-The focused and full Python suites, Sites build, static validator, browser
-checks, and whitespace checks were run before this report was committed.
+The following results are tied to the verification sequence above:
+
+| Command | Result |
+| --- | --- |
+| `PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python -m pytest -q tests/test_semantic_acceptance.py tests/test_semantic_index.py tests/test_project_composition.py tests/test_static_site.py tests/test_render_html.py` | 65 passed in 2.22s |
+| `PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python -m pytest -q` | 515 passed in 12.12s |
+| `(cd web/portfolio && npm run build)` | Vite 6.4.3 build passed |
+| static output validator plus canonical HTML safety assertions | passed; one inlined stylesheet, no `<link>`, no `fetch(` |
+| loopback browser interaction checks | passed; populated project path and 390px mobile path |
+| `git diff --check` | exit 0 |
