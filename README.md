@@ -360,13 +360,26 @@ Codex 분석은 외부 LLM API나 token 저장 없이 safe chunk를 통해 수�
 `.portfolio-maker`라는 일반 명칭이 포함돼도 허용하되, 실제 내부 workspace 경로 형태는 계속
 차단합니다.
 
+### 다음 우선 목표: 0.2.2 이력 보존·정리 정책
+
+다음 release 목표는 [Issue #5](https://github.com/koreaben777/portfolio-maker/issues/5)의
+`.portfolio-maker/` 스냅샷·SQLite 이력 보존 및 정리 정책입니다. 이 기능은 사용자가 생성한
+**원본 자료를 삭제하지 않으며**, Portfolio Maker가 관리하는 snapshot과 database 이력만
+대상으로 합니다. 기본은 미리보기(dry-run)와 명시적 확인이며, 백업·복구·부분 실패 대응을
+검증한 뒤에만 실제 정리를 허용합니다.
+
+[Issue #8](https://github.com/koreaben777/portfolio-maker/issues/8)의 OCR·이미지 자료 처리는
+후속 범위입니다. Codex가 대화에서 이미지와 여러 형식을 이해할 수 있는 것과 별도로, 제품은
+승인 범위, 추출 결과의 출처·신뢰도, 마스킹, 재처리와 삭제 이력을 일관되게 관리해야 합니다.
+따라서 0.2.2에서 storage lifecycle 기반을 먼저 완성합니다.
+
 Task 21의 read-only smoke는 보호된 사용자 legacy/runtime 자료를 건드리지 않기 위해 별도 workspace에서
 사용자가 선택한 repository `src` subtree만 대상으로 수행했습니다. 따라서 이 release 기록은 전체 home,
 대규모 외부 project, live GitHub 응답의 성능·내용을 보증하지 않습니다. 검증 수치와 browser 결과는
 [0.2.0 검증 기록](docs/reviews/2026-07-14-portfolio-maker-0.2.0-verification.md)에 고정합니다.
 
-개인 근거 knowledge graph, Google Drive connector, MCP/App UI, 회사·JD별 맞춤 생성, 자동 Sites
-deployment는 0.2.0 후속 범위입니다. 전체 설계와 구현 순서는
+개인 근거 knowledge graph, Google Drive connector, OCR·이미지 adapter, MCP/App UI, 회사·JD별 맞춤 생성,
+자동 Sites deployment는 0.2.2 이후의 후속 범위입니다. 전체 설계와 구현 순서는
 [0.2.0 설계 명세](docs/superpowers/specs/2026-07-14-portfolio-maker-0.2.0-semantic-index-plugin-design.md)와
 [0.2.0 구현 계획](docs/superpowers/plans/2026-07-14-portfolio-maker-0.2.0.md)에서 관리합니다.
 

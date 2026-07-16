@@ -22,7 +22,8 @@ source scope와 제외 정책
 
 - 현재 공개 runtime: 0.2.1
 - 호환 기준선: 0.1.0 workspace와 기존 CLI/artifact 경로
-- 다음 제품 확장 목표: 회사·JD 맞춤 artifact와 별도 source/graph adapter
+- 다음 release 목표: 0.2.2의 managed workspace snapshot·SQLite 이력 보존 및 정리 정책 (#5)
+- 다음 제품 확장 순서: #5 이후 회사·JD 맞춤 artifact와 별도 source/graph adapter
 - 0.2.0 권위 명세: [0.2.0 계층형 의미 인덱스·플러그인 설계](superpowers/specs/2026-07-14-portfolio-maker-0.2.0-semantic-index-plugin-design.md)
 - 현재 semantic composition 기준선: [Codex 기반 프로젝트 구성 설계](superpowers/specs/2026-07-14-codex-assisted-project-composition-design.md)
 - 공개 사용자 안내: [README](../README.md)
@@ -67,7 +68,9 @@ source scope와 제외 정책
 
 ### 2.3 후속 범위
 
-personal evidence knowledge graph, portfolio semantic ontology, Google Drive, OCR, semantic search, MCP/App, 회사·JD 맞춤 artifact는 별도 Issue와 설계를 통해 확장한다. 0.2.0 문서에 미래 확장점이 있다는 이유만으로 현재 제공 기능처럼 표현하지 않는다.
+0.2.2는 [#5](https://github.com/koreaben777/portfolio-maker/issues/5)의 managed workspace 이력 보존·정리 정책을 최우선으로 한다. 이 release는 원본 사용자 source를 삭제하지 않으며, snapshot·SQLite 이력에 한정한 dry-run, 명시 확인, 백업·복구, 부분 실패·재시도 경계를 먼저 확정한다.
+
+personal evidence knowledge graph, portfolio semantic ontology, Google Drive, OCR·이미지 자료 처리 (#8), semantic search, MCP/App, 회사·JD 맞춤 artifact는 별도 Issue와 설계를 통해 확장한다. Codex App이 대화 표면에서 이미지·다양한 파일을 이해할 수 있어도, 제품 runtime에는 승인 범위, 추출물의 provenance·신뢰도, 민감 정보 마스킹, 재처리와 보존·삭제 이력을 명시적으로 구현해야 한다. 따라서 그 능력만으로 OCR/이미지 adapter가 구현된 것으로 표현하지 않는다. 0.2.0 문서에 미래 확장점이 있다는 이유만으로 현재 제공 기능처럼 표현하지 않는다.
 
 ## 3. 아키텍처 원칙
 

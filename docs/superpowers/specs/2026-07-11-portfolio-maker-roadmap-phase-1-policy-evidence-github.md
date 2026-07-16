@@ -4,12 +4,15 @@
 상태: #4 → #2 → #1은 역사적 Phase 1 기준선이며, 현재 공개 runtime은 0.2.0 semantic index·plugin release다. 0.1.0 workspace와 CLI/artifact 경로는 호환 기준선으로 보존한다.
 역사적 기준선 대상 Issue: #4 → #2 → #1
 현재 구현 slice: #12 통합 근거 정책, 일반형 #11 renderer, #13 semantic project composition, 0.2.0 계층형 semantic index/plugin
-현재 release: 0.2.0 계층형 의미 인덱스, Project Boundary Detection, multi-skill Codex plugin
-후속 제품 단계: #3 회사/JD별 맞춤 생성과 추가 source/graph adapter (`@sites`는 presentation/hosting 계층)
+현재 release: 0.2.1 계층형 의미 인덱스, Project Boundary Detection, multi-skill Codex plugin과 정적 HTML 안전성 patch
+다음 release 목표: 0.2.2의 #5 managed workspace snapshot·SQLite 이력 보존 및 정리 정책
+후속 제품 단계: #5 완료 뒤 #3 회사/JD별 맞춤 생성과 추가 source/graph adapter (`@sites`는 presentation/hosting 계층)
 
 2026-07-13 정렬 메모: #4, #2, #1 기준선, 일반형 #11 renderer, #12 통합 근거 정책, #13 composition 계층은 현재 runtime의 기반이다. 0.2.0은 이 승인 경계 위에 계층형 semantic index와 plugin workflow를 추가한다.
 
 2026-07-14 0.2.0 결정 및 구현: #13의 flat review bundle을 계층형 의미 인덱스로 확장하고, 책임별 skill을 하나의 installable Codex plugin으로 묶었다. 0.2.0 전체 계약은 [계층형 의미 인덱스·플러그인 설계](2026-07-14-portfolio-maker-0.2.0-semantic-index-plugin-design.md)와 [검증 기록](../../reviews/2026-07-14-portfolio-maker-0.2.0-verification.md)을 따른다.
+
+2026-07-16 우선순위 결정: #5를 0.2.2의 release 목표로 먼저 구현한다. scope는 Portfolio Maker가 관리하는 snapshot·SQLite 이력의 lifecycle로 한정하며, 원본 사용자 자료는 대상이 아니다. #8 OCR·이미지 자료 처리는 Codex의 대화형 이미지 이해와 별개로 승인, provenance, 마스킹, 신뢰도, 재처리·정리 계약이 필요한 후속 adapter로 남긴다.
 
 ## 1. 목적과 범위
 
@@ -65,6 +68,8 @@
 #13 Codex 기반 프로젝트 식별·구성·선정  0.2.0 승인 경계의 기준선
   ↓
 0.2.0 계층형 의미 인덱스·Project Boundary Detection·Codex plugin  현재 구현
+  ↓
+#5 managed workspace 이력 보존·정리 정책                 0.2.2 최우선
   ↓
 #3 회사/JD별 맞춤 포트폴리오
 ```
