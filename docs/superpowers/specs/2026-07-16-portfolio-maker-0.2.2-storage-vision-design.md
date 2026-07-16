@@ -111,7 +111,7 @@ Policy schema v1은 다음 고정 필드를 사용한다.
 
 - source type이 `local_file`이고 `source-approval.json`의 approved URI와 정확히 일치한다.
 - 현재 `FilePolicy`를 통과하고 symlink가 아닌 regular file이다.
-- descriptor 기반 read로 current SHA-256, size, device/inode를 획득한다.
+- descriptor 기반 streaming read로 current SHA-256, size, device/inode를 획득한다. 이 경로는 text extraction의 2MB decode limit를 적용하지 않으며 전체 binary를 Python memory에 적재하지 않는다. 파일 크기의 실제 수용 여부는 Codex App capability가 판정한다.
 - source가 정리 중이 아니며 database family와 managed request directory가 안전하다.
 
 receipt에는 `request_id`, source id, display name, source content hash, size, requested-at, adapter name `codex-app-vision-v1`, status `pending`, confirmation timestamp만 저장한다. raw file bytes와 raw absolute path는 receipt, artifact, semantic-index input, public output에 저장하지 않는다. 전용 skill은 request id로 source를 안전하게 다시 열어 현재 Codex App이 제공하는 직접 파일 인식 surface에만 전달한다.

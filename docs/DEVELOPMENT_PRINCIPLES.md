@@ -26,6 +26,7 @@ source scope와 제외 정책
 - 다음 제품 확장 순서: #5/#14 이후 회사·JD 맞춤 artifact와 별도 source/graph adapter
 - 0.2.0 권위 명세: [0.2.0 계층형 의미 인덱스·플러그인 설계](superpowers/specs/2026-07-14-portfolio-maker-0.2.0-semantic-index-plugin-design.md)
 - 0.2.2 권위 명세: [0.2.2 managed history·Codex vision 설계](superpowers/specs/2026-07-16-portfolio-maker-0.2.2-storage-vision-design.md)
+- 0.2.2 구현 계획: [task·test·review gate](superpowers/plans/2026-07-16-portfolio-maker-0.2.2.md)
 - 현재 semantic composition 기준선: [Codex 기반 프로젝트 구성 설계](superpowers/specs/2026-07-14-codex-assisted-project-composition-design.md)
 - 공개 사용자 안내: [README](../README.md)
 - 특정 변경의 검증 근거: `docs/reviews/`
