@@ -14,6 +14,8 @@
 
 2026-07-16 우선순위 결정: #5를 0.2.2의 release 목표로 먼저 구현한다. scope는 Portfolio Maker가 관리하는 snapshot·SQLite 이력의 lifecycle로 한정하며, 원본 사용자 자료는 대상이 아니다. 같은 0.2.2에는 #14로 사용자 선택·명시 확인 기반 Codex 비전 분석 adapter를 포함한다. 이 adapter는 raw visual input을 workspace에 복사하지 않고, 마스킹된 구조화 분석과 provenance·검토 상태만 전달한다. #8은 독립적으로 배포·비활성화 가능한 OCR/이미지 추출 전체를 다루는 후속 범위로 남긴다.
 
+0.2.2 권위 설계: [managed history·Codex vision 설계](2026-07-16-portfolio-maker-0.2.2-storage-vision-design.md). Codex가 인식하는 파일 형식은 고정 extension allowlist가 아니라 해당 Codex App session의 실제 capability로 판단하며, 지원하지 않는 형식은 safe `unsupported` 결과로 남긴다.
+
 ## 1. 목적과 범위
 
 역사적 Phase 1 기준선인 Portfolio Maker 0.1.0은 승인된 로컬 파일에서 근거 기반 master profile과 검토용 Markdown 포트폴리오 골격을 생성했다. GitHub repository와 activity는 기본적으로 discovery metadata다. 현재 0.2.0도 같은 승인 경계를 유지하며, policy 재검증을 통과한 confirmed public repository의 activity 중 `approved_github_activity_urls`에 정확히 있는 URL만 profile과 portfolio draft의 public-safe evidence로 사용할 수 있다. 이는 자동 project narrative를 만들지 않는다.

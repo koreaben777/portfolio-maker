@@ -379,6 +379,10 @@ Codex 분석은 외부 LLM API나 token 저장 없이 safe chunk를 통해 수�
 승인 범위, 추출 결과의 출처·신뢰도, 마스킹, 재처리와 삭제 이력을 일관되게 관리해야 합니다. 0.2.2의
 선택형 adapter는 그 제품 경계의 첫 단계이지, 일반 OCR 기능 전체의 완료 선언이 아닙니다.
 
+0.2.2의 data lifecycle, Codex 전송 확인, capability 판단, 결과 검토와 복구 절차의 상세 계약은
+[0.2.2 managed history·Codex vision 설계](docs/superpowers/specs/2026-07-16-portfolio-maker-0.2.2-storage-vision-design.md)에
+기록합니다.
+
 Task 21의 read-only smoke는 보호된 사용자 legacy/runtime 자료를 건드리지 않기 위해 별도 workspace에서
 사용자가 선택한 repository `src` subtree만 대상으로 수행했습니다. 따라서 이 release 기록은 전체 home,
 대규모 외부 project, live GitHub 응답의 성능·내용을 보증하지 않습니다. 검증 수치와 browser 결과는
