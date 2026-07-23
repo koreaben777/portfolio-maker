@@ -1,3 +1,5 @@
+from hashlib import sha256
+import json
 import os
 import sqlite3
 import subprocess
@@ -121,6 +123,58 @@ def test_legacy_database_adds_history_vision_schema_without_rewriting_rows(works
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 201
 
 
+def test_initialize_adds_history_plan_binding_columns_and_old_rows_fail_closed(
+    workspace,
+) -> None:
+    paths = WorkspacePaths.from_root(workspace)
+    paths.ensure()
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    with repository._connection() as connection:
+        connection.execute("DROP TABLE history_cleanup_plans")
+        connection.execute(
+            """
+            CREATE TABLE history_cleanup_plans (
+                id TEXT PRIMARY KEY,
+                policy_hash TEXT NOT NULL,
+                manifest_hash TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                export_receipt_hash TEXT,
+                execution_id TEXT,
+                completed_at TEXT
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO history_cleanup_plans
+                (id, policy_hash, manifest_hash, status, created_at)
+            VALUES ('legacy-plan', ?, ?, 'planned', '2000-01-01T00:00:00Z')
+            """,
+            ("a" * 64, "b" * 64),
+        )
+
+    repository.initialize()
+
+    assert {
+        "canonical_policy_json",
+        "canonical_units_json",
+        "manifest_relative_path",
+    } <= column_names(repository, "history_cleanup_plans")
+    stored = repository.get_history_plan("legacy-plan")
+    assert stored["status"] == "planned"
+    assert stored["canonical_policy_json"] is None
+    assert stored["canonical_units_json"] is None
+    assert stored["manifest_relative_path"] is None
+    with pytest.raises(RepositoryError, match="binding metadata"):
+        repository.delete_planned_history_units(
+            "legacy-plan",
+            (("source_snapshot", "1"),),
+        )
+    assert repository.get_history_plan("legacy-plan")["status"] == "planned"
+
+
 def test_vision_request_and_analysis_round_trip(workspace) -> None:
     paths = WorkspacePaths.from_root(workspace)
     paths.ensure()
@@ -230,6 +284,92 @@ def test_vision_analysis_include_and_exclude_enforce_references(workspace) -> No
 
     assert repository.evidence_id_for_stable_id(stable_id) == linked_evidence_id
     assert repository.get_vision_analysis(applied.id)["review_status"] == "included"
+
+
+def test_vision_analysis_inclusion_rejects_content_hash_mismatch(workspace) -> None:
+    paths = WorkspacePaths.from_root(workspace)
+    paths.ensure()
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    source_id = _insert_synthetic_source(repository, "vision-hash-mismatch")
+    analysis = _insert_test_vision_analysis(
+        repository,
+        paths,
+        source_id,
+        "hash-mismatch",
+        VisionReviewStatus.PENDING,
+    )
+    evidence_id = repository.upsert_evidence_item(
+        source_id=source_id,
+        snapshot_id=None,
+        github_activity_id=None,
+        locator=f"derived:vision-analysis:{analysis.id}",
+        stable_id=f"vision-analysis:{analysis.id}:{analysis.result_hash}",
+        content_hash="0" * 64,
+        public_safe=False,
+    )
+
+    with pytest.raises(RepositoryError, match="does not match"):
+        repository.mark_vision_analysis_included(analysis.id, evidence_id)
+
+    assert repository.get_vision_analysis(analysis.id)["review_status"] == "pending"
+
+
+def test_vision_analysis_exclusion_ignores_and_preserves_locator_collision(
+    workspace,
+) -> None:
+    paths = WorkspacePaths.from_root(workspace)
+    paths.ensure()
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    source_id = _insert_synthetic_source(repository, "vision-locator-collision")
+    analysis = _insert_test_vision_analysis(
+        repository,
+        paths,
+        source_id,
+        "locator-collision",
+        VisionReviewStatus.PENDING,
+    )
+    exact_stable_id = f"vision-analysis:{analysis.id}:{analysis.result_hash}"
+    exact_evidence_id = repository.upsert_evidence_item(
+        source_id=source_id,
+        snapshot_id=None,
+        github_activity_id=None,
+        locator=f"derived:vision-analysis:{analysis.id}",
+        stable_id=exact_stable_id,
+        content_hash=analysis.result_hash,
+        public_safe=False,
+    )
+    collision_stable_id = f"unrelated:{analysis.id}"
+    collision_evidence_id = repository.upsert_evidence_item(
+        source_id=source_id,
+        snapshot_id=None,
+        github_activity_id=None,
+        locator=f"derived:vision-analysis:{analysis.id}",
+        stable_id=collision_stable_id,
+        content_hash="0" * 64,
+        public_safe=False,
+    )
+    project_id = repository.upsert_project("vision-collision", False)
+    claim_id = repository.upsert_career_claim(project_id, "collision claim", False)
+    repository.link_claim_evidence(claim_id, collision_evidence_id, "direct")
+
+    repository.exclude_unreferenced_vision_analysis(analysis.id)
+
+    assert repository.evidence_id_for_stable_id(exact_stable_id) is None
+    assert (
+        repository.evidence_id_for_stable_id(collision_stable_id)
+        == collision_evidence_id
+    )
+    assert repository.get_vision_analysis(analysis.id)["review_status"] == "excluded"
+    with repository._read_connection() as connection:
+        assert (
+            connection.execute(
+                "SELECT id FROM evidence_items WHERE id = ?",
+                (exact_evidence_id,),
+            ).fetchone()
+            is None
+        )
 
 
 def test_vision_request_hydration_maps_blob_to_controlled_error(workspace) -> None:
@@ -410,6 +550,309 @@ def test_history_candidates_include_finished_unreferenced_vision_records(workspa
     ]
 
 
+def test_history_candidates_and_deletion_honor_nonretained_incomplete_requests(
+    workspace,
+) -> None:
+    paths = WorkspacePaths.from_root(workspace)
+    paths.ensure()
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    source_id = _insert_synthetic_source(repository, "history-pending-policy")
+    request = _vision_request("request-pending-policy", source_id)
+    repository.create_vision_request(request)
+    _write_vision_request_receipt(paths, request.id)
+    with repository._connection() as connection:
+        connection.execute(
+            """
+            UPDATE vision_analysis_requests
+            SET requested_at = '2000-01-01T00:00:00Z'
+            WHERE id = ?
+            """,
+            (request.id,),
+        )
+    policy = HistoryPolicy(30, 1, True, True, False)
+
+    candidates = repository.history_candidates(policy)
+
+    assert [(unit.kind, unit.row_id) for unit in candidates] == [
+        ("vision_request", request.id)
+    ]
+    plan = HistoryPlan.create(policy, candidates)
+    repository.create_history_plan(
+        plan,
+        Path(f"reviews/history-plans/{plan.id}.json"),
+    )
+    repository.delete_planned_history_units(plan.id, plan.unit_ids())
+    with pytest.raises(RepositoryError, match="not found"):
+        repository.get_vision_request(request.id)
+
+
+def test_history_candidates_hash_descriptor_read_managed_file_bytes(workspace) -> None:
+    paths = WorkspacePaths.from_root(workspace)
+    paths.ensure()
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    source_id = _insert_synthetic_source(repository, "history-file-hashes")
+    snapshot_bytes = b'{"snapshot":"actual-bytes"}'
+    snapshot_path = paths.local_snapshots_dir / "hash-old.json"
+    snapshot_path.write_bytes(snapshot_bytes)
+    snapshot_id = repository.insert_source_snapshot(
+        source_id,
+        snapshot_path,
+        "1" * 64,
+        "text-v2",
+    )
+    latest_path = paths.local_snapshots_dir / "hash-latest.json"
+    latest_path.write_text('{"snapshot":"latest"}', encoding="utf-8")
+    repository.insert_source_snapshot(
+        source_id,
+        latest_path,
+        "2" * 64,
+        "text-v2",
+    )
+    analysis = _insert_test_vision_analysis(
+        repository,
+        paths,
+        source_id,
+        "descriptor-hash",
+        VisionReviewStatus.EXCLUDED,
+    )
+    request_path = (
+        paths.vision_requests_dir / f"request-request-{analysis.id}.json"
+    )
+    with repository._connection() as connection:
+        connection.execute(
+            "UPDATE source_snapshots SET extracted_at = '2000-01-01T00:00:00Z'"
+        )
+        connection.execute(
+            """
+            UPDATE vision_analysis_requests
+            SET requested_at = '2000-01-01T00:00:00Z',
+                completed_at = '2000-01-01T00:00:00Z'
+            """
+        )
+        connection.execute(
+            "UPDATE vision_analyses SET created_at = '2000-01-01T00:00:00Z'"
+        )
+
+    units = {
+        (unit.kind, unit.row_id): unit
+        for unit in repository.history_candidates(HistoryPolicy.default())
+    }
+
+    assert units[("source_snapshot", str(snapshot_id))].content_hash == sha256(
+        snapshot_bytes
+    ).hexdigest()
+    assert units[("vision_analysis", analysis.id)].content_hash == sha256(
+        analysis.analysis_path.read_bytes()
+    ).hexdigest()
+    assert units[
+        ("vision_request", f"request-{analysis.id}")
+    ].content_hash == sha256(request_path.read_bytes()).hexdigest()
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    (
+        "reviews/source-approval.json",
+        "artifacts/master-profile.json",
+        "reviews/semantic-index/input-manifest.json",
+        "reviews/history-plans/plan-protected.json",
+        "quarantine/execution/protected.json",
+        "raw/source-content.json",
+        "raw/snapshots/github/protected.json",
+        "derived/vision/wrong-kind.json",
+    ),
+)
+def test_history_candidates_reject_source_snapshot_protected_roots(
+    workspace,
+    relative_path,
+) -> None:
+    paths = WorkspacePaths.from_root(workspace)
+    paths.ensure()
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    source_id = _insert_synthetic_source(repository, "history-protected-root")
+    protected_path = paths.root / relative_path
+    protected_path.parent.mkdir(parents=True, exist_ok=True)
+    protected_path.write_text('{"protected":true}', encoding="utf-8")
+    repository.insert_source_snapshot(
+        source_id,
+        protected_path,
+        "1" * 64,
+        "text-v2",
+    )
+    latest_path = paths.local_snapshots_dir / "protected-root-latest.json"
+    latest_path.write_text('{"latest":true}', encoding="utf-8")
+    repository.insert_source_snapshot(
+        source_id,
+        latest_path,
+        "2" * 64,
+        "text-v2",
+    )
+    with repository._connection() as connection:
+        connection.execute(
+            "UPDATE source_snapshots SET extracted_at = '2000-01-01T00:00:00Z'"
+        )
+
+    with pytest.raises(RepositoryError, match="kind-specific managed root"):
+        repository.history_candidates(HistoryPolicy.default())
+
+
+def test_history_candidates_reject_vision_analysis_outside_derived_root(
+    workspace,
+) -> None:
+    paths = WorkspacePaths.from_root(workspace)
+    paths.ensure()
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    source_id = _insert_synthetic_source(repository, "history-analysis-root")
+    analysis = _insert_test_vision_analysis(
+        repository,
+        paths,
+        source_id,
+        "wrong-root",
+        VisionReviewStatus.EXCLUDED,
+    )
+    protected_path = paths.artifacts_dir / "analysis-wrong-root.json"
+    protected_path.write_text('{"protected":true}', encoding="utf-8")
+    with repository._connection() as connection:
+        connection.execute(
+            """
+            UPDATE vision_analysis_requests
+            SET requested_at = '2000-01-01T00:00:00Z',
+                completed_at = '2000-01-01T00:00:00Z'
+            WHERE id = ?
+            """,
+            (f"request-{analysis.id}",),
+        )
+        connection.execute(
+            """
+            UPDATE vision_analyses
+            SET created_at = '2000-01-01T00:00:00Z',
+                relative_path = ?
+            WHERE id = ?
+            """,
+            (str(protected_path.relative_to(paths.root)), analysis.id),
+        )
+
+    with pytest.raises(RepositoryError, match="kind-specific managed root"):
+        repository.history_candidates(HistoryPolicy.default())
+
+
+@pytest.mark.parametrize("unsafe_kind", ("symlink", "directory", "hardlink"))
+def test_history_candidates_reject_unsafe_snapshot_file_types(
+    workspace,
+    unsafe_kind,
+) -> None:
+    paths = WorkspacePaths.from_root(workspace)
+    paths.ensure()
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    source_id = _insert_synthetic_source(repository, f"history-{unsafe_kind}")
+    target_path = paths.local_snapshots_dir / f"{unsafe_kind}-target.json"
+    target_path.write_text('{"target":true}', encoding="utf-8")
+    unsafe_path = paths.local_snapshots_dir / f"{unsafe_kind}-candidate"
+    if unsafe_kind == "symlink":
+        unsafe_path.symlink_to(target_path)
+    elif unsafe_kind == "directory":
+        unsafe_path.mkdir()
+    else:
+        os.link(target_path, unsafe_path)
+    repository.insert_source_snapshot(
+        source_id,
+        unsafe_path,
+        "1" * 64,
+        "text-v2",
+    )
+    latest_path = paths.local_snapshots_dir / f"{unsafe_kind}-latest.json"
+    latest_path.write_text('{"latest":true}', encoding="utf-8")
+    repository.insert_source_snapshot(
+        source_id,
+        latest_path,
+        "2" * 64,
+        "text-v2",
+    )
+    with repository._connection() as connection:
+        connection.execute(
+            "UPDATE source_snapshots SET extracted_at = '2000-01-01T00:00:00Z'"
+        )
+
+    with pytest.raises(RepositoryError, match="unsafe or unavailable"):
+        repository.history_candidates(HistoryPolicy.default())
+
+
+def test_history_deletion_ignores_and_preserves_locator_collision(workspace) -> None:
+    paths = WorkspacePaths.from_root(workspace)
+    paths.ensure()
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    source_id = _insert_synthetic_source(repository, "history-locator-collision")
+    analysis = _insert_test_vision_analysis(
+        repository,
+        paths,
+        source_id,
+        "history-collision",
+        VisionReviewStatus.EXCLUDED,
+    )
+    exact_stable_id = f"vision-analysis:{analysis.id}:{analysis.result_hash}"
+    repository.upsert_evidence_item(
+        source_id=source_id,
+        snapshot_id=None,
+        github_activity_id=None,
+        locator=f"derived:vision-analysis:{analysis.id}",
+        stable_id=exact_stable_id,
+        content_hash=analysis.result_hash,
+        public_safe=False,
+    )
+    collision_stable_id = f"history-unrelated:{analysis.id}"
+    collision_evidence_id = repository.upsert_evidence_item(
+        source_id=source_id,
+        snapshot_id=None,
+        github_activity_id=None,
+        locator=f"derived:vision-analysis:{analysis.id}",
+        stable_id=collision_stable_id,
+        content_hash="0" * 64,
+        public_safe=False,
+    )
+    project_id = repository.upsert_project("history-collision", False)
+    claim_id = repository.upsert_career_claim(
+        project_id,
+        "history collision claim",
+        False,
+    )
+    repository.link_claim_evidence(claim_id, collision_evidence_id, "direct")
+    with repository._connection() as connection:
+        connection.execute(
+            """
+            UPDATE vision_analysis_requests
+            SET requested_at = '2000-01-01T00:00:00Z',
+                completed_at = '2000-01-01T00:00:00Z'
+            """
+        )
+        connection.execute(
+            "UPDATE vision_analyses SET created_at = '2000-01-01T00:00:00Z'"
+        )
+
+    candidates = repository.history_candidates(HistoryPolicy.default())
+    candidate_ids = {(unit.kind, unit.row_id) for unit in candidates}
+    assert ("vision_analysis", analysis.id) in candidate_ids
+    assert ("vision_request", f"request-{analysis.id}") in candidate_ids
+    plan = HistoryPlan.create(HistoryPolicy.default(), candidates)
+    repository.create_history_plan(
+        plan,
+        Path(f"reviews/history-plans/{plan.id}.json"),
+    )
+
+    repository.delete_planned_history_units(plan.id, plan.unit_ids())
+
+    assert repository.evidence_id_for_stable_id(exact_stable_id) is None
+    assert (
+        repository.evidence_id_for_stable_id(collision_stable_id)
+        == collision_evidence_id
+    )
+
+
 def test_history_plan_journal_and_exclusive_operation_round_trip(workspace) -> None:
     repository = SQLiteRepository(WorkspacePaths.from_root(workspace).db_path)
     repository.initialize()
@@ -424,10 +867,11 @@ def test_history_plan_journal_and_exclusive_operation_round_trip(workspace) -> N
         "expired_unreferenced_snapshot",
     )
     plan = HistoryPlan.create(HistoryPolicy.default(), [unit])
+    manifest_path = Path(f"reviews/history-plans/plan-{plan.id}.json")
 
     repository.create_history_plan(
         plan,
-        Path(f"reviews/history-plans/plan-{plan.id}.json"),
+        manifest_path,
     )
     repository.record_history_journal_entry(
         "execution-1",
@@ -441,6 +885,26 @@ def test_history_plan_journal_and_exclusive_operation_round_trip(workspace) -> N
         assert "history_cleanup_plans" in repository.table_names()
     assert stored["manifest_hash"] == plan.manifest_hash
     assert stored["status"] == "planned"
+    assert json.loads(stored["canonical_policy_json"]) == {
+        "keep_latest_text_snapshots_per_source": 1,
+        "minimum_age_days": 30,
+        "retain_included_vision_analyses": True,
+        "retain_incomplete_vision_requests": True,
+        "retain_pending_review_vision_analyses": True,
+    }
+    assert json.loads(stored["canonical_units_json"]) == [
+        {
+            "content_hash": "e" * 64,
+            "device": 20,
+            "inode": 30,
+            "kind": "source_snapshot",
+            "reason": "expired_unreferenced_snapshot",
+            "relative_path": "raw/snapshots/local/synthetic.json",
+            "row_id": "42",
+            "size": 10,
+        }
+    ]
+    assert stored["manifest_relative_path"] == manifest_path.as_posix()
     with repository._read_connection() as connection:
         journal = connection.execute(
             """
@@ -476,6 +940,389 @@ def test_history_plan_rejects_unknown_unit_kind_without_sql_interpolation(worksp
         repository.create_history_plan(plan, Path("reviews/history-plans/malicious.json"))
 
     assert "sources" in repository.table_names()
+
+
+def test_create_history_plan_rejects_manifest_hash_mismatch(workspace) -> None:
+    repository = SQLiteRepository(WorkspacePaths.from_root(workspace).db_path)
+    repository.initialize()
+    unit = HistoryUnit(
+        "source_snapshot",
+        "1",
+        "raw/snapshots/local/synthetic.json",
+        "f" * 64,
+        1,
+        2,
+        3,
+        "synthetic",
+    )
+    plan = HistoryPlan.create(HistoryPolicy.default(), [unit])
+    invalid_plan = HistoryPlan(
+        plan.id,
+        plan.policy,
+        plan.units,
+        "0" * 64,
+    )
+
+    with pytest.raises(RepositoryError, match="manifest hash"):
+        repository.create_history_plan(
+            invalid_plan,
+            Path(f"reviews/history-plans/{plan.id}.json"),
+        )
+
+    with pytest.raises(RepositoryError, match="not found"):
+        repository.get_history_plan(plan.id)
+
+
+def test_delete_planned_history_units_rejects_substituted_unit_set(workspace) -> None:
+    paths = WorkspacePaths.from_root(workspace)
+    paths.ensure()
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    source_id, _, candidates = _seed_old_snapshot_candidates(
+        repository,
+        paths,
+        "substituted",
+        3,
+        HistoryPolicy.default(),
+    )
+    assert len(candidates) == 2
+    plan = HistoryPlan.create(HistoryPolicy.default(), [candidates[0]])
+    repository.create_history_plan(
+        plan,
+        Path(f"reviews/history-plans/{plan.id}.json"),
+    )
+    substituted_ids = ((candidates[1].kind, candidates[1].row_id),)
+
+    with pytest.raises(RepositoryError, match="exact ordered unit set"):
+        repository.delete_planned_history_units(plan.id, substituted_ids)
+
+    assert len(repository.snapshot_metadata_for_source(source_id)) == 3
+    assert repository.get_history_plan(plan.id)["status"] == "planned"
+
+
+def test_delete_planned_history_units_rejects_empty_unit_set(workspace) -> None:
+    paths = WorkspacePaths.from_root(workspace)
+    paths.ensure()
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    source_id, _, candidates = _seed_old_snapshot_candidates(
+        repository,
+        paths,
+        "empty",
+        2,
+        HistoryPolicy.default(),
+    )
+    plan = HistoryPlan.create(HistoryPolicy.default(), candidates)
+    repository.create_history_plan(
+        plan,
+        Path(f"reviews/history-plans/{plan.id}.json"),
+    )
+
+    with pytest.raises(RepositoryError, match="exact ordered unit set"):
+        repository.delete_planned_history_units(plan.id, ())
+
+    assert len(repository.snapshot_metadata_for_source(source_id)) == 2
+    assert repository.get_history_plan(plan.id)["status"] == "planned"
+
+
+def test_delete_planned_history_units_rejects_reordered_unit_set(workspace) -> None:
+    paths = WorkspacePaths.from_root(workspace)
+    paths.ensure()
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    source_id, _, candidates = _seed_old_snapshot_candidates(
+        repository,
+        paths,
+        "reordered",
+        3,
+        HistoryPolicy.default(),
+    )
+    plan = HistoryPlan.create(HistoryPolicy.default(), candidates)
+    repository.create_history_plan(
+        plan,
+        Path(f"reviews/history-plans/{plan.id}.json"),
+    )
+
+    with pytest.raises(RepositoryError, match="exact ordered unit set"):
+        repository.delete_planned_history_units(
+            plan.id,
+            tuple(reversed(plan.unit_ids())),
+        )
+
+    assert len(repository.snapshot_metadata_for_source(source_id)) == 3
+    assert repository.get_history_plan(plan.id)["status"] == "planned"
+
+
+def test_delete_planned_history_units_rejects_tampered_plan_metadata(workspace) -> None:
+    paths = WorkspacePaths.from_root(workspace)
+    paths.ensure()
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    source_id, _, candidates = _seed_old_snapshot_candidates(
+        repository,
+        paths,
+        "tampered",
+        2,
+        HistoryPolicy.default(),
+    )
+    plan = HistoryPlan.create(HistoryPolicy.default(), candidates)
+    repository.create_history_plan(
+        plan,
+        Path(f"reviews/history-plans/{plan.id}.json"),
+    )
+    with repository._connection() as connection:
+        columns = {
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA table_info(history_cleanup_plans)"
+            ).fetchall()
+        }
+        if "canonical_units_json" in columns:
+            connection.execute(
+                """
+                UPDATE history_cleanup_plans
+                SET canonical_units_json = '[]'
+                WHERE id = ?
+                """,
+                (plan.id,),
+            )
+
+    with pytest.raises(RepositoryError, match="binding metadata"):
+        repository.delete_planned_history_units(plan.id, plan.unit_ids())
+
+    assert len(repository.snapshot_metadata_for_source(source_id)) == 2
+    assert repository.get_history_plan(plan.id)["status"] == "planned"
+
+
+def test_delete_planned_history_units_reapplies_snapshot_retention_count(
+    workspace,
+) -> None:
+    paths = WorkspacePaths.from_root(workspace)
+    paths.ensure()
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    policy = HistoryPolicy(30, 2, True, True, True)
+    source_id, snapshot_ids, candidates = _seed_old_snapshot_candidates(
+        repository,
+        paths,
+        "retained-window",
+        3,
+        policy,
+    )
+    assert [unit.row_id for unit in candidates] == [str(snapshot_ids[0])]
+    plan = HistoryPlan.create(policy, candidates)
+    repository.create_history_plan(
+        plan,
+        Path(f"reviews/history-plans/{plan.id}.json"),
+    )
+    repository.delete_source_snapshot(snapshot_ids[1])
+
+    with pytest.raises(RepositoryError, match="now protected"):
+        repository.delete_planned_history_units(plan.id, plan.unit_ids())
+
+    assert repository.snapshot_metadata_for_source(source_id)[0][0] == snapshot_ids[0]
+    assert repository.get_history_plan(plan.id)["status"] == "planned"
+
+
+def test_delete_planned_history_units_rechecks_current_vision_review_state(
+    workspace,
+) -> None:
+    paths = WorkspacePaths.from_root(workspace)
+    paths.ensure()
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    source_id = _insert_synthetic_source(repository, "history-review-drift")
+    analysis = _insert_test_vision_analysis(
+        repository,
+        paths,
+        source_id,
+        "review-drift",
+        VisionReviewStatus.EXCLUDED,
+    )
+    with repository._connection() as connection:
+        connection.execute(
+            """
+            UPDATE vision_analysis_requests
+            SET requested_at = '2000-01-01T00:00:00Z',
+                completed_at = '2000-01-01T00:00:00Z'
+            """
+        )
+        connection.execute(
+            "UPDATE vision_analyses SET created_at = '2000-01-01T00:00:00Z'"
+        )
+    policy = HistoryPolicy.default()
+    plan = HistoryPlan.create(policy, repository.history_candidates(policy))
+    repository.create_history_plan(
+        plan,
+        Path(f"reviews/history-plans/{plan.id}.json"),
+    )
+    with repository._connection() as connection:
+        connection.execute(
+            "UPDATE vision_analyses SET review_status = 'included' WHERE id = ?",
+            (analysis.id,),
+        )
+
+    with pytest.raises(RepositoryError, match="now protected"):
+        repository.delete_planned_history_units(plan.id, plan.unit_ids())
+
+    assert repository.get_vision_analysis(analysis.id)["review_status"] == "included"
+    assert repository.get_history_plan(plan.id)["status"] == "planned"
+
+
+def test_delete_planned_history_units_rechecks_request_analysis_pairing(
+    workspace,
+) -> None:
+    paths = WorkspacePaths.from_root(workspace)
+    paths.ensure()
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    source_id = _insert_synthetic_source(repository, "history-pairing-drift")
+    request = _vision_request("request-pairing-drift", source_id)
+    repository.create_vision_request(request)
+    repository.finish_vision_request(request.id, VisionRequestStatus.COMPLETED)
+    _write_vision_request_receipt(paths, request.id)
+    with repository._connection() as connection:
+        connection.execute(
+            """
+            UPDATE vision_analysis_requests
+            SET requested_at = '2000-01-01T00:00:00Z',
+                completed_at = '2000-01-01T00:00:00Z'
+            WHERE id = ?
+            """,
+            (request.id,),
+        )
+    policy = HistoryPolicy.default()
+    plan = HistoryPlan.create(policy, repository.history_candidates(policy))
+    assert plan.unit_ids() == (("vision_request", request.id),)
+    repository.create_history_plan(
+        plan,
+        Path(f"reviews/history-plans/{plan.id}.json"),
+    )
+    analysis_path = paths.vision_analyses_dir / "pairing-drift.json"
+    analysis_path.write_text('{"summary":"pairing drift"}', encoding="utf-8")
+    applied = AppliedVisionAnalysisResult(
+        "analysis-pairing-drift",
+        "d" * 64,
+        analysis_path,
+        VisionReviewStatus.EXCLUDED,
+    )
+    repository.insert_vision_analysis(
+        applied,
+        VisionAnalysisResult(
+            request.id,
+            request.source_content_hash,
+            request.adapter,
+            VisionRequestStatus.COMPLETED,
+            "medium",
+            "pairing drift",
+            (),
+            True,
+        ),
+    )
+    with repository._connection() as connection:
+        connection.execute(
+            """
+            UPDATE vision_analyses
+            SET created_at = '2000-01-01T00:00:00Z'
+            WHERE id = ?
+            """,
+            (applied.id,),
+        )
+
+    with pytest.raises(RepositoryError, match="now protected"):
+        repository.delete_planned_history_units(plan.id, plan.unit_ids())
+
+    assert repository.get_vision_analysis(applied.id)["request_id"] == request.id
+    assert repository.get_history_plan(plan.id)["status"] == "planned"
+
+
+@pytest.mark.parametrize("reference_kind", ("claim", "portfolio_project"))
+def test_delete_planned_history_units_rechecks_exact_vision_evidence_references(
+    workspace,
+    reference_kind,
+) -> None:
+    paths = WorkspacePaths.from_root(workspace)
+    paths.ensure()
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    source_id = _insert_synthetic_source(
+        repository,
+        f"history-{reference_kind}-reference",
+    )
+    analysis = _insert_test_vision_analysis(
+        repository,
+        paths,
+        source_id,
+        f"{reference_kind}-reference",
+        VisionReviewStatus.EXCLUDED,
+    )
+    evidence_id = repository.upsert_evidence_item(
+        source_id=source_id,
+        snapshot_id=None,
+        github_activity_id=None,
+        locator=f"derived:vision-analysis:{analysis.id}",
+        stable_id=f"vision-analysis:{analysis.id}:{analysis.result_hash}",
+        content_hash=analysis.result_hash,
+        public_safe=False,
+    )
+    with repository._connection() as connection:
+        connection.execute(
+            """
+            UPDATE vision_analysis_requests
+            SET requested_at = '2000-01-01T00:00:00Z',
+                completed_at = '2000-01-01T00:00:00Z'
+            """
+        )
+        connection.execute(
+            "UPDATE vision_analyses SET created_at = '2000-01-01T00:00:00Z'"
+        )
+    policy = HistoryPolicy.default()
+    plan = HistoryPlan.create(policy, repository.history_candidates(policy))
+    repository.create_history_plan(
+        plan,
+        Path(f"reviews/history-plans/{plan.id}.json"),
+    )
+    if reference_kind == "claim":
+        project_id = repository.upsert_project("late-vision-reference", False)
+        claim_id = repository.upsert_career_claim(
+            project_id,
+            "late vision reference",
+            False,
+        )
+        repository.link_claim_evidence(claim_id, evidence_id, "direct")
+    else:
+        with repository._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO portfolio_projects
+                    (id, title, overview, status, approval_sha256,
+                     review_input_sha256)
+                VALUES (
+                    'late-vision-reference',
+                    'Late Vision Reference',
+                    'Synthetic',
+                    'approved',
+                    'a',
+                    'b'
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO portfolio_project_evidence
+                    (project_id, evidence_id, support_level)
+                VALUES ('late-vision-reference', ?, 'direct')
+                """,
+                (evidence_id,),
+            )
+
+    with pytest.raises(RepositoryError, match="now protected"):
+        repository.delete_planned_history_units(plan.id, plan.unit_ids())
+
+    assert repository.evidence_id_for_stable_id(
+        f"vision-analysis:{analysis.id}:{analysis.result_hash}"
+    ) == evidence_id
+    assert repository.get_history_plan(plan.id)["status"] == "planned"
 
 
 def test_delete_planned_history_units_rechecks_protected_snapshot(workspace) -> None:
@@ -564,6 +1411,36 @@ def test_delete_planned_history_units_uses_static_kind_mapping(workspace) -> Non
             is None
         )
     assert repository.get_history_plan(plan.id)["status"] == "completed"
+
+
+def _seed_old_snapshot_candidates(
+    repository: SQLiteRepository,
+    paths: WorkspacePaths,
+    suffix: str,
+    count: int,
+    policy: HistoryPolicy,
+) -> tuple[int, list[int], list[HistoryUnit]]:
+    source_id = _insert_synthetic_source(repository, f"history-{suffix}")
+    snapshot_ids: list[int] = []
+    for index in range(count):
+        snapshot_path = paths.local_snapshots_dir / f"{suffix}-{index}.json"
+        snapshot_path.write_text(
+            json.dumps({"index": index}, sort_keys=True),
+            encoding="utf-8",
+        )
+        snapshot_ids.append(
+            repository.insert_source_snapshot(
+                source_id,
+                snapshot_path,
+                str(index) * 64,
+                "text-v2",
+            )
+        )
+    with repository._connection() as connection:
+        connection.execute(
+            "UPDATE source_snapshots SET extracted_at = '2000-01-01T00:00:00Z'"
+        )
+    return source_id, snapshot_ids, repository.history_candidates(policy)
 
 
 def _insert_synthetic_source(repository: SQLiteRepository, suffix: str) -> int:

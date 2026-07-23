@@ -244,6 +244,9 @@ CREATE TABLE IF NOT EXISTS history_cleanup_plans (
     id TEXT PRIMARY KEY,
     policy_hash TEXT NOT NULL,
     manifest_hash TEXT NOT NULL,
+    canonical_policy_json TEXT NOT NULL,
+    canonical_units_json TEXT NOT NULL,
+    manifest_relative_path TEXT NOT NULL,
     status TEXT NOT NULL,
     created_at TEXT NOT NULL,
     export_receipt_hash TEXT,
@@ -292,6 +295,32 @@ _PORTFOLIO_PROJECT_DECISION_ORIGINS = frozenset({"manual", "automatic"})
 _PORTFOLIO_PROJECT_CONFIDENCE_LEVELS = frozenset({"low", "medium", "high"})
 _HISTORY_UNIT_KINDS = frozenset(
     {"source_snapshot", "vision_analysis", "vision_request"}
+)
+_HISTORY_UNIT_ROOTS = {
+    "source_snapshot": ("raw", "snapshots", "local"),
+    "vision_analysis": ("derived", "vision"),
+    "vision_request": ("reviews", "vision-requests"),
+}
+_HISTORY_POLICY_FIELDS = frozenset(
+    {
+        "minimum_age_days",
+        "keep_latest_text_snapshots_per_source",
+        "retain_included_vision_analyses",
+        "retain_pending_review_vision_analyses",
+        "retain_incomplete_vision_requests",
+    }
+)
+_HISTORY_UNIT_FIELDS = frozenset(
+    {
+        "kind",
+        "row_id",
+        "relative_path",
+        "content_hash",
+        "size",
+        "device",
+        "inode",
+        "reason",
+    }
 )
 
 
@@ -633,6 +662,7 @@ class SQLiteRepository:
             self._ensure_legacy_normalized_columns(conn)
             self._ensure_origin_columns(conn)
             self._ensure_portfolio_project_decision_columns(conn)
+            self._ensure_history_cleanup_plan_columns(conn)
 
     @staticmethod
     def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
@@ -842,6 +872,25 @@ class SQLiteRepository:
             """
         )
 
+    @classmethod
+    def _ensure_history_cleanup_plan_columns(cls, conn: sqlite3.Connection) -> None:
+        columns = cls._table_columns(conn, "history_cleanup_plans")
+        if "canonical_policy_json" not in columns:
+            conn.execute(
+                "ALTER TABLE history_cleanup_plans "
+                "ADD COLUMN canonical_policy_json TEXT"
+            )
+        if "canonical_units_json" not in columns:
+            conn.execute(
+                "ALTER TABLE history_cleanup_plans "
+                "ADD COLUMN canonical_units_json TEXT"
+            )
+        if "manifest_relative_path" not in columns:
+            conn.execute(
+                "ALTER TABLE history_cleanup_plans "
+                "ADD COLUMN manifest_relative_path TEXT"
+            )
+
     def table_names(self) -> set[str]:
         with self._read_connection() as conn:
             rows = conn.execute(
@@ -948,8 +997,9 @@ class SQLiteRepository:
             review_status = VisionReviewStatus(analysis.review_status)
         except (TypeError, ValueError) as error:
             raise self._semantic_error() from error
-        relative_path, _, _, _ = self._managed_history_file_metadata(
-            str(analysis.analysis_path)
+        relative_path, _, _, _, _ = self._managed_history_file_metadata(
+            "vision_analysis",
+            str(analysis.analysis_path),
         )
         with self._connection() as conn:
             request = conn.execute(
@@ -1058,6 +1108,7 @@ class SQLiteRepository:
                  AND evidence_items.stable_id =
                      'vision-analysis:' || vision_analyses.id || ':' ||
                      vision_analyses.result_hash
+                 AND evidence_items.content_hash = vision_analyses.result_hash
                 WHERE vision_analyses.id = ?
                   AND vision_analyses.status = 'completed'
                   AND vision_analyses.result_hash IS NOT NULL
@@ -1087,20 +1138,35 @@ class SQLiteRepository:
                            FROM evidence_items
                            JOIN claim_evidence
                              ON claim_evidence.evidence_id = evidence_items.id
-                           WHERE evidence_items.locator =
+                           WHERE evidence_items.source_id =
+                               vision_analyses.source_id
+                             AND evidence_items.locator =
                                'derived:vision-analysis:' || vision_analyses.id
+                             AND evidence_items.stable_id =
+                               'vision-analysis:' || vision_analyses.id || ':' ||
+                               vision_analyses.result_hash
+                             AND evidence_items.content_hash =
+                               vision_analyses.result_hash
                        ) AS claim_referenced,
                        EXISTS (
                            SELECT 1
                            FROM evidence_items
                            JOIN portfolio_project_evidence
                              ON portfolio_project_evidence.evidence_id = evidence_items.id
-                           WHERE evidence_items.locator =
+                           WHERE evidence_items.source_id =
+                               vision_analyses.source_id
+                             AND evidence_items.locator =
                                'derived:vision-analysis:' || vision_analyses.id
+                             AND evidence_items.stable_id =
+                               'vision-analysis:' || vision_analyses.id || ':' ||
+                               vision_analyses.result_hash
+                             AND evidence_items.content_hash =
+                               vision_analyses.result_hash
                        ) AS project_referenced
                 FROM vision_analyses
                 WHERE vision_analyses.id = ?
                   AND vision_analyses.status = 'completed'
+                  AND vision_analyses.result_hash IS NOT NULL
                 """,
                 (analysis_id,),
             ).fetchone()
@@ -1113,13 +1179,7 @@ class SQLiteRepository:
                 raise self._semantic_error() from error
             if claim_referenced or project_referenced:
                 raise RepositoryError("vision analysis evidence is still referenced")
-            conn.execute(
-                """
-                DELETE FROM evidence_items
-                WHERE locator = 'derived:vision-analysis:' || ?
-                """,
-                (analysis_id,),
-            )
+            self._delete_unreferenced_vision_evidence(conn, analysis_id)
             conn.execute(
                 """
                 UPDATE vision_analyses
@@ -1128,6 +1188,43 @@ class SQLiteRepository:
                 """,
                 (utc_now(), analysis_id),
             )
+
+    @staticmethod
+    def _delete_unreferenced_vision_evidence(
+        conn: sqlite3.Connection,
+        analysis_id: str,
+    ) -> None:
+        conn.execute(
+            """
+            DELETE FROM evidence_items
+            WHERE EXISTS (
+                    SELECT 1
+                    FROM vision_analyses
+                    WHERE vision_analyses.id = ?
+                      AND vision_analyses.result_hash IS NOT NULL
+                      AND evidence_items.source_id = vision_analyses.source_id
+                      AND evidence_items.locator =
+                          'derived:vision-analysis:' || vision_analyses.id
+                      AND evidence_items.stable_id =
+                          'vision-analysis:' || vision_analyses.id || ':' ||
+                          vision_analyses.result_hash
+                      AND evidence_items.content_hash =
+                          vision_analyses.result_hash
+                )
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM claim_evidence
+                    WHERE claim_evidence.evidence_id = evidence_items.id
+                )
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM portfolio_project_evidence
+                    WHERE portfolio_project_evidence.evidence_id =
+                          evidence_items.id
+                )
+            """,
+            (analysis_id,),
+        )
 
     def evidence_id_for_stable_id(self, stable_id: str) -> int | None:
         with self._read_connection() as conn:
@@ -1144,177 +1241,185 @@ class SQLiteRepository:
 
     def history_candidates(self, policy: HistoryPolicy) -> list[HistoryUnit]:
         self._validate_history_policy(policy)
+        units: list[HistoryUnit] = []
+        with self._read_connection() as conn:
+            snapshot_rows, analysis_rows, request_rows = (
+                self._history_candidate_rows(conn, policy)
+            )
+            try:
+                for row in snapshot_rows:
+                    units.append(
+                        self._history_unit(
+                            "source_snapshot",
+                            str(self._required_int(row, "id")),
+                            self._required_text(row, "snapshot_path"),
+                            "expired_unreferenced_snapshot",
+                        )
+                    )
+                for row in analysis_rows:
+                    units.append(
+                        self._history_unit(
+                            "vision_analysis",
+                            self._required_text(row, "id"),
+                            self._required_text(row, "relative_path"),
+                            "expired_unreferenced_vision_analysis",
+                        )
+                    )
+                for row in request_rows:
+                    request_id = self._required_text(row, "id")
+                    units.append(
+                        self._history_unit(
+                            "vision_request",
+                            request_id,
+                            f"reviews/vision-requests/request-{request_id}.json",
+                            "expired_finished_vision_request",
+                        )
+                    )
+            except (KeyError, TypeError, ValueError) as error:
+                raise self._semantic_error() from error
+        return sorted(units, key=self._history_unit_sort_key)
+
+    def _history_candidate_rows(
+        self,
+        conn: sqlite3.Connection,
+        policy: HistoryPolicy,
+    ) -> tuple[list[sqlite3.Row], list[sqlite3.Row], list[sqlite3.Row]]:
+        self._validate_history_policy(policy)
         cutoff = (
             datetime.now(timezone.utc) - timedelta(days=policy.minimum_age_days)
         ).isoformat().replace("+00:00", "Z")
         keep_snapshots = max(1, policy.keep_latest_text_snapshots_per_source)
-        with self._read_connection() as conn:
-            snapshot_rows = conn.execute(
-                """
-                SELECT snapshots.id, snapshots.snapshot_path, snapshots.content_hash
-                FROM source_snapshots AS snapshots
-                LEFT JOIN evidence_items
-                  ON evidence_items.snapshot_id = snapshots.id
-                WHERE datetime(snapshots.extracted_at) <= datetime(?)
-                  AND evidence_items.id IS NULL
-                  AND (
-                      SELECT COUNT(*)
-                      FROM source_snapshots AS newer
-                      WHERE newer.source_id = snapshots.source_id
-                        AND newer.id > snapshots.id
-                  ) >= ?
-                ORDER BY snapshots.id
-                """,
-                (cutoff, keep_snapshots),
-            ).fetchall()
-            analysis_rows = conn.execute(
-                """
-                SELECT analyses.id, analyses.relative_path, analyses.result_hash
-                FROM vision_analyses AS analyses
-                LEFT JOIN evidence_items
-                  ON evidence_items.locator =
-                     'derived:vision-analysis:' || analyses.id
-                LEFT JOIN claim_evidence
-                  ON claim_evidence.evidence_id = evidence_items.id
-                LEFT JOIN portfolio_project_evidence
-                  ON portfolio_project_evidence.evidence_id = evidence_items.id
-                WHERE datetime(analyses.created_at) <= datetime(?)
-                  AND analyses.relative_path IS NOT NULL
-                  AND analyses.result_hash IS NOT NULL
-                  AND (analyses.review_status <> 'included' OR ? = 0)
-                  AND (analyses.review_status <> 'pending' OR ? = 0)
-                GROUP BY analyses.id, analyses.relative_path, analyses.result_hash
-                HAVING COUNT(claim_evidence.claim_id) = 0
-                   AND COUNT(portfolio_project_evidence.project_id) = 0
-                ORDER BY analyses.id
-                """,
-                (
-                    cutoff,
-                    int(policy.retain_included_vision_analyses),
-                    int(policy.retain_pending_review_vision_analyses),
-                ),
-            ).fetchall()
-            request_rows = conn.execute(
-                """
-                SELECT requests.id, requests.source_content_hash
-                FROM vision_analysis_requests AS requests
-                LEFT JOIN vision_analyses AS analyses
-                  ON analyses.request_id = requests.id
-                LEFT JOIN evidence_items
-                  ON evidence_items.locator =
-                     'derived:vision-analysis:' || analyses.id
-                LEFT JOIN claim_evidence
-                  ON claim_evidence.evidence_id = evidence_items.id
-                LEFT JOIN portfolio_project_evidence
-                  ON portfolio_project_evidence.evidence_id = evidence_items.id
-                WHERE requests.status IN (
-                    'completed', 'unsupported', 'unavailable', 'failed', 'cancelled',
-                    'stale_source'
-                )
-                  AND datetime(requests.requested_at) <= datetime(?)
-                  AND (
-                      analyses.id IS NULL
-                      OR (
-                          datetime(analyses.created_at) <= datetime(?)
-                          AND analyses.relative_path IS NOT NULL
-                          AND analyses.result_hash IS NOT NULL
-                          AND (analyses.review_status <> 'included' OR ? = 0)
-                          AND (analyses.review_status <> 'pending' OR ? = 0)
-                      )
-                  )
-                GROUP BY requests.id, requests.source_content_hash
-                HAVING COUNT(claim_evidence.claim_id) = 0
-                   AND COUNT(portfolio_project_evidence.project_id) = 0
-                ORDER BY requests.id
-                """,
-                (
-                    cutoff,
-                    cutoff,
-                    int(policy.retain_included_vision_analyses),
-                    int(policy.retain_pending_review_vision_analyses),
-                ),
-            ).fetchall()
-        units: list[HistoryUnit] = []
-        try:
-            for row in snapshot_rows:
-                units.append(
-                    self._history_unit(
-                        "source_snapshot",
-                        str(self._required_int(row, "id")),
-                        self._required_text(row, "snapshot_path"),
-                        self._required_text(row, "content_hash"),
-                        "expired_unreferenced_snapshot",
-                    )
-                )
-            for row in analysis_rows:
-                units.append(
-                    self._history_unit(
-                        "vision_analysis",
-                        self._required_text(row, "id"),
-                        self._required_text(row, "relative_path"),
-                        self._required_text(row, "result_hash"),
-                        "expired_unreferenced_vision_analysis",
-                    )
-                )
-            for row in request_rows:
-                request_id = self._required_text(row, "id")
-                units.append(
-                    self._history_unit(
-                        "vision_request",
-                        request_id,
-                        f"reviews/vision-requests/request-{request_id}.json",
-                        self._required_text(row, "source_content_hash"),
-                        "expired_finished_vision_request",
-                    )
-                )
-        except (KeyError, TypeError, ValueError) as error:
-            raise self._semantic_error() from error
-        return sorted(
-            units,
-            key=lambda unit: (
-                unit.kind,
-                unit.row_id,
-                unit.relative_path,
-                unit.content_hash,
-                unit.size,
-                unit.device,
-                unit.inode,
-                unit.reason,
+        snapshot_rows = conn.execute(
+            """
+            SELECT snapshots.id, snapshots.snapshot_path
+            FROM source_snapshots AS snapshots
+            LEFT JOIN evidence_items
+              ON evidence_items.snapshot_id = snapshots.id
+            WHERE datetime(snapshots.extracted_at) <= datetime(?)
+              AND evidence_items.id IS NULL
+              AND (
+                  SELECT COUNT(*)
+                  FROM source_snapshots AS newer
+                  WHERE newer.source_id = snapshots.source_id
+                    AND newer.id > snapshots.id
+              ) >= ?
+            ORDER BY snapshots.id
+            """,
+            (cutoff, keep_snapshots),
+        ).fetchall()
+        analysis_rows = conn.execute(
+            """
+            SELECT analyses.id, analyses.relative_path, analyses.result_hash
+            FROM vision_analyses AS analyses
+            LEFT JOIN evidence_items
+              ON evidence_items.source_id = analyses.source_id
+             AND evidence_items.locator =
+                 'derived:vision-analysis:' || analyses.id
+             AND evidence_items.stable_id =
+                 'vision-analysis:' || analyses.id || ':' ||
+                 analyses.result_hash
+             AND evidence_items.content_hash = analyses.result_hash
+            LEFT JOIN claim_evidence
+              ON claim_evidence.evidence_id = evidence_items.id
+            LEFT JOIN portfolio_project_evidence
+              ON portfolio_project_evidence.evidence_id = evidence_items.id
+            WHERE datetime(analyses.created_at) <= datetime(?)
+              AND analyses.relative_path IS NOT NULL
+              AND analyses.result_hash IS NOT NULL
+              AND (analyses.review_status <> 'included' OR ? = 0)
+              AND (analyses.review_status <> 'pending' OR ? = 0)
+            GROUP BY analyses.id, analyses.relative_path, analyses.result_hash
+            HAVING COUNT(claim_evidence.claim_id) = 0
+               AND COUNT(portfolio_project_evidence.project_id) = 0
+            ORDER BY analyses.id
+            """,
+            (
+                cutoff,
+                int(policy.retain_included_vision_analyses),
+                int(policy.retain_pending_review_vision_analyses),
             ),
-        )
+        ).fetchall()
+        request_rows = conn.execute(
+            """
+            SELECT requests.id
+            FROM vision_analysis_requests AS requests
+            LEFT JOIN vision_analyses AS analyses
+              ON analyses.request_id = requests.id
+            LEFT JOIN evidence_items
+              ON evidence_items.source_id = analyses.source_id
+             AND evidence_items.locator =
+                 'derived:vision-analysis:' || analyses.id
+             AND evidence_items.stable_id =
+                 'vision-analysis:' || analyses.id || ':' ||
+                 analyses.result_hash
+             AND evidence_items.content_hash = analyses.result_hash
+            LEFT JOIN claim_evidence
+              ON claim_evidence.evidence_id = evidence_items.id
+            LEFT JOIN portfolio_project_evidence
+              ON portfolio_project_evidence.evidence_id = evidence_items.id
+            WHERE datetime(requests.requested_at) <= datetime(?)
+              AND (requests.status <> 'pending' OR ? = 0)
+              AND (
+                  analyses.id IS NULL
+                  OR (
+                      datetime(analyses.created_at) <= datetime(?)
+                      AND analyses.relative_path IS NOT NULL
+                      AND analyses.result_hash IS NOT NULL
+                      AND (analyses.review_status <> 'included' OR ? = 0)
+                      AND (analyses.review_status <> 'pending' OR ? = 0)
+                  )
+              )
+            GROUP BY requests.id
+            HAVING COUNT(claim_evidence.claim_id) = 0
+               AND COUNT(portfolio_project_evidence.project_id) = 0
+            ORDER BY requests.id
+            """,
+            (
+                cutoff,
+                int(policy.retain_incomplete_vision_requests),
+                cutoff,
+                int(policy.retain_included_vision_analyses),
+                int(policy.retain_pending_review_vision_analyses),
+            ),
+        ).fetchall()
+        return snapshot_rows, analysis_rows, request_rows
 
     def create_history_plan(self, plan: HistoryPlan, relative_path: Path) -> None:
-        self._validate_history_policy(plan.policy)
-        self._validate_history_unit_ids(plan.unit_ids())
-        if (
-            relative_path.is_absolute()
-            or not relative_path.parts
-            or any(part in {"", ".", ".."} for part in relative_path.parts)
-        ):
-            raise RepositoryError("history plan path must be managed and relative")
-        policy_hash = sha256(
-            json.dumps(
-                asdict(plan.policy),
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("utf-8")
-        ).hexdigest()
+        (
+            canonical_policy_json,
+            canonical_units_json,
+            policy_hash,
+            manifest_hash,
+        ) = self._canonical_history_plan_metadata(plan.policy, plan.units)
+        if plan.manifest_hash != manifest_hash:
+            raise RepositoryError("history plan manifest hash does not match its units")
+        manifest_relative_path = self._canonical_history_manifest_path(relative_path)
         with self._connection() as conn:
             conn.execute(
                 """
                 INSERT INTO history_cleanup_plans
-                    (id, policy_hash, manifest_hash, status, created_at)
-                VALUES (?, ?, ?, 'planned', ?)
+                    (id, policy_hash, manifest_hash, canonical_policy_json,
+                     canonical_units_json, manifest_relative_path, status, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, 'planned', ?)
                 """,
-                (plan.id, policy_hash, plan.manifest_hash, utc_now()),
+                (
+                    plan.id,
+                    policy_hash,
+                    manifest_hash,
+                    canonical_policy_json,
+                    canonical_units_json,
+                    manifest_relative_path,
+                    utc_now(),
+                ),
             )
 
     def get_history_plan(self, plan_id: str) -> dict[str, object]:
         with self._read_connection() as conn:
             row = conn.execute(
                 """
-                SELECT id, policy_hash, manifest_hash, status, created_at,
-                       export_receipt_hash, execution_id, completed_at
+                SELECT id, policy_hash, manifest_hash, canonical_policy_json,
+                       canonical_units_json, manifest_relative_path, status,
+                       created_at, export_receipt_hash, execution_id, completed_at
                 FROM history_cleanup_plans
                 WHERE id = ?
                 """,
@@ -1327,6 +1432,18 @@ class SQLiteRepository:
                 "id": self._required_text(row, "id"),
                 "policy_hash": self._required_text(row, "policy_hash"),
                 "manifest_hash": self._required_text(row, "manifest_hash"),
+                "canonical_policy_json": self._optional_text(
+                    row,
+                    "canonical_policy_json",
+                ),
+                "canonical_units_json": self._optional_text(
+                    row,
+                    "canonical_units_json",
+                ),
+                "manifest_relative_path": self._optional_text(
+                    row,
+                    "manifest_relative_path",
+                ),
                 "status": self._required_text(row, "status"),
                 "created_at": self._required_text(row, "created_at"),
                 "export_receipt_hash": self._optional_text(row, "export_receipt_hash"),
@@ -1376,8 +1493,8 @@ class SQLiteRepository:
         unit_ids: tuple[tuple[str, str], ...],
     ) -> None:
         with self._connection() as conn:
-            self._assert_history_plan_is_current(conn, plan_id, unit_ids)
-            self._assert_no_history_unit_is_now_protected(conn, unit_ids)
+            policy = self._assert_history_plan_is_current(conn, plan_id, unit_ids)
+            self._assert_no_history_unit_is_now_protected(conn, unit_ids, policy)
             self._delete_history_units(conn, unit_ids)
             conn.execute(
                 """
@@ -1454,16 +1571,115 @@ class SQLiteRepository:
                 raise RepositoryError("history unit ids must be unique")
             seen.add(unit_id)
 
+    @classmethod
+    def _validate_history_unit(cls, unit: HistoryUnit) -> None:
+        if not isinstance(unit, HistoryUnit):
+            raise RepositoryError("history cleanup plan binding metadata is invalid")
+        cls._validate_history_unit_ids(((unit.kind, unit.row_id),))
+        if (
+            not isinstance(unit.relative_path, str)
+            or not unit.relative_path
+            or not isinstance(unit.content_hash, str)
+            or not unit.content_hash
+            or type(unit.size) is not int
+            or unit.size < 0
+            or type(unit.device) is not int
+            or unit.device < 0
+            or type(unit.inode) is not int
+            or unit.inode < 0
+            or not isinstance(unit.reason, str)
+            or not unit.reason
+        ):
+            raise RepositoryError("history cleanup plan binding metadata is invalid")
+        relative = Path(unit.relative_path)
+        expected_root = _HISTORY_UNIT_ROOTS[unit.kind]
+        if (
+            relative.is_absolute()
+            or not relative.parts
+            or any(part in {"", ".", ".."} for part in relative.parts)
+            or relative.as_posix() != unit.relative_path
+            or len(relative.parts) <= len(expected_root)
+            or relative.parts[: len(expected_root)] != expected_root
+        ):
+            raise RepositoryError("history cleanup plan binding metadata is invalid")
+
+    @staticmethod
+    def _history_unit_sort_key(
+        unit: HistoryUnit,
+    ) -> tuple[str, str, str, str, int, int, int, str]:
+        return (
+            unit.kind,
+            unit.row_id,
+            unit.relative_path,
+            unit.content_hash,
+            unit.size,
+            unit.device,
+            unit.inode,
+            unit.reason,
+        )
+
+    @classmethod
+    def _canonical_history_plan_metadata(
+        cls,
+        policy: HistoryPolicy,
+        units: tuple[HistoryUnit, ...],
+    ) -> tuple[str, str, str, str]:
+        cls._validate_history_policy(policy)
+        if not isinstance(units, tuple):
+            raise RepositoryError("history cleanup plan binding metadata is invalid")
+        for unit in units:
+            cls._validate_history_unit(unit)
+        cls._validate_history_unit_ids(
+            tuple((unit.kind, unit.row_id) for unit in units)
+        )
+        if units != tuple(sorted(units, key=cls._history_unit_sort_key)):
+            raise RepositoryError("history cleanup plan units are not canonical")
+        policy_payload = asdict(policy)
+        units_payload = [asdict(unit) for unit in units]
+        canonical_policy_json = json.dumps(
+            policy_payload,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        canonical_units_json = json.dumps(
+            units_payload,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        manifest_json = json.dumps(
+            {"policy": policy_payload, "units": units_payload},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        policy_hash = sha256(canonical_policy_json.encode("utf-8")).hexdigest()
+        manifest_hash = sha256(manifest_json.encode("utf-8")).hexdigest()
+        return (
+            canonical_policy_json,
+            canonical_units_json,
+            policy_hash,
+            manifest_hash,
+        )
+
+    @staticmethod
+    def _canonical_history_manifest_path(relative_path: Path) -> str:
+        if (
+            not isinstance(relative_path, Path)
+            or relative_path.is_absolute()
+            or not relative_path.parts
+            or any(part in {"", ".", ".."} for part in relative_path.parts)
+        ):
+            raise RepositoryError("history plan path must be managed and relative")
+        return relative_path.as_posix()
+
     def _history_unit(
         self,
         kind: str,
         row_id: str,
         stored_path: str,
-        content_hash: str,
         reason: str,
     ) -> HistoryUnit:
-        relative_path, size, device, inode = self._managed_history_file_metadata(
-            stored_path
+        relative_path, size, device, inode, content_hash = (
+            self._managed_history_file_metadata(kind, stored_path)
         )
         return HistoryUnit(
             kind,
@@ -1478,8 +1694,11 @@ class SQLiteRepository:
 
     def _managed_history_file_metadata(
         self,
+        kind: str,
         stored_path: str,
-    ) -> tuple[str, int, int, int]:
+    ) -> tuple[str, int, int, int, str]:
+        if kind not in _HISTORY_UNIT_KINDS:
+            raise RepositoryError("history unit kind or row id is invalid")
         root = self.db_path.parent.absolute()
         path = Path(stored_path)
         candidate = path if path.is_absolute() else root / path
@@ -1494,6 +1713,14 @@ class SQLiteRepository:
             or any(part in {"", ".", ".."} for part in relative.parts)
         ):
             raise RepositoryError("managed history path is invalid")
+        expected_root = _HISTORY_UNIT_ROOTS[kind]
+        if (
+            len(relative.parts) <= len(expected_root)
+            or relative.parts[: len(expected_root)] != expected_root
+        ):
+            raise RepositoryError(
+                "managed history path is outside its kind-specific managed root"
+            )
         directory_descriptor: int | None = None
         file_descriptor: int | None = None
         try:
@@ -1508,11 +1735,15 @@ class SQLiteRepository:
             stat_result = os.fstat(file_descriptor)
             if not S_ISREG(stat_result.st_mode) or stat_result.st_nlink != 1:
                 raise OSError("managed history candidate must be a regular file")
+            digest = sha256()
+            while chunk := os.read(file_descriptor, 65_536):
+                digest.update(chunk)
             return (
                 relative.as_posix(),
                 stat_result.st_size,
                 stat_result.st_dev,
                 stat_result.st_ino,
+                digest.hexdigest(),
             )
         except OSError as error:
             raise RepositoryError(
@@ -1529,10 +1760,15 @@ class SQLiteRepository:
         conn: sqlite3.Connection,
         plan_id: str,
         unit_ids: tuple[tuple[str, str], ...],
-    ) -> None:
+    ) -> HistoryPolicy:
         self._validate_history_unit_ids(unit_ids)
         row = conn.execute(
-            "SELECT status FROM history_cleanup_plans WHERE id = ?",
+            """
+            SELECT policy_hash, manifest_hash, canonical_policy_json,
+                   canonical_units_json, manifest_relative_path, status
+            FROM history_cleanup_plans
+            WHERE id = ?
+            """,
             (plan_id,),
         ).fetchone()
         if row is None:
@@ -1543,104 +1779,124 @@ class SQLiteRepository:
             raise self._semantic_error() from error
         if status != "planned":
             raise RepositoryError("history cleanup plan is no longer current")
+        policy, units = self._hydrate_history_plan_binding(row)
+        stored_unit_ids = tuple((unit.kind, unit.row_id) for unit in units)
+        if not unit_ids or unit_ids != stored_unit_ids:
+            raise RepositoryError(
+                "history cleanup requires the plan's exact ordered unit set"
+            )
+        return policy
+
+    def _hydrate_history_plan_binding(
+        self,
+        row: sqlite3.Row,
+    ) -> tuple[HistoryPolicy, tuple[HistoryUnit, ...]]:
+        try:
+            policy_hash = self._required_text(row, "policy_hash")
+            manifest_hash = self._required_text(row, "manifest_hash")
+            canonical_policy_json = self._optional_text(
+                row,
+                "canonical_policy_json",
+            )
+            canonical_units_json = self._optional_text(
+                row,
+                "canonical_units_json",
+            )
+            manifest_relative_path = self._optional_text(
+                row,
+                "manifest_relative_path",
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise RepositoryError(
+                "history cleanup plan binding metadata is invalid"
+            ) from error
+        if (
+            canonical_policy_json is None
+            or canonical_units_json is None
+            or manifest_relative_path is None
+        ):
+            raise RepositoryError(
+                "history cleanup plan binding metadata is unavailable"
+            )
+        try:
+            policy_payload = json.loads(canonical_policy_json)
+            units_payload = json.loads(canonical_units_json)
+            if (
+                type(policy_payload) is not dict
+                or frozenset(policy_payload) != _HISTORY_POLICY_FIELDS
+                or type(units_payload) is not list
+            ):
+                raise ValueError("history plan metadata shape is invalid")
+            policy = HistoryPolicy(**policy_payload)
+            units: list[HistoryUnit] = []
+            for unit_payload in units_payload:
+                if (
+                    type(unit_payload) is not dict
+                    or frozenset(unit_payload) != _HISTORY_UNIT_FIELDS
+                ):
+                    raise ValueError("history unit metadata shape is invalid")
+                units.append(HistoryUnit(**unit_payload))
+            canonical = self._canonical_history_plan_metadata(
+                policy,
+                tuple(units),
+            )
+            stored_manifest_path = Path(manifest_relative_path)
+            if (
+                self._canonical_history_manifest_path(stored_manifest_path)
+                != manifest_relative_path
+                or canonical[0] != canonical_policy_json
+                or canonical[1] != canonical_units_json
+                or canonical[2] != policy_hash
+                or canonical[3] != manifest_hash
+            ):
+                raise ValueError("history plan metadata hashes do not match")
+        except (
+            json.JSONDecodeError,
+            KeyError,
+            TypeError,
+            ValueError,
+            RepositoryError,
+        ) as error:
+            raise RepositoryError(
+                "history cleanup plan binding metadata is invalid"
+            ) from error
+        return policy, tuple(units)
 
     def _assert_no_history_unit_is_now_protected(
         self,
         conn: sqlite3.Connection,
         unit_ids: tuple[tuple[str, str], ...],
+        policy: HistoryPolicy,
     ) -> None:
+        snapshot_rows, analysis_rows, request_rows = self._history_candidate_rows(
+            conn,
+            policy,
+        )
+        try:
+            eligible_ids = {
+                ("source_snapshot", str(self._required_int(row, "id")))
+                for row in snapshot_rows
+            }
+            eligible_ids.update(
+                ("vision_analysis", self._required_text(row, "id"))
+                for row in analysis_rows
+            )
+            eligible_ids.update(
+                ("vision_request", self._required_text(row, "id"))
+                for row in request_rows
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise self._semantic_error() from error
         planned_ids = set(unit_ids)
         for kind, row_id in unit_ids:
-            if kind == "source_snapshot":
-                snapshot_id = self._history_integer_row_id(row_id)
+            if not self._history_unit_exists(conn, kind, row_id):
+                raise RepositoryError("planned history unit is stale")
+            if (kind, row_id) not in eligible_ids:
+                raise RepositoryError("planned history unit is now protected")
+            if kind == "vision_request":
                 row = conn.execute(
                     """
-                    SELECT snapshots.id,
-                           EXISTS (
-                               SELECT 1
-                               FROM source_snapshots AS newer
-                               WHERE newer.source_id = snapshots.source_id
-                                 AND newer.id > snapshots.id
-                           ) AS has_newer,
-                           EXISTS (
-                               SELECT 1
-                               FROM evidence_items
-                               WHERE evidence_items.snapshot_id = snapshots.id
-                           ) AS evidence_referenced
-                    FROM source_snapshots AS snapshots
-                    WHERE snapshots.id = ?
-                    """,
-                    (snapshot_id,),
-                ).fetchone()
-                if row is None:
-                    raise RepositoryError("planned history unit is stale")
-                try:
-                    has_newer = self._required_boolean(row, "has_newer")
-                    referenced = self._required_boolean(row, "evidence_referenced")
-                except (KeyError, TypeError, ValueError) as error:
-                    raise self._semantic_error() from error
-                if not has_newer or referenced:
-                    raise RepositoryError("planned history unit is now protected")
-            elif kind == "vision_analysis":
-                row = conn.execute(
-                    """
-                    SELECT analyses.id,
-                           EXISTS (
-                               SELECT 1
-                               FROM evidence_items
-                               JOIN claim_evidence
-                                 ON claim_evidence.evidence_id = evidence_items.id
-                               WHERE evidence_items.locator =
-                                   'derived:vision-analysis:' || analyses.id
-                           ) AS claim_referenced,
-                           EXISTS (
-                               SELECT 1
-                               FROM evidence_items
-                               JOIN portfolio_project_evidence
-                                 ON portfolio_project_evidence.evidence_id =
-                                    evidence_items.id
-                               WHERE evidence_items.locator =
-                                   'derived:vision-analysis:' || analyses.id
-                           ) AS project_referenced
-                    FROM vision_analyses AS analyses
-                    WHERE analyses.id = ?
-                    """,
-                    (row_id,),
-                ).fetchone()
-                if row is None:
-                    raise RepositoryError("planned history unit is stale")
-                try:
-                    claim_referenced = self._required_boolean(
-                        row, "claim_referenced"
-                    )
-                    project_referenced = self._required_boolean(
-                        row, "project_referenced"
-                    )
-                except (KeyError, TypeError, ValueError) as error:
-                    raise self._semantic_error() from error
-                if claim_referenced or project_referenced:
-                    raise RepositoryError("planned history unit is now protected")
-            else:
-                row = conn.execute(
-                    """
-                    SELECT requests.status, analyses.id AS analysis_id,
-                           EXISTS (
-                               SELECT 1
-                               FROM evidence_items
-                               JOIN claim_evidence
-                                 ON claim_evidence.evidence_id = evidence_items.id
-                               WHERE evidence_items.locator =
-                                   'derived:vision-analysis:' || analyses.id
-                           ) AS claim_referenced,
-                           EXISTS (
-                               SELECT 1
-                               FROM evidence_items
-                               JOIN portfolio_project_evidence
-                                 ON portfolio_project_evidence.evidence_id =
-                                    evidence_items.id
-                               WHERE evidence_items.locator =
-                                   'derived:vision-analysis:' || analyses.id
-                           ) AS project_referenced
+                    SELECT analyses.id AS analysis_id
                     FROM vision_analysis_requests AS requests
                     LEFT JOIN vision_analyses AS analyses
                       ON analyses.request_id = requests.id
@@ -1648,31 +1904,38 @@ class SQLiteRepository:
                     """,
                     (row_id,),
                 ).fetchone()
-                if row is None:
-                    raise RepositoryError("planned history unit is stale")
                 try:
-                    status = VisionRequestStatus(
-                        self._required_text(row, "status")
-                    )
                     analysis_id = self._optional_text(row, "analysis_id")
-                    claim_referenced = self._required_boolean(
-                        row, "claim_referenced"
-                    )
-                    project_referenced = self._required_boolean(
-                        row, "project_referenced"
-                    )
                 except (KeyError, TypeError, ValueError) as error:
                     raise self._semantic_error() from error
                 if (
-                    status is VisionRequestStatus.PENDING
-                    or claim_referenced
-                    or project_referenced
-                    or (
-                        analysis_id is not None
-                        and ("vision_analysis", analysis_id) not in planned_ids
-                    )
+                    analysis_id is not None
+                    and ("vision_analysis", analysis_id) not in planned_ids
                 ):
                     raise RepositoryError("planned history unit is now protected")
+
+    def _history_unit_exists(
+        self,
+        conn: sqlite3.Connection,
+        kind: str,
+        row_id: str,
+    ) -> bool:
+        if kind == "source_snapshot":
+            row = conn.execute(
+                "SELECT 1 FROM source_snapshots WHERE id = ?",
+                (self._history_integer_row_id(row_id),),
+            ).fetchone()
+        elif kind == "vision_analysis":
+            row = conn.execute(
+                "SELECT 1 FROM vision_analyses WHERE id = ?",
+                (row_id,),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT 1 FROM vision_analysis_requests WHERE id = ?",
+                (row_id,),
+            ).fetchone()
+        return row is not None
 
     def _delete_history_units(
         self,
@@ -1682,24 +1945,7 @@ class SQLiteRepository:
         for kind, row_id in unit_ids:
             if kind != "vision_analysis":
                 continue
-            conn.execute(
-                """
-                DELETE FROM evidence_items
-                WHERE locator = 'derived:vision-analysis:' || ?
-                  AND NOT EXISTS (
-                      SELECT 1
-                      FROM claim_evidence
-                      WHERE claim_evidence.evidence_id = evidence_items.id
-                  )
-                  AND NOT EXISTS (
-                      SELECT 1
-                      FROM portfolio_project_evidence
-                      WHERE portfolio_project_evidence.evidence_id =
-                            evidence_items.id
-                  )
-                """,
-                (row_id,),
-            )
+            self._delete_unreferenced_vision_evidence(conn, row_id)
             cursor = conn.execute(
                 "DELETE FROM vision_analyses WHERE id = ?",
                 (row_id,),
