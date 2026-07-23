@@ -53,7 +53,21 @@ class HistoryPlan:
 
     @classmethod
     def create(cls, policy: HistoryPolicy, units: list[HistoryUnit]) -> HistoryPlan:
-        canonical_units = tuple(sorted(units, key=lambda unit: (unit.kind, unit.row_id)))
+        canonical_units = tuple(
+            sorted(
+                units,
+                key=lambda unit: (
+                    unit.kind,
+                    unit.row_id,
+                    unit.relative_path,
+                    unit.content_hash,
+                    unit.size,
+                    unit.device,
+                    unit.inode,
+                    unit.reason,
+                ),
+            )
+        )
         manifest_hash = sha256(_canonical_json(policy, canonical_units)).hexdigest()
         return cls(uuid4().hex, policy, canonical_units, manifest_hash)
 

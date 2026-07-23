@@ -40,6 +40,18 @@ def test_history_plan_canonicalizes_units_and_has_confirmation_phrase() -> None:
     assert plan.confirmation_phrase == "DELETE MANAGED HISTORY"
 
 
+def test_history_plan_canonicalizes_reversed_units_with_same_identity() -> None:
+    policy = HistoryPolicy.default()
+    first = HistoryUnit("snapshot", "1", "raw/snapshots/1-a.txt", "a" * 64, 1, 1, 1, "old")
+    second = HistoryUnit("snapshot", "1", "raw/snapshots/1-b.txt", "b" * 64, 2, 1, 2, "new")
+
+    forward = HistoryPlan.create(policy, [first, second])
+    reverse = HistoryPlan.create(policy, [second, first])
+
+    assert forward.units == reverse.units
+    assert forward.manifest_hash == reverse.manifest_hash
+
+
 def test_history_contracts_are_immutable_and_expose_execution_states() -> None:
     policy = HistoryPolicy.default()
 
