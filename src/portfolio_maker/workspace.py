@@ -16,6 +16,13 @@ class WorkspacePaths:
     local_snapshots_dir: Path
     artifacts_dir: Path
     reviews_dir: Path
+    derived_dir: Path
+    vision_analyses_dir: Path
+    vision_requests_dir: Path
+    history_policy_path: Path
+    history_plans_dir: Path
+    history_journal_dir: Path
+    history_quarantine_dir: Path
     discovery_report_path: Path
     approval_path: Path
     artifact_approval_path: Path
@@ -42,6 +49,7 @@ class WorkspacePaths:
         snapshots_dir = raw_dir / "snapshots"
         artifacts_dir = root / "artifacts"
         reviews_dir = root / "reviews"
+        derived_dir = root / "derived"
         return cls(
             workspace=workspace,
             root=root,
@@ -51,6 +59,13 @@ class WorkspacePaths:
             local_snapshots_dir=snapshots_dir / "local",
             artifacts_dir=artifacts_dir,
             reviews_dir=reviews_dir,
+            derived_dir=derived_dir,
+            vision_analyses_dir=derived_dir / "vision",
+            vision_requests_dir=reviews_dir / "vision-requests",
+            history_policy_path=reviews_dir / "history-policy.json",
+            history_plans_dir=reviews_dir / "history-plans",
+            history_journal_dir=reviews_dir / "history-journal",
+            history_quarantine_dir=root / "quarantine",
             discovery_report_path=reviews_dir / "discovery-report.md",
             approval_path=reviews_dir / "source-approval.json",
             artifact_approval_path=reviews_dir / "artifact-approval.json",
@@ -78,5 +93,11 @@ class WorkspacePaths:
             self.local_snapshots_dir,
             self.artifacts_dir,
             self.reviews_dir,
+            self.derived_dir,
+            self.vision_analyses_dir,
+            self.vision_requests_dir,
+            self.history_plans_dir,
+            self.history_journal_dir,
+            self.history_quarantine_dir,
         ):
             ensure_managed_directory(path)

@@ -169,3 +169,43 @@ class ApplySemanticIndexResult:
     complete_count: int
     partial_count: int
     failed_count: int
+
+
+@dataclass(frozen=True)
+class HistoryPlanRequest:
+    workspace: Path
+
+
+@dataclass(frozen=True)
+class HistoryExportRequest:
+    workspace: Path
+    plan_id: str
+    backup_dir: Path
+
+
+@dataclass(frozen=True)
+class HistoryApplyRequest:
+    workspace: Path
+    plan_id: str
+    export_receipt_hash: str
+    confirmation: str
+
+
+@dataclass(frozen=True)
+class PrepareVisionAnalysisRequest:
+    workspace: Path
+    source_id: int
+    confirm_codex_share: bool
+
+
+@dataclass(frozen=True)
+class ApplyVisionAnalysisRequest:
+    workspace: Path
+    result_path: Path
+
+
+@dataclass(frozen=True)
+class SetVisionAnalysisStateRequest:
+    workspace: Path
+    analysis_id: str
+    state: str
