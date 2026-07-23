@@ -31,6 +31,7 @@
 
 | Phase | Tasks | Reviewable deliverable |
 |---|---:|---|
+| P. Baseline repair | 0 | green 0.2.1 version contract before feature RED tests |
 | A. Contracts/persistence | 1-2 | additive model, path, migration, repository contract |
 | B. #5 history lifecycle | 3-5 | read-only planning, export, quarantined apply/recovery, CLI |
 | C. #14 vision lifecycle | 6-9 | consented request, sanitized result, review, skill/CLI |
@@ -62,6 +63,67 @@ tests/test_plugin_structure.py
 tests/test_profile_and_portfolio.py
 tests/test_public_portfolio.py
 tests/test_sqlite_repository.py
+~~~
+
+## Phase P — Baseline repair
+
+### Task 0: Restore a green 0.2.1 version contract
+
+**Files:**
+- Modify: tests/test_plugin_structure.py:1-10
+- Modify: src/portfolio_maker/__init__.py:1-3
+
+**Interfaces:**
+- Produces a single cross-surface release-version contract for Python, plugin, and web metadata.
+- Consumes the current 0.2.1 values in pyproject.toml, .codex-plugin/plugin.json, web/portfolio/package.json, and web/portfolio/package-lock.json.
+
+- [ ] **Step 1: Preserve the observed baseline failure**
+
+Run: python -m pytest -q
+Expected: exactly one existing failure because tests/test_plugin_structure.py expects 0.2.0 while the plugin manifest is 0.2.1; all other current tests pass.
+
+- [ ] **Step 2: Replace the stale literal with a cross-surface contract**
+
+~~~python
+import json
+import tomllib
+from pathlib import Path
+
+from portfolio_maker import __version__
+
+
+def test_release_versions_stay_aligned() -> None:
+    pyproject = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+    plugin = json.loads(Path(".codex-plugin/plugin.json").read_text(encoding="utf-8"))
+    web_package = json.loads(Path("web/portfolio/package.json").read_text(encoding="utf-8"))
+    web_lock = json.loads(Path("web/portfolio/package-lock.json").read_text(encoding="utf-8"))
+    expected = pyproject["project"]["version"]
+
+    assert {
+        plugin["version"],
+        web_package["version"],
+        web_lock["version"],
+        web_lock["packages"][""]["version"],
+        __version__,
+    } == {expected}
+~~~
+
+Keep test_plugin_manifest_names_repository_and_skill_root focused on plugin name and skill-root discovery. Set src/portfolio_maker/__init__.py __version__ to 0.2.1. Do not change any release value to 0.2.2 in this task.
+
+- [ ] **Step 3: Verify the repaired baseline**
+
+Run: python -m pytest tests/test_plugin_structure.py -v
+Expected: PASS.
+
+Run: python -m pytest -q
+Expected: PASS with no pre-existing failure left for later RED/GREEN tasks.
+
+- [ ] **Step 4: Commit**
+
+~~~bash
+git add src/portfolio_maker/__init__.py tests/test_plugin_structure.py
+git diff --check
+git commit -m "fix: align 0.2.1 release versions"
 ~~~
 
 ## Phase A — Contracts and persistence
@@ -1046,7 +1108,19 @@ Expected: PASS.
 
 Write the exact commands, pass counts, isolated-workspace smoke result, capability-unavailable result, and untested live format boundaries to the verification record. Do not claim a format succeeded unless the current Codex session actually exercised it.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Exercise the current Codex capability with synthetic files**
+
+In a disposable workspace containing no user data, run the real portfolio-vision-analysis skill against:
+
+- one ordinary image;
+- one multi-page text PDF;
+- one multi-page scanned PDF;
+- one document, spreadsheet, and presentation format that the current Codex App session offers directly;
+- one deliberately unsupported regular file.
+
+For each case, record only format class, byte size, request/result status, capability outcome, and whether explicit inclusion was exercised. Do not record raw text, absolute paths, or source bytes. A format may safely return unsupported or unavailable; the acceptance condition is that every selected source follows the same confirmed request protocol, successful results begin pending, and no failed/unsupported result becomes evidence. Verify that text-only profile, draft, manifest, and HTML generation still succeed after the matrix.
+
+- [ ] **Step 6: Commit**
 
 ~~~bash
 git add tests/test_history_lifecycle.py tests/test_vision_analysis.py tests/test_profile_and_portfolio.py tests/test_public_portfolio.py docs/reviews/2026-07-16-portfolio-maker-0.2.2-verification.md
@@ -1062,7 +1136,11 @@ git commit -m "test: verify 0.2.2 history and vision boundaries"
 - Modify: docs/superpowers/specs/2026-07-11-portfolio-maker-roadmap-phase-1-policy-evidence-github.md
 - Modify: .codex-plugin/plugin.json
 - Modify: pyproject.toml
+- Modify: src/portfolio_maker/__init__.py
+- Modify: web/portfolio/package.json
+- Modify: web/portfolio/package-lock.json
 - Modify: tests/test_cli.py
+- Modify: tests/test_plugin_structure.py
 
 **Interfaces:**
 - Consumes Task 10 verification record.
@@ -1096,9 +1174,11 @@ Set versions exactly:
 version = "0.2.2"
 ~~~
 
+Set src/portfolio_maker/__init__.py, web/portfolio/package.json, both root package version fields in web/portfolio/package-lock.json, pyproject.toml, and .codex-plugin/plugin.json to 0.2.2. The Task 0 cross-surface test must pass without weakening or removing a version surface.
+
 README tutorial must show: create policy sample; inspect history-plan; export to an outside-workspace directory; apply only after reading the plan's confirmation phrase; resume/recover an execution; choose a source; run prepare-vision-analysis --confirm-codex-share; let portfolio-vision-analysis submit a result; inspect pending status; explicitly include/exclude it. State that format availability is current-session dependent and that #8 remains open for independent OCR/renderer support.
 
-Change roadmap/development-principles language from planned 0.2.2 to current 0.2.2 only after Task 10 passes. Update #5 and #14 with the verification record and close them only if every completion criterion has evidence. Keep #8 open.
+Change roadmap/development-principles language from planned 0.2.2 to current 0.2.2 only after Task 10 passes. Prepare the factual #5 and #14 completion updates from the verification record, but do not mutate or close the remote issues until the reviewed release commit has been pushed with explicit user authorization. Keep #8 open.
 
 - [ ] **Step 4: Run final release checks**
 
@@ -1117,7 +1197,7 @@ Expected: only intended release files are staged; no historical local review art
 - [ ] **Step 5: Commit and hand off for release review**
 
 ~~~bash
-git add README.md docs/DEVELOPMENT_PRINCIPLES.md docs/superpowers/specs/2026-07-11-portfolio-maker-roadmap-phase-1-policy-evidence-github.md .codex-plugin/plugin.json pyproject.toml tests/test_cli.py docs/reviews/2026-07-16-portfolio-maker-0.2.2-verification.md
+git add README.md docs/DEVELOPMENT_PRINCIPLES.md docs/superpowers/specs/2026-07-11-portfolio-maker-roadmap-phase-1-policy-evidence-github.md .codex-plugin/plugin.json pyproject.toml src/portfolio_maker/__init__.py web/portfolio/package.json web/portfolio/package-lock.json tests/test_cli.py tests/test_plugin_structure.py docs/reviews/2026-07-16-portfolio-maker-0.2.2-verification.md
 git diff --check
 git commit -m "release: prepare portfolio maker 0.2.2"
 ~~~
@@ -1130,6 +1210,7 @@ Do not push, tag, publish, or close remote issues until the user authorizes publ
 
 | Approved design requirement | Tasks |
 |---|---|
+| green current-release baseline and cross-surface version contract | 0, 11 |
 | #5 default policy, candidate planning, protected units | 1-3, 5 |
 | export, confirmation, quarantine, transaction, resume/recovery, vacuum | 2, 4, 5, 10 |
 | path/symlink/sidecar/concurrency protection | 2-4, 10 |
@@ -1137,7 +1218,7 @@ Do not push, tag, publish, or close remote issues until the user authorizes publ
 | all Codex-recognized approved local formats with no converter/allowlist | 6, 9-11 |
 | analysis consent separate from artifact consent | 6, 8-9 |
 | sanitization, failure state, artifact/public-output isolation | 7-10 |
-| additive migration and 0.2.1 compatibility | 1-2, 10-11 |
+| additive migration and 0.2.1 compatibility | 0-2, 10-11 |
 | Korean tutorial, version, release/Issue gate | 10-11 |
 
 Placeholder scan: complete. Type consistency: HistoryPolicy, HistoryPlan, PreparedVisionRequest, VisionAnalysisResult, HistoryApplyRequest, and SetVisionAnalysisStateRequest are defined in Task 1 before later tasks use them. Scope is split into #5 then #14; #8 OCR/renderer implementation is excluded from this release.
