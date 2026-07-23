@@ -6,6 +6,7 @@ from hashlib import sha256
 import json
 import os
 from pathlib import Path
+import sqlite3
 from stat import S_IMODE, S_ISDIR, S_ISREG
 
 import pytest
@@ -394,6 +395,251 @@ def test_history_plan_removes_private_plan_when_database_binding_fails(
     assert state.latest_path.exists()
 
 
+def test_history_plan_preserves_exact_binding_after_post_commit_error(
+    workspace,
+    monkeypatch,
+) -> None:
+    state = _seed_old_unreferenced_snapshot(workspace)
+    write_sample_history_policy(state.paths)
+    _fail_history_plan_after_commit(monkeypatch)
+
+    with pytest.raises(HistoryError, match="planning failed safely"):
+        plan_history_cleanup(HistoryPlanRequest(workspace=workspace))
+
+    plan_files = list(state.paths.history_plans_dir.glob("plan-*.json"))
+    report_files = list(
+        state.paths.reviews_dir.glob("history-plan-*-report.md")
+    )
+    assert (
+        _history_plan_count(state.repository),
+        len(plan_files),
+        len(report_files),
+    ) == (1, 1, 0)
+    plan_payload = json.loads(plan_files[0].read_text(encoding="utf-8"))
+    stored = state.repository.get_history_plan(plan_payload["id"])
+    assert stored["id"] == plan_payload["id"]
+    assert stored["manifest_hash"] == plan_payload["manifest_hash"]
+    assert stored["manifest_relative_path"] == plan_files[0].relative_to(
+        state.paths.root
+    ).as_posix()
+    assert state.old_path.exists()
+    assert state.latest_path.exists()
+
+
+def test_history_plan_preserves_manifest_when_database_replaced_during_commit(
+    workspace,
+    tmp_path,
+    monkeypatch,
+) -> None:
+    state = _seed_old_unreferenced_snapshot(workspace)
+    write_sample_history_policy(state.paths)
+    replacement = tmp_path / "replacement.db"
+    displaced = tmp_path / "displaced.db"
+    with sqlite3.connect(state.paths.db_path) as visible:
+        with sqlite3.connect(replacement) as replacement_connection:
+            visible.backup(replacement_connection)
+    original_connect = sqlite3.connect
+    replaced = False
+
+    def connect_with_replacement_trace(path, *args, **kwargs):
+        connection = original_connect(path, *args, **kwargs)
+
+        def replace_on_commit(statement):
+            nonlocal replaced
+            if statement == "COMMIT" and not replaced:
+                replaced = True
+                os.link(state.paths.db_path, displaced)
+                os.replace(replacement, state.paths.db_path)
+
+        connection.set_trace_callback(replace_on_commit)
+        return connection
+
+    monkeypatch.setattr(SQLiteRepository, "initialize", lambda self: None)
+    monkeypatch.setattr(
+        SQLiteRepository,
+        "_lock_database_directory",
+        lambda self, directory_descriptor: None,
+    )
+    monkeypatch.setattr(
+        "portfolio_maker.infrastructure.sqlite_repository.sqlite3.connect",
+        connect_with_replacement_trace,
+    )
+
+    with pytest.raises(HistoryError, match="planning failed safely"):
+        plan_history_cleanup(HistoryPlanRequest(workspace=workspace))
+
+    with original_connect(displaced) as displaced_connection:
+        displaced_rows = displaced_connection.execute(
+            "SELECT COUNT(*) FROM history_cleanup_plans"
+        ).fetchone()[0]
+    with original_connect(state.paths.db_path) as visible_connection:
+        visible_rows = visible_connection.execute(
+            "SELECT COUNT(*) FROM history_cleanup_plans"
+        ).fetchone()[0]
+    plan_files = list(state.paths.history_plans_dir.glob("plan-*.json"))
+    report_files = list(
+        state.paths.reviews_dir.glob("history-plan-*-report.md")
+    )
+
+    assert replaced is True
+    assert (displaced_rows, visible_rows) == (1, 0)
+    assert (len(plan_files), len(report_files)) == (1, 0)
+    assert state.old_path.exists()
+    assert state.latest_path.exists()
+
+
+def test_history_plan_preserves_manifest_after_post_commit_error_and_pre_lookup_switch(
+    workspace,
+    tmp_path,
+    monkeypatch,
+) -> None:
+    state = _seed_old_unreferenced_snapshot(workspace)
+    write_sample_history_policy(state.paths)
+    replacement = tmp_path / "replacement.db"
+    displaced = tmp_path / "displaced.db"
+    external_sidecar = tmp_path / "external-journal"
+    external_sidecar.write_bytes(b"")
+    with sqlite3.connect(state.paths.db_path) as visible:
+        with sqlite3.connect(replacement) as replacement_connection:
+            visible.backup(replacement_connection)
+    original_connect = sqlite3.connect
+    real_validate = SQLiteRepository._validate_database_family
+    real_find_history_plan = SQLiteRepository.find_history_plan
+    unsafe_sidecar_injected = False
+    database_switched = False
+    lookup_calls = 0
+
+    def connect_with_unsafe_commit_sidecar(path, *args, **kwargs):
+        connection = original_connect(path, *args, **kwargs)
+
+        def inject_unsafe_sidecar(statement):
+            nonlocal unsafe_sidecar_injected
+            if statement == "COMMIT" and not unsafe_sidecar_injected:
+                sidecar = state.paths.db_path.with_name(
+                    f"{state.paths.db_path.name}-journal"
+                )
+                sidecar.unlink()
+                os.link(external_sidecar, sidecar)
+                unsafe_sidecar_injected = True
+
+        connection.set_trace_callback(inject_unsafe_sidecar)
+        return connection
+
+    def switch_database_after_post_commit_error(
+        self,
+        directory_descriptor,
+        identity,
+        stage,
+    ):
+        nonlocal database_switched
+        try:
+            real_validate(self, directory_descriptor, identity, stage)
+        except RepositoryError:
+            if stage == "after commit" and not database_switched:
+                sidecar = state.paths.db_path.with_name(
+                    f"{state.paths.db_path.name}-journal"
+                )
+                sidecar.unlink()
+                os.link(state.paths.db_path, displaced)
+                os.replace(replacement, state.paths.db_path)
+                database_switched = True
+            raise
+
+    def count_lookup(self, plan_id):
+        nonlocal lookup_calls
+        lookup_calls += 1
+        return real_find_history_plan(self, plan_id)
+
+    monkeypatch.setattr(SQLiteRepository, "initialize", lambda self: None)
+    monkeypatch.setattr(
+        SQLiteRepository,
+        "_lock_database_directory",
+        lambda self, directory_descriptor: None,
+    )
+    monkeypatch.setattr(
+        "portfolio_maker.infrastructure.sqlite_repository.sqlite3.connect",
+        connect_with_unsafe_commit_sidecar,
+    )
+    monkeypatch.setattr(
+        SQLiteRepository,
+        "_validate_database_family",
+        switch_database_after_post_commit_error,
+    )
+    monkeypatch.setattr(
+        SQLiteRepository,
+        "find_history_plan",
+        count_lookup,
+    )
+
+    with pytest.raises(HistoryError, match="planning failed safely"):
+        plan_history_cleanup(HistoryPlanRequest(workspace=workspace))
+
+    with original_connect(displaced) as displaced_connection:
+        displaced_rows = displaced_connection.execute(
+            "SELECT COUNT(*) FROM history_cleanup_plans"
+        ).fetchone()[0]
+    with original_connect(state.paths.db_path) as visible_connection:
+        visible_rows = visible_connection.execute(
+            "SELECT COUNT(*) FROM history_cleanup_plans"
+        ).fetchone()[0]
+    plan_files = list(state.paths.history_plans_dir.glob("plan-*.json"))
+    report_files = list(
+        state.paths.reviews_dir.glob("history-plan-*-report.md")
+    )
+
+    assert unsafe_sidecar_injected is True
+    assert database_switched is True
+    assert (
+        displaced_rows,
+        visible_rows,
+        len(plan_files),
+        len(report_files),
+        lookup_calls,
+    ) == (1, 0, 1, 0, 0)
+    assert state.old_path.exists()
+    assert state.latest_path.exists()
+
+
+def test_history_plan_preserves_manifest_when_binding_lookup_fails(
+    workspace,
+    monkeypatch,
+) -> None:
+    state = _seed_old_unreferenced_snapshot(workspace)
+    write_sample_history_policy(state.paths)
+    lookup_calls: list[str] = []
+
+    def fail_binding(self, plan, relative_path):
+        raise RepositoryError("injected history plan binding failure")
+
+    def fail_lookup(self, plan_id):
+        lookup_calls.append(plan_id)
+        raise RepositoryError("injected ambiguous history plan lookup failure")
+
+    monkeypatch.setattr(SQLiteRepository, "create_history_plan", fail_binding)
+    monkeypatch.setattr(
+        SQLiteRepository,
+        "find_history_plan",
+        fail_lookup,
+        raising=False,
+    )
+
+    with pytest.raises(HistoryError, match="planning failed safely"):
+        plan_history_cleanup(HistoryPlanRequest(workspace=workspace))
+
+    plan_files = list(state.paths.history_plans_dir.glob("plan-*.json"))
+    report_files = list(
+        state.paths.reviews_dir.glob("history-plan-*-report.md")
+    )
+    assert len(lookup_calls) == 1
+    assert (
+        _history_plan_count(state.repository),
+        len(plan_files),
+        len(report_files),
+    ) == (0, 1, 0)
+    assert state.old_path.exists()
+    assert state.latest_path.exists()
+
+
 def test_history_plan_report_failure_keeps_only_database_bound_private_plan(
     workspace,
     monkeypatch,
@@ -639,6 +885,24 @@ def _history_plan_count(repository: SQLiteRepository) -> int:
         ).fetchone()
     assert row is not None
     return int(row[0])
+
+
+def _fail_history_plan_after_commit(monkeypatch) -> None:
+    real_validate = SQLiteRepository._validate_database_family
+
+    def fail_after_commit(self, directory_descriptor, identity, stage):
+        real_validate(self, directory_descriptor, identity, stage)
+        if stage == "after commit":
+            raise RepositoryError(
+                "injected history plan database validation failure after commit"
+            )
+
+    monkeypatch.setattr(SQLiteRepository, "initialize", lambda self: None)
+    monkeypatch.setattr(
+        SQLiteRepository,
+        "_validate_database_family",
+        fail_after_commit,
+    )
 
 
 def _snapshot_count(repository: SQLiteRepository) -> int:

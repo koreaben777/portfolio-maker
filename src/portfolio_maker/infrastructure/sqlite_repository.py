@@ -273,6 +273,14 @@ class RepositoryError(RuntimeError):
     pass
 
 
+class CommitOutcomeAmbiguousError(RepositoryError):
+    pass
+
+
+class DatabaseFamilyChangedError(CommitOutcomeAmbiguousError):
+    pass
+
+
 _DATABASE_SIDECARS = ("-journal", "-wal", "-shm")
 _REPOSITORY_OPERATION_LOCK = threading.RLock()
 _REPOSITORY_OPERATION_STATE = threading.local()
@@ -343,6 +351,7 @@ class SQLiteRepository:
     def _connection(self) -> Iterator[sqlite3.Connection]:
         with self._database_operation() as (directory_descriptor, identity):
             conn: sqlite3.Connection | None = None
+            commit_started = False
             try:
                 conn = self._connect_validated(directory_descriptor, identity, read_only=False)
                 self._configure_write_journal(conn)
@@ -351,17 +360,41 @@ class SQLiteRepository:
                 self._validate_database_family(directory_descriptor, identity, "after write transaction")
                 yield conn
                 self._validate_database_family(directory_descriptor, identity, "before commit")
+                commit_started = True
                 conn.commit()
                 self._validate_database_family(directory_descriptor, identity, "after commit")
-            except RepositoryError:
+            except RepositoryError as error:
                 self._rollback(conn)
+                if commit_started and not isinstance(
+                    error,
+                    CommitOutcomeAmbiguousError,
+                ):
+                    raise CommitOutcomeAmbiguousError(str(error)) from error
                 raise
             except sqlite3.Error as error:
                 self._rollback(conn)
-                raise self._repository_error(error) from error
+                repository_error = self._repository_error(error)
+                if commit_started:
+                    raise CommitOutcomeAmbiguousError(
+                        str(repository_error)
+                    ) from error
+                raise repository_error from error
             except OSError as error:
                 self._rollback(conn)
-                raise self._unsafe_path_error(self.db_path.name) from error
+                repository_error = self._unsafe_path_error(self.db_path.name)
+                if commit_started:
+                    raise CommitOutcomeAmbiguousError(
+                        str(repository_error)
+                    ) from error
+                raise repository_error from error
+            except Exception as error:
+                self._rollback(conn)
+                if commit_started:
+                    raise CommitOutcomeAmbiguousError(
+                        "Repository transaction outcome is committed or ambiguous; "
+                        "preserve or back up the workspace state and rerun"
+                    ) from error
+                raise
             finally:
                 if conn is not None:
                     conn.close()
@@ -629,7 +662,7 @@ class SQLiteRepository:
         )
 
     def _changed_database_error(self, stage: str) -> RepositoryError:
-        return RepositoryError(
+        return DatabaseFamilyChangedError(
             f"Managed database changed {stage}; preserve or back up the workspace state and rerun"
         )
 
@@ -1413,7 +1446,7 @@ class SQLiteRepository:
                 ),
             )
 
-    def get_history_plan(self, plan_id: str) -> dict[str, object]:
+    def find_history_plan(self, plan_id: str) -> dict[str, object] | None:
         with self._read_connection() as conn:
             row = conn.execute(
                 """
@@ -1426,7 +1459,7 @@ class SQLiteRepository:
                 (plan_id,),
             ).fetchone()
         if row is None:
-            raise RepositoryError("history cleanup plan was not found")
+            return None
         try:
             return {
                 "id": self._required_text(row, "id"),
@@ -1452,6 +1485,12 @@ class SQLiteRepository:
             }
         except (KeyError, TypeError, ValueError) as error:
             raise self._semantic_error() from error
+
+    def get_history_plan(self, plan_id: str) -> dict[str, object]:
+        plan = self.find_history_plan(plan_id)
+        if plan is None:
+            raise RepositoryError("history cleanup plan was not found")
+        return plan
 
     def record_history_journal_entry(
         self,

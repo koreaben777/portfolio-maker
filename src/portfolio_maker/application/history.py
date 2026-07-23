@@ -21,6 +21,7 @@ from portfolio_maker.infrastructure.managed_files import (
     write_managed_text,
 )
 from portfolio_maker.infrastructure.sqlite_repository import (
+    CommitOutcomeAmbiguousError,
     RepositoryError,
     SQLiteRepository,
 )
@@ -131,7 +132,33 @@ def plan_history_cleanup(request: HistoryPlanRequest) -> HistoryPlanResult:
                     plan,
                     plan_path.relative_to(paths.root),
                 )
+            except CommitOutcomeAmbiguousError as error:
+                raise HistoryError(
+                    "history cleanup planning failed safely"
+                ) from error
             except RepositoryError as error:
+                try:
+                    stored_plan = repository.find_history_plan(plan.id)
+                except RepositoryError as lookup_error:
+                    raise HistoryError(
+                        "history cleanup planning failed safely"
+                    ) from lookup_error
+                expected_relative_path = plan_path.relative_to(
+                    paths.root
+                ).as_posix()
+                if stored_plan is not None:
+                    if (
+                        stored_plan["id"] != plan.id
+                        or stored_plan["manifest_hash"] != plan.manifest_hash
+                        or stored_plan["manifest_relative_path"]
+                        != expected_relative_path
+                    ):
+                        raise HistoryError(
+                            "history cleanup plan binding is inconsistent"
+                        ) from error
+                    raise HistoryError(
+                        "history cleanup planning failed safely"
+                    ) from error
                 try:
                     store.remove_plan(plan_path)
                 except OSError as cleanup_error:
