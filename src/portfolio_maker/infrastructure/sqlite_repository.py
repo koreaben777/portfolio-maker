@@ -1552,6 +1552,12 @@ class SQLiteRepository:
             or type(policy.retain_incomplete_vision_requests) is not bool
         ):
             raise RepositoryError("history policy is invalid")
+        if not (
+            policy.retain_included_vision_analyses
+            and policy.retain_pending_review_vision_analyses
+            and policy.retain_incomplete_vision_requests
+        ):
+            raise RepositoryError("history policy disables mandatory retention")
 
     @staticmethod
     def _validate_history_unit_ids(
@@ -1627,6 +1633,8 @@ class SQLiteRepository:
         cls._validate_history_policy(policy)
         if not isinstance(units, tuple):
             raise RepositoryError("history cleanup plan binding metadata is invalid")
+        if not units:
+            raise RepositoryError("history cleanup plan requires at least one unit")
         for unit in units:
             cls._validate_history_unit(unit)
         cls._validate_history_unit_ids(

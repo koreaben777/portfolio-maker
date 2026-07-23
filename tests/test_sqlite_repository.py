@@ -550,41 +550,62 @@ def test_history_candidates_include_finished_unreferenced_vision_records(workspa
     ]
 
 
-def test_history_candidates_and_deletion_honor_nonretained_incomplete_requests(
+@pytest.mark.parametrize(
+    "policy",
+    (
+        HistoryPolicy(30, 1, False, True, True),
+        HistoryPolicy(30, 1, True, False, True),
+        HistoryPolicy(30, 1, True, True, False),
+    ),
+    ids=("included_vision_analyses", "pending_vision_analyses", "incomplete_requests"),
+)
+def test_history_candidates_reject_policy_disabling_mandatory_retention(
     workspace,
+    policy,
 ) -> None:
     paths = WorkspacePaths.from_root(workspace)
     paths.ensure()
     repository = SQLiteRepository(paths.db_path)
     repository.initialize()
-    source_id = _insert_synthetic_source(repository, "history-pending-policy")
-    request = _vision_request("request-pending-policy", source_id)
-    repository.create_vision_request(request)
-    _write_vision_request_receipt(paths, request.id)
-    with repository._connection() as connection:
-        connection.execute(
-            """
-            UPDATE vision_analysis_requests
-            SET requested_at = '2000-01-01T00:00:00Z'
-            WHERE id = ?
-            """,
-            (request.id,),
-        )
-    policy = HistoryPolicy(30, 1, True, True, False)
 
-    candidates = repository.history_candidates(policy)
+    with pytest.raises(RepositoryError, match="mandatory retention"):
+        repository.history_candidates(policy)
 
-    assert [(unit.kind, unit.row_id) for unit in candidates] == [
-        ("vision_request", request.id)
-    ]
-    plan = HistoryPlan.create(policy, candidates)
-    repository.create_history_plan(
-        plan,
-        Path(f"reviews/history-plans/{plan.id}.json"),
+
+@pytest.mark.parametrize(
+    "policy",
+    (
+        HistoryPolicy(30, 1, False, True, True),
+        HistoryPolicy(30, 1, True, False, True),
+        HistoryPolicy(30, 1, True, True, False),
+    ),
+    ids=("included_vision_analyses", "pending_vision_analyses", "incomplete_requests"),
+)
+def test_create_history_plan_rejects_policy_disabling_mandatory_retention(
+    workspace,
+    policy,
+) -> None:
+    paths = WorkspacePaths.from_root(workspace)
+    paths.ensure()
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    _, _, candidates = _seed_old_snapshot_candidates(
+        repository,
+        paths,
+        "mandatory-retention",
+        2,
+        HistoryPolicy.default(),
     )
-    repository.delete_planned_history_units(plan.id, plan.unit_ids())
+    plan = HistoryPlan.create(policy, candidates)
+
+    with pytest.raises(RepositoryError, match="mandatory retention"):
+        repository.create_history_plan(
+            plan,
+            Path(f"reviews/history-plans/{plan.id}.json"),
+        )
+
     with pytest.raises(RepositoryError, match="not found"):
-        repository.get_vision_request(request.id)
+        repository.get_history_plan(plan.id)
 
 
 def test_history_candidates_hash_descriptor_read_managed_file_bytes(workspace) -> None:
@@ -1023,6 +1044,21 @@ def test_delete_planned_history_units_rejects_empty_unit_set(workspace) -> None:
 
     assert len(repository.snapshot_metadata_for_source(source_id)) == 2
     assert repository.get_history_plan(plan.id)["status"] == "planned"
+
+
+def test_create_history_plan_rejects_empty_plan_before_insertion(workspace) -> None:
+    repository = SQLiteRepository(WorkspacePaths.from_root(workspace).db_path)
+    repository.initialize()
+    plan = HistoryPlan.create(HistoryPolicy.default(), [])
+
+    with pytest.raises(RepositoryError, match="at least one unit"):
+        repository.create_history_plan(
+            plan,
+            Path(f"reviews/history-plans/{plan.id}.json"),
+        )
+
+    with pytest.raises(RepositoryError, match="not found"):
+        repository.get_history_plan(plan.id)
 
 
 def test_delete_planned_history_units_rejects_reordered_unit_set(workspace) -> None:
