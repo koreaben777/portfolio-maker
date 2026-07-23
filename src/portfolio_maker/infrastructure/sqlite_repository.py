@@ -349,55 +349,56 @@ class SQLiteRepository:
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
-        with self._database_operation() as (directory_descriptor, identity):
-            conn: sqlite3.Connection | None = None
-            commit_started = False
-            try:
-                conn = self._connect_validated(directory_descriptor, identity, read_only=False)
-                self._configure_write_journal(conn)
-                self._validate_database_family(directory_descriptor, identity, "after journal setup")
-                conn.execute("BEGIN IMMEDIATE")
-                self._validate_database_family(directory_descriptor, identity, "after write transaction")
-                yield conn
-                self._validate_database_family(directory_descriptor, identity, "before commit")
-                commit_started = True
-                conn.commit()
-                self._validate_database_family(directory_descriptor, identity, "after commit")
-            except RepositoryError as error:
-                self._rollback(conn)
-                if commit_started and not isinstance(
-                    error,
-                    CommitOutcomeAmbiguousError,
-                ):
-                    raise CommitOutcomeAmbiguousError(str(error)) from error
-                raise
-            except sqlite3.Error as error:
-                self._rollback(conn)
-                repository_error = self._repository_error(error)
-                if commit_started:
-                    raise CommitOutcomeAmbiguousError(
-                        str(repository_error)
-                    ) from error
-                raise repository_error from error
-            except OSError as error:
-                self._rollback(conn)
-                repository_error = self._unsafe_path_error(self.db_path.name)
-                if commit_started:
-                    raise CommitOutcomeAmbiguousError(
-                        str(repository_error)
-                    ) from error
-                raise repository_error from error
-            except Exception as error:
-                self._rollback(conn)
-                if commit_started:
-                    raise CommitOutcomeAmbiguousError(
-                        "Repository transaction outcome is committed or ambiguous; "
-                        "preserve or back up the workspace state and rerun"
-                    ) from error
-                raise
-            finally:
-                if conn is not None:
-                    conn.close()
+        conn: sqlite3.Connection | None = None
+        commit_started = False
+        try:
+            with self._database_operation() as (directory_descriptor, identity):
+                try:
+                    conn = self._connect_validated(directory_descriptor, identity, read_only=False)
+                    self._configure_write_journal(conn)
+                    self._validate_database_family(directory_descriptor, identity, "after journal setup")
+                    conn.execute("BEGIN IMMEDIATE")
+                    self._validate_database_family(directory_descriptor, identity, "after write transaction")
+                    yield conn
+                    self._validate_database_family(directory_descriptor, identity, "before commit")
+                    commit_started = True
+                    conn.commit()
+                    self._validate_database_family(directory_descriptor, identity, "after commit")
+                finally:
+                    if conn is not None:
+                        conn.close()
+        except RepositoryError as error:
+            self._rollback(conn)
+            if commit_started and not isinstance(
+                error,
+                CommitOutcomeAmbiguousError,
+            ):
+                raise CommitOutcomeAmbiguousError(str(error)) from error
+            raise
+        except sqlite3.Error as error:
+            self._rollback(conn)
+            repository_error = self._repository_error(error)
+            if commit_started:
+                raise CommitOutcomeAmbiguousError(
+                    str(repository_error)
+                ) from error
+            raise repository_error from error
+        except OSError as error:
+            self._rollback(conn)
+            repository_error = self._unsafe_path_error(self.db_path.name)
+            if commit_started:
+                raise CommitOutcomeAmbiguousError(
+                    str(repository_error)
+                ) from error
+            raise repository_error from error
+        except Exception as error:
+            self._rollback(conn)
+            if commit_started:
+                raise CommitOutcomeAmbiguousError(
+                    "Repository transaction outcome is committed or ambiguous; "
+                    "preserve or back up the workspace state and rerun"
+                ) from error
+            raise
 
     @contextmanager
     def _read_connection(self) -> Iterator[sqlite3.Connection]:

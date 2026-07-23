@@ -23,6 +23,8 @@ from portfolio_maker.domain.models import Source, SourceStatus, SourceType
 from portfolio_maker.infrastructure import managed_files
 from portfolio_maker.infrastructure.history_store import HistoryStore
 from portfolio_maker.infrastructure.sqlite_repository import (
+    CommitOutcomeAmbiguousError,
+    DatabaseFamilyChangedError,
     RepositoryError,
     SQLiteRepository,
 )
@@ -37,6 +39,30 @@ class _SnapshotState:
     old_path: Path
     latest_path: Path
     old_id: int
+
+
+class _SyntheticFinalizerConnection(sqlite3.Connection):
+    fail_close = False
+    fail_close_after_commit = False
+    commit_callback = None
+    commit_succeeded = False
+
+    def commit(self) -> None:
+        super().commit()
+        self.commit_succeeded = True
+        if self.commit_callback is not None:
+            self.commit_callback()
+
+    def close(self) -> None:
+        fail_after_close = self.fail_close or (
+            self.fail_close_after_commit and self.commit_succeeded
+        )
+        super().close()
+        if fail_after_close:
+            stage = "before" if self.fail_close else "after"
+            raise RuntimeError(
+                f"injected connection close failure {stage} commit"
+            )
 
 
 def test_write_and_load_history_policy_uses_exact_v1_schema(workspace) -> None:
@@ -426,6 +452,191 @@ def test_history_plan_preserves_exact_binding_after_post_commit_error(
     assert state.latest_path.exists()
 
 
+def test_history_plan_preserves_manifest_after_connection_close_failure(
+    workspace,
+    monkeypatch,
+) -> None:
+    state = _seed_old_unreferenced_snapshot(workspace)
+    write_sample_history_policy(state.paths)
+    original_connect = sqlite3.connect
+    lookup_calls: list[str] = []
+
+    def connect_with_close_failure(*args, **kwargs):
+        connection = original_connect(
+            *args,
+            **kwargs,
+            factory=_SyntheticFinalizerConnection,
+        )
+        connection.fail_close_after_commit = True
+        return connection
+
+    def count_lookup(self, plan_id):
+        lookup_calls.append(plan_id)
+        return None
+
+    monkeypatch.setattr(SQLiteRepository, "initialize", lambda self: None)
+    monkeypatch.setattr(
+        "portfolio_maker.infrastructure.sqlite_repository.sqlite3.connect",
+        connect_with_close_failure,
+    )
+    monkeypatch.setattr(SQLiteRepository, "find_history_plan", count_lookup)
+
+    with pytest.raises(HistoryError, match="planning failed safely") as captured:
+        plan_history_cleanup(HistoryPlanRequest(workspace=workspace))
+
+    ambiguous_error = captured.value.__cause__
+    assert isinstance(ambiguous_error, CommitOutcomeAmbiguousError)
+    assert isinstance(ambiguous_error.__cause__, RuntimeError)
+    assert str(ambiguous_error.__cause__) == (
+        "injected connection close failure after commit"
+    )
+    with original_connect(state.paths.db_path) as connection:
+        durable_rows = connection.execute(
+            "SELECT COUNT(*) FROM history_cleanup_plans"
+        ).fetchone()[0]
+    plan_files = list(state.paths.history_plans_dir.glob("plan-*.json"))
+    report_files = list(
+        state.paths.reviews_dir.glob("history-plan-*-report.md")
+    )
+    assert (durable_rows, len(plan_files), len(report_files), len(lookup_calls)) == (
+        1,
+        1,
+        0,
+        0,
+    )
+    assert state.old_path.exists()
+    assert state.latest_path.exists()
+
+
+def test_history_plan_preserves_manifest_after_database_operation_close_failure(
+    workspace,
+    monkeypatch,
+) -> None:
+    state = _seed_old_unreferenced_snapshot(workspace)
+    write_sample_history_policy(state.paths)
+    original_connect = sqlite3.connect
+    original_open_database_family = SQLiteRepository._open_database_family
+    original_close = os.close
+    finalizer_state = {
+        "commit_succeeded": False,
+        "directory_descriptor": None,
+        "failure_raised": False,
+    }
+    lookup_calls: list[str] = []
+
+    def mark_commit_succeeded():
+        finalizer_state["commit_succeeded"] = True
+
+    def connect_with_commit_marker(*args, **kwargs):
+        connection = original_connect(
+            *args,
+            **kwargs,
+            factory=_SyntheticFinalizerConnection,
+        )
+        connection.commit_callback = mark_commit_succeeded
+        return connection
+
+    def record_database_directory(self, *, ensure_directory):
+        descriptor, identity = original_open_database_family(
+            self,
+            ensure_directory=ensure_directory,
+        )
+        finalizer_state["directory_descriptor"] = descriptor
+        return descriptor, identity
+
+    def close_database_directory_with_failure(descriptor):
+        should_fail = (
+            finalizer_state["commit_succeeded"]
+            and descriptor == finalizer_state["directory_descriptor"]
+            and not finalizer_state["failure_raised"]
+        )
+        original_close(descriptor)
+        if should_fail:
+            finalizer_state["failure_raised"] = True
+            raise RuntimeError(
+                "injected database operation descriptor close failure after commit"
+            )
+
+    def count_lookup(self, plan_id):
+        lookup_calls.append(plan_id)
+        return None
+
+    monkeypatch.setattr(SQLiteRepository, "initialize", lambda self: None)
+    monkeypatch.setattr(
+        "portfolio_maker.infrastructure.sqlite_repository.sqlite3.connect",
+        connect_with_commit_marker,
+    )
+    monkeypatch.setattr(
+        SQLiteRepository,
+        "_open_database_family",
+        record_database_directory,
+    )
+    monkeypatch.setattr(
+        "portfolio_maker.infrastructure.sqlite_repository.os.close",
+        close_database_directory_with_failure,
+    )
+    monkeypatch.setattr(SQLiteRepository, "find_history_plan", count_lookup)
+
+    with pytest.raises(HistoryError, match="planning failed safely") as captured:
+        plan_history_cleanup(HistoryPlanRequest(workspace=workspace))
+
+    ambiguous_error = captured.value.__cause__
+    assert isinstance(ambiguous_error, CommitOutcomeAmbiguousError)
+    assert isinstance(ambiguous_error.__cause__, RuntimeError)
+    assert str(ambiguous_error.__cause__) == (
+        "injected database operation descriptor close failure after commit"
+    )
+    with original_connect(state.paths.db_path) as connection:
+        durable_rows = connection.execute(
+            "SELECT COUNT(*) FROM history_cleanup_plans"
+        ).fetchone()[0]
+    plan_files = list(state.paths.history_plans_dir.glob("plan-*.json"))
+    report_files = list(
+        state.paths.reviews_dir.glob("history-plan-*-report.md")
+    )
+    assert (
+        finalizer_state["failure_raised"],
+        durable_rows,
+        len(plan_files),
+        len(report_files),
+        len(lookup_calls),
+    ) == (True, 1, 1, 0, 0)
+    assert state.old_path.exists()
+    assert state.latest_path.exists()
+
+
+def test_repository_does_not_classify_precommit_close_failure_as_ambiguous(
+    workspace,
+    monkeypatch,
+) -> None:
+    state = _seed_old_unreferenced_snapshot(workspace)
+    original_connect = sqlite3.connect
+
+    def connect_with_close_failure(*args, **kwargs):
+        connection = original_connect(
+            *args,
+            **kwargs,
+            factory=_SyntheticFinalizerConnection,
+        )
+        connection.fail_close = True
+        return connection
+
+    monkeypatch.setattr(
+        "portfolio_maker.infrastructure.sqlite_repository.sqlite3.connect",
+        connect_with_close_failure,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="injected connection close failure before commit",
+    ) as captured:
+        with state.repository._connection():
+            raise ValueError("injected operation failure before commit")
+
+    assert not isinstance(captured.value, CommitOutcomeAmbiguousError)
+    assert isinstance(captured.value.__context__, ValueError)
+
+
 def test_history_plan_preserves_manifest_when_database_replaced_during_commit(
     workspace,
     tmp_path,
@@ -465,9 +676,10 @@ def test_history_plan_preserves_manifest_when_database_replaced_during_commit(
         connect_with_replacement_trace,
     )
 
-    with pytest.raises(HistoryError, match="planning failed safely"):
+    with pytest.raises(HistoryError, match="planning failed safely") as captured:
         plan_history_cleanup(HistoryPlanRequest(workspace=workspace))
 
+    assert type(captured.value.__cause__) is DatabaseFamilyChangedError
     with original_connect(displaced) as displaced_connection:
         displaced_rows = displaced_connection.execute(
             "SELECT COUNT(*) FROM history_cleanup_plans"
