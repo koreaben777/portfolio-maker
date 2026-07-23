@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 from typing import Any
@@ -36,6 +37,8 @@ _POLICY_FIELDS = frozenset(
         "retain_incomplete_vision_requests",
     }
 )
+_MAX_MINIMUM_AGE_DAYS = timedelta.max.days
+_MAX_SQLITE_INTEGER = (1 << 63) - 1
 
 
 class HistoryError(RuntimeError):
@@ -113,7 +116,7 @@ def plan_history_cleanup(request: HistoryPlanRequest) -> HistoryPlanResult:
     try:
         with repository.exclusive_workspace_operation():
             repository.initialize()
-            units = tuple(repository.history_candidates(policy))
+            units = _select_history_candidates(repository, policy)
             if not units:
                 return _write_summary(
                     paths,
@@ -123,16 +126,29 @@ def plan_history_cleanup(request: HistoryPlanRequest) -> HistoryPlanResult:
                 )
             plan = HistoryPlan.create(policy, list(units))
             plan_path = store.write_plan(plan)
-            result = _write_summary(
-                paths,
-                plan_id=plan.id,
-                units=plan.units,
-            )
-            repository.create_history_plan(
-                plan,
-                plan_path.relative_to(paths.root),
-            )
-            return result
+            try:
+                repository.create_history_plan(
+                    plan,
+                    plan_path.relative_to(paths.root),
+                )
+            except RepositoryError as error:
+                try:
+                    store.remove_plan(plan_path)
+                except OSError as cleanup_error:
+                    raise HistoryError(
+                        "history cleanup plan binding failed and cleanup was incomplete"
+                    ) from cleanup_error
+                raise HistoryError("history cleanup planning failed safely") from error
+            try:
+                return _write_summary(
+                    paths,
+                    plan_id=plan.id,
+                    units=plan.units,
+                )
+            except OSError as error:
+                raise HistoryError(
+                    "history cleanup report publication failed safely"
+                ) from error
     except RepositoryError as error:
         raise HistoryError("history cleanup planning failed safely") from error
     except (OSError, TypeError, ValueError) as error:
@@ -154,8 +170,10 @@ def _parse_history_policy(payload: Any) -> HistoryPolicy:
     if (
         type(minimum_age_days) is not int
         or minimum_age_days < 0
+        or minimum_age_days > _MAX_MINIMUM_AGE_DAYS
         or type(keep_latest) is not int
         or keep_latest < 1
+        or keep_latest > _MAX_SQLITE_INTEGER
         or any(type(value) is not bool for value in retained_states)
     ):
         raise HistoryError("history policy contains invalid values")
@@ -168,6 +186,17 @@ def _parse_history_policy(payload: Any) -> HistoryPolicy:
         retain_pending_review_vision_analyses=retained_states[1],
         retain_incomplete_vision_requests=retained_states[2],
     )
+
+
+def _select_history_candidates(
+    repository: SQLiteRepository,
+    policy: HistoryPolicy,
+) -> tuple[HistoryUnit, ...]:
+    oldest_datetime = datetime.min.replace(tzinfo=timezone.utc)
+    maximum_elapsed_days = (datetime.now(timezone.utc) - oldest_datetime).days
+    if policy.minimum_age_days > maximum_elapsed_days:
+        return ()
+    return tuple(repository.history_candidates(policy))
 
 
 def _write_summary(

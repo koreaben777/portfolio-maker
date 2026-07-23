@@ -36,9 +36,12 @@ def write_managed_text(path: Path, content: str, *, overwrite: bool = True) -> P
     ensure_managed_directory(path.parent)
     directory_descriptor = _open_directory(path.parent, create=False)
     temporary_name = f".{path.name}.{os.getpid()}.{uuid4().hex}.tmp"
+    temporary_may_exist = False
+    exclusive_target_published = False
     try:
         _validate_filename(path.name)
         _validate_regular_target(directory_descriptor, path.name, allow_missing=True)
+        temporary_may_exist = True
         _write_temporary(directory_descriptor, temporary_name, content.encode("utf-8"))
         if overwrite:
             os.replace(
@@ -47,6 +50,7 @@ def write_managed_text(path: Path, content: str, *, overwrite: bool = True) -> P
                 src_dir_fd=directory_descriptor,
                 dst_dir_fd=directory_descriptor,
             )
+            temporary_may_exist = False
         else:
             os.link(
                 temporary_name,
@@ -55,12 +59,26 @@ def write_managed_text(path: Path, content: str, *, overwrite: bool = True) -> P
                 dst_dir_fd=directory_descriptor,
                 follow_symlinks=False,
             )
-        return path
-    finally:
-        try:
+            exclusive_target_published = True
             os.unlink(temporary_name, dir_fd=directory_descriptor)
-        except FileNotFoundError:
-            pass
+            temporary_may_exist = False
+        os.fsync(directory_descriptor)
+        return path
+    except Exception:
+        if exclusive_target_published:
+            try:
+                os.unlink(path.name, dir_fd=directory_descriptor)
+            except FileNotFoundError:
+                pass
+            else:
+                os.fsync(directory_descriptor)
+        raise
+    finally:
+        if temporary_may_exist:
+            try:
+                os.unlink(temporary_name, dir_fd=directory_descriptor)
+            except FileNotFoundError:
+                pass
         os.close(directory_descriptor)
 
 
@@ -167,6 +185,7 @@ def remove_managed_file(path: Path, *, missing_ok: bool = False) -> None:
         if not S_ISREG(target.st_mode):
             raise OSError("managed output target must be a regular file")
         os.unlink(path.name, dir_fd=directory_descriptor)
+        os.fsync(directory_descriptor)
     finally:
         os.close(directory_descriptor)
 

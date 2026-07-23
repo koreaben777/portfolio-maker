@@ -8,6 +8,7 @@ from pathlib import Path
 from portfolio_maker.domain.history_models import HistoryPlan, HistoryUnit
 from portfolio_maker.infrastructure.managed_files import (
     read_managed_relative_file,
+    remove_managed_file,
     write_managed_text,
 )
 from portfolio_maker.workspace import WorkspacePaths
@@ -40,6 +41,11 @@ class HistoryStore:
             f"plan-{plan.id}-{plan.manifest_hash}.json"
         )
         return write_managed_text(plan_path, content, overwrite=False)
+
+    def remove_plan(self, plan_path: Path) -> None:
+        if plan_path.parent != self.paths.history_plans_dir:
+            raise OSError("managed history plan path is invalid")
+        remove_managed_file(plan_path)
 
     def revalidate_units(
         self,

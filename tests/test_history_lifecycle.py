@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import timedelta
 from hashlib import sha256
 import json
 import os
 from pathlib import Path
-from stat import S_IMODE
+from stat import S_IMODE, S_ISDIR, S_ISREG
 
 import pytest
 
@@ -18,8 +19,12 @@ from portfolio_maker.application.history import (
 from portfolio_maker.application.models import HistoryPlanRequest
 from portfolio_maker.domain.history_models import HistoryPlan, HistoryPolicy
 from portfolio_maker.domain.models import Source, SourceStatus, SourceType
+from portfolio_maker.infrastructure import managed_files
 from portfolio_maker.infrastructure.history_store import HistoryStore
-from portfolio_maker.infrastructure.sqlite_repository import SQLiteRepository
+from portfolio_maker.infrastructure.sqlite_repository import (
+    RepositoryError,
+    SQLiteRepository,
+)
 from portfolio_maker.workspace import WorkspacePaths
 
 
@@ -153,6 +158,65 @@ def test_malformed_or_unsafe_history_policy_fails_closed(
         load_history_policy(paths)
 
     assert paths.history_policy_path.read_bytes() == payload
+
+
+@pytest.mark.parametrize(
+    ("field", "boundary"),
+    (
+        ("minimum_age_days", timedelta.max.days),
+        ("keep_latest_text_snapshots_per_source", (1 << 63) - 1),
+    ),
+    ids=("timedelta-days", "sqlite-integer"),
+)
+def test_history_policy_integer_boundaries_are_processable(
+    workspace,
+    field,
+    boundary,
+) -> None:
+    state = _seed_old_unreferenced_snapshot(workspace)
+    payload = _history_policy_payload()
+    payload[field] = boundary
+    if field == "keep_latest_text_snapshots_per_source":
+        payload["minimum_age_days"] = 0
+    state.paths.history_policy_path.write_text(
+        json.dumps(payload),
+        encoding="utf-8",
+    )
+
+    policy = load_history_policy(state.paths)
+    result = plan_history_cleanup(HistoryPlanRequest(workspace=workspace))
+
+    assert policy is not None
+    assert getattr(policy, field) == boundary
+    assert result.plan_id is None
+    assert result.candidate_count == 0
+    assert list(state.paths.history_plans_dir.iterdir()) == []
+    assert _history_plan_count(state.repository) == 0
+
+
+@pytest.mark.parametrize(
+    ("field", "overflow"),
+    (
+        ("minimum_age_days", timedelta.max.days + 1),
+        ("keep_latest_text_snapshots_per_source", 1 << 63),
+    ),
+    ids=("timedelta-days", "sqlite-integer"),
+)
+def test_history_policy_rejects_integer_overflow_before_repository_processing(
+    workspace,
+    field,
+    overflow,
+) -> None:
+    paths = WorkspacePaths.from_root(workspace)
+    paths.ensure()
+    payload = _history_policy_payload()
+    payload[field] = overflow
+    paths.history_policy_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(HistoryError, match="history policy"):
+        load_history_policy(paths)
+
+    assert list(paths.history_plans_dir.iterdir()) == []
 
 
 @pytest.mark.parametrize("unsafe_kind", ("symlink", "hardlink", "directory"))
@@ -302,6 +366,78 @@ def test_history_plan_is_read_only_and_separates_private_plan_from_public_report
     assert _snapshot_count(state.repository) == 2
 
 
+def test_history_plan_removes_private_plan_when_database_binding_fails(
+    workspace,
+    monkeypatch,
+) -> None:
+    state = _seed_old_unreferenced_snapshot(workspace)
+    write_sample_history_policy(state.paths)
+    observed: dict[str, object] = {}
+
+    def fail_binding(self, plan, relative_path):
+        observed["plan_exists"] = (state.paths.root / relative_path).is_file()
+        observed["reports"] = list(
+            state.paths.reviews_dir.glob("history-plan-*-report.md")
+        )
+        raise RepositoryError("injected history plan binding failure")
+
+    monkeypatch.setattr(SQLiteRepository, "create_history_plan", fail_binding)
+
+    with pytest.raises(HistoryError, match="planning failed safely"):
+        plan_history_cleanup(HistoryPlanRequest(workspace=workspace))
+
+    assert observed == {"plan_exists": True, "reports": []}
+    assert list(state.paths.history_plans_dir.glob("plan-*.json")) == []
+    assert list(state.paths.reviews_dir.glob("history-plan-*-report.md")) == []
+    assert _history_plan_count(state.repository) == 0
+    assert state.old_path.exists()
+    assert state.latest_path.exists()
+
+
+def test_history_plan_report_failure_keeps_only_database_bound_private_plan(
+    workspace,
+    monkeypatch,
+) -> None:
+    state = _seed_old_unreferenced_snapshot(workspace)
+    write_sample_history_policy(state.paths)
+    observed: dict[str, int] = {}
+    real_fsync = os.fsync
+    directory_fsync_count = 0
+
+    def fail_report_directory_fsync(descriptor):
+        nonlocal directory_fsync_count
+        if S_ISDIR(os.fstat(descriptor).st_mode):
+            directory_fsync_count += 1
+            if directory_fsync_count == 2:
+                observed["rows_at_report"] = _history_plan_count(state.repository)
+                raise OSError("injected history plan report publication failure")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(
+        managed_files.os,
+        "fsync",
+        fail_report_directory_fsync,
+    )
+
+    with pytest.raises(HistoryError, match="report publication failed safely"):
+        plan_history_cleanup(HistoryPlanRequest(workspace=workspace))
+
+    plan_files = list(state.paths.history_plans_dir.glob("plan-*.json"))
+    assert observed == {"rows_at_report": 1}
+    assert directory_fsync_count == 3
+    assert len(plan_files) == 1
+    assert list(state.paths.reviews_dir.glob("history-plan-*-report.md")) == []
+    plan_payload = json.loads(plan_files[0].read_text(encoding="utf-8"))
+    stored = state.repository.get_history_plan(plan_payload["id"])
+    assert stored["manifest_hash"] == plan_payload["manifest_hash"]
+    assert stored["manifest_relative_path"] == plan_files[0].relative_to(
+        state.paths.root
+    ).as_posix()
+    assert stored["status"] == "planned"
+    assert state.old_path.exists()
+    assert state.latest_path.exists()
+
+
 def test_history_store_never_overwrites_an_immutable_plan(workspace) -> None:
     state = _seed_old_unreferenced_snapshot(workspace)
     policy = HistoryPolicy.default()
@@ -316,6 +452,39 @@ def test_history_store_never_overwrites_an_immutable_plan(workspace) -> None:
         store.write_plan(plan)
 
     assert plan_path.read_bytes() == original
+
+
+def test_managed_publication_and_removal_fsync_file_and_directory_descriptors(
+    workspace,
+    monkeypatch,
+) -> None:
+    paths = WorkspacePaths.from_root(workspace)
+    paths.ensure()
+    target = paths.history_plans_dir / "descriptor-spy.json"
+    fsync_targets: list[str] = []
+    real_fsync = os.fsync
+
+    def observe_fsync(descriptor):
+        mode = os.fstat(descriptor).st_mode
+        if S_ISREG(mode):
+            fsync_targets.append("file")
+        elif S_ISDIR(mode):
+            fsync_targets.append("directory")
+        else:
+            fsync_targets.append("other")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(managed_files.os, "fsync", observe_fsync)
+
+    managed_files.write_managed_text(target, "durable", overwrite=False)
+
+    assert fsync_targets == ["file", "directory"]
+
+    fsync_targets.clear()
+    managed_files.remove_managed_file(target)
+
+    assert fsync_targets == ["directory"]
+    assert not target.exists()
 
 
 @pytest.mark.parametrize(
@@ -477,3 +646,14 @@ def _snapshot_count(repository: SQLiteRepository) -> int:
         row = connection.execute("SELECT COUNT(*) FROM source_snapshots").fetchone()
     assert row is not None
     return int(row[0])
+
+
+def _history_policy_payload() -> dict[str, object]:
+    return {
+        "version": 1,
+        "minimum_age_days": 30,
+        "keep_latest_text_snapshots_per_source": 1,
+        "retain_included_vision_analyses": True,
+        "retain_pending_review_vision_analyses": True,
+        "retain_incomplete_vision_requests": True,
+    }
