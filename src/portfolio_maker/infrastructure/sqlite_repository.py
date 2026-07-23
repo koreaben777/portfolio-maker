@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from datetime import datetime, timedelta, timezone
 import fcntl
+from hashlib import sha256
 import json
 import os
 import sqlite3
@@ -11,6 +13,13 @@ import threading
 from pathlib import Path
 from stat import S_ISDIR, S_ISREG
 
+from portfolio_maker.domain.history_models import (
+    CleanupExecutionState,
+    HistoryPlan,
+    HistoryPolicy,
+    HistoryUnit,
+    utc_now,
+)
 from portfolio_maker.domain.models import (
     GitHubActivity,
     PublicEvidenceRecord,
@@ -19,6 +28,13 @@ from portfolio_maker.domain.models import (
     SourceType,
 )
 from portfolio_maker.domain.semantic_models import SemanticEdge, SemanticNode
+from portfolio_maker.domain.vision_models import (
+    AppliedVisionAnalysisResult,
+    PreparedVisionRequest,
+    VisionAnalysisResult,
+    VisionRequestStatus,
+    VisionReviewStatus,
+)
 from portfolio_maker.infrastructure.github_connector import (
     canonical_public_github_activity_url,
     canonical_repository_name,
@@ -193,6 +209,60 @@ CREATE TABLE IF NOT EXISTS semantic_edges (
     PRIMARY KEY (revision_id, from_node_id, relation, to_node_id)
 );
 
+CREATE TABLE IF NOT EXISTS vision_analysis_requests (
+    id TEXT PRIMARY KEY,
+    source_id INTEGER NOT NULL REFERENCES sources(id),
+    source_content_hash TEXT NOT NULL,
+    source_size INTEGER NOT NULL,
+    adapter TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN (
+        'pending', 'completed', 'unsupported', 'unavailable', 'failed', 'cancelled',
+        'stale_source'
+    )),
+    confirmation_at TEXT NOT NULL,
+    requested_at TEXT NOT NULL,
+    completed_at TEXT,
+    reason_code TEXT
+);
+
+CREATE TABLE IF NOT EXISTS vision_analyses (
+    id TEXT PRIMARY KEY,
+    request_id TEXT NOT NULL UNIQUE REFERENCES vision_analysis_requests(id),
+    source_id INTEGER NOT NULL REFERENCES sources(id),
+    source_content_hash TEXT NOT NULL,
+    result_hash TEXT,
+    relative_path TEXT,
+    adapter TEXT NOT NULL,
+    status TEXT NOT NULL,
+    confidence TEXT,
+    review_status TEXT NOT NULL CHECK(review_status IN ('pending', 'included', 'excluded')),
+    created_at TEXT NOT NULL,
+    reviewed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS history_cleanup_plans (
+    id TEXT PRIMARY KEY,
+    policy_hash TEXT NOT NULL,
+    manifest_hash TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    export_receipt_hash TEXT,
+    execution_id TEXT,
+    completed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS history_cleanup_journal_entries (
+    execution_id TEXT NOT NULL,
+    sequence INTEGER NOT NULL,
+    stage TEXT NOT NULL,
+    unit_kind TEXT NOT NULL,
+    row_id TEXT NOT NULL,
+    relative_path TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    recorded_at TEXT NOT NULL,
+    PRIMARY KEY (execution_id, sequence)
+);
+
 """
 
 
@@ -220,6 +290,9 @@ _PORTFOLIO_PROJECT_DECISION_STATUSES = frozenset(
 )
 _PORTFOLIO_PROJECT_DECISION_ORIGINS = frozenset({"manual", "automatic"})
 _PORTFOLIO_PROJECT_CONFIDENCE_LEVELS = frozenset({"low", "medium", "high"})
+_HISTORY_UNIT_KINDS = frozenset(
+    {"source_snapshot", "vision_analysis", "vision_request"}
+)
 
 
 @dataclass(frozen=True)
@@ -231,6 +304,11 @@ class _DatabaseIdentity:
 class SQLiteRepository:
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
+
+    @contextmanager
+    def exclusive_workspace_operation(self) -> Iterator[None]:
+        with self._repository_critical_section():
+            yield
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
@@ -770,6 +848,892 @@ class SQLiteRepository:
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         return {row["name"] for row in rows}
+
+    def create_vision_request(self, request: PreparedVisionRequest) -> None:
+        self._validate_record_identifier(request.id)
+        try:
+            status = VisionRequestStatus(request.status)
+        except (TypeError, ValueError) as error:
+            raise self._semantic_error() from error
+        if status is not VisionRequestStatus.PENDING:
+            raise RepositoryError("new vision requests must be pending")
+        with self._connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO vision_analysis_requests
+                    (id, source_id, source_content_hash, source_size, adapter, status,
+                     confirmation_at, requested_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    request.id,
+                    request.source_id,
+                    request.source_content_hash,
+                    request.source_size,
+                    request.adapter,
+                    status.value,
+                    request.confirmation_at,
+                    utc_now(),
+                ),
+            )
+
+    def get_vision_request(self, request_id: str) -> dict[str, object]:
+        with self._read_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT id, source_id, source_content_hash, source_size, adapter, status,
+                       confirmation_at, requested_at, completed_at, reason_code
+                FROM vision_analysis_requests
+                WHERE id = ?
+                """,
+                (request_id,),
+            ).fetchone()
+        if row is None:
+            raise RepositoryError("vision request was not found")
+        try:
+            status = VisionRequestStatus(self._required_text(row, "status")).value
+            return {
+                "id": self._required_text(row, "id"),
+                "source_id": self._required_int(row, "source_id"),
+                "source_content_hash": self._required_text(row, "source_content_hash"),
+                "source_size": self._required_int(row, "source_size"),
+                "adapter": self._required_text(row, "adapter"),
+                "status": status,
+                "confirmation_at": self._required_text(row, "confirmation_at"),
+                "requested_at": self._required_text(row, "requested_at"),
+                "completed_at": self._optional_text(row, "completed_at"),
+                "reason_code": self._optional_text(row, "reason_code"),
+            }
+        except (KeyError, TypeError, ValueError) as error:
+            raise self._semantic_error() from error
+
+    def finish_vision_request(
+        self,
+        request_id: str,
+        status: VisionRequestStatus,
+        reason_code: str | None = None,
+    ) -> None:
+        try:
+            resolved_status = VisionRequestStatus(status)
+        except (TypeError, ValueError) as error:
+            raise self._semantic_error() from error
+        if resolved_status is VisionRequestStatus.PENDING:
+            raise RepositoryError("finished vision request status cannot be pending")
+        with self._connection() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE vision_analysis_requests
+                SET status = ?, completed_at = ?, reason_code = ?
+                WHERE id = ? AND status = 'pending'
+                """,
+                (resolved_status.value, utc_now(), reason_code, request_id),
+            )
+            if cursor.rowcount != 1:
+                row = conn.execute(
+                    "SELECT status FROM vision_analysis_requests WHERE id = ?",
+                    (request_id,),
+                ).fetchone()
+                if row is None:
+                    raise RepositoryError("vision request was not found")
+                raise RepositoryError("vision request is no longer pending")
+
+    def insert_vision_analysis(
+        self,
+        analysis: AppliedVisionAnalysisResult,
+        result: VisionAnalysisResult,
+    ) -> None:
+        self._validate_record_identifier(analysis.id)
+        try:
+            status = VisionRequestStatus(result.status)
+            review_status = VisionReviewStatus(analysis.review_status)
+        except (TypeError, ValueError) as error:
+            raise self._semantic_error() from error
+        relative_path, _, _, _ = self._managed_history_file_metadata(
+            str(analysis.analysis_path)
+        )
+        with self._connection() as conn:
+            request = conn.execute(
+                """
+                SELECT source_id, source_content_hash, adapter
+                FROM vision_analysis_requests
+                WHERE id = ?
+                """,
+                (result.request_id,),
+            ).fetchone()
+            if request is None:
+                raise RepositoryError("vision request was not found")
+            try:
+                source_id = self._required_int(request, "source_id")
+                request_hash = self._required_text(request, "source_content_hash")
+                request_adapter = self._required_text(request, "adapter")
+            except (KeyError, TypeError, ValueError) as error:
+                raise self._semantic_error() from error
+            if (
+                result.source_content_hash != request_hash
+                or result.adapter != request_adapter
+            ):
+                raise RepositoryError("vision analysis does not match its request")
+            conn.execute(
+                """
+                INSERT INTO vision_analyses
+                    (id, request_id, source_id, source_content_hash, result_hash,
+                     relative_path, adapter, status, confidence, review_status, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    analysis.id,
+                    result.request_id,
+                    source_id,
+                    result.source_content_hash,
+                    analysis.result_hash,
+                    relative_path,
+                    result.adapter,
+                    status.value,
+                    result.confidence,
+                    review_status.value,
+                    utc_now(),
+                ),
+            )
+
+    def get_vision_analysis(self, analysis_id: str) -> dict[str, object]:
+        with self._read_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT id, request_id, source_id, source_content_hash, result_hash,
+                       relative_path, adapter, status, confidence, review_status,
+                       created_at, reviewed_at
+                FROM vision_analyses
+                WHERE id = ?
+                """,
+                (analysis_id,),
+            ).fetchone()
+        if row is None:
+            raise RepositoryError("vision analysis was not found")
+        return self._hydrate_vision_analysis(row)
+
+    def list_vision_analyses(
+        self,
+        review_status: VisionReviewStatus | None = None,
+    ) -> list[dict[str, object]]:
+        with self._read_connection() as conn:
+            if review_status is None:
+                rows = conn.execute(
+                    """
+                    SELECT id, request_id, source_id, source_content_hash, result_hash,
+                           relative_path, adapter, status, confidence, review_status,
+                           created_at, reviewed_at
+                    FROM vision_analyses
+                    ORDER BY created_at, id
+                    """
+                ).fetchall()
+            else:
+                try:
+                    resolved_status = VisionReviewStatus(review_status)
+                except (TypeError, ValueError) as error:
+                    raise self._semantic_error() from error
+                rows = conn.execute(
+                    """
+                    SELECT id, request_id, source_id, source_content_hash, result_hash,
+                           relative_path, adapter, status, confidence, review_status,
+                           created_at, reviewed_at
+                    FROM vision_analyses
+                    WHERE review_status = ?
+                    ORDER BY created_at, id
+                    """,
+                    (resolved_status.value,),
+                ).fetchall()
+        return [self._hydrate_vision_analysis(row) for row in rows]
+
+    def mark_vision_analysis_included(self, analysis_id: str, evidence_id: int) -> None:
+        with self._connection() as conn:
+            row = conn.execute(
+                """
+                SELECT vision_analyses.id
+                FROM vision_analyses
+                JOIN evidence_items
+                  ON evidence_items.id = ?
+                 AND evidence_items.source_id = vision_analyses.source_id
+                 AND evidence_items.locator =
+                     'derived:vision-analysis:' || vision_analyses.id
+                 AND evidence_items.stable_id =
+                     'vision-analysis:' || vision_analyses.id || ':' ||
+                     vision_analyses.result_hash
+                WHERE vision_analyses.id = ?
+                  AND vision_analyses.status = 'completed'
+                  AND vision_analyses.result_hash IS NOT NULL
+                """,
+                (evidence_id, analysis_id),
+            ).fetchone()
+            if row is None:
+                raise RepositoryError(
+                    "vision analysis evidence does not match a completed analysis"
+                )
+            conn.execute(
+                """
+                UPDATE vision_analyses
+                SET review_status = 'included', reviewed_at = ?
+                WHERE id = ?
+                """,
+                (utc_now(), analysis_id),
+            )
+
+    def exclude_unreferenced_vision_analysis(self, analysis_id: str) -> None:
+        with self._connection() as conn:
+            row = conn.execute(
+                """
+                SELECT vision_analyses.id,
+                       EXISTS (
+                           SELECT 1
+                           FROM evidence_items
+                           JOIN claim_evidence
+                             ON claim_evidence.evidence_id = evidence_items.id
+                           WHERE evidence_items.locator =
+                               'derived:vision-analysis:' || vision_analyses.id
+                       ) AS claim_referenced,
+                       EXISTS (
+                           SELECT 1
+                           FROM evidence_items
+                           JOIN portfolio_project_evidence
+                             ON portfolio_project_evidence.evidence_id = evidence_items.id
+                           WHERE evidence_items.locator =
+                               'derived:vision-analysis:' || vision_analyses.id
+                       ) AS project_referenced
+                FROM vision_analyses
+                WHERE vision_analyses.id = ?
+                  AND vision_analyses.status = 'completed'
+                """,
+                (analysis_id,),
+            ).fetchone()
+            if row is None:
+                raise RepositoryError("completed vision analysis was not found")
+            try:
+                claim_referenced = self._required_boolean(row, "claim_referenced")
+                project_referenced = self._required_boolean(row, "project_referenced")
+            except (KeyError, TypeError, ValueError) as error:
+                raise self._semantic_error() from error
+            if claim_referenced or project_referenced:
+                raise RepositoryError("vision analysis evidence is still referenced")
+            conn.execute(
+                """
+                DELETE FROM evidence_items
+                WHERE locator = 'derived:vision-analysis:' || ?
+                """,
+                (analysis_id,),
+            )
+            conn.execute(
+                """
+                UPDATE vision_analyses
+                SET review_status = 'excluded', reviewed_at = ?
+                WHERE id = ?
+                """,
+                (utc_now(), analysis_id),
+            )
+
+    def evidence_id_for_stable_id(self, stable_id: str) -> int | None:
+        with self._read_connection() as conn:
+            row = conn.execute(
+                "SELECT id FROM evidence_items WHERE stable_id = ?",
+                (stable_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            return self._required_int(row, "id")
+        except (KeyError, TypeError, ValueError) as error:
+            raise self._semantic_error() from error
+
+    def history_candidates(self, policy: HistoryPolicy) -> list[HistoryUnit]:
+        self._validate_history_policy(policy)
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=policy.minimum_age_days)
+        ).isoformat().replace("+00:00", "Z")
+        keep_snapshots = max(1, policy.keep_latest_text_snapshots_per_source)
+        with self._read_connection() as conn:
+            snapshot_rows = conn.execute(
+                """
+                SELECT snapshots.id, snapshots.snapshot_path, snapshots.content_hash
+                FROM source_snapshots AS snapshots
+                LEFT JOIN evidence_items
+                  ON evidence_items.snapshot_id = snapshots.id
+                WHERE datetime(snapshots.extracted_at) <= datetime(?)
+                  AND evidence_items.id IS NULL
+                  AND (
+                      SELECT COUNT(*)
+                      FROM source_snapshots AS newer
+                      WHERE newer.source_id = snapshots.source_id
+                        AND newer.id > snapshots.id
+                  ) >= ?
+                ORDER BY snapshots.id
+                """,
+                (cutoff, keep_snapshots),
+            ).fetchall()
+            analysis_rows = conn.execute(
+                """
+                SELECT analyses.id, analyses.relative_path, analyses.result_hash
+                FROM vision_analyses AS analyses
+                LEFT JOIN evidence_items
+                  ON evidence_items.locator =
+                     'derived:vision-analysis:' || analyses.id
+                LEFT JOIN claim_evidence
+                  ON claim_evidence.evidence_id = evidence_items.id
+                LEFT JOIN portfolio_project_evidence
+                  ON portfolio_project_evidence.evidence_id = evidence_items.id
+                WHERE datetime(analyses.created_at) <= datetime(?)
+                  AND analyses.relative_path IS NOT NULL
+                  AND analyses.result_hash IS NOT NULL
+                  AND (analyses.review_status <> 'included' OR ? = 0)
+                  AND (analyses.review_status <> 'pending' OR ? = 0)
+                GROUP BY analyses.id, analyses.relative_path, analyses.result_hash
+                HAVING COUNT(claim_evidence.claim_id) = 0
+                   AND COUNT(portfolio_project_evidence.project_id) = 0
+                ORDER BY analyses.id
+                """,
+                (
+                    cutoff,
+                    int(policy.retain_included_vision_analyses),
+                    int(policy.retain_pending_review_vision_analyses),
+                ),
+            ).fetchall()
+            request_rows = conn.execute(
+                """
+                SELECT requests.id, requests.source_content_hash
+                FROM vision_analysis_requests AS requests
+                LEFT JOIN vision_analyses AS analyses
+                  ON analyses.request_id = requests.id
+                LEFT JOIN evidence_items
+                  ON evidence_items.locator =
+                     'derived:vision-analysis:' || analyses.id
+                LEFT JOIN claim_evidence
+                  ON claim_evidence.evidence_id = evidence_items.id
+                LEFT JOIN portfolio_project_evidence
+                  ON portfolio_project_evidence.evidence_id = evidence_items.id
+                WHERE requests.status IN (
+                    'completed', 'unsupported', 'unavailable', 'failed', 'cancelled',
+                    'stale_source'
+                )
+                  AND datetime(requests.requested_at) <= datetime(?)
+                  AND (
+                      analyses.id IS NULL
+                      OR (
+                          datetime(analyses.created_at) <= datetime(?)
+                          AND analyses.relative_path IS NOT NULL
+                          AND analyses.result_hash IS NOT NULL
+                          AND (analyses.review_status <> 'included' OR ? = 0)
+                          AND (analyses.review_status <> 'pending' OR ? = 0)
+                      )
+                  )
+                GROUP BY requests.id, requests.source_content_hash
+                HAVING COUNT(claim_evidence.claim_id) = 0
+                   AND COUNT(portfolio_project_evidence.project_id) = 0
+                ORDER BY requests.id
+                """,
+                (
+                    cutoff,
+                    cutoff,
+                    int(policy.retain_included_vision_analyses),
+                    int(policy.retain_pending_review_vision_analyses),
+                ),
+            ).fetchall()
+        units: list[HistoryUnit] = []
+        try:
+            for row in snapshot_rows:
+                units.append(
+                    self._history_unit(
+                        "source_snapshot",
+                        str(self._required_int(row, "id")),
+                        self._required_text(row, "snapshot_path"),
+                        self._required_text(row, "content_hash"),
+                        "expired_unreferenced_snapshot",
+                    )
+                )
+            for row in analysis_rows:
+                units.append(
+                    self._history_unit(
+                        "vision_analysis",
+                        self._required_text(row, "id"),
+                        self._required_text(row, "relative_path"),
+                        self._required_text(row, "result_hash"),
+                        "expired_unreferenced_vision_analysis",
+                    )
+                )
+            for row in request_rows:
+                request_id = self._required_text(row, "id")
+                units.append(
+                    self._history_unit(
+                        "vision_request",
+                        request_id,
+                        f"reviews/vision-requests/request-{request_id}.json",
+                        self._required_text(row, "source_content_hash"),
+                        "expired_finished_vision_request",
+                    )
+                )
+        except (KeyError, TypeError, ValueError) as error:
+            raise self._semantic_error() from error
+        return sorted(
+            units,
+            key=lambda unit: (
+                unit.kind,
+                unit.row_id,
+                unit.relative_path,
+                unit.content_hash,
+                unit.size,
+                unit.device,
+                unit.inode,
+                unit.reason,
+            ),
+        )
+
+    def create_history_plan(self, plan: HistoryPlan, relative_path: Path) -> None:
+        self._validate_history_policy(plan.policy)
+        self._validate_history_unit_ids(plan.unit_ids())
+        if (
+            relative_path.is_absolute()
+            or not relative_path.parts
+            or any(part in {"", ".", ".."} for part in relative_path.parts)
+        ):
+            raise RepositoryError("history plan path must be managed and relative")
+        policy_hash = sha256(
+            json.dumps(
+                asdict(plan.policy),
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        with self._connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO history_cleanup_plans
+                    (id, policy_hash, manifest_hash, status, created_at)
+                VALUES (?, ?, ?, 'planned', ?)
+                """,
+                (plan.id, policy_hash, plan.manifest_hash, utc_now()),
+            )
+
+    def get_history_plan(self, plan_id: str) -> dict[str, object]:
+        with self._read_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT id, policy_hash, manifest_hash, status, created_at,
+                       export_receipt_hash, execution_id, completed_at
+                FROM history_cleanup_plans
+                WHERE id = ?
+                """,
+                (plan_id,),
+            ).fetchone()
+        if row is None:
+            raise RepositoryError("history cleanup plan was not found")
+        try:
+            return {
+                "id": self._required_text(row, "id"),
+                "policy_hash": self._required_text(row, "policy_hash"),
+                "manifest_hash": self._required_text(row, "manifest_hash"),
+                "status": self._required_text(row, "status"),
+                "created_at": self._required_text(row, "created_at"),
+                "export_receipt_hash": self._optional_text(row, "export_receipt_hash"),
+                "execution_id": self._optional_text(row, "execution_id"),
+                "completed_at": self._optional_text(row, "completed_at"),
+            }
+        except (KeyError, TypeError, ValueError) as error:
+            raise self._semantic_error() from error
+
+    def record_history_journal_entry(
+        self,
+        execution_id: str,
+        sequence: int,
+        stage: CleanupExecutionState,
+        unit: HistoryUnit,
+    ) -> None:
+        if type(sequence) is not int or sequence < 1:
+            raise RepositoryError("history journal sequence must be a positive integer")
+        self._validate_history_unit_ids(((unit.kind, unit.row_id),))
+        try:
+            resolved_stage = CleanupExecutionState(stage)
+        except (TypeError, ValueError) as error:
+            raise self._semantic_error() from error
+        with self._connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO history_cleanup_journal_entries
+                    (execution_id, sequence, stage, unit_kind, row_id, relative_path,
+                     content_hash, recorded_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    execution_id,
+                    sequence,
+                    resolved_stage.value,
+                    unit.kind,
+                    unit.row_id,
+                    unit.relative_path,
+                    unit.content_hash,
+                    utc_now(),
+                ),
+            )
+
+    def delete_planned_history_units(
+        self,
+        plan_id: str,
+        unit_ids: tuple[tuple[str, str], ...],
+    ) -> None:
+        with self._connection() as conn:
+            self._assert_history_plan_is_current(conn, plan_id, unit_ids)
+            self._assert_no_history_unit_is_now_protected(conn, unit_ids)
+            self._delete_history_units(conn, unit_ids)
+            conn.execute(
+                """
+                UPDATE history_cleanup_plans
+                SET status = 'completed', completed_at = ?
+                WHERE id = ?
+                """,
+                (utc_now(), plan_id),
+            )
+
+    def _hydrate_vision_analysis(self, row: sqlite3.Row) -> dict[str, object]:
+        try:
+            status = VisionRequestStatus(self._required_text(row, "status")).value
+            review_status = VisionReviewStatus(
+                self._required_text(row, "review_status")
+            ).value
+            return {
+                "id": self._required_text(row, "id"),
+                "request_id": self._required_text(row, "request_id"),
+                "source_id": self._required_int(row, "source_id"),
+                "source_content_hash": self._required_text(
+                    row, "source_content_hash"
+                ),
+                "result_hash": self._optional_text(row, "result_hash"),
+                "relative_path": self._optional_text(row, "relative_path"),
+                "adapter": self._required_text(row, "adapter"),
+                "status": status,
+                "confidence": self._optional_text(row, "confidence"),
+                "review_status": review_status,
+                "created_at": self._required_text(row, "created_at"),
+                "reviewed_at": self._optional_text(row, "reviewed_at"),
+            }
+        except (KeyError, TypeError, ValueError) as error:
+            raise self._semantic_error() from error
+
+    @staticmethod
+    def _validate_record_identifier(identifier: str) -> None:
+        if (
+            not isinstance(identifier, str)
+            or not identifier
+            or "/" in identifier
+            or identifier in {".", ".."}
+        ):
+            raise RepositoryError("stored record identifier is invalid")
+
+    @staticmethod
+    def _validate_history_policy(policy: HistoryPolicy) -> None:
+        if (
+            type(policy.minimum_age_days) is not int
+            or policy.minimum_age_days < 0
+            or type(policy.keep_latest_text_snapshots_per_source) is not int
+            or policy.keep_latest_text_snapshots_per_source < 0
+            or type(policy.retain_included_vision_analyses) is not bool
+            or type(policy.retain_pending_review_vision_analyses) is not bool
+            or type(policy.retain_incomplete_vision_requests) is not bool
+        ):
+            raise RepositoryError("history policy is invalid")
+
+    @staticmethod
+    def _validate_history_unit_ids(
+        unit_ids: tuple[tuple[str, str], ...],
+    ) -> None:
+        seen: set[tuple[str, str]] = set()
+        for unit_id in unit_ids:
+            if (
+                not isinstance(unit_id, tuple)
+                or len(unit_id) != 2
+                or unit_id[0] not in _HISTORY_UNIT_KINDS
+                or not isinstance(unit_id[1], str)
+                or not unit_id[1]
+            ):
+                raise RepositoryError("history unit kind or row id is invalid")
+            if unit_id in seen:
+                raise RepositoryError("history unit ids must be unique")
+            seen.add(unit_id)
+
+    def _history_unit(
+        self,
+        kind: str,
+        row_id: str,
+        stored_path: str,
+        content_hash: str,
+        reason: str,
+    ) -> HistoryUnit:
+        relative_path, size, device, inode = self._managed_history_file_metadata(
+            stored_path
+        )
+        return HistoryUnit(
+            kind,
+            row_id,
+            relative_path,
+            content_hash,
+            size,
+            device,
+            inode,
+            reason,
+        )
+
+    def _managed_history_file_metadata(
+        self,
+        stored_path: str,
+    ) -> tuple[str, int, int, int]:
+        root = self.db_path.parent.absolute()
+        path = Path(stored_path)
+        candidate = path if path.is_absolute() else root / path
+        try:
+            relative = candidate.relative_to(root)
+        except ValueError as error:
+            raise RepositoryError(
+                "managed history path is outside the workspace"
+            ) from error
+        if (
+            not relative.parts
+            or any(part in {"", ".", ".."} for part in relative.parts)
+        ):
+            raise RepositoryError("managed history path is invalid")
+        directory_descriptor: int | None = None
+        file_descriptor: int | None = None
+        try:
+            directory_descriptor = open_managed_directory(
+                root.joinpath(*relative.parts[:-1])
+            )
+            file_descriptor = os.open(
+                relative.name,
+                os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW,
+                dir_fd=directory_descriptor,
+            )
+            stat_result = os.fstat(file_descriptor)
+            if not S_ISREG(stat_result.st_mode) or stat_result.st_nlink != 1:
+                raise OSError("managed history candidate must be a regular file")
+            return (
+                relative.as_posix(),
+                stat_result.st_size,
+                stat_result.st_dev,
+                stat_result.st_ino,
+            )
+        except OSError as error:
+            raise RepositoryError(
+                "managed history path is unsafe or unavailable"
+            ) from error
+        finally:
+            if file_descriptor is not None:
+                os.close(file_descriptor)
+            if directory_descriptor is not None:
+                os.close(directory_descriptor)
+
+    def _assert_history_plan_is_current(
+        self,
+        conn: sqlite3.Connection,
+        plan_id: str,
+        unit_ids: tuple[tuple[str, str], ...],
+    ) -> None:
+        self._validate_history_unit_ids(unit_ids)
+        row = conn.execute(
+            "SELECT status FROM history_cleanup_plans WHERE id = ?",
+            (plan_id,),
+        ).fetchone()
+        if row is None:
+            raise RepositoryError("history cleanup plan was not found")
+        try:
+            status = self._required_text(row, "status")
+        except (KeyError, TypeError, ValueError) as error:
+            raise self._semantic_error() from error
+        if status != "planned":
+            raise RepositoryError("history cleanup plan is no longer current")
+
+    def _assert_no_history_unit_is_now_protected(
+        self,
+        conn: sqlite3.Connection,
+        unit_ids: tuple[tuple[str, str], ...],
+    ) -> None:
+        planned_ids = set(unit_ids)
+        for kind, row_id in unit_ids:
+            if kind == "source_snapshot":
+                snapshot_id = self._history_integer_row_id(row_id)
+                row = conn.execute(
+                    """
+                    SELECT snapshots.id,
+                           EXISTS (
+                               SELECT 1
+                               FROM source_snapshots AS newer
+                               WHERE newer.source_id = snapshots.source_id
+                                 AND newer.id > snapshots.id
+                           ) AS has_newer,
+                           EXISTS (
+                               SELECT 1
+                               FROM evidence_items
+                               WHERE evidence_items.snapshot_id = snapshots.id
+                           ) AS evidence_referenced
+                    FROM source_snapshots AS snapshots
+                    WHERE snapshots.id = ?
+                    """,
+                    (snapshot_id,),
+                ).fetchone()
+                if row is None:
+                    raise RepositoryError("planned history unit is stale")
+                try:
+                    has_newer = self._required_boolean(row, "has_newer")
+                    referenced = self._required_boolean(row, "evidence_referenced")
+                except (KeyError, TypeError, ValueError) as error:
+                    raise self._semantic_error() from error
+                if not has_newer or referenced:
+                    raise RepositoryError("planned history unit is now protected")
+            elif kind == "vision_analysis":
+                row = conn.execute(
+                    """
+                    SELECT analyses.id,
+                           EXISTS (
+                               SELECT 1
+                               FROM evidence_items
+                               JOIN claim_evidence
+                                 ON claim_evidence.evidence_id = evidence_items.id
+                               WHERE evidence_items.locator =
+                                   'derived:vision-analysis:' || analyses.id
+                           ) AS claim_referenced,
+                           EXISTS (
+                               SELECT 1
+                               FROM evidence_items
+                               JOIN portfolio_project_evidence
+                                 ON portfolio_project_evidence.evidence_id =
+                                    evidence_items.id
+                               WHERE evidence_items.locator =
+                                   'derived:vision-analysis:' || analyses.id
+                           ) AS project_referenced
+                    FROM vision_analyses AS analyses
+                    WHERE analyses.id = ?
+                    """,
+                    (row_id,),
+                ).fetchone()
+                if row is None:
+                    raise RepositoryError("planned history unit is stale")
+                try:
+                    claim_referenced = self._required_boolean(
+                        row, "claim_referenced"
+                    )
+                    project_referenced = self._required_boolean(
+                        row, "project_referenced"
+                    )
+                except (KeyError, TypeError, ValueError) as error:
+                    raise self._semantic_error() from error
+                if claim_referenced or project_referenced:
+                    raise RepositoryError("planned history unit is now protected")
+            else:
+                row = conn.execute(
+                    """
+                    SELECT requests.status, analyses.id AS analysis_id,
+                           EXISTS (
+                               SELECT 1
+                               FROM evidence_items
+                               JOIN claim_evidence
+                                 ON claim_evidence.evidence_id = evidence_items.id
+                               WHERE evidence_items.locator =
+                                   'derived:vision-analysis:' || analyses.id
+                           ) AS claim_referenced,
+                           EXISTS (
+                               SELECT 1
+                               FROM evidence_items
+                               JOIN portfolio_project_evidence
+                                 ON portfolio_project_evidence.evidence_id =
+                                    evidence_items.id
+                               WHERE evidence_items.locator =
+                                   'derived:vision-analysis:' || analyses.id
+                           ) AS project_referenced
+                    FROM vision_analysis_requests AS requests
+                    LEFT JOIN vision_analyses AS analyses
+                      ON analyses.request_id = requests.id
+                    WHERE requests.id = ?
+                    """,
+                    (row_id,),
+                ).fetchone()
+                if row is None:
+                    raise RepositoryError("planned history unit is stale")
+                try:
+                    status = VisionRequestStatus(
+                        self._required_text(row, "status")
+                    )
+                    analysis_id = self._optional_text(row, "analysis_id")
+                    claim_referenced = self._required_boolean(
+                        row, "claim_referenced"
+                    )
+                    project_referenced = self._required_boolean(
+                        row, "project_referenced"
+                    )
+                except (KeyError, TypeError, ValueError) as error:
+                    raise self._semantic_error() from error
+                if (
+                    status is VisionRequestStatus.PENDING
+                    or claim_referenced
+                    or project_referenced
+                    or (
+                        analysis_id is not None
+                        and ("vision_analysis", analysis_id) not in planned_ids
+                    )
+                ):
+                    raise RepositoryError("planned history unit is now protected")
+
+    def _delete_history_units(
+        self,
+        conn: sqlite3.Connection,
+        unit_ids: tuple[tuple[str, str], ...],
+    ) -> None:
+        for kind, row_id in unit_ids:
+            if kind != "vision_analysis":
+                continue
+            conn.execute(
+                """
+                DELETE FROM evidence_items
+                WHERE locator = 'derived:vision-analysis:' || ?
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM claim_evidence
+                      WHERE claim_evidence.evidence_id = evidence_items.id
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM portfolio_project_evidence
+                      WHERE portfolio_project_evidence.evidence_id =
+                            evidence_items.id
+                  )
+                """,
+                (row_id,),
+            )
+            cursor = conn.execute(
+                "DELETE FROM vision_analyses WHERE id = ?",
+                (row_id,),
+            )
+            if cursor.rowcount != 1:
+                raise RepositoryError("planned history unit is stale")
+        for kind, row_id in unit_ids:
+            if kind != "vision_request":
+                continue
+            cursor = conn.execute(
+                "DELETE FROM vision_analysis_requests WHERE id = ?",
+                (row_id,),
+            )
+            if cursor.rowcount != 1:
+                raise RepositoryError("planned history unit is stale")
+        for kind, row_id in unit_ids:
+            if kind != "source_snapshot":
+                continue
+            cursor = conn.execute(
+                "DELETE FROM source_snapshots WHERE id = ?",
+                (self._history_integer_row_id(row_id),),
+            )
+            if cursor.rowcount != 1:
+                raise RepositoryError("planned history unit is stale")
+
+    @staticmethod
+    def _history_integer_row_id(row_id: str) -> int:
+        try:
+            value = int(row_id)
+        except ValueError as error:
+            raise RepositoryError("history unit row id is invalid") from error
+        if value < 1 or str(value) != row_id:
+            raise RepositoryError("history unit row id is invalid")
+        return value
 
     def create_semantic_revision(
         self,
