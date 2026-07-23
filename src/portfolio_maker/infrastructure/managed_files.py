@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+from hashlib import sha256
 import os
 from pathlib import Path
 from stat import S_ISDIR, S_ISREG
@@ -7,6 +9,15 @@ from uuid import uuid4
 
 
 _DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK
+
+
+@dataclass(frozen=True)
+class ManagedFileSnapshot:
+    content: bytes
+    size: int
+    device: int
+    inode: int
+    content_hash: str
 
 
 def ensure_managed_directory(path: Path) -> None:
@@ -75,6 +86,74 @@ def read_managed_bytes(path: Path) -> bytes:
         os.close(directory_descriptor)
 
 
+def read_managed_relative_file(
+    root: Path,
+    relative_path: Path,
+) -> ManagedFileSnapshot:
+    parts = _validate_relative_path(relative_path)
+    directory_descriptor = _open_directory(root, create=False)
+    file_descriptor: int | None = None
+    try:
+        for component in parts[:-1]:
+            next_descriptor = os.open(
+                component,
+                _DIRECTORY_FLAGS,
+                dir_fd=directory_descriptor,
+            )
+            try:
+                if not S_ISDIR(os.fstat(next_descriptor).st_mode):
+                    raise OSError("managed path component must be a directory")
+            except Exception:
+                os.close(next_descriptor)
+                raise
+            os.close(directory_descriptor)
+            directory_descriptor = next_descriptor
+        file_descriptor = os.open(
+            parts[-1],
+            os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW,
+            dir_fd=directory_descriptor,
+        )
+        before = os.fstat(file_descriptor)
+        if not S_ISREG(before.st_mode) or before.st_nlink != 1:
+            raise OSError("managed file must be a private regular file")
+        chunks: list[bytes] = []
+        while chunk := os.read(file_descriptor, 65_536):
+            chunks.append(chunk)
+        content = b"".join(chunks)
+        after = os.fstat(file_descriptor)
+        if (
+            not S_ISREG(after.st_mode)
+            or after.st_nlink != 1
+            or (
+                before.st_dev,
+                before.st_ino,
+                before.st_size,
+                before.st_mtime_ns,
+                before.st_ctime_ns,
+            )
+            != (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+            )
+            or len(content) != after.st_size
+        ):
+            raise OSError("managed file changed while it was read")
+        return ManagedFileSnapshot(
+            content=content,
+            size=after.st_size,
+            device=after.st_dev,
+            inode=after.st_ino,
+            content_hash=sha256(content).hexdigest(),
+        )
+    finally:
+        if file_descriptor is not None:
+            os.close(file_descriptor)
+        os.close(directory_descriptor)
+
+
 def remove_managed_file(path: Path, *, missing_ok: bool = False) -> None:
     directory_descriptor = _open_directory(path.parent, create=False)
     try:
@@ -126,6 +205,17 @@ def _open_directory(path: Path, *, create: bool) -> int:
 def _validate_filename(filename: str) -> None:
     if not filename or "/" in filename or filename in {".", ".."}:
         raise OSError("managed filename is invalid")
+
+
+def _validate_relative_path(relative_path: Path) -> tuple[str, ...]:
+    if (
+        not isinstance(relative_path, Path)
+        or relative_path.is_absolute()
+        or not relative_path.parts
+        or any(part in {"", ".", ".."} for part in relative_path.parts)
+    ):
+        raise OSError("managed relative path is invalid")
+    return relative_path.parts
 
 
 def _validate_regular_target(

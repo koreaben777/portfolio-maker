@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
@@ -174,6 +174,16 @@ class ApplySemanticIndexResult:
 @dataclass(frozen=True)
 class HistoryPlanRequest:
     workspace: Path
+
+
+@dataclass(frozen=True)
+class HistoryPlanResult:
+    plan_id: str | None
+    candidate_count: int
+    total_bytes: int
+    kinds: tuple[str, ...]
+    reasons: tuple[str, ...]
+    report_path: Path = field(repr=False, compare=False)
 
 
 @dataclass(frozen=True)
