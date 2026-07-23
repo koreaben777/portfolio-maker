@@ -1,12 +1,30 @@
 import json
+import tomllib
 from pathlib import Path
+
+from portfolio_maker import __version__
 
 
 def test_plugin_manifest_names_repository_and_skill_root() -> None:
     payload = json.loads(Path(".codex-plugin/plugin.json").read_text())
     assert payload["name"] == "portfolio-maker"
-    assert payload["version"] == "0.2.0"
     assert payload["skills"] == "./skills/"
+
+
+def test_release_versions_stay_aligned() -> None:
+    pyproject = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+    plugin = json.loads(Path(".codex-plugin/plugin.json").read_text(encoding="utf-8"))
+    web_package = json.loads(Path("web/portfolio/package.json").read_text(encoding="utf-8"))
+    web_lock = json.loads(Path("web/portfolio/package-lock.json").read_text(encoding="utf-8"))
+    expected = pyproject["project"]["version"]
+
+    assert {
+        plugin["version"],
+        web_package["version"],
+        web_lock["version"],
+        web_lock["packages"][""]["version"],
+        __version__,
+    } == {expected}
 
 
 def test_plugin_discovers_the_router_and_all_five_child_skills() -> None:
