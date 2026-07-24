@@ -1421,6 +1421,137 @@ def test_history_export_rechecks_exact_plan_binding_after_database_backup(
     assert list(backup_dir.iterdir()) == []
 
 
+def test_history_export_rejects_case_alias_inside_workspace_by_identity(
+    workspace,
+) -> None:
+    state, plan = _seed_executable_history_plan(workspace)
+    alias_name = "".join(
+        character.swapcase() if character.isalpha() else character
+        for character in workspace.name
+    )
+    alias_workspace = workspace.with_name(alias_name)
+    if not alias_workspace.exists() or not alias_workspace.samefile(workspace):
+        pytest.skip("filesystem does not provide a case-insensitive workspace alias")
+    backup_dir = alias_workspace / "backup"
+
+    with pytest.raises(HistoryError, match="export"):
+        history_application.export_history_plan(
+            application_models.HistoryExportRequest(
+                workspace,
+                plan.id,
+                backup_dir,
+            )
+        )
+
+    assert not backup_dir.exists()
+    assert state.repository.get_history_plan(plan.id)["export_receipt_hash"] is None
+
+
+def test_history_export_revalidates_target_name_identity_before_receipt_binding(
+    workspace,
+    monkeypatch,
+) -> None:
+    state, plan = _seed_executable_history_plan(workspace)
+    backup_dir = _outside_backup_dir(workspace, "renamed-export-target")
+    moved_dir = backup_dir.with_name(f"{backup_dir.name}-moved")
+    backup_dir.mkdir()
+    target_identity = (backup_dir.stat().st_dev, backup_dir.stat().st_ino)
+    real_fsync = os.fsync
+    renamed = False
+
+    def rename_target_after_archive_fsync(descriptor):
+        nonlocal renamed
+        real_fsync(descriptor)
+        stat_result = os.fstat(descriptor)
+        if (
+            not renamed
+            and S_ISDIR(stat_result.st_mode)
+            and (stat_result.st_dev, stat_result.st_ino) == target_identity
+            and (backup_dir / f"history-plan-{plan.id}.tar").exists()
+        ):
+            backup_dir.rename(moved_dir)
+            backup_dir.mkdir()
+            renamed = True
+
+    monkeypatch.setattr(
+        "portfolio_maker.infrastructure.history_store.os.fsync",
+        rename_target_after_archive_fsync,
+    )
+
+    with pytest.raises(HistoryError, match="export"):
+        history_application.export_history_plan(
+            application_models.HistoryExportRequest(
+                workspace,
+                plan.id,
+                backup_dir,
+            )
+        )
+
+    assert renamed is True
+    assert state.repository.get_history_plan(plan.id)["export_receipt_hash"] is None
+
+
+def test_history_export_rechecks_target_identity_immediately_before_receipt_write(
+    workspace,
+    monkeypatch,
+) -> None:
+    state, plan = _seed_executable_history_plan(workspace)
+    backup_dir = _outside_backup_dir(workspace, "pre-receipt-target-check")
+    moved_dir = backup_dir.with_name(f"{backup_dir.name}-moved")
+    real_create_archive = HistoryStore.create_export_archive
+
+    def rename_target_after_archive(self, *args, **kwargs):
+        result = real_create_archive(self, *args, **kwargs)
+        backup_dir.rename(moved_dir)
+        backup_dir.mkdir()
+        return result
+
+    monkeypatch.setattr(
+        HistoryStore,
+        "create_export_archive",
+        rename_target_after_archive,
+    )
+
+    with pytest.raises(HistoryError, match="export"):
+        history_application.export_history_plan(
+            application_models.HistoryExportRequest(
+                workspace,
+                plan.id,
+                backup_dir,
+            )
+        )
+
+    assert state.repository.get_history_plan(plan.id)["export_receipt_hash"] is None
+
+
+def test_history_export_keeps_first_receipt_immutable_across_repeated_export(
+    workspace,
+) -> None:
+    state, plan = _seed_executable_history_plan(workspace)
+    first = history_application.export_history_plan(
+        application_models.HistoryExportRequest(
+            workspace,
+            plan.id,
+            _outside_backup_dir(workspace, "first-receipt"),
+        )
+    )
+
+    with pytest.raises(HistoryError, match="receipt"):
+        history_application.export_history_plan(
+            application_models.HistoryExportRequest(
+                workspace,
+                plan.id,
+                _outside_backup_dir(workspace, "second-receipt"),
+            )
+        )
+
+    assert state.repository.get_history_plan(plan.id)["export_receipt_hash"] == (
+        first.receipt_hash
+    )
+    applied = _apply_exported_plan(workspace, plan, first.receipt_hash)
+    assert applied.state is CleanupExecutionState.PURGED
+
+
 @pytest.mark.parametrize(
     ("receipt_override", "confirmation", "message"),
     (
@@ -1548,6 +1679,59 @@ def test_partial_move_checkpoint_failure_restores_every_candidate(
     assert journal.moved_units == ()
 
 
+@pytest.mark.parametrize(
+    "crash_point",
+    ("before-rename", "after-rename"),
+)
+def test_abrupt_termination_around_quarantine_rename_is_recoverable(
+    workspace,
+    monkeypatch,
+    crash_point,
+) -> None:
+    state, plan, exported = _seed_exported_history_plan(
+        workspace,
+        f"abrupt-{crash_point}",
+    )
+    real_move = HistoryStore._move_unit_to_quarantine
+
+    class AbruptTermination(BaseException):
+        pass
+
+    def terminate_around_rename(self, execution_id, unit):
+        if crash_point == "after-rename":
+            real_move(self, execution_id, unit)
+        raise AbruptTermination
+
+    monkeypatch.setattr(
+        HistoryStore,
+        "_move_unit_to_quarantine",
+        terminate_around_rename,
+    )
+
+    with pytest.raises(AbruptTermination):
+        _apply_exported_plan(workspace, plan, exported.receipt_hash)
+
+    interrupted = _load_only_journal(state.paths)
+    monkeypatch.setattr(
+        HistoryStore,
+        "_move_unit_to_quarantine",
+        real_move,
+    )
+    recovered = history_application.recover_history_cleanup(
+        application_models.HistoryExecutionRequest(
+            workspace,
+            interrupted.execution_id,
+        )
+    )
+
+    assert recovered.state is CleanupExecutionState.RESTORED
+    restored = HistoryStore(state.paths).load_journal(interrupted.execution_id)
+    assert restored.state is CleanupExecutionState.RESTORED
+    assert restored.moved_units == ()
+    assert state.old_path.exists()
+    assert state.repository.get_history_plan(plan.id)["status"] == "planned"
+
+
 def test_precommit_database_failure_restores_quarantined_files(
     workspace,
     monkeypatch,
@@ -1574,6 +1758,146 @@ def test_precommit_database_failure_restores_quarantined_files(
     journal = _load_only_journal(state.paths)
     assert journal.state is CleanupExecutionState.RESTORED
     assert journal.moved_units == ()
+
+
+def test_apply_rejects_database_family_replacement_after_quarantine(
+    workspace,
+    tmp_path,
+    monkeypatch,
+) -> None:
+    state, plan, exported = _seed_exported_history_plan(
+        workspace,
+        "family-replacement-after-quarantine",
+    )
+    replacement = tmp_path / "replacement.db"
+    with sqlite3.connect(state.paths.db_path) as source:
+        with sqlite3.connect(replacement) as destination:
+            source.backup(destination)
+    with sqlite3.connect(replacement) as connection:
+        _replace_stored_plan_binding(connection, plan.id)
+    real_move_all = HistoryStore.move_units_to_quarantine
+    replacement_installed = False
+
+    def replace_family_after_quarantine(self, journal):
+        nonlocal replacement_installed
+        moved = real_move_all(self, journal)
+        os.replace(replacement, state.paths.db_path)
+        replacement_installed = True
+        return moved
+
+    monkeypatch.setattr(
+        SQLiteRepository,
+        "_lock_database_directory",
+        lambda self, descriptor: None,
+    )
+    monkeypatch.setattr(
+        HistoryStore,
+        "move_units_to_quarantine",
+        replace_family_after_quarantine,
+    )
+
+    with pytest.raises(HistoryError, match="restored"):
+        _apply_exported_plan(workspace, plan, exported.receipt_hash)
+
+    assert replacement_installed is True
+    assert state.old_path.exists()
+    journal = _load_only_journal(state.paths)
+    assert journal.state is CleanupExecutionState.RESTORED
+    with sqlite3.connect(state.paths.db_path) as connection:
+        assert connection.execute(
+            "SELECT status FROM history_cleanup_plans WHERE id = ?",
+            (plan.id,),
+        ).fetchone() == ("planned",)
+        assert connection.execute(
+            "SELECT COUNT(*) FROM source_snapshots WHERE id = ?",
+            (state.old_id,),
+        ).fetchone() == (1,)
+
+
+@pytest.mark.parametrize("binding_change", ("canonical-units", "receipt"))
+def test_apply_reasserts_exact_plan_and_receipt_inside_delete_transaction(
+    workspace,
+    monkeypatch,
+    binding_change,
+) -> None:
+    state, plan, exported = _seed_exported_history_plan(
+        workspace,
+        f"transaction-binding-{binding_change}",
+    )
+    real_move_all = HistoryStore.move_units_to_quarantine
+
+    def change_binding_after_quarantine(self, journal):
+        moved = real_move_all(self, journal)
+        with state.repository._connection() as connection:
+            if binding_change == "canonical-units":
+                _replace_stored_plan_binding(connection, plan.id)
+            else:
+                connection.execute(
+                    """
+                    UPDATE history_cleanup_plans
+                    SET export_receipt_hash = ?
+                    WHERE id = ?
+                    """,
+                    ("f" * 64, plan.id),
+                )
+        return moved
+
+    monkeypatch.setattr(
+        HistoryStore,
+        "move_units_to_quarantine",
+        change_binding_after_quarantine,
+    )
+
+    with pytest.raises(HistoryError, match="restored"):
+        _apply_exported_plan(workspace, plan, exported.receipt_hash)
+
+    assert state.old_path.exists()
+    journal = _load_only_journal(state.paths)
+    assert journal.state is CleanupExecutionState.RESTORED
+    assert journal.moved_units == ()
+
+
+def test_apply_reclassifies_exact_binding_after_commit_before_purge(
+    workspace,
+    monkeypatch,
+) -> None:
+    state, plan, exported = _seed_exported_history_plan(
+        workspace,
+        "postcommit-binding-classification",
+    )
+    real_classify = SQLiteRepository.classify_history_cleanup_outcome
+    classification_calls = 0
+
+    def change_receipt_then_classify(self, *args, **kwargs):
+        nonlocal classification_calls
+        classification_calls += 1
+        if classification_calls == 1:
+            with self._connection() as connection:
+                connection.execute(
+                    """
+                    UPDATE history_cleanup_plans
+                    SET export_receipt_hash = ?
+                    WHERE id = ?
+                    """,
+                    ("f" * 64, plan.id),
+                )
+        return real_classify(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        SQLiteRepository,
+        "classify_history_cleanup_outcome",
+        change_receipt_then_classify,
+    )
+
+    with pytest.raises(HistoryError, match="reconciliation"):
+        _apply_exported_plan(workspace, plan, exported.receipt_hash)
+
+    assert classification_calls == 1
+    assert not state.old_path.exists()
+    journal = _load_only_journal(state.paths)
+    assert journal.state is CleanupExecutionState.RECONCILIATION_REQUIRED
+    assert len(journal.moved_units) == 1
+    assert _quarantined_path(state.paths, journal, 0).exists()
 
 
 def test_ambiguous_database_outcome_never_restores_purges_or_vacuums(
@@ -1762,6 +2086,59 @@ def test_recover_ambiguous_outcome_requires_exact_database_classification(
     else:
         assert state.old_path.exists()
         assert recovered_journal.moved_units == ()
+
+
+@pytest.mark.parametrize("missing_family_part", ("main", "sidecars"))
+def test_recover_missing_database_family_is_noncreating_and_nonmutating(
+    workspace,
+    monkeypatch,
+    missing_family_part,
+) -> None:
+    state, plan, exported = _seed_exported_history_plan(
+        workspace,
+        f"recover-missing-{missing_family_part}",
+    )
+
+    def raise_ambiguous(self, plan_id, unit_ids, execution_id=None):
+        raise CommitOutcomeAmbiguousError("injected ambiguous outcome")
+
+    monkeypatch.setattr(
+        SQLiteRepository,
+        "delete_planned_history_units",
+        raise_ambiguous,
+    )
+    with pytest.raises(HistoryError, match="reconciliation"):
+        _apply_exported_plan(workspace, plan, exported.receipt_hash)
+    journal = _load_only_journal(state.paths)
+    journal_path = _only_journal_path(state.paths)
+    journal_bytes = journal_path.read_bytes()
+    quarantine_path = _quarantined_path(state.paths, journal, 0)
+    quarantine_bytes = quarantine_path.read_bytes()
+    family_paths = (
+        state.paths.db_path,
+        state.paths.db_path.with_name(f"{state.paths.db_path.name}-journal"),
+        state.paths.db_path.with_name(f"{state.paths.db_path.name}-wal"),
+        state.paths.db_path.with_name(f"{state.paths.db_path.name}-shm"),
+    )
+    removed_paths = family_paths[:1] if missing_family_part == "main" else family_paths[1:]
+    for path in removed_paths:
+        path.unlink(missing_ok=True)
+
+    with pytest.raises(
+        HistoryError,
+        match="recovery|repository|indeterminate|binding",
+    ):
+        history_application.recover_history_cleanup(
+            application_models.HistoryExecutionRequest(
+                workspace,
+                journal.execution_id,
+            )
+        )
+
+    assert all(not path.exists() for path in removed_paths)
+    assert journal_path.read_bytes() == journal_bytes
+    assert quarantine_path.read_bytes() == quarantine_bytes
+    assert not state.old_path.exists()
 
 
 def test_recover_indeterminate_mixed_rows_leaves_journal_and_files_unchanged(
@@ -2343,6 +2720,44 @@ def _quarantined_path(paths: WorkspacePaths, journal, index: int) -> Path:
         paths.history_quarantine_dir
         / journal.execution_id
         / moved_unit.quarantine_relative_path
+    )
+
+
+def _replace_stored_plan_binding(
+    connection: sqlite3.Connection,
+    plan_id: str,
+) -> None:
+    row = connection.execute(
+        """
+        SELECT canonical_policy_json, canonical_units_json
+        FROM history_cleanup_plans
+        WHERE id = ?
+        """,
+        (plan_id,),
+    ).fetchone()
+    assert row is not None
+    policy_payload = json.loads(row[0])
+    units_payload = json.loads(row[1])
+    units_payload[0]["reason"] = f"{units_payload[0]['reason']}-replacement"
+    canonical_units_json = json.dumps(
+        units_payload,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    manifest_hash = sha256(
+        json.dumps(
+            {"policy": policy_payload, "units": units_payload},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    connection.execute(
+        """
+        UPDATE history_cleanup_plans
+        SET canonical_units_json = ?, manifest_hash = ?
+        WHERE id = ?
+        """,
+        (canonical_units_json, manifest_hash, plan_id),
     )
 
 

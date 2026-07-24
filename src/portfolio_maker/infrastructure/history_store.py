@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 from hashlib import sha256
 from io import BytesIO
 import json
@@ -12,6 +12,8 @@ import tarfile
 from portfolio_maker.domain.history_models import (
     CleanupExecutionState,
     HistoryCleanupJournal,
+    HistoryDatabaseFamilyIdentity,
+    HistoryDatabaseSidecarIdentity,
     HistoryPlan,
     HistoryPolicy,
     HistoryUnit,
@@ -72,14 +74,37 @@ _JOURNAL_FIELDS = frozenset(
         "state",
         "units",
         "moved_units",
+        "export_receipt_hash",
+        "database_family",
+        "pending_move",
         "journal_hash",
     }
 )
 _MOVED_UNIT_FIELDS = frozenset({"unit", "quarantine_relative_path"})
+_DATABASE_FAMILY_FIELDS = frozenset(
+    {
+        "directory_device",
+        "directory_inode",
+        "main_device",
+        "main_inode",
+        "sidecars",
+    }
+)
+_DATABASE_SIDECAR_FIELDS = frozenset({"suffix", "device", "inode"})
+_DATABASE_SIDECARS = ("-journal", "-wal", "-shm")
 
 
 class _DuplicateFieldError(ValueError):
     pass
+
+
+@dataclass(frozen=True)
+class _ExportDirectoryIdentity:
+    absolute_path: Path
+    parent_device: int
+    parent_inode: int
+    target_device: int
+    target_inode: int
 
 
 class HistoryStore:
@@ -179,6 +204,7 @@ class HistoryStore:
         plan: HistoryPlan,
         backup_dir: Path,
         database_backup: bytes,
+        expected_directory: _ExportDirectoryIdentity,
     ) -> tuple[Path, str]:
         _validate_plan(plan)
         if not isinstance(database_backup, bytes) or not database_backup:
@@ -197,8 +223,13 @@ class HistoryStore:
             _assert_snapshot_matches_unit(snapshot, unit)
             candidate_contents.append((unit, snapshot.content))
 
-        absolute_backup_dir, directory_descriptor = self._open_export_directory(
-            backup_dir
+        (
+            export_directory,
+            parent_descriptor,
+            directory_descriptor,
+        ) = self._open_export_directory(
+            backup_dir,
+            expected=expected_directory,
         )
         archive_name = f"history-plan-{plan.id}.tar"
         archive_descriptor: int | None = None
@@ -239,7 +270,15 @@ class HistoryStore:
                 ):
                     raise OSError("history export archive is unsafe")
             os.fsync(directory_descriptor)
-            return absolute_backup_dir / archive_name, digest.hexdigest()
+            self._assert_export_directory_binding(
+                export_directory,
+                parent_descriptor,
+                directory_descriptor,
+            )
+            return (
+                export_directory.absolute_path / archive_name,
+                digest.hexdigest(),
+            )
         except Exception:
             if archive_created:
                 try:
@@ -253,11 +292,44 @@ class HistoryStore:
             if archive_descriptor is not None:
                 os.close(archive_descriptor)
             os.close(directory_descriptor)
+            os.close(parent_descriptor)
 
-    def prepare_export_directory(self, backup_dir: Path) -> Path:
-        absolute, directory_descriptor = self._open_export_directory(backup_dir)
+    def prepare_export_directory(
+        self,
+        backup_dir: Path,
+    ) -> _ExportDirectoryIdentity:
+        identity, parent_descriptor, directory_descriptor = (
+            self._open_export_directory(backup_dir)
+        )
         os.close(directory_descriptor)
-        return absolute
+        os.close(parent_descriptor)
+        return identity
+
+    def revalidate_export_directory(
+        self,
+        identity: _ExportDirectoryIdentity,
+    ) -> None:
+        if not isinstance(identity, _ExportDirectoryIdentity):
+            raise OSError("history export directory identity is invalid")
+        parent_descriptor = open_managed_directory(
+            identity.absolute_path.parent
+        )
+        directory_descriptor: int | None = None
+        try:
+            directory_descriptor = os.open(
+                identity.absolute_path.name,
+                _DIRECTORY_FLAGS,
+                dir_fd=parent_descriptor,
+            )
+            self._assert_export_directory_binding(
+                identity,
+                parent_descriptor,
+                directory_descriptor,
+            )
+        finally:
+            if directory_descriptor is not None:
+                os.close(directory_descriptor)
+            os.close(parent_descriptor)
 
     def write_journal(
         self,
@@ -300,6 +372,7 @@ class HistoryStore:
                 or payload["version"] != 1
                 or type(payload["units"]) is not list
                 or type(payload["moved_units"]) is not list
+                or type(payload["database_family"]) is not dict
             ):
                 raise ValueError("history cleanup journal hash is invalid")
             units = tuple(
@@ -310,6 +383,15 @@ class HistoryStore:
                 _quarantined_unit_from_payload(moved_payload)
                 for moved_payload in payload["moved_units"]
             )
+            pending_payload = payload["pending_move"]
+            pending_move = (
+                None
+                if pending_payload is None
+                else _quarantined_unit_from_payload(pending_payload)
+            )
+            database_family = _database_family_from_payload(
+                payload["database_family"]
+            )
             journal = HistoryCleanupJournal(
                 execution_id=payload["execution_id"],
                 plan_id=payload["plan_id"],
@@ -317,6 +399,9 @@ class HistoryStore:
                 state=CleanupExecutionState(payload["state"]),
                 units=units,
                 moved_units=moved_units,
+                export_receipt_hash=payload["export_receipt_hash"],
+                database_family=database_family,
+                pending_move=pending_move,
             )
             _validate_journal(journal)
         except (
@@ -339,23 +424,27 @@ class HistoryStore:
     ) -> HistoryCleanupJournal:
         current = journal
         for unit in journal.units[len(journal.moved_units) :]:
+            pending_move = QuarantinedHistoryUnit(
+                unit,
+                unit.relative_path,
+            )
+            intent = replace(
+                current,
+                state=CleanupExecutionState.QUARANTINED,
+                pending_move=pending_move,
+            )
+            self.write_journal(intent)
             moved_unit = self._move_unit_to_quarantine(
                 journal.execution_id,
                 unit,
             )
             next_journal = replace(
-                current,
+                intent,
                 state=CleanupExecutionState.QUARANTINED,
                 moved_units=(*current.moved_units, moved_unit),
+                pending_move=None,
             )
-            try:
-                self.write_journal(next_journal)
-            except Exception:
-                self._restore_quarantined_unit(
-                    journal.execution_id,
-                    moved_unit,
-                )
-                raise
+            self.write_journal(next_journal)
             current = next_journal
         return current
 
@@ -363,7 +452,7 @@ class HistoryStore:
         self,
         journal: HistoryCleanupJournal,
     ) -> HistoryCleanupJournal:
-        current = journal
+        current = self._resolve_pending_move(journal)
         while current.moved_units:
             moved_unit = current.moved_units[-1]
             self._restore_quarantined_unit(
@@ -385,6 +474,50 @@ class HistoryStore:
             current = replace(current, state=CleanupExecutionState.RESTORED)
             self.write_journal(current)
         return current
+
+    def _resolve_pending_move(
+        self,
+        journal: HistoryCleanupJournal,
+    ) -> HistoryCleanupJournal:
+        pending_move = journal.pending_move
+        if pending_move is None:
+            return journal
+        unit = pending_move.unit
+        original_root, original_relative = self._unit_root_and_path(unit)
+        quarantine_root = (
+            self.paths.history_quarantine_dir / journal.execution_id
+        )
+        quarantine_relative = Path(pending_move.quarantine_relative_path)
+        original_exists = _exact_unit_exists(
+            original_root,
+            original_relative,
+            unit,
+        )
+        quarantine_exists = _exact_unit_exists(
+            quarantine_root,
+            quarantine_relative,
+            unit,
+        )
+        if original_exists == quarantine_exists:
+            raise OSError(
+                "history cleanup pending move location is indeterminate"
+            )
+        if quarantine_exists:
+            self._restore_quarantined_unit(
+                journal.execution_id,
+                pending_move,
+            )
+        resolved = replace(
+            journal,
+            state=(
+                CleanupExecutionState.QUARANTINED
+                if journal.moved_units
+                else CleanupExecutionState.RESTORED
+            ),
+            pending_move=None,
+        )
+        self.write_journal(resolved)
+        return resolved
 
     def purge_quarantine(
         self,
@@ -444,7 +577,12 @@ class HistoryStore:
         )
         return self.paths.history_journal_dir / f"execution-{execution_id}.json"
 
-    def _open_export_directory(self, backup_dir: Path) -> tuple[Path, int]:
+    def _open_export_directory(
+        self,
+        backup_dir: Path,
+        *,
+        expected: _ExportDirectoryIdentity | None = None,
+    ) -> tuple[_ExportDirectoryIdentity, int, int]:
         if not isinstance(backup_dir, Path):
             raise OSError("history export directory is invalid")
         absolute = backup_dir if backup_dir.is_absolute() else backup_dir.absolute()
@@ -465,6 +603,7 @@ class HistoryStore:
         directory_descriptor: int | None = None
         created = False
         try:
+            self._assert_directory_outside_workspace(parent_descriptor)
             try:
                 directory_descriptor = os.open(
                     absolute.name,
@@ -487,10 +626,26 @@ class HistoryStore:
             stat_result = os.fstat(directory_descriptor)
             if not S_ISDIR(stat_result.st_mode):
                 raise OSError("history export target must be a directory")
+            self._assert_directory_outside_workspace(directory_descriptor)
             if os.listdir(directory_descriptor):
                 raise OSError("history export directory must be empty")
             os.fchmod(directory_descriptor, 0o700)
-            return absolute, directory_descriptor
+            parent_stat = os.fstat(parent_descriptor)
+            identity = _ExportDirectoryIdentity(
+                absolute_path=absolute,
+                parent_device=parent_stat.st_dev,
+                parent_inode=parent_stat.st_ino,
+                target_device=stat_result.st_dev,
+                target_inode=stat_result.st_ino,
+            )
+            if expected is not None and identity != expected:
+                raise OSError("history export directory identity changed")
+            self._assert_export_directory_binding(
+                identity,
+                parent_descriptor,
+                directory_descriptor,
+            )
+            return identity, parent_descriptor, directory_descriptor
         except Exception:
             if directory_descriptor is not None:
                 os.close(directory_descriptor)
@@ -499,9 +654,49 @@ class HistoryStore:
                     os.rmdir(absolute.name, dir_fd=parent_descriptor)
                 except OSError:
                     pass
-            raise
-        finally:
             os.close(parent_descriptor)
+            raise
+
+    def _assert_directory_outside_workspace(
+        self,
+        directory_descriptor: int,
+    ) -> None:
+        workspace_descriptor = open_managed_directory(self.paths.workspace)
+        try:
+            workspace_identity = _descriptor_identity(workspace_descriptor)
+        finally:
+            os.close(workspace_descriptor)
+        if _descriptor_has_ancestor(
+            directory_descriptor,
+            workspace_identity,
+        ):
+            raise OSError("history export directory must be outside the workspace")
+
+    def _assert_export_directory_binding(
+        self,
+        identity: _ExportDirectoryIdentity,
+        parent_descriptor: int,
+        directory_descriptor: int,
+    ) -> None:
+        if (
+            _descriptor_identity(parent_descriptor)
+            != (identity.parent_device, identity.parent_inode)
+            or _descriptor_identity(directory_descriptor)
+            != (identity.target_device, identity.target_inode)
+        ):
+            raise OSError("history export directory identity changed")
+        named_target = os.stat(
+            identity.absolute_path.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            not S_ISDIR(named_target.st_mode)
+            or (named_target.st_dev, named_target.st_ino)
+            != (identity.target_device, identity.target_inode)
+        ):
+            raise OSError("history export directory identity changed")
+        self._assert_directory_outside_workspace(directory_descriptor)
 
     def _move_unit_to_quarantine(
         self,
@@ -514,12 +709,6 @@ class HistoryStore:
             "history cleanup execution id",
         )
         original_root, original_relative = self._unit_root_and_path(unit)
-        source_snapshot = read_managed_relative_file(
-            original_root,
-            original_relative,
-        )
-        _assert_snapshot_matches_unit(source_snapshot, unit)
-
         quarantine_relative = Path(unit.relative_path)
         quarantine_root = self.paths.history_quarantine_dir / execution_id
         destination_parent = quarantine_root / quarantine_relative.parent
@@ -531,22 +720,37 @@ class HistoryStore:
         )
         renamed = False
         try:
-            source_stat = os.stat(
+            source_stat = _optional_stat(
+                source_parent_descriptor,
                 original_relative.name,
-                dir_fd=source_parent_descriptor,
-                follow_symlinks=False,
             )
-            _assert_stat_matches_unit(source_stat, unit)
-            try:
-                os.stat(
-                    quarantine_relative.name,
-                    dir_fd=destination_parent_descriptor,
-                    follow_symlinks=False,
+            destination_stat = _optional_stat(
+                destination_parent_descriptor,
+                quarantine_relative.name,
+            )
+            if source_stat is None:
+                if destination_stat is None:
+                    raise OSError(
+                        "managed history move source and target are missing"
+                    )
+                _assert_stat_matches_unit(destination_stat, unit)
+                moved_snapshot = read_managed_relative_file(
+                    quarantine_root,
+                    quarantine_relative,
                 )
-            except FileNotFoundError:
-                pass
-            else:
+                _assert_snapshot_matches_unit(moved_snapshot, unit)
+                return QuarantinedHistoryUnit(
+                    unit,
+                    quarantine_relative.as_posix(),
+                )
+            if destination_stat is not None:
                 raise OSError("history quarantine target already exists")
+            source_snapshot = read_managed_relative_file(
+                original_root,
+                original_relative,
+            )
+            _assert_snapshot_matches_unit(source_snapshot, unit)
+            _assert_stat_matches_unit(source_stat, unit)
             if source_stat.st_dev != os.fstat(destination_parent_descriptor).st_dev:
                 raise OSError("history quarantine must use the same filesystem")
             os.rename(
@@ -782,6 +986,12 @@ def _validate_journal(journal: HistoryCleanupJournal) -> None:
         64,
         "managed history manifest hash",
     )
+    _validate_hex_identifier(
+        journal.export_receipt_hash,
+        64,
+        "history export receipt hash",
+    )
+    _validate_database_family_identity(journal.database_family)
     if (
         not isinstance(journal.state, CleanupExecutionState)
         or not isinstance(journal.units, tuple)
@@ -809,6 +1019,20 @@ def _validate_journal(journal: HistoryCleanupJournal) -> None:
         ):
             raise OSError("history cleanup journal move is invalid")
         seen_moved.add(unit_id)
+    pending_move = journal.pending_move
+    if pending_move is not None:
+        if not isinstance(pending_move, QuarantinedHistoryUnit):
+            raise OSError("history cleanup pending move is invalid")
+        _validate_history_unit(pending_move.unit)
+        next_index = len(journal.moved_units)
+        if (
+            journal.state is not CleanupExecutionState.QUARANTINED
+            or next_index >= len(journal.units)
+            or pending_move.unit != journal.units[next_index]
+            or pending_move.quarantine_relative_path
+            != pending_move.unit.relative_path
+        ):
+            raise OSError("history cleanup pending move is invalid")
     observed_moved = tuple(
         (moved.unit.kind, moved.unit.row_id)
         for moved in journal.moved_units
@@ -821,14 +1045,19 @@ def _validate_journal(journal: HistoryCleanupJournal) -> None:
     }
     if (
         journal.state is CleanupExecutionState.PLANNED
+        or (journal.state in no_moved_states and pending_move is not None)
         or (journal.state in no_moved_states and journal.moved_units)
         or (
             journal.state is CleanupExecutionState.QUARANTINED
             and not journal.moved_units
+            and pending_move is None
         )
         or (
             journal.state is CleanupExecutionState.RECONCILIATION_REQUIRED
-            and len(journal.moved_units) != len(journal.units)
+            and (
+                len(journal.moved_units) != len(journal.units)
+                or pending_move is not None
+            )
         )
     ):
         raise OSError("history cleanup journal state is inconsistent")
@@ -862,6 +1091,67 @@ def _quarantined_unit_from_payload(payload: object) -> QuarantinedHistoryUnit:
     if not isinstance(quarantine_relative_path, str):
         raise ValueError("history cleanup moved path is invalid")
     return QuarantinedHistoryUnit(unit, quarantine_relative_path)
+
+
+def _database_family_from_payload(
+    payload: object,
+) -> HistoryDatabaseFamilyIdentity:
+    if (
+        type(payload) is not dict
+        or frozenset(payload) != _DATABASE_FAMILY_FIELDS
+        or type(payload["sidecars"]) is not list
+    ):
+        raise ValueError("history database family shape is invalid")
+    sidecars: list[HistoryDatabaseSidecarIdentity] = []
+    for sidecar_payload in payload["sidecars"]:
+        if (
+            type(sidecar_payload) is not dict
+            or frozenset(sidecar_payload) != _DATABASE_SIDECAR_FIELDS
+        ):
+            raise ValueError("history database sidecar shape is invalid")
+        sidecars.append(HistoryDatabaseSidecarIdentity(**sidecar_payload))
+    identity = HistoryDatabaseFamilyIdentity(
+        directory_device=payload["directory_device"],
+        directory_inode=payload["directory_inode"],
+        main_device=payload["main_device"],
+        main_inode=payload["main_inode"],
+        sidecars=tuple(sidecars),
+    )
+    _validate_database_family_identity(identity)
+    return identity
+
+
+def _validate_database_family_identity(
+    identity: HistoryDatabaseFamilyIdentity,
+) -> None:
+    if (
+        not isinstance(identity, HistoryDatabaseFamilyIdentity)
+        or type(identity.directory_device) is not int
+        or identity.directory_device < 0
+        or type(identity.directory_inode) is not int
+        or identity.directory_inode < 0
+        or type(identity.main_device) is not int
+        or identity.main_device < 0
+        or type(identity.main_inode) is not int
+        or identity.main_inode < 0
+        or not isinstance(identity.sidecars, tuple)
+        or len(identity.sidecars) != len(_DATABASE_SIDECARS)
+    ):
+        raise OSError("history database family identity is invalid")
+    for expected_suffix, sidecar in zip(
+        _DATABASE_SIDECARS,
+        identity.sidecars,
+        strict=True,
+    ):
+        if (
+            not isinstance(sidecar, HistoryDatabaseSidecarIdentity)
+            or sidecar.suffix != expected_suffix
+            or type(sidecar.device) is not int
+            or sidecar.device < 0
+            or type(sidecar.inode) is not int
+            or sidecar.inode < 0
+        ):
+            raise OSError("history database family identity is invalid")
 
 
 def _plan_payload(plan: HistoryPlan) -> dict[str, object]:
@@ -898,6 +1188,27 @@ def _journal_payload(journal: HistoryCleanupJournal) -> dict[str, object]:
             }
             for moved_unit in journal.moved_units
         ],
+        "export_receipt_hash": journal.export_receipt_hash,
+        "database_family": {
+            "directory_device": journal.database_family.directory_device,
+            "directory_inode": journal.database_family.directory_inode,
+            "main_device": journal.database_family.main_device,
+            "main_inode": journal.database_family.main_inode,
+            "sidecars": [
+                asdict(sidecar)
+                for sidecar in journal.database_family.sidecars
+            ],
+        },
+        "pending_move": (
+            None
+            if journal.pending_move is None
+            else {
+                "unit": asdict(journal.pending_move.unit),
+                "quarantine_relative_path": (
+                    journal.pending_move.quarantine_relative_path
+                ),
+            }
+        ),
     }
 
 
@@ -953,6 +1264,65 @@ def _assert_stat_matches_unit(stat_result: os.stat_result, unit: HistoryUnit) ->
         or stat_result.st_ino != unit.inode
     ):
         raise OSError("managed history candidate identity changed")
+
+
+def _optional_stat(
+    directory_descriptor: int,
+    name: str,
+) -> os.stat_result | None:
+    try:
+        return os.stat(
+            name,
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return None
+
+
+def _exact_unit_exists(
+    root: Path,
+    relative_path: Path,
+    unit: HistoryUnit,
+) -> bool:
+    try:
+        snapshot = read_managed_relative_file(root, relative_path)
+    except FileNotFoundError:
+        return False
+    _assert_snapshot_matches_unit(snapshot, unit)
+    return True
+
+
+def _descriptor_identity(descriptor: int) -> tuple[int, int]:
+    stat_result = os.fstat(descriptor)
+    if not S_ISDIR(stat_result.st_mode):
+        raise OSError("managed directory descriptor is invalid")
+    return stat_result.st_dev, stat_result.st_ino
+
+
+def _descriptor_has_ancestor(
+    descriptor: int,
+    expected_identity: tuple[int, int],
+) -> bool:
+    current_descriptor = os.dup(descriptor)
+    try:
+        while True:
+            current_identity = _descriptor_identity(current_descriptor)
+            if current_identity == expected_identity:
+                return True
+            parent_descriptor = os.open(
+                "..",
+                _DIRECTORY_FLAGS,
+                dir_fd=current_descriptor,
+            )
+            parent_identity = _descriptor_identity(parent_descriptor)
+            if parent_identity == current_identity:
+                os.close(parent_descriptor)
+                return False
+            os.close(current_descriptor)
+            current_descriptor = parent_descriptor
+    finally:
+        os.close(current_descriptor)
 
 
 def _open_durable_directory(path: Path) -> int:

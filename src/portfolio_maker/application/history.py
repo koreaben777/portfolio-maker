@@ -196,7 +196,7 @@ def export_history_plan(request: HistoryExportRequest) -> HistoryExportResult:
     repository = SQLiteRepository(paths.db_path)
     store = HistoryStore(paths)
     try:
-        store.prepare_export_directory(request.backup_dir)
+        export_directory = store.prepare_export_directory(request.backup_dir)
         with repository.exclusive_workspace_operation():
             plan = _load_bound_plan(
                 store,
@@ -219,7 +219,9 @@ def export_history_plan(request: HistoryExportRequest) -> HistoryExportResult:
                 plan,
                 request.backup_dir,
                 database_backup,
+                export_directory,
             )
+            store.revalidate_export_directory(export_directory)
             try:
                 repository.record_history_export_receipt(
                     plan.id,
@@ -251,7 +253,7 @@ def apply_history_plan(request: HistoryApplyRequest) -> HistoryApplyResult:
     repository = SQLiteRepository(paths.db_path)
     store = HistoryStore(paths)
     try:
-        with repository.exclusive_workspace_operation():
+        with repository.pinned_history_cleanup_operation() as database_family:
             plan = _load_bound_plan(
                 store,
                 repository,
@@ -265,6 +267,9 @@ def apply_history_plan(request: HistoryApplyRequest) -> HistoryApplyResult:
                 )
             except RepositoryError as error:
                 raise HistoryError(str(error)) from error
+            receipt_hash = request.export_receipt_hash
+            if receipt_hash is None:
+                raise HistoryError("history export receipt is required")
             _require_exact_confirmation(
                 request.confirmation,
                 plan.confirmation_phrase,
@@ -284,6 +289,8 @@ def apply_history_plan(request: HistoryApplyRequest) -> HistoryApplyResult:
                 state=CleanupExecutionState.EXPORTED,
                 units=plan.units,
                 moved_units=(),
+                export_receipt_hash=receipt_hash,
+                database_family=database_family,
             )
             journal_created = False
             try:
@@ -307,11 +314,15 @@ def apply_history_plan(request: HistoryApplyRequest) -> HistoryApplyResult:
                 ) from error
 
             try:
-                repository.delete_planned_history_units(
-                    plan.id,
-                    plan.unit_ids(),
-                    execution_id,
-                )
+                with repository.exact_history_plan_binding(
+                    plan,
+                    receipt_hash,
+                ):
+                    repository.delete_planned_history_units(
+                        plan.id,
+                        plan.unit_ids(),
+                        execution_id,
+                    )
             except CommitOutcomeAmbiguousError as error:
                 journal = replace(
                     journal,
@@ -336,6 +347,28 @@ def apply_history_plan(request: HistoryApplyRequest) -> HistoryApplyResult:
                 raise HistoryError(
                     "database update failed; managed files were restored"
                 ) from error
+
+            outcome = repository.classify_history_cleanup_outcome(
+                plan.id,
+                plan.unit_ids(),
+                expected_plan=plan,
+                expected_receipt_hash=receipt_hash,
+                expected_execution_id=execution_id,
+            )
+            if outcome != "committed":
+                reconciliation_required = replace(
+                    journal,
+                    state=CleanupExecutionState.RECONCILIATION_REQUIRED,
+                )
+                try:
+                    store.write_journal(reconciliation_required)
+                except Exception as journal_error:
+                    raise HistoryError(
+                        "database cleanup committed; recovery journal update failed"
+                    ) from journal_error
+                raise HistoryError(
+                    "database cleanup committed; reconciliation is required"
+                )
 
             journal = replace(
                 journal,
@@ -373,19 +406,30 @@ def recover_history_cleanup(
     repository = SQLiteRepository(paths.db_path)
     store = HistoryStore(paths)
     try:
-        with repository.exclusive_workspace_operation():
-            journal = store.load_journal(request.execution_id)
-            if journal.state not in {
-                CleanupExecutionState.QUARANTINED,
-                CleanupExecutionState.RECONCILIATION_REQUIRED,
-            }:
+        journal = store.load_journal(request.execution_id)
+        if journal.state not in {
+            CleanupExecutionState.QUARANTINED,
+            CleanupExecutionState.RECONCILIATION_REQUIRED,
+        }:
+            raise HistoryError(
+                "history cleanup journal cannot be recovered from its current state"
+            )
+        with repository.pinned_history_cleanup_operation(
+            journal.database_family
+        ):
+            current = store.load_journal(request.execution_id)
+            if current != journal:
                 raise HistoryError(
-                    "history cleanup journal cannot be recovered from its current state"
+                    "history cleanup journal changed during recovery"
                 )
-            _assert_journal_plan_binding(store, repository, journal)
+            journal = current
+            plan = _assert_journal_plan_binding(store, journal)
             outcome = repository.classify_history_cleanup_outcome(
                 journal.plan_id,
                 tuple((unit.kind, unit.row_id) for unit in journal.units),
+                expected_plan=plan,
+                expected_receipt_hash=journal.export_receipt_hash,
+                expected_execution_id=journal.execution_id,
             )
             if outcome == "indeterminate":
                 raise HistoryError(
@@ -422,14 +466,34 @@ def resume_history_cleanup(
     repository = SQLiteRepository(paths.db_path)
     store = HistoryStore(paths)
     try:
-        with repository.exclusive_workspace_operation():
-            journal = store.load_journal(request.execution_id)
+        journal = store.load_journal(request.execution_id)
+        if journal.state not in {
+            CleanupExecutionState.COMMITTED_PENDING_PURGE,
+            CleanupExecutionState.VACUUM_PENDING,
+        }:
+            raise HistoryError(
+                "history cleanup journal cannot be resumed from its current state"
+            )
+        with repository.pinned_history_cleanup_operation(
+            journal.database_family
+        ):
+            current = store.load_journal(request.execution_id)
+            if current != journal:
+                raise HistoryError(
+                    "history cleanup journal changed during resume"
+                )
+            journal = current
             if journal.state is CleanupExecutionState.VACUUM_PENDING:
                 try:
+                    repository.release_pinned_history_database_directory_lock()
                     repository.vacuum()
+                    database_family = (
+                        repository.refresh_pinned_history_database_family()
+                    )
                     completed = replace(
                         journal,
                         state=CleanupExecutionState.PURGED,
+                        database_family=database_family,
                     )
                     store.write_journal(completed)
                 except (OSError, RepositoryError) as error:
@@ -437,14 +501,13 @@ def resume_history_cleanup(
                         "history cleanup VACUUM retry failed"
                     ) from error
                 return _execution_result(completed)
-            if journal.state is not CleanupExecutionState.COMMITTED_PENDING_PURGE:
-                raise HistoryError(
-                    "history cleanup journal cannot be resumed from its current state"
-                )
-            _assert_journal_plan_binding(store, repository, journal)
+            plan = _assert_journal_plan_binding(store, journal)
             outcome = repository.classify_history_cleanup_outcome(
                 journal.plan_id,
                 tuple((unit.kind, unit.row_id) for unit in journal.units),
+                expected_plan=plan,
+                expected_receipt_hash=journal.export_receipt_hash,
+                expected_execution_id=journal.execution_id,
             )
             if outcome != "committed":
                 raise HistoryError(
@@ -463,17 +526,30 @@ def _finish_committed_cleanup(
     journal: HistoryCleanupJournal,
 ) -> HistoryApplyResult:
     try:
+        repository.assert_pinned_history_database_family()
         journal = store.purge_quarantine(journal)
-    except OSError as error:
+        repository.assert_pinned_history_database_family()
+        repository.release_pinned_history_database_directory_lock()
+    except (OSError, RepositoryError) as error:
         raise HistoryError(
             "history quarantine purge was interrupted; resume is required"
         ) from error
     try:
         repository.vacuum()
+        database_family = repository.refresh_pinned_history_database_family()
     except Exception as error:
+        try:
+            database_family = (
+                repository.refresh_pinned_history_database_family()
+            )
+        except Exception as family_error:
+            raise HistoryError(
+                "history cleanup committed; VACUUM and database family recovery are required"
+            ) from family_error
         vacuum_pending = replace(
             journal,
             state=CleanupExecutionState.VACUUM_PENDING,
+            database_family=database_family,
         )
         try:
             store.write_journal(vacuum_pending)
@@ -484,7 +560,11 @@ def _finish_committed_cleanup(
         raise HistoryError(
             "history cleanup committed; VACUUM retry is required"
         ) from error
-    completed = replace(journal, state=CleanupExecutionState.PURGED)
+    completed = replace(
+        journal,
+        state=CleanupExecutionState.PURGED,
+        database_family=database_family,
+    )
     try:
         store.write_journal(completed)
     except OSError as error:
@@ -516,20 +596,20 @@ def _load_bound_plan(
 
 def _assert_journal_plan_binding(
     store: HistoryStore,
-    repository: SQLiteRepository,
     journal: HistoryCleanupJournal,
-) -> None:
-    plan = _load_bound_plan(
-        store,
-        repository,
-        journal.plan_id,
-        allowed_statuses=("planned", "completed"),
-    )
+) -> HistoryPlan:
+    try:
+        plan = store.load_verified_plan(journal.plan_id)
+    except (OSError, TypeError, ValueError) as error:
+        raise HistoryError(
+            "history cleanup journal plan binding is invalid"
+        ) from error
     if (
         plan.manifest_hash != journal.manifest_hash
         or plan.units != journal.units
     ):
         raise HistoryError("history cleanup journal plan binding is invalid")
+    return plan
 
 
 def _require_exact_confirmation(actual: str, expected: str) -> None:

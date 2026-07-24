@@ -16,6 +16,8 @@ from typing import Literal
 
 from portfolio_maker.domain.history_models import (
     CleanupExecutionState,
+    HistoryDatabaseFamilyIdentity,
+    HistoryDatabaseSidecarIdentity,
     HistoryPlan,
     HistoryPolicy,
     HistoryUnit,
@@ -335,8 +337,11 @@ _HISTORY_UNIT_FIELDS = frozenset(
 
 @dataclass(frozen=True)
 class _DatabaseIdentity:
+    directory_device: int
+    directory_inode: int
     device: int
     inode: int
+    sidecars: tuple[tuple[str, int | None, int | None], ...]
 
 
 class SQLiteRepository:
@@ -347,6 +352,150 @@ class SQLiteRepository:
     def exclusive_workspace_operation(self) -> Iterator[None]:
         with self._repository_critical_section():
             yield
+
+    @contextmanager
+    def pinned_history_cleanup_operation(
+        self,
+        expected_family: HistoryDatabaseFamilyIdentity | None = None,
+    ) -> Iterator[HistoryDatabaseFamilyIdentity]:
+        expected_identity = (
+            None
+            if expected_family is None
+            else self._database_identity_from_history(expected_family)
+        )
+        with self._existing_database_operation(
+            expected_identity=expected_identity,
+            require_complete=True,
+        ) as (directory_descriptor, identity):
+            key = self._operation_key()
+            pins = getattr(_REPOSITORY_OPERATION_STATE, "database_pins", {})
+            if key in pins:
+                raise RepositoryError(
+                    "history database family is already pinned"
+                )
+            pin_descriptors = getattr(
+                _REPOSITORY_OPERATION_STATE,
+                "database_pin_descriptors",
+                {},
+            )
+            pins[key] = identity
+            pin_descriptors[key] = directory_descriptor
+            _REPOSITORY_OPERATION_STATE.database_pins = pins
+            _REPOSITORY_OPERATION_STATE.database_pin_descriptors = (
+                pin_descriptors
+            )
+            try:
+                self._validate_database_family(
+                    directory_descriptor,
+                    identity,
+                    "before history cleanup",
+                )
+                yield self._history_database_family(identity)
+                current_identity = (
+                    self._pinned_database_identity() or identity
+                )
+                self._validate_database_family(
+                    directory_descriptor,
+                    current_identity,
+                    "after history cleanup",
+                )
+            finally:
+                del pin_descriptors[key]
+                del pins[key]
+
+    @contextmanager
+    def exact_history_plan_binding(
+        self,
+        plan: HistoryPlan,
+        receipt_hash: str,
+    ) -> Iterator[None]:
+        self._validate_history_hex(receipt_hash, 64)
+        self._canonical_history_plan_metadata(plan.policy, plan.units)
+        key = self._operation_key()
+        bindings = getattr(
+            _REPOSITORY_OPERATION_STATE,
+            "history_plan_bindings",
+            {},
+        )
+        if key in bindings:
+            raise RepositoryError(
+                "history cleanup plan binding is already active"
+            )
+        bindings[key] = (plan, receipt_hash)
+        _REPOSITORY_OPERATION_STATE.history_plan_bindings = bindings
+        try:
+            yield
+        finally:
+            del bindings[key]
+
+    def assert_pinned_history_database_family(self) -> None:
+        identity = self._pinned_database_identity()
+        if identity is None:
+            raise RepositoryError("history database family is not pinned")
+        directory_descriptor = open_managed_directory(self.db_path.parent)
+        try:
+            self._validate_database_family(
+                directory_descriptor,
+                identity,
+                "during history cleanup",
+            )
+        finally:
+            os.close(directory_descriptor)
+
+    def release_pinned_history_database_directory_lock(self) -> None:
+        identity = self._pinned_database_identity()
+        descriptors = getattr(
+            _REPOSITORY_OPERATION_STATE,
+            "database_pin_descriptors",
+            {},
+        )
+        directory_descriptor = descriptors.get(self._operation_key())
+        if identity is None or not isinstance(directory_descriptor, int):
+            raise RepositoryError("history database family is not pinned")
+        self._validate_database_family(
+            directory_descriptor,
+            identity,
+            "before VACUUM",
+        )
+        self._unlock_database_directory(directory_descriptor)
+
+    def refresh_pinned_history_database_family(
+        self,
+    ) -> HistoryDatabaseFamilyIdentity:
+        identity = self._pinned_database_identity()
+        descriptors = getattr(
+            _REPOSITORY_OPERATION_STATE,
+            "database_pin_descriptors",
+            {},
+        )
+        directory_descriptor = descriptors.get(self._operation_key())
+        if identity is None or not isinstance(directory_descriptor, int):
+            raise RepositoryError("history database family is not pinned")
+        self._validate_database_main_identity(
+            directory_descriptor,
+            identity,
+            "after VACUUM",
+        )
+        self._ensure_database_sidecars(directory_descriptor)
+        refreshed = self._capture_database_identity(
+            directory_descriptor,
+            require_complete=True,
+        )
+        if (
+            refreshed.directory_device,
+            refreshed.directory_inode,
+            refreshed.device,
+            refreshed.inode,
+        ) != (
+            identity.directory_device,
+            identity.directory_inode,
+            identity.device,
+            identity.inode,
+        ):
+            raise self._changed_database_error("after VACUUM")
+        pins = getattr(_REPOSITORY_OPERATION_STATE, "database_pins", {})
+        pins[self._operation_key()] = refreshed
+        return self._history_database_family(refreshed)
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
@@ -454,11 +603,19 @@ class SQLiteRepository:
     @contextmanager
     def _database_operation(self) -> Iterator[tuple[int, _DatabaseIdentity]]:
         with self._repository_critical_section() as outermost:
-            directory_descriptor, identity = self._open_database_family(
+            directory_descriptor, current_identity = self._open_database_family(
                 ensure_directory=outermost
             )
+            pinned_identity = self._pinned_database_identity()
+            identity = pinned_identity or current_identity
             directory_locked = False
             try:
+                if pinned_identity is not None:
+                    self._validate_database_family(
+                        directory_descriptor,
+                        identity,
+                        "during pinned database operation",
+                    )
                 if outermost:
                     self._lock_database_directory(directory_descriptor)
                     directory_locked = True
@@ -473,6 +630,9 @@ class SQLiteRepository:
     @contextmanager
     def _existing_database_operation(
         self,
+        *,
+        expected_identity: _DatabaseIdentity | None = None,
+        require_complete: bool = False,
     ) -> Iterator[tuple[int, _DatabaseIdentity]]:
         with self._repository_critical_section() as outermost:
             directory_descriptor: int | None = None
@@ -482,13 +642,16 @@ class SQLiteRepository:
                     self.db_path.parent
                 )
                 self._verify_current_database_directory(directory_descriptor)
-                main = self._validated_family_entry(
+                current_identity = self._capture_database_identity(
                     directory_descriptor,
-                    self.db_path.name,
+                    require_complete=require_complete,
                 )
-                if main is None:
-                    raise self._changed_database_error("before connect")
-                identity = _DatabaseIdentity(main.st_dev, main.st_ino)
+                pinned_identity = self._pinned_database_identity()
+                identity = (
+                    expected_identity
+                    or pinned_identity
+                    or current_identity
+                )
                 self._validate_database_family(
                     directory_descriptor,
                     identity,
@@ -514,7 +677,7 @@ class SQLiteRepository:
 
     @contextmanager
     def _repository_critical_section(self) -> Iterator[bool]:
-        key = str(self.db_path.parent.absolute())
+        key = self._operation_key()
         with _REPOSITORY_OPERATION_LOCK:
             depths = getattr(_REPOSITORY_OPERATION_STATE, "depths", {})
             depth = depths.get(key, 0)
@@ -542,6 +705,32 @@ class SQLiteRepository:
                         depths[key] = depth
                     else:
                         del depths[key]
+
+    def _operation_key(self) -> str:
+        return str(self.db_path.parent.absolute())
+
+    def _pinned_database_identity(self) -> _DatabaseIdentity | None:
+        pins = getattr(_REPOSITORY_OPERATION_STATE, "database_pins", {})
+        identity = pins.get(self._operation_key())
+        return identity if isinstance(identity, _DatabaseIdentity) else None
+
+    def _active_history_plan_binding(
+        self,
+    ) -> tuple[HistoryPlan, str] | None:
+        bindings = getattr(
+            _REPOSITORY_OPERATION_STATE,
+            "history_plan_bindings",
+            {},
+        )
+        binding = bindings.get(self._operation_key())
+        if (
+            isinstance(binding, tuple)
+            and len(binding) == 2
+            and isinstance(binding[0], HistoryPlan)
+            and isinstance(binding[1], str)
+        ):
+            return binding
+        return None
 
     def _open_repository_lock(self) -> int:
         workspace = self.db_path.parent.parent
@@ -576,8 +765,12 @@ class SQLiteRepository:
         directory_descriptor = open_managed_directory(self.db_path.parent)
         try:
             self._verify_current_database_directory(directory_descriptor)
-            identity = self._validate_or_create_main_database(directory_descriptor)
+            self._validate_or_create_main_database(directory_descriptor)
             self._ensure_database_sidecars(directory_descriptor)
+            identity = self._capture_database_identity(
+                directory_descriptor,
+                require_complete=True,
+            )
             self._validate_database_family(directory_descriptor, identity, "before connect")
             return directory_descriptor, identity
         except Exception:
@@ -647,7 +840,7 @@ class SQLiteRepository:
         if row[0].casefold() != "wal":
             conn.execute("PRAGMA journal_mode = PERSIST")
 
-    def _validate_or_create_main_database(self, directory_descriptor: int) -> _DatabaseIdentity:
+    def _validate_or_create_main_database(self, directory_descriptor: int) -> None:
         name = self.db_path.name
         stat_result = self._validated_family_entry(directory_descriptor, name)
         if stat_result is None:
@@ -678,7 +871,6 @@ class SQLiteRepository:
                 os.close(descriptor)
         if not S_ISREG(stat_result.st_mode) or stat_result.st_nlink != 1:
             raise self._unsafe_path_error(name)
-        return _DatabaseIdentity(stat_result.st_dev, stat_result.st_ino)
 
     def _validate_database_family(
         self,
@@ -686,12 +878,145 @@ class SQLiteRepository:
         identity: _DatabaseIdentity,
         stage: str,
     ) -> None:
+        self._validate_database_main_identity(
+            directory_descriptor,
+            identity,
+            stage,
+        )
+        for suffix, expected_device, expected_inode in identity.sidecars:
+            sidecar = self._validated_family_entry(
+                directory_descriptor,
+                f"{self.db_path.name}{suffix}",
+            )
+            if sidecar is None:
+                if expected_device is not None or expected_inode is not None:
+                    raise self._changed_database_error(stage)
+            elif (
+                expected_device is None
+                or expected_inode is None
+                or (sidecar.st_dev, sidecar.st_ino)
+                != (expected_device, expected_inode)
+            ):
+                raise self._changed_database_error(stage)
+
+    def _validate_database_main_identity(
+        self,
+        directory_descriptor: int,
+        identity: _DatabaseIdentity,
+        stage: str,
+    ) -> None:
         self._verify_current_database_directory(directory_descriptor)
-        main = self._validated_family_entry(directory_descriptor, self.db_path.name)
-        if main is None or (main.st_dev, main.st_ino) != (identity.device, identity.inode):
+        directory = os.fstat(directory_descriptor)
+        if (
+            directory.st_dev,
+            directory.st_ino,
+        ) != (
+            identity.directory_device,
+            identity.directory_inode,
+        ):
             raise self._changed_database_error(stage)
+        main = self._validated_family_entry(
+            directory_descriptor,
+            self.db_path.name,
+        )
+        if (
+            main is None
+            or (main.st_dev, main.st_ino)
+            != (identity.device, identity.inode)
+        ):
+            raise self._changed_database_error(stage)
+
+    def _capture_database_identity(
+        self,
+        directory_descriptor: int,
+        *,
+        require_complete: bool,
+    ) -> _DatabaseIdentity:
+        directory = os.fstat(directory_descriptor)
+        if not S_ISDIR(directory.st_mode):
+            raise self._changed_database_error("before connect")
+        main = self._validated_family_entry(
+            directory_descriptor,
+            self.db_path.name,
+        )
+        if main is None:
+            raise self._changed_database_error("before connect")
+        sidecars: list[tuple[str, int | None, int | None]] = []
         for suffix in _DATABASE_SIDECARS:
-            self._validated_family_entry(directory_descriptor, f"{self.db_path.name}{suffix}")
+            sidecar = self._validated_family_entry(
+                directory_descriptor,
+                f"{self.db_path.name}{suffix}",
+            )
+            if sidecar is None:
+                if require_complete:
+                    raise self._changed_database_error("before connect")
+                sidecars.append((suffix, None, None))
+            else:
+                sidecars.append(
+                    (suffix, sidecar.st_dev, sidecar.st_ino)
+                )
+        return _DatabaseIdentity(
+            directory_device=directory.st_dev,
+            directory_inode=directory.st_ino,
+            device=main.st_dev,
+            inode=main.st_ino,
+            sidecars=tuple(sidecars),
+        )
+
+    def _history_database_family(
+        self,
+        identity: _DatabaseIdentity,
+    ) -> HistoryDatabaseFamilyIdentity:
+        sidecars: list[HistoryDatabaseSidecarIdentity] = []
+        for suffix, device, inode in identity.sidecars:
+            if device is None or inode is None:
+                raise RepositoryError(
+                    "history database family is incomplete"
+                )
+            sidecars.append(
+                HistoryDatabaseSidecarIdentity(suffix, device, inode)
+            )
+        return HistoryDatabaseFamilyIdentity(
+            directory_device=identity.directory_device,
+            directory_inode=identity.directory_inode,
+            main_device=identity.device,
+            main_inode=identity.inode,
+            sidecars=tuple(sidecars),
+        )
+
+    def _database_identity_from_history(
+        self,
+        identity: HistoryDatabaseFamilyIdentity,
+    ) -> _DatabaseIdentity:
+        if (
+            not isinstance(identity, HistoryDatabaseFamilyIdentity)
+            or type(identity.directory_device) is not int
+            or type(identity.directory_inode) is not int
+            or type(identity.main_device) is not int
+            or type(identity.main_inode) is not int
+            or not isinstance(identity.sidecars, tuple)
+            or tuple(sidecar.suffix for sidecar in identity.sidecars)
+            != _DATABASE_SIDECARS
+            or any(
+                not isinstance(sidecar, HistoryDatabaseSidecarIdentity)
+                or type(sidecar.device) is not int
+                or type(sidecar.inode) is not int
+                for sidecar in identity.sidecars
+            )
+        ):
+            raise RepositoryError(
+                "history database family identity is invalid"
+            )
+        return _DatabaseIdentity(
+            directory_device=identity.directory_device,
+            directory_inode=identity.directory_inode,
+            device=identity.main_device,
+            inode=identity.main_inode,
+            sidecars=tuple(
+                (sidecar.suffix, sidecar.device, sidecar.inode)
+                for sidecar in identity.sidecars
+            ),
+        )
 
     def _validated_family_entry(self, directory_descriptor: int, name: str) -> os.stat_result | None:
         try:
@@ -1616,9 +1941,15 @@ class SQLiteRepository:
                 """
                 UPDATE history_cleanup_plans
                 SET export_receipt_hash = ?
-                WHERE id = ? AND manifest_hash = ? AND status = 'planned'
+                WHERE id = ?
+                  AND manifest_hash = ?
+                  AND status = 'planned'
+                  AND (
+                      export_receipt_hash IS NULL
+                      OR export_receipt_hash = ?
+                  )
                 """,
-                (receipt_hash, plan_id, manifest_hash),
+                (receipt_hash, plan_id, manifest_hash, receipt_hash),
             )
             if cursor.rowcount != 1:
                 raise RepositoryError(
@@ -1706,15 +2037,32 @@ class SQLiteRepository:
         self,
         plan_id: str,
         unit_ids: tuple[tuple[str, str], ...],
+        *,
+        expected_plan: HistoryPlan | None = None,
+        expected_receipt_hash: str | None = None,
+        expected_execution_id: str | None = None,
     ) -> Literal["not_committed", "committed", "indeterminate"]:
         try:
             self._validate_history_hex(plan_id, 32)
             self._validate_history_unit_ids(unit_ids)
+            if expected_plan is not None:
+                if expected_receipt_hash is None:
+                    return "indeterminate"
+                self._validate_history_hex(expected_receipt_hash, 64)
+                if expected_execution_id is not None:
+                    self._validate_history_hex(expected_execution_id, 32)
+            elif (
+                expected_receipt_hash is not None
+                or expected_execution_id is not None
+            ):
+                return "indeterminate"
             with self._existing_read_connection() as conn:
                 row = conn.execute(
                     """
-                    SELECT policy_hash, manifest_hash, canonical_policy_json,
-                           canonical_units_json, manifest_relative_path, status
+                    SELECT id, policy_hash, manifest_hash,
+                           canonical_policy_json, canonical_units_json,
+                           manifest_relative_path, status,
+                           export_receipt_hash, execution_id
                     FROM history_cleanup_plans
                     WHERE id = ?
                     """,
@@ -1725,7 +2073,21 @@ class SQLiteRepository:
                 status = self._required_text(row, "status")
                 if status not in {"planned", "completed"}:
                     return "indeterminate"
-                _, units = self._hydrate_history_plan_binding(row)
+                if expected_plan is None:
+                    _, units = self._hydrate_history_plan_binding(row)
+                    stored_execution_id = self._optional_text(
+                        row,
+                        "execution_id",
+                    )
+                else:
+                    _, units, stored_execution_id = (
+                        self._assert_exact_history_plan_row(
+                            row,
+                            expected_plan,
+                            expected_receipt_hash,
+                            allowed_statuses=("planned", "completed"),
+                        )
+                    )
                 stored_unit_ids = tuple(
                     (unit.kind, unit.row_id)
                     for unit in units
@@ -1738,9 +2100,23 @@ class SQLiteRepository:
                 )
         except Exception:
             return "indeterminate"
-        if status == "planned" and all(presence):
+        if (
+            status == "planned"
+            and stored_execution_id is None
+            and all(presence)
+        ):
             return "not_committed"
-        if status == "completed" and not any(presence):
+        if (
+            status == "completed"
+            and (
+                expected_plan is None
+                or (
+                    expected_execution_id is not None
+                    and stored_execution_id == expected_execution_id
+                )
+            )
+            and not any(presence)
+        ):
             return "committed"
         return "indeterminate"
 
@@ -1758,7 +2134,7 @@ class SQLiteRepository:
                         read_only=False,
                     )
                     conn.execute("VACUUM")
-                    self._validate_database_family(
+                    self._validate_database_main_identity(
                         directory_descriptor,
                         identity,
                         "after VACUUM",
@@ -2105,8 +2481,9 @@ class SQLiteRepository:
         self._validate_history_unit_ids(unit_ids)
         row = conn.execute(
             """
-            SELECT policy_hash, manifest_hash, canonical_policy_json,
-                   canonical_units_json, manifest_relative_path, status
+            SELECT id, policy_hash, manifest_hash, canonical_policy_json,
+                   canonical_units_json, manifest_relative_path, status,
+                   export_receipt_hash, execution_id
             FROM history_cleanup_plans
             WHERE id = ?
             """,
@@ -2120,13 +2497,107 @@ class SQLiteRepository:
             raise self._semantic_error() from error
         if status != "planned":
             raise RepositoryError("history cleanup plan is no longer current")
-        policy, units = self._hydrate_history_plan_binding(row)
+        active_binding = self._active_history_plan_binding()
+        if active_binding is None:
+            policy, units = self._hydrate_history_plan_binding(row)
+        else:
+            expected_plan, expected_receipt_hash = active_binding
+            if expected_plan.id != plan_id:
+                raise RepositoryError(
+                    "history cleanup plan binding is inconsistent"
+                )
+            policy, units, execution_id = (
+                self._assert_exact_history_plan_row(
+                    row,
+                    expected_plan,
+                    expected_receipt_hash,
+                    allowed_statuses=("planned",),
+                )
+            )
+            if execution_id is not None:
+                raise RepositoryError(
+                    "history cleanup plan binding is inconsistent"
+                )
         stored_unit_ids = tuple((unit.kind, unit.row_id) for unit in units)
         if not unit_ids or unit_ids != stored_unit_ids:
             raise RepositoryError(
                 "history cleanup requires the plan's exact ordered unit set"
             )
         return policy
+
+    def _assert_exact_history_plan_row(
+        self,
+        row: sqlite3.Row,
+        expected_plan: HistoryPlan,
+        expected_receipt_hash: str,
+        *,
+        allowed_statuses: tuple[str, ...],
+    ) -> tuple[HistoryPolicy, tuple[HistoryUnit, ...], str | None]:
+        (
+            canonical_policy_json,
+            canonical_units_json,
+            policy_hash,
+            manifest_hash,
+        ) = self._canonical_history_plan_metadata(
+            expected_plan.policy,
+            expected_plan.units,
+        )
+        self._validate_history_hex(expected_receipt_hash, 64)
+        expected_manifest_path = (
+            Path("reviews")
+            / "history-plans"
+            / f"plan-{expected_plan.id}-{expected_plan.manifest_hash}.json"
+        ).as_posix()
+        try:
+            stored_id = self._required_text(row, "id")
+            stored_policy_hash = self._required_text(row, "policy_hash")
+            stored_manifest_hash = self._required_text(
+                row,
+                "manifest_hash",
+            )
+            stored_policy_json = self._optional_text(
+                row,
+                "canonical_policy_json",
+            )
+            stored_units_json = self._optional_text(
+                row,
+                "canonical_units_json",
+            )
+            stored_manifest_path = self._optional_text(
+                row,
+                "manifest_relative_path",
+            )
+            stored_status = self._required_text(row, "status")
+            stored_receipt_hash = self._optional_text(
+                row,
+                "export_receipt_hash",
+            )
+            stored_execution_id = self._optional_text(
+                row,
+                "execution_id",
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise RepositoryError(
+                "history cleanup plan binding is inconsistent"
+            ) from error
+        policy, units = self._hydrate_history_plan_binding(row)
+        if (
+            expected_plan.manifest_hash != manifest_hash
+            or stored_id != expected_plan.id
+            or stored_policy_hash != policy_hash
+            or stored_manifest_hash != manifest_hash
+            or stored_policy_json != canonical_policy_json
+            or stored_units_json != canonical_units_json
+            or stored_manifest_path != expected_manifest_path
+            or stored_status not in allowed_statuses
+            or stored_receipt_hash != expected_receipt_hash
+            or policy != expected_plan.policy
+            or units != expected_plan.units
+        ):
+            raise RepositoryError(
+                "history cleanup plan binding is inconsistent"
+            )
+        return policy, units, stored_execution_id
 
     def _hydrate_history_plan_binding(
         self,

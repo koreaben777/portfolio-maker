@@ -51,6 +51,22 @@ class QuarantinedHistoryUnit:
 
 
 @dataclass(frozen=True)
+class HistoryDatabaseSidecarIdentity:
+    suffix: str
+    device: int
+    inode: int
+
+
+@dataclass(frozen=True)
+class HistoryDatabaseFamilyIdentity:
+    directory_device: int
+    directory_inode: int
+    main_device: int
+    main_inode: int
+    sidecars: tuple[HistoryDatabaseSidecarIdentity, ...]
+
+
+@dataclass(frozen=True)
 class HistoryCleanupJournal:
     execution_id: str
     plan_id: str
@@ -58,6 +74,9 @@ class HistoryCleanupJournal:
     state: CleanupExecutionState
     units: tuple[HistoryUnit, ...]
     moved_units: tuple[QuarantinedHistoryUnit, ...]
+    export_receipt_hash: str
+    database_family: HistoryDatabaseFamilyIdentity
+    pending_move: QuarantinedHistoryUnit | None = None
 
 
 @dataclass(frozen=True)
