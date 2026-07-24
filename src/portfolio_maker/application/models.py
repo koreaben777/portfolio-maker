@@ -4,6 +4,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
+from portfolio_maker.domain.history_models import CleanupExecutionState
+
 
 ArtifactKind = Literal[
     "master_profile",
@@ -197,8 +199,28 @@ class HistoryExportRequest:
 class HistoryApplyRequest:
     workspace: Path
     plan_id: str
-    export_receipt_hash: str
+    export_receipt_hash: str | None
     confirmation: str
+
+
+@dataclass(frozen=True)
+class HistoryExportResult:
+    plan_id: str
+    receipt_hash: str
+    archive_path: Path = field(repr=False, compare=False)
+
+
+@dataclass(frozen=True)
+class HistoryExecutionRequest:
+    workspace: Path
+    execution_id: str
+
+
+@dataclass(frozen=True)
+class HistoryApplyResult:
+    execution_id: str
+    state: CleanupExecutionState
+    affected_count: int
 
 
 @dataclass(frozen=True)

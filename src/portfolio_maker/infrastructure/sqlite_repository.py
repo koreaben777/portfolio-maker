@@ -12,6 +12,7 @@ import sqlite3
 import threading
 from pathlib import Path
 from stat import S_ISDIR, S_ISREG
+from typing import Literal
 
 from portfolio_maker.domain.history_models import (
     CleanupExecutionState,
@@ -422,6 +423,35 @@ class SQLiteRepository:
                     conn.close()
 
     @contextmanager
+    def _existing_read_connection(self) -> Iterator[sqlite3.Connection]:
+        with self._existing_database_operation() as (
+            directory_descriptor,
+            identity,
+        ):
+            conn: sqlite3.Connection | None = None
+            try:
+                conn = self._connect_validated(
+                    directory_descriptor,
+                    identity,
+                    read_only=True,
+                )
+                yield conn
+                self._validate_database_family(
+                    directory_descriptor,
+                    identity,
+                    "after read",
+                )
+            except RepositoryError:
+                raise
+            except sqlite3.Error as error:
+                raise self._repository_error(error) from error
+            except OSError as error:
+                raise self._unsafe_path_error(self.db_path.name) from error
+            finally:
+                if conn is not None:
+                    conn.close()
+
+    @contextmanager
     def _database_operation(self) -> Iterator[tuple[int, _DatabaseIdentity]]:
         with self._repository_critical_section() as outermost:
             directory_descriptor, identity = self._open_database_family(
@@ -439,6 +469,48 @@ class SQLiteRepository:
                         self._unlock_database_directory(directory_descriptor)
                 finally:
                     os.close(directory_descriptor)
+
+    @contextmanager
+    def _existing_database_operation(
+        self,
+    ) -> Iterator[tuple[int, _DatabaseIdentity]]:
+        with self._repository_critical_section() as outermost:
+            directory_descriptor: int | None = None
+            directory_locked = False
+            try:
+                directory_descriptor = open_managed_directory(
+                    self.db_path.parent
+                )
+                self._verify_current_database_directory(directory_descriptor)
+                main = self._validated_family_entry(
+                    directory_descriptor,
+                    self.db_path.name,
+                )
+                if main is None:
+                    raise self._changed_database_error("before connect")
+                identity = _DatabaseIdentity(main.st_dev, main.st_ino)
+                self._validate_database_family(
+                    directory_descriptor,
+                    identity,
+                    "before connect",
+                )
+                if outermost:
+                    self._lock_database_directory(directory_descriptor)
+                    directory_locked = True
+                yield directory_descriptor, identity
+            except RepositoryError:
+                raise
+            except OSError as error:
+                raise self._unsafe_path_error(self.db_path.name) from error
+            finally:
+                if directory_descriptor is not None:
+                    try:
+                        if directory_locked:
+                            self._unlock_database_directory(
+                                directory_descriptor
+                            )
+                    finally:
+                        os.close(directory_descriptor)
 
     @contextmanager
     def _repository_critical_section(self) -> Iterator[bool]:
@@ -1497,6 +1569,211 @@ class SQLiteRepository:
             raise RepositoryError("history cleanup plan was not found")
         return plan
 
+    def assert_history_plan_binding(
+        self,
+        plan: HistoryPlan,
+        *,
+        allowed_statuses: tuple[str, ...] = ("planned",),
+    ) -> dict[str, object]:
+        (
+            canonical_policy_json,
+            canonical_units_json,
+            policy_hash,
+            manifest_hash,
+        ) = self._canonical_history_plan_metadata(plan.policy, plan.units)
+        if plan.manifest_hash != manifest_hash:
+            raise RepositoryError("history cleanup plan binding is inconsistent")
+        stored = self.find_history_plan(plan.id)
+        expected_manifest_path = (
+            Path("reviews")
+            / "history-plans"
+            / f"plan-{plan.id}-{plan.manifest_hash}.json"
+        ).as_posix()
+        if (
+            stored is None
+            or stored["id"] != plan.id
+            or stored["policy_hash"] != policy_hash
+            or stored["manifest_hash"] != manifest_hash
+            or stored["canonical_policy_json"] != canonical_policy_json
+            or stored["canonical_units_json"] != canonical_units_json
+            or stored["manifest_relative_path"] != expected_manifest_path
+            or stored["status"] not in allowed_statuses
+        ):
+            raise RepositoryError("history cleanup plan binding is inconsistent")
+        return stored
+
+    def record_history_export_receipt(
+        self,
+        plan_id: str,
+        manifest_hash: str,
+        receipt_hash: str,
+    ) -> None:
+        self._validate_history_hex(plan_id, 32)
+        self._validate_history_hex(manifest_hash, 64)
+        self._validate_history_hex(receipt_hash, 64)
+        with self._connection() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE history_cleanup_plans
+                SET export_receipt_hash = ?
+                WHERE id = ? AND manifest_hash = ? AND status = 'planned'
+                """,
+                (receipt_hash, plan_id, manifest_hash),
+            )
+            if cursor.rowcount != 1:
+                raise RepositoryError(
+                    "history export receipt could not be bound to the exact plan"
+                )
+
+    def export_receipt_matches(
+        self,
+        plan_id: str,
+        manifest_hash: str,
+        receipt_hash: str,
+    ) -> bool:
+        try:
+            self._validate_history_hex(plan_id, 32)
+            self._validate_history_hex(manifest_hash, 64)
+            self._validate_history_hex(receipt_hash, 64)
+            with self._existing_read_connection() as conn:
+                row = conn.execute(
+                    """
+                    SELECT id, manifest_hash, status, export_receipt_hash
+                    FROM history_cleanup_plans
+                    WHERE id = ?
+                    """,
+                    (plan_id,),
+                ).fetchone()
+                if row is None:
+                    return False
+                stored_id = self._required_text(row, "id")
+                stored_manifest_hash = self._required_text(
+                    row,
+                    "manifest_hash",
+                )
+                status = self._required_text(row, "status")
+                stored_receipt_hash = self._optional_text(
+                    row,
+                    "export_receipt_hash",
+                )
+        except Exception:
+            return False
+        return (
+            stored_id == plan_id
+            and stored_manifest_hash == manifest_hash
+            and status == "planned"
+            and stored_receipt_hash == receipt_hash
+        )
+
+    def assert_export_receipt(
+        self,
+        plan_id: str,
+        receipt_hash: str | None,
+    ) -> None:
+        if receipt_hash is None:
+            raise RepositoryError("history export receipt is required")
+        try:
+            self._validate_history_hex(receipt_hash, 64)
+        except RepositoryError as error:
+            raise RepositoryError("history export receipt does not match") from error
+        stored = self.find_history_plan(plan_id)
+        if (
+            stored is None
+            or stored["status"] != "planned"
+            or stored["export_receipt_hash"] != receipt_hash
+        ):
+            raise RepositoryError("history export receipt does not match")
+
+    def backup_bytes(self) -> bytes:
+        destination: sqlite3.Connection | None = None
+        try:
+            destination = sqlite3.connect(":memory:")
+            with self._existing_read_connection() as source:
+                source.backup(destination)
+            backup = destination.serialize()
+            if not backup:
+                raise RepositoryError("history export database backup is empty")
+            return backup
+        except RepositoryError:
+            raise
+        except sqlite3.Error as error:
+            raise self._repository_error(error) from error
+        finally:
+            if destination is not None:
+                destination.close()
+
+    def classify_history_cleanup_outcome(
+        self,
+        plan_id: str,
+        unit_ids: tuple[tuple[str, str], ...],
+    ) -> Literal["not_committed", "committed", "indeterminate"]:
+        try:
+            self._validate_history_hex(plan_id, 32)
+            self._validate_history_unit_ids(unit_ids)
+            with self._existing_read_connection() as conn:
+                row = conn.execute(
+                    """
+                    SELECT policy_hash, manifest_hash, canonical_policy_json,
+                           canonical_units_json, manifest_relative_path, status
+                    FROM history_cleanup_plans
+                    WHERE id = ?
+                    """,
+                    (plan_id,),
+                ).fetchone()
+                if row is None:
+                    return "indeterminate"
+                status = self._required_text(row, "status")
+                if status not in {"planned", "completed"}:
+                    return "indeterminate"
+                _, units = self._hydrate_history_plan_binding(row)
+                stored_unit_ids = tuple(
+                    (unit.kind, unit.row_id)
+                    for unit in units
+                )
+                if not unit_ids or stored_unit_ids != unit_ids:
+                    return "indeterminate"
+                presence = tuple(
+                    self._history_unit_exists(conn, kind, row_id)
+                    for kind, row_id in unit_ids
+                )
+        except Exception:
+            return "indeterminate"
+        if status == "planned" and all(presence):
+            return "not_committed"
+        if status == "completed" and not any(presence):
+            return "committed"
+        return "indeterminate"
+
+    def vacuum(self) -> None:
+        conn: sqlite3.Connection | None = None
+        try:
+            with self._existing_database_operation() as (
+                directory_descriptor,
+                identity,
+            ):
+                try:
+                    conn = self._connect_validated(
+                        directory_descriptor,
+                        identity,
+                        read_only=False,
+                    )
+                    conn.execute("VACUUM")
+                    self._validate_database_family(
+                        directory_descriptor,
+                        identity,
+                        "after VACUUM",
+                    )
+                finally:
+                    if conn is not None:
+                        conn.close()
+                        conn = None
+        except RepositoryError:
+            raise
+        except sqlite3.Error as error:
+            raise self._repository_error(error) from error
+        except OSError as error:
+            raise self._unsafe_path_error(self.db_path.name) from error
+
     def record_history_journal_entry(
         self,
         execution_id: str,
@@ -1535,7 +1812,10 @@ class SQLiteRepository:
         self,
         plan_id: str,
         unit_ids: tuple[tuple[str, str], ...],
+        execution_id: str | None = None,
     ) -> None:
+        if execution_id is not None:
+            self._validate_history_hex(execution_id, 32)
         with self._connection() as conn:
             policy = self._assert_history_plan_is_current(conn, plan_id, unit_ids)
             self._assert_no_history_unit_is_now_protected(conn, unit_ids, policy)
@@ -1543,10 +1823,10 @@ class SQLiteRepository:
             conn.execute(
                 """
                 UPDATE history_cleanup_plans
-                SET status = 'completed', completed_at = ?
+                SET status = 'completed', execution_id = ?, completed_at = ?
                 WHERE id = ?
                 """,
-                (utc_now(), plan_id),
+                (execution_id, utc_now(), plan_id),
             )
 
     def _hydrate_vision_analysis(self, row: sqlite3.Row) -> dict[str, object]:
@@ -1602,6 +1882,15 @@ class SQLiteRepository:
             and policy.retain_incomplete_vision_requests
         ):
             raise RepositoryError("history policy disables mandatory retention")
+
+    @staticmethod
+    def _validate_history_hex(value: object, length: int) -> None:
+        if (
+            not isinstance(value, str)
+            or len(value) != length
+            or any(character not in "0123456789abcdef" for character in value)
+        ):
+            raise RepositoryError("history cleanup identifier or hash is invalid")
 
     @staticmethod
     def _validate_history_unit_ids(

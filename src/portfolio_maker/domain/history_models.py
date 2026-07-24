@@ -25,6 +25,7 @@ class CleanupExecutionState(StrEnum):
     PLANNED = "planned"
     EXPORTED = "exported"
     QUARANTINED = "quarantined"
+    RECONCILIATION_REQUIRED = "reconciliation_required"
     COMMITTED_PENDING_PURGE = "committed_pending_purge"
     PURGED = "purged"
     RESTORED = "restored"
@@ -41,6 +42,22 @@ class HistoryUnit:
     device: int
     inode: int
     reason: str
+
+
+@dataclass(frozen=True)
+class QuarantinedHistoryUnit:
+    unit: HistoryUnit
+    quarantine_relative_path: str
+
+
+@dataclass(frozen=True)
+class HistoryCleanupJournal:
+    execution_id: str
+    plan_id: str
+    manifest_hash: str
+    state: CleanupExecutionState
+    units: tuple[HistoryUnit, ...]
+    moved_units: tuple[QuarantinedHistoryUnit, ...]
 
 
 @dataclass(frozen=True)
