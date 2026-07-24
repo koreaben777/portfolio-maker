@@ -277,7 +277,7 @@ class CommitOutcomeAmbiguousError(RepositoryError):
     pass
 
 
-class DatabaseFamilyChangedError(CommitOutcomeAmbiguousError):
+class DatabaseFamilyChangedError(RepositoryError):
     pass
 
 
@@ -364,6 +364,10 @@ class SQLiteRepository:
                     commit_started = True
                     conn.commit()
                     self._validate_database_family(directory_descriptor, identity, "after commit")
+                except BaseException:
+                    if not commit_started:
+                        self._rollback(conn)
+                    raise
                 finally:
                     if conn is not None:
                         conn.close()

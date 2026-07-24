@@ -637,6 +637,85 @@ def test_repository_does_not_classify_precommit_close_failure_as_ambiguous(
     assert isinstance(captured.value.__context__, ValueError)
 
 
+def test_history_plan_removes_manifest_after_precommit_database_change(
+    workspace,
+    tmp_path,
+    monkeypatch,
+) -> None:
+    state = _seed_old_unreferenced_snapshot(workspace)
+    write_sample_history_policy(state.paths)
+    replacement = tmp_path / "replacement.db"
+    with sqlite3.connect(state.paths.db_path) as visible:
+        with sqlite3.connect(replacement) as replacement_connection:
+            visible.backup(replacement_connection)
+    original_connect = sqlite3.connect
+    real_find_history_plan = SQLiteRepository.find_history_plan
+    real_validate_database_family = SQLiteRepository._validate_database_family
+    replaced = False
+    lookup_calls: list[str] = []
+
+    def replace_before_commit(
+        self,
+        directory_descriptor,
+        identity,
+        stage,
+    ):
+        nonlocal replaced
+        if stage == "before commit" and not replaced:
+            replaced = True
+            os.replace(replacement, state.paths.db_path)
+        return real_validate_database_family(
+            self,
+            directory_descriptor,
+            identity,
+            stage,
+        )
+
+    def count_lookup(self, plan_id):
+        lookup_calls.append(plan_id)
+        return real_find_history_plan(self, plan_id)
+
+    monkeypatch.setattr(
+        SQLiteRepository,
+        "_lock_database_directory",
+        lambda self, directory_descriptor: None,
+    )
+    monkeypatch.setattr(SQLiteRepository, "initialize", lambda self: None)
+    monkeypatch.setattr(
+        SQLiteRepository,
+        "_validate_database_family",
+        replace_before_commit,
+    )
+    monkeypatch.setattr(
+        SQLiteRepository,
+        "find_history_plan",
+        count_lookup,
+    )
+
+    with pytest.raises(HistoryError, match="planning failed safely") as captured:
+        plan_history_cleanup(HistoryPlanRequest(workspace=workspace))
+
+    assert type(captured.value.__cause__) is DatabaseFamilyChangedError
+    with original_connect(state.paths.db_path) as visible_connection:
+        visible_rows = visible_connection.execute(
+            "SELECT COUNT(*) FROM history_cleanup_plans"
+        ).fetchone()[0]
+    plan_files = list(state.paths.history_plans_dir.glob("plan-*.json"))
+    report_files = list(
+        state.paths.reviews_dir.glob("history-plan-*-report.md")
+    )
+
+    assert replaced is True
+    assert (visible_rows, len(plan_files), len(report_files), len(lookup_calls)) == (
+        0,
+        0,
+        0,
+        1,
+    )
+    assert state.old_path.exists()
+    assert state.latest_path.exists()
+
+
 def test_history_plan_preserves_manifest_when_database_replaced_during_commit(
     workspace,
     tmp_path,
@@ -650,7 +729,9 @@ def test_history_plan_preserves_manifest_when_database_replaced_during_commit(
         with sqlite3.connect(replacement) as replacement_connection:
             visible.backup(replacement_connection)
     original_connect = sqlite3.connect
+    real_find_history_plan = SQLiteRepository.find_history_plan
     replaced = False
+    lookup_calls: list[str] = []
 
     def connect_with_replacement_trace(path, *args, **kwargs):
         connection = original_connect(path, *args, **kwargs)
@@ -665,6 +746,10 @@ def test_history_plan_preserves_manifest_when_database_replaced_during_commit(
         connection.set_trace_callback(replace_on_commit)
         return connection
 
+    def count_lookup(self, plan_id):
+        lookup_calls.append(plan_id)
+        return real_find_history_plan(self, plan_id)
+
     monkeypatch.setattr(SQLiteRepository, "initialize", lambda self: None)
     monkeypatch.setattr(
         SQLiteRepository,
@@ -675,11 +760,18 @@ def test_history_plan_preserves_manifest_when_database_replaced_during_commit(
         "portfolio_maker.infrastructure.sqlite_repository.sqlite3.connect",
         connect_with_replacement_trace,
     )
+    monkeypatch.setattr(
+        SQLiteRepository,
+        "find_history_plan",
+        count_lookup,
+    )
 
     with pytest.raises(HistoryError, match="planning failed safely") as captured:
         plan_history_cleanup(HistoryPlanRequest(workspace=workspace))
 
-    assert type(captured.value.__cause__) is DatabaseFamilyChangedError
+    ambiguous_error = captured.value.__cause__
+    assert type(ambiguous_error) is CommitOutcomeAmbiguousError
+    assert type(ambiguous_error.__cause__) is DatabaseFamilyChangedError
     with original_connect(displaced) as displaced_connection:
         displaced_rows = displaced_connection.execute(
             "SELECT COUNT(*) FROM history_cleanup_plans"
@@ -695,7 +787,7 @@ def test_history_plan_preserves_manifest_when_database_replaced_during_commit(
 
     assert replaced is True
     assert (displaced_rows, visible_rows) == (1, 0)
-    assert (len(plan_files), len(report_files)) == (1, 0)
+    assert (len(plan_files), len(report_files), len(lookup_calls)) == (1, 0, 0)
     assert state.old_path.exists()
     assert state.latest_path.exists()
 

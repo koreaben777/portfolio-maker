@@ -3107,6 +3107,40 @@ def test_sqlite_repository_rolls_back_when_database_replaced_before_commit(
     assert repository.list_sources()[0].status == SourceStatus.DISCOVERED
 
 
+def test_precommit_failure_rolls_back_before_connection_close(
+    workspace,
+    monkeypatch,
+) -> None:
+    paths = WorkspacePaths.from_root(workspace)
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    original_connect = sqlite3.connect
+    events: list[str] = []
+
+    class RecordingConnection(sqlite3.Connection):
+        def rollback(self) -> None:
+            events.append("rollback")
+            super().rollback()
+
+        def close(self) -> None:
+            events.append("close")
+            super().close()
+
+    def connect_with_event_recording(*args, **kwargs):
+        return original_connect(*args, **kwargs, factory=RecordingConnection)
+
+    monkeypatch.setattr(
+        "portfolio_maker.infrastructure.sqlite_repository.sqlite3.connect",
+        connect_with_event_recording,
+    )
+
+    with pytest.raises(ValueError, match="injected precommit failure"):
+        with repository._connection():
+            raise ValueError("injected precommit failure")
+
+    assert events[:2] == ["rollback", "close"]
+
+
 def test_sqlite_repository_maps_invalid_existing_enum_row_to_controlled_error(workspace):
     paths = WorkspacePaths.from_root(workspace)
     paths.ensure()
