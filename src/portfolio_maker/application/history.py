@@ -215,7 +215,7 @@ def export_history_plan(request: HistoryExportRequest) -> HistoryExportResult:
                 raise HistoryError(
                     "history cleanup plan binding changed during export"
                 ) from error
-            archive_path, receipt_hash = store.create_export_archive(
+            archive_binding, receipt_hash = store.create_export_archive(
                 plan,
                 request.backup_dir,
                 database_backup,
@@ -227,6 +227,7 @@ def export_history_plan(request: HistoryExportRequest) -> HistoryExportResult:
                     plan.id,
                     plan.manifest_hash,
                     receipt_hash,
+                    archive_binding,
                 )
             except (CommitOutcomeAmbiguousError, RepositoryError) as error:
                 try:
@@ -234,6 +235,7 @@ def export_history_plan(request: HistoryExportRequest) -> HistoryExportResult:
                         plan.id,
                         plan.manifest_hash,
                         receipt_hash,
+                        archive_binding,
                     )
                 except Exception:
                     receipt_confirmed = False
@@ -241,7 +243,18 @@ def export_history_plan(request: HistoryExportRequest) -> HistoryExportResult:
                     raise HistoryError(
                         "history export receipt could not be confirmed"
                     ) from error
-            return HistoryExportResult(plan.id, receipt_hash, archive_path)
+            try:
+                with store.open_verified_export_archive(archive_binding):
+                    pass
+            except OSError as error:
+                raise HistoryError(
+                    "history export archive changed before publication"
+                ) from error
+            return HistoryExportResult(
+                plan.id,
+                receipt_hash,
+                Path(archive_binding.archive_path),
+            )
     except HistoryError:
         raise
     except (OSError, RepositoryError, TypeError, ValueError) as error:
@@ -261,7 +274,7 @@ def apply_history_plan(request: HistoryApplyRequest) -> HistoryApplyResult:
                 allowed_statuses=("planned",),
             )
             try:
-                repository.assert_export_receipt(
+                archive_binding = repository.authorize_history_export_receipt(
                     plan.id,
                     request.export_receipt_hash,
                 )
@@ -281,6 +294,12 @@ def apply_history_plan(request: HistoryApplyRequest) -> HistoryApplyResult:
                     "managed history plan is stale or unsafe"
                 ) from error
 
+            try:
+                with store.open_verified_export_archive(archive_binding):
+                    pass
+            except OSError as error:
+                raise HistoryError("history export archive is unsafe") from error
+
             execution_id = uuid4().hex
             journal = HistoryCleanupJournal(
                 execution_id=execution_id,
@@ -294,9 +313,10 @@ def apply_history_plan(request: HistoryApplyRequest) -> HistoryApplyResult:
             )
             journal_created = False
             try:
-                store.write_journal(journal, create=True)
-                journal_created = True
-                journal = store.move_units_to_quarantine(journal)
+                with store.open_verified_export_archive(archive_binding):
+                    store.write_journal(journal, create=True)
+                    journal_created = True
+                    journal = store.move_units_to_quarantine(journal)
             except Exception as error:
                 if not journal_created:
                     raise HistoryError(

@@ -209,8 +209,26 @@ def test_history_export_receipt_requires_an_immutable_full_archive_binding(
         archive_device=105,
         archive_inode=106,
         size=107,
-        sha256="c" * 64,
+        sha256=receipt_hash,
     )
+
+    with pytest.raises(RepositoryError, match="archive binding"):
+        repository.record_history_export_receipt(
+            plan.id,
+            plan.manifest_hash,
+            receipt_hash,
+            HistoryExportArchiveBinding(
+                archive_path=binding.archive_path,
+                parent_device=binding.parent_device,
+                parent_inode=binding.parent_inode,
+                export_directory_device=binding.export_directory_device,
+                export_directory_inode=binding.export_directory_inode,
+                archive_device=binding.archive_device,
+                archive_inode=binding.archive_inode,
+                size=binding.size,
+                sha256="c" * 64,
+            ),
+        )
 
     repository.record_history_export_receipt(
         plan.id,
@@ -256,6 +274,14 @@ def test_history_export_receipt_requires_an_immutable_full_archive_binding(
                 sha256=binding.sha256,
             ),
         )
+
+    with repository._connection() as connection:
+        connection.execute(
+            "UPDATE history_cleanup_plans SET export_receipt_hash = ? WHERE id = ?",
+            ("f" * 64, plan.id),
+        )
+    with pytest.raises(RepositoryError, match="archive binding"):
+        repository.authorize_history_export_receipt(plan.id, "f" * 64)
 
 
 def test_history_export_receipt_hash_only_legacy_row_is_not_applicable(workspace) -> None:

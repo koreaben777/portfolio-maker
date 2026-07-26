@@ -1943,57 +1943,40 @@ class SQLiteRepository:
         plan_id: str,
         manifest_hash: str,
         receipt_hash: str,
-        archive_binding: HistoryExportArchiveBinding | None = None,
+        archive_binding: HistoryExportArchiveBinding,
     ) -> None:
         self._validate_history_hex(plan_id, 32)
         self._validate_history_hex(manifest_hash, 64)
         self._validate_history_hex(receipt_hash, 64)
-        binding_json = (
-            None
-            if archive_binding is None
-            else self._canonical_history_export_archive_binding(archive_binding)
-        )
+        binding_json = self._canonical_history_export_archive_binding(archive_binding)
+        if receipt_hash != archive_binding.sha256:
+            raise RepositoryError(
+                "history export receipt does not match its archive binding"
+            )
         with self._connection() as conn:
-            if binding_json is None:
-                cursor = conn.execute(
-                    """
-                    UPDATE history_cleanup_plans
-                    SET export_receipt_hash = ?
-                    WHERE id = ?
-                      AND manifest_hash = ?
-                      AND status = 'planned'
-                      AND export_archive_binding_json IS NULL
-                      AND (
-                          export_receipt_hash IS NULL
-                          OR export_receipt_hash = ?
-                      )
-                    """,
-                    (receipt_hash, plan_id, manifest_hash, receipt_hash),
-                )
-            else:
-                cursor = conn.execute(
-                    """
-                    UPDATE history_cleanup_plans
-                    SET export_receipt_hash = ?, export_archive_binding_json = ?
-                    WHERE id = ?
-                      AND manifest_hash = ?
-                      AND status = 'planned'
-                      AND (
-                          (export_receipt_hash IS NULL
-                           AND export_archive_binding_json IS NULL)
-                          OR (export_receipt_hash = ?
-                              AND export_archive_binding_json = ?)
-                      )
-                    """,
-                    (
-                        receipt_hash,
-                        binding_json,
-                        plan_id,
-                        manifest_hash,
-                        receipt_hash,
-                        binding_json,
-                    ),
-                )
+            cursor = conn.execute(
+                """
+                UPDATE history_cleanup_plans
+                SET export_receipt_hash = ?, export_archive_binding_json = ?
+                WHERE id = ?
+                  AND manifest_hash = ?
+                  AND status = 'planned'
+                  AND (
+                      (export_receipt_hash IS NULL
+                       AND export_archive_binding_json IS NULL)
+                      OR (export_receipt_hash = ?
+                          AND export_archive_binding_json = ?)
+                  )
+                """,
+                (
+                    receipt_hash,
+                    binding_json,
+                    plan_id,
+                    manifest_hash,
+                    receipt_hash,
+                    binding_json,
+                ),
+            )
             if cursor.rowcount != 1:
                 raise RepositoryError(
                     "history export receipt could not be bound to the exact plan"
@@ -2004,17 +1987,15 @@ class SQLiteRepository:
         plan_id: str,
         manifest_hash: str,
         receipt_hash: str,
-        archive_binding: HistoryExportArchiveBinding | None = None,
+        archive_binding: HistoryExportArchiveBinding,
     ) -> bool:
         try:
             self._validate_history_hex(plan_id, 32)
             self._validate_history_hex(manifest_hash, 64)
             self._validate_history_hex(receipt_hash, 64)
-            binding_json = (
-                None
-                if archive_binding is None
-                else self._canonical_history_export_archive_binding(archive_binding)
-            )
+            binding_json = self._canonical_history_export_archive_binding(archive_binding)
+            if receipt_hash != archive_binding.sha256:
+                return False
             with self._existing_read_connection() as conn:
                 row = conn.execute(
                     """
@@ -2052,7 +2033,7 @@ class SQLiteRepository:
             and stored_manifest_hash == manifest_hash
             and status == "planned"
             and stored_receipt_hash == receipt_hash
-            and (binding_json is None or stored_binding_json == binding_json)
+            and stored_binding_json == binding_json
         )
 
     def assert_export_receipt(
@@ -2082,7 +2063,10 @@ class SQLiteRepository:
         self.assert_export_receipt(plan_id, receipt_hash)
         stored = self.get_history_plan(plan_id)
         binding = stored["export_archive_binding"]
-        if not isinstance(binding, HistoryExportArchiveBinding):
+        if (
+            not isinstance(binding, HistoryExportArchiveBinding)
+            or binding.sha256 != receipt_hash
+        ):
             raise RepositoryError("history export archive binding is unavailable")
         return binding
 

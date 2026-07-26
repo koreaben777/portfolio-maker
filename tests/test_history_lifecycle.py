@@ -1159,6 +1159,14 @@ def test_history_export_binds_receipt_and_archives_exact_plan_files_and_database
     assert state.repository.get_history_plan(plan.id)["export_receipt_hash"] == (
         exported.receipt_hash
     )
+    binding = state.repository.get_history_plan(plan.id)["export_archive_binding"]
+    assert binding is not None
+    assert binding.archive_path == exported.archive_path.as_posix()
+    assert binding.sha256 == exported.receipt_hash
+    assert (binding.archive_device, binding.archive_inode) == (
+        exported.archive_path.stat().st_dev,
+        exported.archive_path.stat().st_ino,
+    )
     with tarfile.open(exported.archive_path, "r") as archive:
         assert set(archive.getnames()) == {
             "history-plan.json",
@@ -1278,9 +1286,9 @@ def test_history_export_receipt_write_is_fail_closed_unless_exactly_confirmed(
     )
     real_record = SQLiteRepository.record_history_export_receipt
 
-    def fail_receipt_write(self, plan_id, manifest_hash, receipt_hash):
+    def fail_receipt_write(self, plan_id, manifest_hash, receipt_hash, binding):
         if commit_receipt:
-            real_record(self, plan_id, manifest_hash, receipt_hash)
+            real_record(self, plan_id, manifest_hash, receipt_hash, binding)
         raise CommitOutcomeAmbiguousError("injected receipt outcome")
 
     monkeypatch.setattr(
@@ -1313,10 +1321,10 @@ def test_history_export_receipt_lookup_failure_is_controlled_and_fail_closed(
 ) -> None:
     state, plan = _seed_executable_history_plan(workspace)
 
-    def fail_receipt_write(self, plan_id, manifest_hash, receipt_hash):
+    def fail_receipt_write(self, plan_id, manifest_hash, receipt_hash, binding):
         raise CommitOutcomeAmbiguousError("injected receipt outcome")
 
-    def fail_receipt_lookup(self, plan_id, manifest_hash, receipt_hash):
+    def fail_receipt_lookup(self, plan_id, manifest_hash, receipt_hash, binding):
         raise RuntimeError("injected receipt lookup failure")
 
     monkeypatch.setattr(
@@ -1359,6 +1367,7 @@ def test_history_export_receipt_lookup_never_creates_a_missing_database_family(
         plan_id,
         manifest_hash,
         receipt_hash,
+        binding,
     ):
         for path in family_paths:
             path.unlink(missing_ok=True)
@@ -1522,6 +1531,167 @@ def test_history_export_rechecks_target_identity_immediately_before_receipt_writ
         )
 
     assert state.repository.get_history_plan(plan.id)["export_receipt_hash"] is None
+
+
+def test_history_export_rejects_target_renamed_after_revalidation_before_receipt(
+    workspace,
+    monkeypatch,
+) -> None:
+    state, plan = _seed_executable_history_plan(workspace)
+    backup_dir = _outside_backup_dir(workspace, "post-revalidation-rename")
+    moved_dir = backup_dir.with_name(f"{backup_dir.name}-moved")
+    real_revalidate = HistoryStore.revalidate_export_directory
+    renamed = False
+
+    def rename_target_after_revalidation(self, identity):
+        nonlocal renamed
+        real_revalidate(self, identity)
+        backup_dir.rename(moved_dir)
+        renamed = True
+
+    monkeypatch.setattr(
+        HistoryStore,
+        "revalidate_export_directory",
+        rename_target_after_revalidation,
+    )
+
+    exported = None
+    export_error = None
+    try:
+        exported = history_application.export_history_plan(
+            application_models.HistoryExportRequest(
+                workspace,
+                plan.id,
+                backup_dir,
+            )
+        )
+    except HistoryError as error:
+        export_error = error
+
+    stored_receipt = state.repository.get_history_plan(plan.id)[
+        "export_receipt_hash"
+    ]
+    unsafe_outcome = (
+        exported is not None
+        and stored_receipt == exported.receipt_hash
+        and not exported.archive_path.exists()
+        and (moved_dir / exported.archive_path.name).is_file()
+    )
+    assert not unsafe_outcome, (
+        "unsafe outcome: export_success=True receipt_bound=True "
+        "returned_archive_exists=False moved_archive_exists=True"
+    )
+    assert renamed is True
+    assert export_error is not None
+    assert "export" in str(export_error)
+    assert stored_receipt is not None
+    with pytest.raises(HistoryError, match="archive"):
+        _apply_exported_plan(workspace, plan, stored_receipt)
+    assert state.old_path.exists()
+    assert list(state.paths.history_journal_dir.iterdir()) == []
+    assert state.repository.get_history_plan(plan.id)["status"] == "planned"
+
+
+@pytest.mark.parametrize(
+    "drift",
+    ("missing", "replaced", "same-content-replaced", "content", "symlink"),
+)
+def test_history_apply_rejects_export_archive_drift_before_any_mutation(
+    workspace,
+    drift,
+) -> None:
+    state, plan, exported = _seed_exported_history_plan(
+        workspace,
+        f"archive-drift-{drift}",
+    )
+    archive_path = exported.archive_path
+    if drift == "missing":
+        archive_path.unlink()
+    elif drift == "replaced":
+        archive_path.unlink()
+        archive_path.write_bytes(b"replacement")
+    elif drift == "same-content-replaced":
+        original_content = archive_path.read_bytes()
+        archive_path.rename(archive_path.with_name("prior-archive"))
+        archive_path.write_bytes(original_content)
+    elif drift == "content":
+        archive_path.write_bytes(archive_path.read_bytes() + b"content-drift")
+    else:
+        replacement = archive_path.with_name("replacement-archive")
+        replacement.write_bytes(b"replacement")
+        archive_path.unlink()
+        archive_path.symlink_to(replacement)
+
+    with pytest.raises(HistoryError, match="archive"):
+        _apply_exported_plan(workspace, plan, exported.receipt_hash)
+
+    assert state.old_path.exists()
+    assert state.latest_path.exists()
+    assert list(state.paths.history_journal_dir.iterdir()) == []
+    assert state.repository.get_history_plan(plan.id)["status"] == "planned"
+
+
+def test_history_apply_rejects_moved_export_directory_before_any_mutation(
+    workspace,
+) -> None:
+    state, plan, exported = _seed_exported_history_plan(
+        workspace,
+        "moved-export-directory",
+    )
+    exported.archive_path.parent.rename(
+        exported.archive_path.parent.with_name("moved-export-directory")
+    )
+
+    with pytest.raises(HistoryError, match="archive"):
+        _apply_exported_plan(workspace, plan, exported.receipt_hash)
+
+    assert state.old_path.exists()
+    assert state.latest_path.exists()
+    assert list(state.paths.history_journal_dir.iterdir()) == []
+    assert state.repository.get_history_plan(plan.id)["status"] == "planned"
+
+
+def test_history_apply_keeps_verified_archive_context_open_through_first_move(
+    workspace,
+    monkeypatch,
+) -> None:
+    state, plan, exported = _seed_exported_history_plan(
+        workspace,
+        "pinned-archive-context",
+    )
+    real_context = HistoryStore.open_verified_export_archive
+    real_move = HistoryStore.move_units_to_quarantine
+    active_contexts = 0
+
+    @contextmanager
+    def track_verified_archive(self, binding):
+        nonlocal active_contexts
+        with real_context(self, binding):
+            active_contexts += 1
+            try:
+                yield
+            finally:
+                active_contexts -= 1
+
+    def assert_context_is_open_during_move(self, journal):
+        assert active_contexts > 0
+        return real_move(self, journal)
+
+    monkeypatch.setattr(
+        HistoryStore,
+        "open_verified_export_archive",
+        track_verified_archive,
+    )
+    monkeypatch.setattr(
+        HistoryStore,
+        "move_units_to_quarantine",
+        assert_context_is_open_during_move,
+    )
+
+    result = _apply_exported_plan(workspace, plan, exported.receipt_hash)
+
+    assert result.state is CleanupExecutionState.PURGED
+    assert active_contexts == 0
 
 
 def test_history_export_keeps_first_receipt_immutable_across_repeated_export(

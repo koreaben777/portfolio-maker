@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 from hashlib import sha256
 from io import BytesIO
@@ -14,6 +16,7 @@ from portfolio_maker.domain.history_models import (
     HistoryCleanupJournal,
     HistoryDatabaseFamilyIdentity,
     HistoryDatabaseSidecarIdentity,
+    HistoryExportArchiveBinding,
     HistoryPlan,
     HistoryPolicy,
     HistoryUnit,
@@ -205,7 +208,7 @@ class HistoryStore:
         backup_dir: Path,
         database_backup: bytes,
         expected_directory: _ExportDirectoryIdentity,
-    ) -> tuple[Path, str]:
+    ) -> tuple[HistoryExportArchiveBinding, str]:
         _validate_plan(plan)
         if not isinstance(database_backup, bytes) or not database_backup:
             raise OSError("history export database backup is invalid")
@@ -275,8 +278,35 @@ class HistoryStore:
                 parent_descriptor,
                 directory_descriptor,
             )
+            named_archive = os.stat(
+                archive_name,
+                dir_fd=directory_descriptor,
+                follow_symlinks=False,
+            )
+            if (
+                not S_ISREG(named_archive.st_mode)
+                or named_archive.st_nlink != 1
+                or (named_archive.st_dev, named_archive.st_ino)
+                != (stat_result.st_dev, stat_result.st_ino)
+                or named_archive.st_size != stat_result.st_size
+            ):
+                raise OSError("history export archive identity changed")
+            parent_stat = os.fstat(parent_descriptor)
+            directory_stat = os.fstat(directory_descriptor)
             return (
-                export_directory.absolute_path / archive_name,
+                HistoryExportArchiveBinding(
+                    archive_path=(
+                        export_directory.absolute_path / archive_name
+                    ).as_posix(),
+                    parent_device=parent_stat.st_dev,
+                    parent_inode=parent_stat.st_ino,
+                    export_directory_device=directory_stat.st_dev,
+                    export_directory_inode=directory_stat.st_ino,
+                    archive_device=stat_result.st_dev,
+                    archive_inode=stat_result.st_ino,
+                    size=stat_result.st_size,
+                    sha256=digest.hexdigest(),
+                ),
                 digest.hexdigest(),
             )
         except Exception:
@@ -327,6 +357,94 @@ class HistoryStore:
                 directory_descriptor,
             )
         finally:
+            if directory_descriptor is not None:
+                os.close(directory_descriptor)
+            os.close(parent_descriptor)
+
+    @contextmanager
+    def open_verified_export_archive(
+        self,
+        binding: HistoryExportArchiveBinding,
+    ) -> Iterator[None]:
+        archive_path = _archive_path_from_binding(binding)
+        export_path = archive_path.parent
+        parent_path = export_path.parent
+        parent_descriptor = open_managed_directory(parent_path)
+        directory_descriptor: int | None = None
+        archive_descriptor: int | None = None
+        try:
+            if _descriptor_identity(parent_descriptor) != (
+                binding.parent_device,
+                binding.parent_inode,
+            ):
+                raise OSError("history export archive parent identity changed")
+            directory_stat = os.stat(
+                export_path.name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            if (
+                not S_ISDIR(directory_stat.st_mode)
+                or (directory_stat.st_dev, directory_stat.st_ino)
+                != (
+                    binding.export_directory_device,
+                    binding.export_directory_inode,
+                )
+            ):
+                raise OSError("history export archive directory identity changed")
+            directory_descriptor = os.open(
+                export_path.name,
+                _DIRECTORY_FLAGS,
+                dir_fd=parent_descriptor,
+            )
+            if _descriptor_identity(directory_descriptor) != (
+                binding.export_directory_device,
+                binding.export_directory_inode,
+            ):
+                raise OSError("history export archive directory identity changed")
+            self._assert_directory_outside_workspace(directory_descriptor)
+            named_archive = os.stat(
+                archive_path.name,
+                dir_fd=directory_descriptor,
+                follow_symlinks=False,
+            )
+            if (
+                not S_ISREG(named_archive.st_mode)
+                or named_archive.st_nlink != 1
+                or (named_archive.st_dev, named_archive.st_ino)
+                != (binding.archive_device, binding.archive_inode)
+                or named_archive.st_size != binding.size
+            ):
+                raise OSError("history export archive identity changed")
+            archive_descriptor = os.open(
+                archive_path.name,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                dir_fd=directory_descriptor,
+            )
+            archive_stat = os.fstat(archive_descriptor)
+            if (
+                not S_ISREG(archive_stat.st_mode)
+                or archive_stat.st_nlink != 1
+                or (archive_stat.st_dev, archive_stat.st_ino)
+                != (binding.archive_device, binding.archive_inode)
+                or archive_stat.st_size != binding.size
+            ):
+                raise OSError("history export archive identity changed")
+            digest = _descriptor_sha256(archive_descriptor)
+            refreshed_stat = os.fstat(archive_descriptor)
+            if (
+                digest != binding.sha256
+                or not S_ISREG(refreshed_stat.st_mode)
+                or refreshed_stat.st_nlink != 1
+                or (refreshed_stat.st_dev, refreshed_stat.st_ino)
+                != (binding.archive_device, binding.archive_inode)
+                or refreshed_stat.st_size != binding.size
+            ):
+                raise OSError("history export archive content changed")
+            yield
+        finally:
+            if archive_descriptor is not None:
+                os.close(archive_descriptor)
             if directory_descriptor is not None:
                 os.close(directory_descriptor)
             os.close(parent_descriptor)
@@ -1298,6 +1416,44 @@ def _descriptor_identity(descriptor: int) -> tuple[int, int]:
     if not S_ISDIR(stat_result.st_mode):
         raise OSError("managed directory descriptor is invalid")
     return stat_result.st_dev, stat_result.st_ino
+
+
+def _archive_path_from_binding(binding: HistoryExportArchiveBinding) -> Path:
+    if (
+        not isinstance(binding, HistoryExportArchiveBinding)
+        or not isinstance(binding.archive_path, str)
+        or "\x00" in binding.archive_path
+    ):
+        raise OSError("history export archive binding is invalid")
+    archive_path = Path(binding.archive_path)
+    if (
+        not archive_path.is_absolute()
+        or archive_path.parent == archive_path
+        or any(part in {"", ".", ".."} for part in archive_path.parts)
+        or archive_path.as_posix() != binding.archive_path
+    ):
+        raise OSError("history export archive binding is invalid")
+    for value in (
+        binding.parent_device,
+        binding.parent_inode,
+        binding.export_directory_device,
+        binding.export_directory_inode,
+        binding.archive_device,
+        binding.archive_inode,
+        binding.size,
+    ):
+        if type(value) is not int or value < 0:
+            raise OSError("history export archive binding is invalid")
+    _validate_hex_identifier(binding.sha256, 64, "history export archive hash")
+    return archive_path
+
+
+def _descriptor_sha256(descriptor: int) -> str:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    digest = sha256()
+    while chunk := os.read(descriptor, 65_536):
+        digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _descriptor_has_ancestor(
