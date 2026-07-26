@@ -67,6 +67,19 @@ class HistoryDatabaseFamilyIdentity:
 
 
 @dataclass(frozen=True)
+class HistoryExportArchiveBinding:
+    archive_path: str
+    parent_device: int
+    parent_inode: int
+    export_directory_device: int
+    export_directory_inode: int
+    archive_device: int
+    archive_inode: int
+    size: int
+    sha256: str
+
+
+@dataclass(frozen=True)
 class HistoryCleanupJournal:
     execution_id: str
     plan_id: str

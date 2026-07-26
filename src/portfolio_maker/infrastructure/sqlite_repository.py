@@ -18,6 +18,7 @@ from portfolio_maker.domain.history_models import (
     CleanupExecutionState,
     HistoryDatabaseFamilyIdentity,
     HistoryDatabaseSidecarIdentity,
+    HistoryExportArchiveBinding,
     HistoryPlan,
     HistoryPolicy,
     HistoryUnit,
@@ -253,6 +254,7 @@ CREATE TABLE IF NOT EXISTS history_cleanup_plans (
     status TEXT NOT NULL,
     created_at TEXT NOT NULL,
     export_receipt_hash TEXT,
+    export_archive_binding_json TEXT,
     execution_id TEXT,
     completed_at TEXT
 );
@@ -1310,6 +1312,11 @@ class SQLiteRepository:
     @classmethod
     def _ensure_history_cleanup_plan_columns(cls, conn: sqlite3.Connection) -> None:
         columns = cls._table_columns(conn, "history_cleanup_plans")
+        if "export_archive_binding_json" not in columns:
+            conn.execute(
+                "ALTER TABLE history_cleanup_plans "
+                "ADD COLUMN export_archive_binding_json TEXT"
+            )
         if "canonical_policy_json" not in columns:
             conn.execute(
                 "ALTER TABLE history_cleanup_plans "
@@ -1854,7 +1861,8 @@ class SQLiteRepository:
                 """
                 SELECT id, policy_hash, manifest_hash, canonical_policy_json,
                        canonical_units_json, manifest_relative_path, status,
-                       created_at, export_receipt_hash, execution_id, completed_at
+                       created_at, export_receipt_hash, export_archive_binding_json,
+                       execution_id, completed_at
                 FROM history_cleanup_plans
                 WHERE id = ?
                 """,
@@ -1882,6 +1890,9 @@ class SQLiteRepository:
                 "status": self._required_text(row, "status"),
                 "created_at": self._required_text(row, "created_at"),
                 "export_receipt_hash": self._optional_text(row, "export_receipt_hash"),
+                "export_archive_binding": self._history_export_archive_binding_from_json(
+                    self._optional_text(row, "export_archive_binding_json")
+                ),
                 "execution_id": self._optional_text(row, "execution_id"),
                 "completed_at": self._optional_text(row, "completed_at"),
             }
@@ -1932,25 +1943,57 @@ class SQLiteRepository:
         plan_id: str,
         manifest_hash: str,
         receipt_hash: str,
+        archive_binding: HistoryExportArchiveBinding | None = None,
     ) -> None:
         self._validate_history_hex(plan_id, 32)
         self._validate_history_hex(manifest_hash, 64)
         self._validate_history_hex(receipt_hash, 64)
+        binding_json = (
+            None
+            if archive_binding is None
+            else self._canonical_history_export_archive_binding(archive_binding)
+        )
         with self._connection() as conn:
-            cursor = conn.execute(
-                """
-                UPDATE history_cleanup_plans
-                SET export_receipt_hash = ?
-                WHERE id = ?
-                  AND manifest_hash = ?
-                  AND status = 'planned'
-                  AND (
-                      export_receipt_hash IS NULL
-                      OR export_receipt_hash = ?
-                  )
-                """,
-                (receipt_hash, plan_id, manifest_hash, receipt_hash),
-            )
+            if binding_json is None:
+                cursor = conn.execute(
+                    """
+                    UPDATE history_cleanup_plans
+                    SET export_receipt_hash = ?
+                    WHERE id = ?
+                      AND manifest_hash = ?
+                      AND status = 'planned'
+                      AND export_archive_binding_json IS NULL
+                      AND (
+                          export_receipt_hash IS NULL
+                          OR export_receipt_hash = ?
+                      )
+                    """,
+                    (receipt_hash, plan_id, manifest_hash, receipt_hash),
+                )
+            else:
+                cursor = conn.execute(
+                    """
+                    UPDATE history_cleanup_plans
+                    SET export_receipt_hash = ?, export_archive_binding_json = ?
+                    WHERE id = ?
+                      AND manifest_hash = ?
+                      AND status = 'planned'
+                      AND (
+                          (export_receipt_hash IS NULL
+                           AND export_archive_binding_json IS NULL)
+                          OR (export_receipt_hash = ?
+                              AND export_archive_binding_json = ?)
+                      )
+                    """,
+                    (
+                        receipt_hash,
+                        binding_json,
+                        plan_id,
+                        manifest_hash,
+                        receipt_hash,
+                        binding_json,
+                    ),
+                )
             if cursor.rowcount != 1:
                 raise RepositoryError(
                     "history export receipt could not be bound to the exact plan"
@@ -1961,15 +2004,22 @@ class SQLiteRepository:
         plan_id: str,
         manifest_hash: str,
         receipt_hash: str,
+        archive_binding: HistoryExportArchiveBinding | None = None,
     ) -> bool:
         try:
             self._validate_history_hex(plan_id, 32)
             self._validate_history_hex(manifest_hash, 64)
             self._validate_history_hex(receipt_hash, 64)
+            binding_json = (
+                None
+                if archive_binding is None
+                else self._canonical_history_export_archive_binding(archive_binding)
+            )
             with self._existing_read_connection() as conn:
                 row = conn.execute(
                     """
-                    SELECT id, manifest_hash, status, export_receipt_hash
+                    SELECT id, manifest_hash, status, export_receipt_hash,
+                           export_archive_binding_json
                     FROM history_cleanup_plans
                     WHERE id = ?
                     """,
@@ -1987,6 +2037,14 @@ class SQLiteRepository:
                     row,
                     "export_receipt_hash",
                 )
+                stored_binding_json = self._optional_text(
+                    row,
+                    "export_archive_binding_json",
+                )
+                if stored_binding_json is not None:
+                    self._history_export_archive_binding_from_json(
+                        stored_binding_json
+                    )
         except Exception:
             return False
         return (
@@ -1994,6 +2052,7 @@ class SQLiteRepository:
             and stored_manifest_hash == manifest_hash
             and status == "planned"
             and stored_receipt_hash == receipt_hash
+            and (binding_json is None or stored_binding_json == binding_json)
         )
 
     def assert_export_receipt(
@@ -2014,6 +2073,18 @@ class SQLiteRepository:
             or stored["export_receipt_hash"] != receipt_hash
         ):
             raise RepositoryError("history export receipt does not match")
+
+    def authorize_history_export_receipt(
+        self,
+        plan_id: str,
+        receipt_hash: str | None,
+    ) -> HistoryExportArchiveBinding:
+        self.assert_export_receipt(plan_id, receipt_hash)
+        stored = self.get_history_plan(plan_id)
+        binding = stored["export_archive_binding"]
+        if not isinstance(binding, HistoryExportArchiveBinding):
+            raise RepositoryError("history export archive binding is unavailable")
+        return binding
 
     def backup_bytes(self) -> bytes:
         destination: sqlite3.Connection | None = None
@@ -2267,6 +2338,80 @@ class SQLiteRepository:
             or any(character not in "0123456789abcdef" for character in value)
         ):
             raise RepositoryError("history cleanup identifier or hash is invalid")
+
+    @classmethod
+    def _canonical_history_export_archive_binding(
+        cls,
+        binding: HistoryExportArchiveBinding,
+    ) -> str:
+        if not isinstance(binding, HistoryExportArchiveBinding):
+            raise RepositoryError("history export archive binding is invalid")
+        if not isinstance(binding.archive_path, str) or "\x00" in binding.archive_path:
+            raise RepositoryError("history export archive binding is invalid")
+        archive_path = Path(binding.archive_path)
+        if (
+            not archive_path.is_absolute()
+            or archive_path.parent == archive_path
+            or any(part in {"", ".", ".."} for part in archive_path.parts)
+            or archive_path.as_posix() != binding.archive_path
+        ):
+            raise RepositoryError("history export archive binding is invalid")
+        for value in (
+            binding.parent_device,
+            binding.parent_inode,
+            binding.export_directory_device,
+            binding.export_directory_inode,
+            binding.archive_device,
+            binding.archive_inode,
+            binding.size,
+        ):
+            if type(value) is not int or value < 0:
+                raise RepositoryError("history export archive binding is invalid")
+        try:
+            cls._validate_history_hex(binding.sha256, 64)
+        except RepositoryError as error:
+            raise RepositoryError("history export archive binding is invalid") from error
+        return json.dumps(
+            asdict(binding),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    @classmethod
+    def _history_export_archive_binding_from_json(
+        cls,
+        value: str | None,
+    ) -> HistoryExportArchiveBinding | None:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError("history export archive binding must be text")
+        try:
+            payload = json.loads(value)
+            if (
+                type(payload) is not dict
+                or frozenset(payload)
+                != frozenset(
+                    {
+                        "archive_path",
+                        "parent_device",
+                        "parent_inode",
+                        "export_directory_device",
+                        "export_directory_inode",
+                        "archive_device",
+                        "archive_inode",
+                        "size",
+                        "sha256",
+                    }
+                )
+            ):
+                raise ValueError("history export archive binding shape is invalid")
+            binding = HistoryExportArchiveBinding(**payload)
+            if cls._canonical_history_export_archive_binding(binding) != value:
+                raise ValueError("history export archive binding is not canonical")
+            return binding
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            raise ValueError("history export archive binding is invalid") from error
 
     @staticmethod
     def _validate_history_unit_ids(

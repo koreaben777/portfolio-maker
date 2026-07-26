@@ -12,6 +12,7 @@ import pytest
 
 from portfolio_maker.domain.history_models import (
     CleanupExecutionState,
+    HistoryExportArchiveBinding,
     HistoryPlan,
     HistoryPolicy,
     HistoryUnit,
@@ -161,6 +162,7 @@ def test_initialize_adds_history_plan_binding_columns_and_old_rows_fail_closed(
         "canonical_policy_json",
         "canonical_units_json",
         "manifest_relative_path",
+        "export_archive_binding_json",
     } <= column_names(repository, "history_cleanup_plans")
     stored = repository.get_history_plan("legacy-plan")
     assert stored["status"] == "planned"
@@ -173,6 +175,118 @@ def test_initialize_adds_history_plan_binding_columns_and_old_rows_fail_closed(
             (("source_snapshot", "1"),),
         )
     assert repository.get_history_plan("legacy-plan")["status"] == "planned"
+
+
+def test_history_export_receipt_requires_an_immutable_full_archive_binding(
+    workspace,
+) -> None:
+    paths = WorkspacePaths.from_root(workspace)
+    paths.ensure()
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    unit = HistoryUnit(
+        "source_snapshot",
+        "42",
+        "raw/snapshots/local/receipt-binding.json",
+        "a" * 64,
+        12,
+        34,
+        56,
+        "expired_unreferenced_snapshot",
+    )
+    plan = HistoryPlan.create(HistoryPolicy.default(), [unit])
+    repository.create_history_plan(
+        plan,
+        Path(f"reviews/history-plans/plan-{plan.id}-{plan.manifest_hash}.json"),
+    )
+    receipt_hash = "b" * 64
+    binding = HistoryExportArchiveBinding(
+        archive_path="/private/tmp/portfolio-maker-history/history-plan.tar",
+        parent_device=101,
+        parent_inode=102,
+        export_directory_device=103,
+        export_directory_inode=104,
+        archive_device=105,
+        archive_inode=106,
+        size=107,
+        sha256="c" * 64,
+    )
+
+    repository.record_history_export_receipt(
+        plan.id,
+        plan.manifest_hash,
+        receipt_hash,
+        binding,
+    )
+    repository.record_history_export_receipt(
+        plan.id,
+        plan.manifest_hash,
+        receipt_hash,
+        binding,
+    )
+
+    stored = repository.get_history_plan(plan.id)
+    assert stored["export_receipt_hash"] == receipt_hash
+    assert stored["export_archive_binding"] == binding
+    assert (
+        repository.authorize_history_export_receipt(plan.id, receipt_hash)
+        == binding
+    )
+    assert repository.export_receipt_matches(
+        plan.id,
+        plan.manifest_hash,
+        receipt_hash,
+        binding,
+    )
+
+    with pytest.raises(RepositoryError, match="could not be bound"):
+        repository.record_history_export_receipt(
+            plan.id,
+            plan.manifest_hash,
+            receipt_hash,
+            HistoryExportArchiveBinding(
+                archive_path=binding.archive_path,
+                parent_device=binding.parent_device,
+                parent_inode=binding.parent_inode,
+                export_directory_device=binding.export_directory_device,
+                export_directory_inode=binding.export_directory_inode,
+                archive_device=binding.archive_device,
+                archive_inode=binding.archive_inode + 1,
+                size=binding.size,
+                sha256=binding.sha256,
+            ),
+        )
+
+
+def test_history_export_receipt_hash_only_legacy_row_is_not_applicable(workspace) -> None:
+    paths = WorkspacePaths.from_root(workspace)
+    paths.ensure()
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    unit = HistoryUnit(
+        "source_snapshot",
+        "42",
+        "raw/snapshots/local/legacy-receipt.json",
+        "d" * 64,
+        12,
+        34,
+        56,
+        "expired_unreferenced_snapshot",
+    )
+    plan = HistoryPlan.create(HistoryPolicy.default(), [unit])
+    repository.create_history_plan(
+        plan,
+        Path(f"reviews/history-plans/plan-{plan.id}-{plan.manifest_hash}.json"),
+    )
+    receipt_hash = "e" * 64
+    with repository._connection() as connection:
+        connection.execute(
+            "UPDATE history_cleanup_plans SET export_receipt_hash = ? WHERE id = ?",
+            (receipt_hash, plan.id),
+        )
+
+    with pytest.raises(RepositoryError, match="archive binding"):
+        repository.authorize_history_export_receipt(plan.id, receipt_hash)
 
 
 def test_vision_request_and_analysis_round_trip(workspace) -> None:
