@@ -428,14 +428,26 @@ def _history_apply_mode(args: argparse.Namespace) -> str:
     new_values = (args.plan_id, args.export_receipt, args.confirm)
     new_apply = all(isinstance(value, str) and value for value in new_values)
     any_new_value = any(value is not None for value in new_values)
-    resume = isinstance(args.resume, str) and bool(args.resume)
-    recover = isinstance(args.recover, str) and bool(args.recover)
+    resume_present = args.resume is not None
+    recover_present = args.recover is not None
 
-    if new_apply and not resume and not recover:
+    if new_apply and not resume_present and not recover_present:
         return "new"
-    if resume and not any_new_value and not recover:
+    if (
+        resume_present
+        and not any_new_value
+        and not recover_present
+        and isinstance(args.resume, str)
+        and args.resume
+    ):
         return "resume"
-    if recover and not any_new_value and not resume:
+    if (
+        recover_present
+        and not any_new_value
+        and not resume_present
+        and isinstance(args.recover, str)
+        and args.recover
+    ):
         return "recover"
     raise HistoryError("history apply mode is invalid")
 
