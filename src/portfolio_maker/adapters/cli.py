@@ -12,6 +12,15 @@ from portfolio_maker.application.build_profile import build_profile
 from portfolio_maker.application.discovery import discover_sources
 from portfolio_maker.application.draft_portfolio import ProfileFormatError, draft_portfolio
 from portfolio_maker.application.ingestion import ingest_sources
+from portfolio_maker.application.history import (
+    HistoryError,
+    apply_history_plan,
+    export_history_plan,
+    plan_history_cleanup,
+    recover_history_cleanup,
+    resume_history_cleanup,
+    write_sample_history_policy,
+)
 from portfolio_maker.application.render_html import HtmlRenderError, render_html
 from portfolio_maker.application.semantic_index import (
     SemanticIndexError,
@@ -33,6 +42,10 @@ from portfolio_maker.application.models import (
     BuildProfileRequest,
     DiscoverSourcesRequest,
     DraftPortfolioRequest,
+    HistoryApplyRequest,
+    HistoryExecutionRequest,
+    HistoryExportRequest,
+    HistoryPlanRequest,
     IngestSourcesRequest,
     RenderHtmlRequest,
     ComposeProjectsRequest,
@@ -79,6 +92,26 @@ def build_parser() -> argparse.ArgumentParser:
     render = subparsers.add_parser("render-html")
     render.add_argument("--workspace", type=Path, default=Path("."))
 
+    history_policy = subparsers.add_parser("history-policy")
+    history_policy.add_argument("--workspace", type=Path, default=Path("."))
+    history_policy.add_argument("--write-sample", action="store_true")
+
+    history_plan = subparsers.add_parser("history-plan")
+    history_plan.add_argument("--workspace", type=Path, default=Path("."))
+
+    history_export = subparsers.add_parser("history-export")
+    history_export.add_argument("--workspace", type=Path, default=Path("."))
+    history_export.add_argument("--plan-id", required=True)
+    history_export.add_argument("--backup-dir", type=Path, required=True)
+
+    history_apply = subparsers.add_parser("history-apply")
+    history_apply.add_argument("--workspace", type=Path, default=Path("."))
+    history_apply.add_argument("--plan-id")
+    history_apply.add_argument("--export-receipt")
+    history_apply.add_argument("--confirm")
+    history_apply.add_argument("--resume")
+    history_apply.add_argument("--recover")
+
     review = subparsers.add_parser("prepare-project-review")
     review.add_argument("--workspace", type=Path, default=Path("."))
     review.add_argument("--version", choices=("v1", "v2"), default="v1")
@@ -117,6 +150,9 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     try:
         return _main(argv)
+    except HistoryError as error:
+        print(_safe_history_error_message(error), file=sys.stderr)
+        return 1
     except (
         ApprovalMissingError,
         ApprovalFormatError,
@@ -191,6 +227,62 @@ def _main(argv: Sequence[str] | None = None) -> int:
         result = render_html(RenderHtmlRequest(workspace=args.workspace))
         print(f"Public manifest: {result.manifest_path}")
         print(f"Portfolio HTML: {result.html_path}")
+        return 0
+
+    if args.command == "history-policy":
+        if not args.write_sample:
+            raise HistoryError("history policy sample option is required")
+        write_sample_history_policy(WorkspacePaths.from_root(args.workspace))
+        print("History policy sample created.")
+        return 0
+
+    if args.command == "history-plan":
+        result = plan_history_cleanup(HistoryPlanRequest(workspace=args.workspace))
+        print(f"History plan: {result.plan_id or 'none'}")
+        print(f"Candidates: {result.candidate_count}")
+        print(f"Bytes: {result.total_bytes}")
+        return 0
+
+    if args.command == "history-export":
+        result = export_history_plan(
+            HistoryExportRequest(
+                workspace=args.workspace,
+                plan_id=args.plan_id,
+                backup_dir=args.backup_dir,
+            )
+        )
+        print(f"History plan: {result.plan_id}")
+        print(f"Export receipt: {result.receipt_hash}")
+        return 0
+
+    if args.command == "history-apply":
+        mode = _history_apply_mode(args)
+        if mode == "new":
+            result = apply_history_plan(
+                HistoryApplyRequest(
+                    workspace=args.workspace,
+                    plan_id=args.plan_id,
+                    export_receipt_hash=args.export_receipt,
+                    confirmation=args.confirm,
+                )
+            )
+        elif mode == "resume":
+            result = resume_history_cleanup(
+                HistoryExecutionRequest(
+                    workspace=args.workspace,
+                    execution_id=args.resume,
+                )
+            )
+        else:
+            result = recover_history_cleanup(
+                HistoryExecutionRequest(
+                    workspace=args.workspace,
+                    execution_id=args.recover,
+                )
+            )
+        print(f"Execution: {result.execution_id}")
+        print(f"State: {result.state.value}")
+        print(f"Affected: {result.affected_count}")
         return 0
 
     if args.command == "prepare-project-review":
@@ -330,3 +422,26 @@ def _write_semantic_index_report(paths: WorkspacePaths, revision_id: str) -> Non
         )
     )
     write_managed_text(paths.semantic_index_report_path, report)
+
+
+def _history_apply_mode(args: argparse.Namespace) -> str:
+    new_values = (args.plan_id, args.export_receipt, args.confirm)
+    new_apply = all(isinstance(value, str) and value for value in new_values)
+    any_new_value = any(value is not None for value in new_values)
+    resume = isinstance(args.resume, str) and bool(args.resume)
+    recover = isinstance(args.recover, str) and bool(args.recover)
+
+    if new_apply and not resume and not recover:
+        return "new"
+    if resume and not any_new_value and not recover:
+        return "resume"
+    if recover and not any_new_value and not resume:
+        return "recover"
+    raise HistoryError("history apply mode is invalid")
+
+
+def _safe_history_error_message(error: HistoryError) -> str:
+    message = str(error)
+    if "/" in message or "\\" in message or "file:" in message.casefold():
+        return "managed history command failed safely"
+    return message

@@ -3,10 +3,14 @@ from __future__ import annotations
 import json
 import sqlite3
 import hashlib
+from types import SimpleNamespace
 
 from portfolio_maker.application.approval import write_sample_approval
 from portfolio_maker.application.artifact_approval import write_sample_artifact_policy
+from portfolio_maker.application.history import HistoryError
+from portfolio_maker.adapters import cli
 from portfolio_maker.adapters.cli import main
+from portfolio_maker.domain.history_models import CleanupExecutionState
 from portfolio_maker.domain.semantic_models import boundary_fingerprint
 from portfolio_maker.domain.models import Source, SourceStatus, SourceType
 from portfolio_maker.infrastructure.sqlite_repository import SQLiteRepository
@@ -787,4 +791,243 @@ def test_cli_ingest_invalid_tilde_forbidden_path_exits_without_traceback(workspa
     captured = capsys.readouterr()
     assert exit_code == 1
     assert "invalid forbidden path" in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_cli_history_policy_writes_sample_without_path_and_handles_duplicate(
+    workspace, capsys
+):
+    command = ["history-policy", "--workspace", str(workspace), "--write-sample"]
+
+    assert main(command) == 0
+    created = capsys.readouterr()
+    assert created.out == "History policy sample created.\n"
+    assert str(workspace) not in created.out
+    assert created.err == ""
+
+    assert main(command) == 1
+    duplicate = capsys.readouterr()
+    assert duplicate.out == ""
+    assert "history policy" in duplicate.err.casefold()
+    assert str(workspace) not in duplicate.err
+    assert "Traceback" not in duplicate.err
+
+
+def test_cli_history_plan_reports_only_safe_summary(workspace, monkeypatch, capsys):
+    received = []
+
+    def plan(request):
+        received.append(request)
+        return SimpleNamespace(
+            plan_id="plan-safe",
+            candidate_count=2,
+            total_bytes=321,
+            report_path=workspace / ".portfolio-maker" / "reviews" / "private-report.md",
+        )
+
+    monkeypatch.setattr(cli, "plan_history_cleanup", plan)
+
+    assert main(["history-plan", "--workspace", str(workspace)]) == 0
+
+    captured = capsys.readouterr()
+    assert captured.out == "History plan: plan-safe\nCandidates: 2\nBytes: 321\n"
+    assert captured.err == ""
+    assert received[0].workspace == workspace
+    assert str(workspace) not in captured.out
+    assert ".portfolio-maker" not in captured.out
+    assert "private-report" not in captured.out
+
+
+def test_cli_history_export_reports_receipt_without_archive_or_backup_path(
+    workspace, tmp_path, monkeypatch, capsys
+):
+    backup_dir = tmp_path / "outside-backup"
+    received = []
+
+    def export(request):
+        received.append(request)
+        return SimpleNamespace(
+            plan_id="plan-safe",
+            receipt_hash="a" * 64,
+            archive_path=backup_dir / "private-history-export.tar",
+        )
+
+    monkeypatch.setattr(cli, "export_history_plan", export)
+
+    assert main(
+        [
+            "history-export",
+            "--workspace",
+            str(workspace),
+            "--plan-id",
+            "plan-safe",
+            "--backup-dir",
+            str(backup_dir),
+        ]
+    ) == 0
+
+    captured = capsys.readouterr()
+    assert captured.out == f"History plan: plan-safe\nExport receipt: {'a' * 64}\n"
+    assert captured.err == ""
+    assert received[0].workspace == workspace
+    assert received[0].backup_dir == backup_dir
+    assert str(workspace) not in captured.out
+    assert str(backup_dir) not in captured.out
+    assert "private-history-export" not in captured.out
+
+
+def test_cli_history_apply_modes_report_only_execution_summary(
+    workspace, monkeypatch, capsys
+):
+    calls = []
+
+    def apply(request):
+        calls.append(("apply", request))
+        return SimpleNamespace(
+            execution_id="execution-new",
+            state=CleanupExecutionState.PURGED,
+            affected_count=3,
+        )
+
+    def resume(request):
+        calls.append(("resume", request))
+        return SimpleNamespace(
+            execution_id="execution-resume",
+            state=CleanupExecutionState.PURGED,
+            affected_count=2,
+        )
+
+    def recover(request):
+        calls.append(("recover", request))
+        return SimpleNamespace(
+            execution_id="execution-recover",
+            state=CleanupExecutionState.QUARANTINED,
+            affected_count=1,
+        )
+
+    monkeypatch.setattr(cli, "apply_history_plan", apply)
+    monkeypatch.setattr(cli, "resume_history_cleanup", resume)
+    monkeypatch.setattr(cli, "recover_history_cleanup", recover)
+
+    commands = (
+        (
+            [
+                "history-apply",
+                "--workspace",
+                str(workspace),
+                "--plan-id",
+                "plan-safe",
+                "--export-receipt",
+                "b" * 64,
+                "--confirm",
+                "synthetic confirmation phrase",
+            ],
+            "Execution: execution-new\nState: purged\nAffected: 3\n",
+        ),
+        (
+            [
+                "history-apply",
+                "--workspace",
+                str(workspace),
+                "--resume",
+                "execution-resume",
+            ],
+            "Execution: execution-resume\nState: purged\nAffected: 2\n",
+        ),
+        (
+            [
+                "history-apply",
+                "--workspace",
+                str(workspace),
+                "--recover",
+                "execution-recover",
+            ],
+            "Execution: execution-recover\nState: quarantined\nAffected: 1\n",
+        ),
+    )
+    for command, expected_output in commands:
+        assert main(command) == 0
+        captured = capsys.readouterr()
+        assert captured.out == expected_output
+        assert captured.err == ""
+        assert str(workspace) not in captured.out
+        assert "synthetic confirmation phrase" not in captured.out
+
+    assert [kind for kind, _ in calls] == ["apply", "resume", "recover"]
+
+
+def test_cli_history_apply_rejects_missing_partial_and_mixed_modes_before_service(
+    workspace, tmp_path, monkeypatch, capsys
+):
+    invoked = []
+
+    def unexpected(*args):
+        invoked.append(args)
+        raise AssertionError("history service must not be invoked")
+
+    monkeypatch.setattr(cli, "apply_history_plan", unexpected)
+    monkeypatch.setattr(cli, "resume_history_cleanup", unexpected)
+    monkeypatch.setattr(cli, "recover_history_cleanup", unexpected)
+
+    private_path = tmp_path / "private-workspace"
+    receipt = "c" * 64
+    confirmation = "synthetic confirmation must not be echoed"
+    invalid_commands = (
+        ["history-apply", "--workspace", str(private_path)],
+        [
+            "history-apply",
+            "--workspace",
+            str(private_path),
+            "--plan-id",
+            "plan-safe",
+        ],
+        [
+            "history-apply",
+            "--workspace",
+            str(private_path),
+            "--resume",
+            "execution-safe",
+            "--confirm",
+            confirmation,
+        ],
+        [
+            "history-apply",
+            "--workspace",
+            str(private_path),
+            "--recover",
+            "execution-safe",
+            "--export-receipt",
+            receipt,
+        ],
+    )
+    for command in invalid_commands:
+        assert main(command) == 1
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "history apply mode is invalid" in captured.err
+        assert str(private_path) not in captured.err
+        assert receipt not in captured.err
+        assert confirmation not in captured.err
+        assert "Traceback" not in captured.err
+
+    assert invoked == []
+
+
+def test_cli_history_error_is_controlled_and_never_leaks_locator(
+    workspace, monkeypatch, capsys
+):
+    unsafe_locator = f"file://{workspace}/private-history-plan.json"
+
+    def fail(_request):
+        raise HistoryError(f"history failure: {unsafe_locator}")
+
+    monkeypatch.setattr(cli, "plan_history_cleanup", fail)
+
+    assert main(["history-plan", "--workspace", str(workspace)]) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "managed history command failed safely" in captured.err
+    assert unsafe_locator not in captured.err
+    assert str(workspace) not in captured.err
     assert "Traceback" not in captured.err
