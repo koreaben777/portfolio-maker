@@ -10,14 +10,19 @@ import pytest
 import portfolio_maker.infrastructure.extractors as extractors
 import portfolio_maker.application.vision_analysis as vision_analysis
 from portfolio_maker.application.approval import write_sample_approval
-from portfolio_maker.application.models import PrepareVisionAnalysisRequest
+from portfolio_maker.application.models import (
+    ApplyVisionAnalysisRequest,
+    PrepareVisionAnalysisRequest,
+)
 from portfolio_maker.application.vision_analysis import (
     VisionAnalysisError,
+    apply_vision_analysis,
     prepare_vision_analysis,
 )
 from portfolio_maker.domain.models import Source, SourceStatus, SourceType
-from portfolio_maker.domain.vision_models import VisionRequestStatus
-from portfolio_maker.infrastructure.sqlite_repository import SQLiteRepository
+from portfolio_maker.domain.vision_models import VisionRequestStatus, VisionReviewStatus
+from portfolio_maker.infrastructure.sqlite_repository import RepositoryError, SQLiteRepository
+from portfolio_maker.infrastructure.vision_store import VisionStore
 from portfolio_maker.workspace import WorkspacePaths
 
 
@@ -57,6 +62,411 @@ def request_count(repository: SQLiteRepository) -> int:
         return int(
             connection.execute("SELECT COUNT(*) FROM vision_analysis_requests").fetchone()[0]
         )
+
+
+def prepare_approved_vision_request(
+    workspace: Path,
+    tmp_path: Path,
+    *,
+    content: bytes = b"approved source",
+) -> tuple[WorkspacePaths, int, object, Path]:
+    source_path = tmp_path / "source.pdf"
+    paths, source_id = approve_binary_source(workspace, source_path, content)
+    prepared = prepare_vision_analysis(
+        PrepareVisionAnalysisRequest(workspace, source_id, True)
+    )
+    return paths, source_id, prepared, source_path
+
+
+def write_vision_result(
+    tmp_path: Path,
+    prepared: object,
+    **overrides: object,
+) -> Path:
+    payload: dict[str, object] = {
+        "schema_version": "vision-analysis-v1",
+        "request_id": prepared.id,
+        "source_content_hash": prepared.source_content_hash,
+        "adapter": "codex-app-vision-v1",
+        "status": "completed",
+        "confidence": "medium",
+        "summary": "Delivered a portfolio document",
+        "observations": [
+            {"kind": "deliverable", "text": "Produced a document", "confidence": "high"}
+        ],
+        "requires_manual_review": True,
+    }
+    payload.update(overrides)
+    result_path = tmp_path / f"result-{prepared.id}.json"
+    result_path.write_text(json.dumps(payload), encoding="utf-8")
+    return result_path
+
+
+def analysis_count(repository: SQLiteRepository) -> int:
+    with repository._read_connection() as connection:
+        return int(connection.execute("SELECT COUNT(*) FROM vision_analyses").fetchone()[0])
+
+
+def evidence_count(repository: SQLiteRepository) -> int:
+    with repository._read_connection() as connection:
+        return int(connection.execute("SELECT COUNT(*) FROM evidence_items").fetchone()[0])
+
+
+def test_apply_completed_result_masks_secret_and_starts_pending(workspace, tmp_path):
+    paths, _, prepared, source_path = prepare_approved_vision_request(workspace, tmp_path)
+    result_path = write_vision_result(
+        tmp_path,
+        prepared,
+        summary="api_key=synthetic-secret-value delivered a document",
+        observations=[
+            {
+                "kind": "technology",
+                "text": "Bearer synthetic-token-value",
+                "confidence": "medium",
+            }
+        ],
+    )
+
+    applied = apply_vision_analysis(ApplyVisionAnalysisRequest(workspace, result_path))
+
+    repository = SQLiteRepository(paths.db_path)
+    request = repository.get_vision_request(prepared.id)
+    analysis = repository.get_vision_analysis(applied.id)
+    persisted_text = applied.analysis_path.read_text(encoding="utf-8")
+    persisted = json.loads(persisted_text)
+    assert applied.review_status is VisionReviewStatus.PENDING
+    assert request["status"] == "completed"
+    assert analysis["request_id"] == prepared.id
+    assert analysis["source_content_hash"] == prepared.source_content_hash
+    assert analysis["result_hash"] == applied.result_hash
+    assert hashlib.sha256(persisted_text.encode("utf-8")).hexdigest() == applied.result_hash
+    assert applied.analysis_path.name == f"analysis-{prepared.id}-{applied.result_hash}.json"
+    assert persisted["summary"] == "api_key=[REDACTED]"
+    assert persisted["observations"][0]["text"] == "[REDACTED]"
+    assert "synthetic-secret-value" not in persisted_text
+    assert "synthetic-token-value" not in persisted_text
+    assert str(result_path) not in persisted_text
+    assert str(paths.workspace) not in persisted_text
+    assert source_path.resolve().as_uri() not in persisted_text
+    assert str(source_path.resolve()) not in persisted_text
+    assert evidence_count(repository) == 0
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    (
+        {"extra": "unexpected"},
+        {"schema_version": "vision-analysis-v2"},
+        {"adapter": "wrong-adapter"},
+        {"status": "pending"},
+        {"source_content_hash": "invalid"},
+        {"confidence": "certain"},
+        {"requires_manual_review": False},
+        {"summary": True},
+        {"observations": [{"kind": "unsafe", "text": "text", "confidence": "low"}]},
+        {"observations": [{}] * 51},
+        {"summary": "x" * 4_001},
+        {"summary": ""},
+    ),
+)
+def test_apply_rejects_nonclosed_completed_schema_without_mutation(
+    workspace, tmp_path, overrides
+):
+    paths, _, prepared, _ = prepare_approved_vision_request(workspace, tmp_path)
+    result_path = write_vision_result(tmp_path, prepared, **overrides)
+
+    with pytest.raises(VisionAnalysisError, match="vision result is unsafe"):
+        apply_vision_analysis(ApplyVisionAnalysisRequest(workspace, result_path))
+
+    repository = SQLiteRepository(paths.db_path)
+    assert repository.get_vision_request(prepared.id)["status"] == "pending"
+    assert analysis_count(repository) == 0
+    assert list(paths.vision_analyses_dir.iterdir()) == []
+
+
+def test_apply_rejects_duplicate_result_keys_without_mutation(workspace, tmp_path):
+    paths, _, prepared, _ = prepare_approved_vision_request(workspace, tmp_path)
+    result_path = write_vision_result(tmp_path, prepared)
+    result_path.write_text(
+        result_path.read_text(encoding="utf-8")[:-1]
+        + f', "request_id": "{prepared.id}"}}',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(VisionAnalysisError, match="vision result is unsafe"):
+        apply_vision_analysis(ApplyVisionAnalysisRequest(workspace, result_path))
+
+    repository = SQLiteRepository(paths.db_path)
+    assert repository.get_vision_request(prepared.id)["status"] == "pending"
+    assert analysis_count(repository) == 0
+
+
+def test_apply_rejects_missing_key_and_unknown_request_without_mutation(
+    workspace, tmp_path
+):
+    paths, _, prepared, _ = prepare_approved_vision_request(workspace, tmp_path)
+    missing_key_path = write_vision_result(tmp_path, prepared)
+    missing_payload = json.loads(missing_key_path.read_text(encoding="utf-8"))
+    missing_payload.pop("summary")
+    missing_key_path.write_text(json.dumps(missing_payload), encoding="utf-8")
+    with pytest.raises(VisionAnalysisError, match="vision result is unsafe"):
+        apply_vision_analysis(ApplyVisionAnalysisRequest(workspace, missing_key_path))
+
+    unknown_path = write_vision_result(
+        tmp_path,
+        prepared,
+        request_id="unknown-request",
+    )
+    with pytest.raises(VisionAnalysisError, match="vision result is unsafe"):
+        apply_vision_analysis(ApplyVisionAnalysisRequest(workspace, unknown_path))
+
+    repository = SQLiteRepository(paths.db_path)
+    assert repository.get_vision_request(prepared.id)["status"] == "pending"
+    assert analysis_count(repository) == 0
+
+
+def test_apply_rejects_payload_hash_mismatch_without_managed_output(workspace, tmp_path):
+    paths, _, prepared, _ = prepare_approved_vision_request(workspace, tmp_path)
+    result_path = write_vision_result(
+        tmp_path,
+        prepared,
+        source_content_hash="0" * 64,
+    )
+
+    with pytest.raises(VisionAnalysisError, match="vision result is unsafe"):
+        apply_vision_analysis(ApplyVisionAnalysisRequest(workspace, result_path))
+
+    repository = SQLiteRepository(paths.db_path)
+    assert repository.get_vision_request(prepared.id)["status"] == "pending"
+    assert analysis_count(repository) == 0
+    assert list(paths.vision_analyses_dir.iterdir()) == []
+
+
+@pytest.mark.parametrize("mutation", ("unapproved", "excluded", "missing", "symlink"))
+def test_apply_revalidates_current_source_before_persistence(
+    workspace, tmp_path, mutation
+):
+    paths, _, prepared, source_path = prepare_approved_vision_request(workspace, tmp_path)
+    result_path = write_vision_result(tmp_path, prepared)
+    if mutation == "unapproved":
+        approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+        approval["approved_source_uris"] = []
+        paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+    elif mutation == "excluded":
+        approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+        approval["excluded_file_patterns"] = ["*.pdf"]
+        paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+    elif mutation == "missing":
+        source_path.unlink()
+    else:
+        replacement = tmp_path / "replacement.pdf"
+        replacement.write_bytes(b"replacement")
+        source_path.unlink()
+        source_path.symlink_to(replacement)
+
+    with pytest.raises(VisionAnalysisError, match="unsafe"):
+        apply_vision_analysis(ApplyVisionAnalysisRequest(workspace, result_path))
+
+    repository = SQLiteRepository(paths.db_path)
+    assert repository.get_vision_request(prepared.id)["status"] == "pending"
+    assert analysis_count(repository) == 0
+    assert list(paths.vision_analyses_dir.iterdir()) == []
+
+
+@pytest.mark.parametrize("malformation", ("invalid_utf8", "oversized", "parent_symlink"))
+def test_apply_rejects_unsafe_result_file_without_request_mutation(
+    workspace, tmp_path, malformation
+):
+    paths, _, prepared, _ = prepare_approved_vision_request(workspace, tmp_path)
+    result_parent = tmp_path / "results"
+    result_parent.mkdir()
+    result_path = write_vision_result(result_parent, prepared)
+    if malformation == "invalid_utf8":
+        result_path.write_bytes(b"\xff")
+    elif malformation == "oversized":
+        result_path.write_bytes(b"x" * 262_145)
+    else:
+        real_parent = tmp_path / "real-results"
+        result_parent.rename(real_parent)
+        result_parent.symlink_to(real_parent, target_is_directory=True)
+        result_path = result_parent / result_path.name
+
+    with pytest.raises(VisionAnalysisError, match="vision result is unsafe"):
+        apply_vision_analysis(ApplyVisionAnalysisRequest(workspace, result_path))
+
+    repository = SQLiteRepository(paths.db_path)
+    assert repository.get_vision_request(prepared.id)["status"] == "pending"
+    assert analysis_count(repository) == 0
+
+
+def test_apply_normalizes_completed_text_and_rejects_locator(workspace, tmp_path):
+    _, _, prepared, _ = prepare_approved_vision_request(workspace, tmp_path)
+    normalized_path = write_vision_result(
+        tmp_path,
+        prepared,
+        summary="Cafe\u0301 delivery",
+    )
+    applied = apply_vision_analysis(ApplyVisionAnalysisRequest(workspace, normalized_path))
+    assert json.loads(applied.analysis_path.read_text(encoding="utf-8"))["summary"] == "Café delivery"
+
+    second_paths, _, second_prepared, _ = prepare_approved_vision_request(
+        tmp_path / "second-workspace", tmp_path / "second-source"
+    )
+    for locator in (
+        "See /synthetic/private/locator before review",
+        "See file:///synthetic/private/locator before review",
+        "See https://example.invalid/private before review",
+        r"See C:\\synthetic\\private before review",
+    ):
+        locator_path = write_vision_result(
+            tmp_path,
+            second_prepared,
+            summary=locator,
+        )
+        with pytest.raises(VisionAnalysisError, match="vision result is unsafe"):
+            apply_vision_analysis(
+                ApplyVisionAnalysisRequest(second_paths.workspace, locator_path)
+            )
+    assert analysis_count(SQLiteRepository(second_paths.db_path)) == 0
+
+
+@pytest.mark.parametrize("status", ("unsupported", "unavailable", "failed", "cancelled"))
+def test_apply_status_only_finishes_request_without_analysis(workspace, tmp_path, status):
+    paths, _, prepared, _ = prepare_approved_vision_request(workspace, tmp_path)
+    result_path = write_vision_result(
+        tmp_path,
+        prepared,
+        status=status,
+        reason_code="capability_unavailable",
+    )
+    payload = json.loads(result_path.read_text(encoding="utf-8"))
+    for key in ("confidence", "summary", "observations", "requires_manual_review"):
+        payload.pop(key)
+    result_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    assert apply_vision_analysis(ApplyVisionAnalysisRequest(workspace, result_path)) is None
+
+    repository = SQLiteRepository(paths.db_path)
+    request = repository.get_vision_request(prepared.id)
+    assert request["status"] == status
+    assert request["reason_code"] == "capability_unavailable"
+    assert analysis_count(repository) == 0
+    assert evidence_count(repository) == 0
+    assert list(paths.vision_analyses_dir.iterdir()) == []
+
+
+def test_apply_marks_changed_source_stale_without_analysis(workspace, tmp_path):
+    paths, _, prepared, source_path = prepare_approved_vision_request(workspace, tmp_path)
+    result_path = write_vision_result(tmp_path, prepared)
+    source_path.write_bytes(b"changed source")
+
+    with pytest.raises(VisionAnalysisError, match="vision source changed"):
+        apply_vision_analysis(ApplyVisionAnalysisRequest(workspace, result_path))
+
+    repository = SQLiteRepository(paths.db_path)
+    request = repository.get_vision_request(prepared.id)
+    assert request["status"] == "stale_source"
+    assert analysis_count(repository) == 0
+    assert evidence_count(repository) == 0
+    assert list(paths.vision_analyses_dir.iterdir()) == []
+
+
+def test_apply_rejects_replay_and_unsafe_result_symlink(workspace, tmp_path):
+    paths, _, prepared, _ = prepare_approved_vision_request(workspace, tmp_path)
+    result_path = write_vision_result(tmp_path, prepared)
+    apply_vision_analysis(ApplyVisionAnalysisRequest(workspace, result_path))
+
+    with pytest.raises(VisionAnalysisError, match="vision result is unsafe"):
+        apply_vision_analysis(ApplyVisionAnalysisRequest(workspace, result_path))
+
+    second_workspace = tmp_path / "second-workspace"
+    second_paths, _, second_prepared, _ = prepare_approved_vision_request(
+        second_workspace, tmp_path / "second"
+    )
+    replacement = write_vision_result(tmp_path, second_prepared)
+    unsafe_path = tmp_path / "unsafe-result.json"
+    unsafe_path.symlink_to(replacement)
+    with pytest.raises(VisionAnalysisError, match="vision result is unsafe"):
+        apply_vision_analysis(ApplyVisionAnalysisRequest(workspace, unsafe_path))
+
+    repository = SQLiteRepository(second_paths.db_path)
+    assert repository.get_vision_request(second_prepared.id)["status"] == "pending"
+    assert analysis_count(repository) == 0
+    assert analysis_count(SQLiteRepository(paths.db_path)) == 1
+
+
+@pytest.mark.parametrize("unsafe_target", (False, True))
+def test_apply_does_not_overwrite_existing_or_unsafe_analysis_target(
+    workspace, tmp_path, unsafe_target
+):
+    paths, _, prepared, _ = prepare_approved_vision_request(workspace, tmp_path)
+    result_path = write_vision_result(tmp_path, prepared)
+    payload = json.loads(result_path.read_text(encoding="utf-8"))
+    canonical = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ) + "\n"
+    result_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    target = paths.vision_analyses_dir / f"analysis-{prepared.id}-{result_hash}.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("existing private data", encoding="utf-8")
+    if unsafe_target:
+        replacement = tmp_path / "replacement-analysis.json"
+        replacement.write_text("replacement private data", encoding="utf-8")
+        target.unlink()
+        target.symlink_to(replacement)
+
+    with pytest.raises(VisionAnalysisError, match="vision result is unsafe"):
+        apply_vision_analysis(ApplyVisionAnalysisRequest(workspace, result_path))
+
+    repository = SQLiteRepository(paths.db_path)
+    assert repository.get_vision_request(prepared.id)["status"] == "pending"
+    assert analysis_count(repository) == 0
+    if unsafe_target:
+        assert target.is_symlink()
+    else:
+        assert target.read_text(encoding="utf-8") == "existing private data"
+
+
+def test_apply_maps_managed_write_and_repository_failures_without_success(
+    workspace, tmp_path, monkeypatch
+):
+    paths, _, prepared, _ = prepare_approved_vision_request(workspace, tmp_path)
+    result_path = write_vision_result(tmp_path, prepared)
+
+    def fail_write(*_args, **_kwargs):
+        raise OSError("synthetic managed write failure")
+
+    monkeypatch.setattr(VisionStore, "write_analysis", fail_write)
+    with pytest.raises(VisionAnalysisError, match="vision result is unsafe"):
+        apply_vision_analysis(ApplyVisionAnalysisRequest(workspace, result_path))
+
+    repository = SQLiteRepository(paths.db_path)
+    assert repository.get_vision_request(prepared.id)["status"] == "pending"
+    assert analysis_count(repository) == 0
+    assert list(paths.vision_analyses_dir.iterdir()) == []
+
+    monkeypatch.undo()
+    second_paths, _, second_prepared, _ = prepare_approved_vision_request(
+        tmp_path / "second-workspace", tmp_path / "second-source"
+    )
+    second_result_path = write_vision_result(tmp_path, second_prepared)
+
+    def fail_insert(*_args, **_kwargs):
+        raise RepositoryError("synthetic repository failure")
+
+    monkeypatch.setattr(SQLiteRepository, "insert_vision_analysis", fail_insert)
+    with pytest.raises(VisionAnalysisError, match="vision result is unsafe"):
+        apply_vision_analysis(
+            ApplyVisionAnalysisRequest(second_paths.workspace, second_result_path)
+        )
+
+    second_repository = SQLiteRepository(second_paths.db_path)
+    assert second_repository.get_vision_request(second_prepared.id)["status"] == "pending"
+    assert analysis_count(second_repository) == 0
+    assert len(list(second_paths.vision_analyses_dir.iterdir())) == 1
 
 
 def test_prepare_requires_confirmation_without_side_effect(workspace, tmp_path):
