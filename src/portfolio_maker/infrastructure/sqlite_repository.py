@@ -1364,7 +1364,7 @@ class SQLiteRepository:
                     request.adapter,
                     status.value,
                     request.confirmation_at,
-                    utc_now(),
+                    request.requested_at,
                 ),
             )
 

@@ -350,6 +350,7 @@ def test_vision_request_and_analysis_round_trip(workspace) -> None:
     analysis = repository.get_vision_analysis(applied.id)
     assert pending["status"] == "pending"
     assert pending["completed_at"] is None
+    assert pending["requested_at"] == request.requested_at
     assert completed["status"] == "completed"
     assert completed["completed_at"] is not None
     assert analysis == repository.list_vision_analyses()[0]
@@ -1643,6 +1644,7 @@ def _vision_request(request_id: str, source_id: int) -> PreparedVisionRequest:
         "codex-app-vision-v1",
         VisionRequestStatus.PENDING,
         "2026-07-23T00:00:00Z",
+        "2026-07-23T00:00:01Z",
     )
 
 

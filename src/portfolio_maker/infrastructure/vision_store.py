@@ -28,6 +28,7 @@ class VisionStore:
             "adapter": request.adapter,
             "status": request.status.value,
             "confirmation_at": request.confirmation_at,
+            "requested_at": request.requested_at,
         }
         path = self.paths.vision_requests_dir / f"request-{request.id}.json"
         return write_managed_text(

@@ -44,6 +44,7 @@ def test_prepared_vision_request_defaults_to_pending_codex_adapter() -> None:
     assert request.adapter == "codex-app-vision-v1"
     assert request.status is VisionRequestStatus.PENDING
     assert request.confirmation_at.endswith("Z")
+    assert request.requested_at.endswith("Z")
 
 
 def test_vision_result_is_immutable_and_statuses_are_explicit() -> None:

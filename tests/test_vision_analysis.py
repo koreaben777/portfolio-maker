@@ -247,6 +247,7 @@ def test_prepare_persists_matching_private_request_and_safe_receipt(
     assert row["source_size"] == prepared.source_size
     assert row["adapter"] == prepared.adapter
     assert row["status"] == "pending"
+    assert row["requested_at"] == prepared.requested_at
     assert set(receipt) == {
         "request_id",
         "source_id",
@@ -256,6 +257,7 @@ def test_prepare_persists_matching_private_request_and_safe_receipt(
         "adapter",
         "status",
         "confirmation_at",
+        "requested_at",
     }
     assert receipt == {
         "request_id": prepared.id,
@@ -266,6 +268,7 @@ def test_prepare_persists_matching_private_request_and_safe_receipt(
         "adapter": "codex-app-vision-v1",
         "status": "pending",
         "confirmation_at": prepared.confirmation_at,
+        "requested_at": prepared.requested_at,
     }
     assert source_path.resolve().as_uri() not in receipt_text
     assert str(source_path.resolve()) not in receipt_text
@@ -301,6 +304,7 @@ def test_prepare_does_not_overwrite_existing_or_unsafe_receipt_target(
             "codex-app-vision-v1",
             VisionRequestStatus.PENDING,
             "2026-07-28T00:00:00Z",
+            "2026-07-28T00:00:01Z",
         )
 
     monkeypatch.setattr(

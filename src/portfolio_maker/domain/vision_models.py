@@ -33,9 +33,12 @@ class PreparedVisionRequest:
     adapter: str
     status: VisionRequestStatus
     confirmation_at: str
+    requested_at: str
 
     @classmethod
     def new(cls, source_id: int, content_hash: str, size: int) -> PreparedVisionRequest:
+        confirmation_at = utc_now()
+        requested_at = utc_now()
         return cls(
             uuid4().hex,
             source_id,
@@ -43,7 +46,8 @@ class PreparedVisionRequest:
             size,
             "codex-app-vision-v1",
             VisionRequestStatus.PENDING,
-            utc_now(),
+            confirmation_at,
+            requested_at,
         )
 
 
