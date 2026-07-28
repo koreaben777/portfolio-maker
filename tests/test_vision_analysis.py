@@ -314,8 +314,11 @@ def test_apply_normalizes_completed_text_and_rejects_locator(workspace, tmp_path
     )
     for locator in (
         "See /synthetic/private/locator before review",
+        "See /tmp before review",
+        "See /Users/example/My Project/source.pdf before review",
         "See file:///synthetic/private/locator before review",
         "See https://example.invalid/private before review",
+        r"See \\server\\share before review",
         r"See C:\\synthetic\\private before review",
     ):
         locator_path = write_vision_result(
@@ -328,6 +331,60 @@ def test_apply_normalizes_completed_text_and_rejects_locator(workspace, tmp_path
                 ApplyVisionAnalysisRequest(second_paths.workspace, locator_path)
             )
     assert analysis_count(SQLiteRepository(second_paths.db_path)) == 0
+
+
+def test_apply_allows_ordinary_slash_prose(workspace, tmp_path):
+    _, _, prepared, _ = prepare_approved_vision_request(workspace, tmp_path)
+    result_path = write_vision_result(
+        tmp_path,
+        prepared,
+        summary="Reviewed API/CLI interoperability",
+    )
+
+    applied = apply_vision_analysis(ApplyVisionAnalysisRequest(workspace, result_path))
+
+    assert applied is not None
+
+
+@pytest.mark.parametrize(
+    "locator",
+    (
+        "Keep the review notes in /tmp",
+        r"Use \\server\\share for the result",
+    ),
+)
+def test_apply_rejects_locator_in_observation(workspace, tmp_path, locator):
+    paths, _, prepared, _ = prepare_approved_vision_request(workspace, tmp_path)
+    result_path = write_vision_result(
+        tmp_path,
+        prepared,
+        observations=[
+            {
+                "kind": "context",
+                "text": locator,
+                "confidence": "medium",
+            }
+        ],
+    )
+
+    with pytest.raises(VisionAnalysisError, match="vision result is unsafe"):
+        apply_vision_analysis(ApplyVisionAnalysisRequest(workspace, result_path))
+
+    assert analysis_count(SQLiteRepository(paths.db_path)) == 0
+
+
+def test_apply_maps_deeply_nested_json_to_controlled_error(workspace, tmp_path):
+    paths, _, prepared, _ = prepare_approved_vision_request(workspace, tmp_path)
+    result_path = tmp_path / "deep-result.json"
+    nesting = 10_000
+    result_path.write_text("[" * nesting + "]" * nesting, encoding="utf-8")
+
+    with pytest.raises(VisionAnalysisError, match="vision result is unsafe"):
+        apply_vision_analysis(ApplyVisionAnalysisRequest(workspace, result_path))
+
+    repository = SQLiteRepository(paths.db_path)
+    assert repository.get_vision_request(prepared.id)["status"] == "pending"
+    assert analysis_count(repository) == 0
 
 
 @pytest.mark.parametrize("status", ("unsupported", "unavailable", "failed", "cancelled"))

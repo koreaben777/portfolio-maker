@@ -80,7 +80,8 @@ _MAX_OBSERVATION_TEXT_LENGTH = 1_000
 _MAX_REASON_CODE_LENGTH = 80
 _REASON_CODE = re.compile(r"[a-z][a-z0-9_]*")
 _WINDOWS_PATH = re.compile(r"(?<![A-Za-z0-9])[A-Za-z]:[\\/]")
-_POSIX_PATH = re.compile(r"(?<![A-Za-z0-9_.-])/(?:[^\s/]+/)+[^\s/]+")
+_POSIX_PATH = re.compile(r"(?<![A-Za-z0-9_.-])/(?:[^\s/]+(?:/[^\s/]+)*)")
+_UNC_PATH = re.compile(r"(?<!\\)\\\\[^\\/\s]+[\\/]+[^\\/\s]+")
 
 
 def prepare_vision_analysis(
@@ -331,6 +332,7 @@ def _looks_like_locator(value: str) -> bool:
         or "https://" in lowered
         or _POSIX_PATH.search(value) is not None
         or _WINDOWS_PATH.search(value) is not None
+        or _UNC_PATH.search(value) is not None
     )
 
 

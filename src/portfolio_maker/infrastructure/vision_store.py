@@ -51,7 +51,7 @@ class VisionStore:
                 raw.decode("utf-8"),
                 object_pairs_hook=_reject_duplicate_object_keys,
             )
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:
             raise ValueError("vision result is not valid JSON") from error
 
     def write_analysis(
