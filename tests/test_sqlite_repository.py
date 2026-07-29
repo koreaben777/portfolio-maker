@@ -326,23 +326,11 @@ def test_vision_request_and_analysis_round_trip(workspace) -> None:
     repository.create_vision_request(request)
     pending = repository.get_vision_request(request.id)
     repository.finish_vision_request(request.id, VisionRequestStatus.COMPLETED)
-    analysis_path = paths.vision_analyses_dir / "analysis-round-trip.json"
-    analysis_path.write_text('{"summary":"synthetic"}', encoding="utf-8")
-    applied = AppliedVisionAnalysisResult(
+    applied, result = _canonical_test_vision_analysis(
+        paths,
+        request,
         "analysis-round-trip",
-        "b" * 64,
-        analysis_path,
         VisionReviewStatus.PENDING,
-    )
-    result = VisionAnalysisResult(
-        request.id,
-        request.source_content_hash,
-        request.adapter,
-        VisionRequestStatus.COMPLETED,
-        "medium",
-        "synthetic summary",
-        (),
-        True,
     )
     repository.insert_vision_analysis(applied, result)
 
@@ -355,8 +343,163 @@ def test_vision_request_and_analysis_round_trip(workspace) -> None:
     assert completed["completed_at"] is not None
     assert analysis == repository.list_vision_analyses()[0]
     assert analysis["source_id"] == source_id
-    assert analysis["relative_path"] == "derived/vision/analysis-round-trip.json"
+    assert analysis["relative_path"] == (
+        f"derived/vision/analysis-{request.id}-{applied.result_hash}.json"
+    )
     assert analysis["review_status"] == "pending"
+
+
+@pytest.mark.parametrize("confidence", ("medium", "high"))
+def test_vision_repository_insert_accepts_bound_included_confidence(
+    workspace,
+    confidence,
+) -> None:
+    paths = WorkspacePaths.from_root(workspace)
+    paths.ensure()
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    source_id = _insert_synthetic_source(repository, f"vision-{confidence}")
+    request = _vision_request(f"request-{confidence}", source_id)
+    repository.create_vision_request(request)
+    repository.finish_vision_request(request.id, VisionRequestStatus.COMPLETED)
+    applied, result = _canonical_test_vision_analysis(
+        paths,
+        request,
+        f"analysis-{confidence}",
+        VisionReviewStatus.INCLUDED,
+        confidence=confidence,
+    )
+
+    repository.insert_vision_analysis(applied, result)
+
+    assert repository.get_vision_analysis(applied.id)["review_status"] == "included"
+    with repository._read_connection() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM evidence_items"
+        ).fetchone()[0] == 0
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "duplicate_key",
+        "result_hash",
+        "relative_path",
+        "request_id",
+        "source_hash",
+        "source_status",
+        "adapter",
+        "status",
+        "confidence",
+        "missing",
+        "symlink",
+        "non_regular",
+    ),
+)
+def test_vision_repository_insert_rejects_unbound_managed_analysis(
+    workspace,
+    mutation,
+) -> None:
+    paths = WorkspacePaths.from_root(workspace)
+    paths.ensure()
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    source_id = _insert_synthetic_source(repository, f"vision-binding-{mutation}")
+    request = _vision_request(f"request-binding-{mutation}", source_id)
+    repository.create_vision_request(request)
+    repository.finish_vision_request(request.id, VisionRequestStatus.COMPLETED)
+    applied, result = _canonical_test_vision_analysis(
+        paths,
+        request,
+        f"analysis-binding-{mutation}",
+        VisionReviewStatus.INCLUDED,
+    )
+    original_path = applied.analysis_path
+
+    if mutation == "source_status":
+        with repository._connection() as connection:
+            connection.execute(
+                "UPDATE sources SET status = 'discovered' WHERE id = ?",
+                (source_id,),
+            )
+    elif mutation == "result_hash":
+        applied = AppliedVisionAnalysisResult(
+            applied.id,
+            "0" * 64,
+            original_path,
+            applied.review_status,
+        )
+    elif mutation == "relative_path":
+        wrong_path = paths.vision_analyses_dir / "wrong-analysis-name.json"
+        wrong_path.write_bytes(original_path.read_bytes())
+        original_path.unlink()
+        applied = AppliedVisionAnalysisResult(
+            applied.id,
+            applied.result_hash,
+            wrong_path,
+            applied.review_status,
+        )
+    elif mutation == "missing":
+        original_path.unlink()
+    elif mutation == "symlink":
+        replacement = workspace / "replacement-analysis.json"
+        replacement.write_bytes(original_path.read_bytes())
+        original_path.unlink()
+        original_path.symlink_to(replacement)
+    elif mutation == "non_regular":
+        original_path.unlink()
+        original_path.mkdir()
+    else:
+        payload = json.loads(original_path.read_text(encoding="utf-8"))
+        if mutation == "request_id":
+            payload["request_id"] = "other-request"
+        elif mutation == "source_hash":
+            payload["source_content_hash"] = "0" * 64
+        elif mutation == "adapter":
+            payload["adapter"] = "other-adapter"
+        elif mutation == "status":
+            payload["status"] = "pending"
+        elif mutation == "confidence":
+            payload["confidence"] = "low"
+        if mutation == "duplicate_key":
+            content = (
+                original_path.read_text(encoding="utf-8")[:-2]
+                + ',"summary":"duplicate"}\n'
+            )
+        else:
+            content = (
+                json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+                + "\n"
+            )
+        result_hash = sha256(content.encode("utf-8")).hexdigest()
+        replacement_path = (
+            paths.vision_analyses_dir
+            / f"analysis-{request.id}-{result_hash}.json"
+        )
+        replacement_path.write_text(content, encoding="utf-8")
+        original_path.unlink()
+        applied = AppliedVisionAnalysisResult(
+            applied.id,
+            result_hash,
+            replacement_path,
+            applied.review_status,
+        )
+
+    with pytest.raises(RepositoryError):
+        repository.insert_vision_analysis(applied, result)
+
+    with repository._read_connection() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM vision_analyses"
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM evidence_items"
+        ).fetchone()[0] == 0
 
 
 def test_vision_analysis_include_and_exclude_enforce_references(workspace) -> None:
@@ -368,27 +511,14 @@ def test_vision_analysis_include_and_exclude_enforce_references(workspace) -> No
     request = _vision_request("request-review", source_id)
     repository.create_vision_request(request)
     repository.finish_vision_request(request.id, VisionRequestStatus.COMPLETED)
-    analysis_path = paths.vision_analyses_dir / "analysis-review.json"
-    analysis_path.write_text('{"summary":"synthetic"}', encoding="utf-8")
-    applied = AppliedVisionAnalysisResult(
+    applied, result = _canonical_test_vision_analysis(
+        paths,
+        request,
         "analysis-review",
-        "c" * 64,
-        analysis_path,
         VisionReviewStatus.PENDING,
+        confidence="high",
     )
-    repository.insert_vision_analysis(
-        applied,
-        VisionAnalysisResult(
-            request.id,
-            request.source_content_hash,
-            request.adapter,
-            VisionRequestStatus.COMPLETED,
-            "high",
-            "synthetic summary",
-            (),
-            True,
-        ),
-    )
+    repository.insert_vision_analysis(applied, result)
     stable_id = f"vision-analysis:{applied.id}:{applied.result_hash}"
     evidence_id = repository.upsert_evidence_item(
         source_id=source_id,
@@ -1375,27 +1505,14 @@ def test_delete_planned_history_units_rechecks_request_analysis_pairing(
         plan,
         Path(f"reviews/history-plans/{plan.id}.json"),
     )
-    analysis_path = paths.vision_analyses_dir / "pairing-drift.json"
-    analysis_path.write_text('{"summary":"pairing drift"}', encoding="utf-8")
-    applied = AppliedVisionAnalysisResult(
+    applied, result = _canonical_test_vision_analysis(
+        paths,
+        request,
         "analysis-pairing-drift",
-        "d" * 64,
-        analysis_path,
         VisionReviewStatus.EXCLUDED,
+        summary="pairing drift",
     )
-    repository.insert_vision_analysis(
-        applied,
-        VisionAnalysisResult(
-            request.id,
-            request.source_content_hash,
-            request.adapter,
-            VisionRequestStatus.COMPLETED,
-            "medium",
-            "pairing drift",
-            (),
-            True,
-        ),
-    )
+    repository.insert_vision_analysis(applied, result)
     with repository._connection() as connection:
         connection.execute(
             """
@@ -1654,6 +1771,61 @@ def _write_vision_request_receipt(paths: WorkspacePaths, request_id: str) -> Pat
     return receipt_path
 
 
+def _canonical_test_vision_analysis(
+    paths: WorkspacePaths,
+    request: PreparedVisionRequest,
+    analysis_id: str,
+    review_status: VisionReviewStatus,
+    *,
+    confidence: str = "medium",
+    summary: str = "synthetic summary",
+) -> tuple[AppliedVisionAnalysisResult, VisionAnalysisResult]:
+    payload = {
+        "schema_version": "vision-analysis-v1",
+        "request_id": request.id,
+        "source_content_hash": request.source_content_hash,
+        "adapter": request.adapter,
+        "status": "completed",
+        "confidence": confidence,
+        "summary": summary,
+        "observations": [],
+        "requires_manual_review": True,
+    }
+    content = (
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n"
+    )
+    result_hash = sha256(content.encode("utf-8")).hexdigest()
+    analysis_path = (
+        paths.vision_analyses_dir
+        / f"analysis-{request.id}-{result_hash}.json"
+    )
+    analysis_path.write_text(content, encoding="utf-8")
+    return (
+        AppliedVisionAnalysisResult(
+            analysis_id,
+            result_hash,
+            analysis_path,
+            review_status,
+        ),
+        VisionAnalysisResult(
+            request.id,
+            request.source_content_hash,
+            request.adapter,
+            VisionRequestStatus.COMPLETED,
+            confidence,
+            summary,
+            (),
+            True,
+        ),
+    )
+
+
 def _insert_test_vision_analysis(
     repository: SQLiteRepository,
     paths: WorkspacePaths,
@@ -1666,27 +1838,13 @@ def _insert_test_vision_analysis(
     repository.create_vision_request(request)
     repository.finish_vision_request(request.id, VisionRequestStatus.COMPLETED)
     _write_vision_request_receipt(paths, request.id)
-    analysis_path = paths.vision_analyses_dir / f"{analysis_id}.json"
-    analysis_path.write_text('{"summary":"synthetic"}', encoding="utf-8")
-    applied = AppliedVisionAnalysisResult(
+    applied, result = _canonical_test_vision_analysis(
+        paths,
+        request,
         analysis_id,
-        suffix[0] * 64,
-        analysis_path,
         review_status,
     )
-    repository.insert_vision_analysis(
-        applied,
-        VisionAnalysisResult(
-            request.id,
-            request.source_content_hash,
-            request.adapter,
-            VisionRequestStatus.COMPLETED,
-            "medium",
-            "synthetic summary",
-            (),
-            True,
-        ),
-    )
+    repository.insert_vision_analysis(applied, result)
     return applied
 
 

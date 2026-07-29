@@ -48,6 +48,11 @@ from portfolio_maker.infrastructure.managed_files import (
     ensure_managed_directory,
     open_managed_directory,
 )
+from portfolio_maker.infrastructure.vision_store import (
+    PersistedVisionAnalysisBinding,
+    VisionStore,
+)
+from portfolio_maker.workspace import WorkspacePaths
 
 
 SCHEMA = """
@@ -1440,20 +1445,38 @@ class SQLiteRepository:
         except (TypeError, ValueError) as error:
             raise self._semantic_error() from error
         if (
+            status is not VisionRequestStatus.COMPLETED
+            or type(result.confidence) is not str
+            or result.confidence not in {"low", "medium", "high"}
+        ):
+            raise RepositoryError("vision analysis confidence is invalid")
+        if (
             review_status is VisionReviewStatus.INCLUDED
-            and result.confidence == "low"
+            and result.confidence not in {"medium", "high"}
         ):
             raise RepositoryError("vision analysis confidence is not eligible")
-        relative_path, _, _, _, _ = self._managed_history_file_metadata(
+        relative_path, _, _, _, stored_hash = self._managed_history_file_metadata(
             "vision_analysis",
             str(analysis.analysis_path),
         )
+        if (
+            stored_hash != analysis.result_hash
+            or relative_path
+            != f"derived/vision/analysis-{result.request_id}-{analysis.result_hash}.json"
+        ):
+            raise RepositoryError("vision analysis does not match its managed result")
         with self._connection() as conn:
             request = conn.execute(
                 """
-                SELECT source_id, source_content_hash, adapter
-                FROM vision_analysis_requests
-                WHERE id = ?
+                SELECT request.source_id,
+                       request.source_content_hash,
+                       request.adapter,
+                       request.status,
+                       source.type AS source_type,
+                       source.status AS source_status
+                FROM vision_analysis_requests AS request
+                JOIN sources AS source ON source.id = request.source_id
+                WHERE request.id = ?
                 """,
                 (result.request_id,),
             ).fetchone()
@@ -1463,13 +1486,45 @@ class SQLiteRepository:
                 source_id = self._required_int(request, "source_id")
                 request_hash = self._required_text(request, "source_content_hash")
                 request_adapter = self._required_text(request, "adapter")
+                request_status = VisionRequestStatus(
+                    self._required_text(request, "status")
+                )
+                source_type = self._required_text(request, "source_type")
+                source_status = self._required_text(request, "source_status")
             except (KeyError, TypeError, ValueError) as error:
                 raise self._semantic_error() from error
             if (
-                result.source_content_hash != request_hash
+                request_status
+                not in {
+                    VisionRequestStatus.PENDING,
+                    VisionRequestStatus.COMPLETED,
+                }
+                or (
+                    review_status is VisionReviewStatus.INCLUDED
+                    and request_status is not VisionRequestStatus.COMPLETED
+                )
+                or result.source_content_hash != request_hash
                 or result.adapter != request_adapter
+                or source_type != SourceType.LOCAL_FILE.value
+                or source_status
+                not in {
+                    SourceStatus.APPROVED.value,
+                    SourceStatus.INGESTED.value,
+                }
             ):
                 raise RepositoryError("vision analysis does not match its request")
+            binding = self._read_vision_analysis_binding(
+                relative_path,
+                analysis.result_hash,
+            )
+            if (
+                binding.request_id != result.request_id
+                or binding.source_content_hash != request_hash
+                or binding.adapter != request_adapter
+                or binding.status != VisionRequestStatus.COMPLETED.value
+                or binding.confidence != result.confidence
+            ):
+                raise RepositoryError("vision analysis does not match its managed result")
             conn.execute(
                 """
                 INSERT INTO vision_analyses
@@ -1543,9 +1598,19 @@ class SQLiteRepository:
 
     def mark_vision_analysis_included(self, analysis_id: str, evidence_id: int) -> None:
         with self._connection() as conn:
+            try:
+                self._bound_vision_analysis(
+                    conn,
+                    analysis_id,
+                    require_inclusion=True,
+                )
+            except RepositoryError as error:
+                raise RepositoryError(
+                    "vision analysis evidence does not match a completed analysis"
+                ) from error
             row = conn.execute(
                 """
-                SELECT vision_analyses.id
+                SELECT evidence_items.id
                 FROM vision_analyses
                 JOIN evidence_items
                   ON evidence_items.id = ?
@@ -1557,9 +1622,6 @@ class SQLiteRepository:
                      vision_analyses.result_hash
                  AND evidence_items.content_hash = vision_analyses.result_hash
                 WHERE vision_analyses.id = ?
-                  AND vision_analyses.status = 'completed'
-                  AND vision_analyses.confidence IN ('medium', 'high')
-                  AND vision_analyses.result_hash IS NOT NULL
                 """,
                 (evidence_id, analysis_id),
             ).fetchone()
@@ -1588,89 +1650,11 @@ class SQLiteRepository:
         }:
             raise RepositoryError("vision analysis review state is invalid")
         with self._connection() as conn:
-            analysis = conn.execute(
-                """
-                SELECT analysis.id AS analysis_id,
-                       analysis.request_id AS analysis_request_id,
-                       analysis.source_id AS analysis_source_id,
-                       analysis.source_content_hash AS analysis_source_hash,
-                       analysis.result_hash AS result_hash,
-                       analysis.relative_path AS relative_path,
-                       analysis.adapter AS analysis_adapter,
-                       analysis.status AS analysis_status,
-                       analysis.confidence AS confidence,
-                       request.id AS request_id,
-                       request.source_id AS request_source_id,
-                       request.source_content_hash AS request_source_hash,
-                       request.adapter AS request_adapter,
-                       request.status AS request_status
-                FROM vision_analyses AS analysis
-                JOIN vision_analysis_requests AS request
-                  ON request.id = analysis.request_id
-                WHERE analysis.id = ?
-                """,
-                (analysis_id,),
-            ).fetchone()
-            if analysis is None:
-                raise RepositoryError("vision analysis was not found")
-            try:
-                stored_analysis_id = self._required_text(analysis, "analysis_id")
-                request_id = self._required_text(analysis, "analysis_request_id")
-                source_id = self._required_int(analysis, "analysis_source_id")
-                source_hash = self._required_text(analysis, "analysis_source_hash")
-                result_hash = self._required_text(analysis, "result_hash")
-                relative_path = self._required_text(analysis, "relative_path")
-                adapter = self._required_text(analysis, "analysis_adapter")
-                confidence = self._required_text(analysis, "confidence")
-                status = VisionRequestStatus(self._required_text(analysis, "analysis_status"))
-                stored_request_id = self._required_text(analysis, "request_id")
-                request_source_id = self._required_int(analysis, "request_source_id")
-                request_source_hash = self._required_text(analysis, "request_source_hash")
-                request_adapter = self._required_text(analysis, "request_adapter")
-                request_status = VisionRequestStatus(
-                    self._required_text(analysis, "request_status")
-                )
-                self._validate_record_identifier(request_id)
-            except (KeyError, TypeError, ValueError) as error:
-                raise self._semantic_error() from error
-            if (
-                stored_analysis_id != analysis_id
-                or status is not VisionRequestStatus.COMPLETED
-                or request_status is not VisionRequestStatus.COMPLETED
-                or request_id != stored_request_id
-                or source_id != request_source_id
-                or source_hash != request_source_hash
-                or adapter != request_adapter
-                or relative_path
-                != f"derived/vision/analysis-{request_id}-{result_hash}.json"
-                or confidence not in {"low", "medium", "high"}
-                or len(result_hash) != 64
-                or any(character not in "0123456789abcdef" for character in result_hash)
-                or len(source_hash) != 64
-                or any(character not in "0123456789abcdef" for character in source_hash)
-            ):
-                raise RepositoryError("completed vision analysis was not found")
-            if (
-                review_status is VisionReviewStatus.INCLUDED
-                and confidence == "low"
-            ):
-                raise RepositoryError("vision analysis confidence is not eligible")
-            source = conn.execute(
-                "SELECT type, status FROM sources WHERE id = ?",
-                (source_id,),
-            ).fetchone()
-            if source is None:
-                raise RepositoryError("vision analysis source was not found")
-            try:
-                source_type = self._required_text(source, "type")
-                source_status = self._required_text(source, "status")
-            except (KeyError, TypeError, ValueError) as error:
-                raise self._semantic_error() from error
-            if source_type != SourceType.LOCAL_FILE.value or source_status not in {
-                SourceStatus.APPROVED.value,
-                SourceStatus.INGESTED.value,
-            }:
-                raise RepositoryError("vision analysis source is not current")
+            source_id, result_hash = self._bound_vision_analysis(
+                conn,
+                analysis_id,
+                require_inclusion=review_status is VisionReviewStatus.INCLUDED,
+            )
             if review_status is VisionReviewStatus.INCLUDED:
                 locator = f"derived:vision-analysis:{analysis_id}"
                 stable_id = f"vision-analysis:{analysis_id}:{result_hash}"
@@ -1724,6 +1708,117 @@ class SQLiteRepository:
             )
             if cursor.rowcount != 1:
                 raise RepositoryError("completed vision analysis was not found")
+
+    def _bound_vision_analysis(
+        self,
+        conn: sqlite3.Connection,
+        analysis_id: str,
+        *,
+        require_inclusion: bool,
+    ) -> tuple[int, str]:
+        analysis = conn.execute(
+            """
+            SELECT analysis.id AS analysis_id,
+                   analysis.request_id AS analysis_request_id,
+                   analysis.source_id AS analysis_source_id,
+                   analysis.source_content_hash AS analysis_source_hash,
+                   analysis.result_hash AS result_hash,
+                   analysis.relative_path AS relative_path,
+                   analysis.adapter AS analysis_adapter,
+                   analysis.status AS analysis_status,
+                   analysis.confidence AS confidence,
+                   request.id AS request_id,
+                   request.source_id AS request_source_id,
+                   request.source_content_hash AS request_source_hash,
+                   request.adapter AS request_adapter,
+                   request.status AS request_status,
+                   source.type AS source_type,
+                   source.status AS source_status
+            FROM vision_analyses AS analysis
+            JOIN vision_analysis_requests AS request
+              ON request.id = analysis.request_id
+            JOIN sources AS source
+              ON source.id = analysis.source_id
+            WHERE analysis.id = ?
+            """,
+            (analysis_id,),
+        ).fetchone()
+        if analysis is None:
+            raise RepositoryError("vision analysis was not found")
+        try:
+            stored_analysis_id = self._required_text(analysis, "analysis_id")
+            request_id = self._required_text(analysis, "analysis_request_id")
+            source_id = self._required_int(analysis, "analysis_source_id")
+            source_hash = self._required_text(analysis, "analysis_source_hash")
+            result_hash = self._required_text(analysis, "result_hash")
+            relative_path = self._required_text(analysis, "relative_path")
+            adapter = self._required_text(analysis, "analysis_adapter")
+            confidence = self._required_text(analysis, "confidence")
+            status = VisionRequestStatus(
+                self._required_text(analysis, "analysis_status")
+            )
+            stored_request_id = self._required_text(analysis, "request_id")
+            request_source_id = self._required_int(analysis, "request_source_id")
+            request_source_hash = self._required_text(
+                analysis,
+                "request_source_hash",
+            )
+            request_adapter = self._required_text(analysis, "request_adapter")
+            request_status = VisionRequestStatus(
+                self._required_text(analysis, "request_status")
+            )
+            source_type = self._required_text(analysis, "source_type")
+            source_status = self._required_text(analysis, "source_status")
+            self._validate_record_identifier(request_id)
+        except (KeyError, TypeError, ValueError) as error:
+            raise self._semantic_error() from error
+        if (
+            stored_analysis_id != analysis_id
+            or status is not VisionRequestStatus.COMPLETED
+            or request_status is not VisionRequestStatus.COMPLETED
+            or request_id != stored_request_id
+            or source_id != request_source_id
+            or source_hash != request_source_hash
+            or adapter != request_adapter
+            or relative_path
+            != f"derived/vision/analysis-{request_id}-{result_hash}.json"
+            or confidence not in {"low", "medium", "high"}
+            or source_type != SourceType.LOCAL_FILE.value
+            or source_status
+            not in {
+                SourceStatus.APPROVED.value,
+                SourceStatus.INGESTED.value,
+            }
+        ):
+            raise RepositoryError("completed vision analysis was not found")
+        binding = self._read_vision_analysis_binding(relative_path, result_hash)
+        if (
+            binding.request_id != request_id
+            or binding.source_content_hash != source_hash
+            or binding.adapter != adapter
+            or binding.status != status.value
+            or binding.confidence != confidence
+        ):
+            raise RepositoryError("completed vision analysis was not found")
+        if require_inclusion and confidence not in {"medium", "high"}:
+            raise RepositoryError("vision analysis confidence is not eligible")
+        return source_id, result_hash
+
+    def _read_vision_analysis_binding(
+        self,
+        relative_path: str,
+        result_hash: str,
+    ) -> PersistedVisionAnalysisBinding:
+        paths = WorkspacePaths.from_root(self.db_path.parent.parent)
+        try:
+            return VisionStore(paths).read_analysis_binding(
+                relative_path,
+                result_hash,
+            )
+        except (OSError, TypeError, ValueError) as error:
+            raise RepositoryError(
+                "vision analysis does not match its managed result"
+            ) from error
 
     def exclude_unreferenced_vision_analysis(self, analysis_id: str) -> None:
         with self._connection() as conn:

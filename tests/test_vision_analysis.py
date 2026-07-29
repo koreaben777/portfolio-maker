@@ -380,6 +380,143 @@ def test_repository_insert_rejects_low_confidence_included_analysis(
     assert repository.get_vision_request(prepared.id)["status"] == "pending"
 
 
+@pytest.mark.parametrize("transition", ("set", "mark"))
+def test_repository_confidence_binding_rejects_managed_low_after_db_tamper(
+    workspace,
+    tmp_path,
+    transition,
+):
+    paths, source_id, prepared, _ = prepare_approved_vision_request(
+        workspace,
+        tmp_path,
+    )
+    applied = apply_vision_analysis(
+        ApplyVisionAnalysisRequest(
+            workspace,
+            write_vision_result(tmp_path, prepared, confidence="low"),
+        )
+    )
+    assert applied is not None
+    repository = SQLiteRepository(paths.db_path)
+    with repository._connection() as connection:
+        connection.execute(
+            "UPDATE vision_analyses SET confidence = 'medium' WHERE id = ?",
+            (applied.id,),
+        )
+
+    matching_evidence_id = None
+    if transition == "mark":
+        matching_evidence_id = repository.upsert_evidence_item(
+            source_id=source_id,
+            snapshot_id=None,
+            github_activity_id=None,
+            locator=f"derived:vision-analysis:{applied.id}",
+            stable_id=vision_evidence_stable_id(applied),
+            content_hash=applied.result_hash,
+            public_safe=False,
+            origin_type="local",
+            origin_visibility="private",
+        )
+    unrelated_evidence_id = repository.upsert_evidence_item(
+        source_id=source_id,
+        snapshot_id=None,
+        github_activity_id=None,
+        locator="derived:unrelated",
+        stable_id=f"unrelated-{transition}",
+        content_hash=None,
+        public_safe=False,
+        origin_type="local",
+        origin_visibility="private",
+    )
+    before_evidence = evidence_count(repository)
+
+    with pytest.raises(RepositoryError):
+        if transition == "set":
+            repository.set_vision_analysis_state(applied.id, "included")
+        else:
+            assert matching_evidence_id is not None
+            repository.mark_vision_analysis_included(
+                applied.id,
+                matching_evidence_id,
+            )
+
+    assert repository.get_vision_analysis(applied.id)["review_status"] == "pending"
+    assert evidence_count(repository) == before_evidence
+    assert repository.evidence_id_for_stable_id(
+        f"unrelated-{transition}"
+    ) == unrelated_evidence_id
+    assert repository.evidence_id_for_stable_id(
+        vision_evidence_stable_id(applied)
+    ) == matching_evidence_id
+
+
+class _SyntheticConfidenceValue:
+    pass
+
+
+@pytest.mark.parametrize(
+    "confidence",
+    ("certain", None, True, _SyntheticConfidenceValue()),
+    ids=("unexpected-string", "none", "bool", "value-object"),
+)
+def test_repository_confidence_insert_rejects_noncanonical_values(
+    workspace,
+    tmp_path,
+    confidence,
+):
+    paths, _, prepared, _ = prepare_approved_vision_request(workspace, tmp_path)
+    repository = SQLiteRepository(paths.db_path)
+    repository.finish_vision_request(
+        prepared.id,
+        VisionRequestStatus.COMPLETED,
+    )
+    payload = {
+        "schema_version": "vision-analysis-v1",
+        "request_id": prepared.id,
+        "source_content_hash": prepared.source_content_hash,
+        "adapter": prepared.adapter,
+        "status": "completed",
+        "confidence": "medium",
+        "summary": "Synthetic summary",
+        "observations": [],
+        "requires_manual_review": True,
+    }
+    content = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ) + "\n"
+    result_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    analysis_path = (
+        paths.vision_analyses_dir
+        / f"analysis-{prepared.id}-{result_hash}.json"
+    )
+    analysis_path.write_text(content, encoding="utf-8")
+    analysis = AppliedVisionAnalysisResult(
+        id="2" * 32,
+        result_hash=result_hash,
+        analysis_path=analysis_path,
+        review_status=VisionReviewStatus.INCLUDED,
+    )
+    result = VisionAnalysisResult(
+        request_id=prepared.id,
+        source_content_hash=prepared.source_content_hash,
+        adapter=prepared.adapter,
+        status=VisionRequestStatus.COMPLETED,
+        confidence=confidence,
+        summary="Synthetic summary",
+        observations=(),
+        requires_manual_review=True,
+    )
+
+    with pytest.raises(RepositoryError):
+        repository.insert_vision_analysis(analysis, result)
+
+    assert analysis_count(repository) == 0
+    assert evidence_count(repository) == 0
+
+
 def test_repository_transition_failure_keeps_pending_analysis_without_evidence(
     workspace, tmp_path
 ):
