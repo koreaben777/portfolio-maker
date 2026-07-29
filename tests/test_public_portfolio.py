@@ -6,6 +6,7 @@ import subprocess
 
 import pytest
 from portfolio_maker.application.approval import write_sample_approval
+from portfolio_maker.application.artifact_approval import write_sample_artifact_policy
 from portfolio_maker.application.build_profile import build_profile
 from portfolio_maker.application.draft_portfolio import draft_portfolio
 from portfolio_maker.application.ingestion import ingest_sources
@@ -229,6 +230,246 @@ def test_forced_low_confidence_included_analysis_stays_out_of_all_artifacts(
         "derived/vision",
         applied.result_hash,
         "codex-app-vision-v1",
+    ):
+        assert forbidden not in serialized
+
+
+def test_included_vision_respects_restricted_and_open_public_artifact_scopes(
+    tmp_path,
+    monkeypatch,
+):
+    workspace, paths, source_uri, prepared, applied = _completed_local_vision_analysis(
+        tmp_path
+    )
+    write_sample_artifact_policy(paths)
+    set_vision_analysis_state(
+        SetVisionAnalysisStateRequest(workspace, applied.id, "included")
+    )
+    repository = SQLiteRepository(paths.db_path)
+    evidence_id = repository.evidence_id_for_stable_id(
+        f"vision-analysis:{applied.id}:{applied.result_hash}"
+    )
+    assert evidence_id is not None
+    repository.replace_portfolio_projects(
+        (
+            {
+                "id": "vision-project",
+                "title": "Reviewed visual deliverable",
+                "overview": "A project grounded in approved visual evidence",
+                "evidence_ids": (evidence_id,),
+            },
+        ),
+        "a" * 64,
+        "b" * 64,
+    )
+    monkeypatch.setattr(render_html_module.subprocess, "run", _fake_build_with_generated_data)
+
+    build_profile(BuildProfileRequest(workspace=workspace))
+    draft_portfolio(DraftPortfolioRequest(workspace=workspace))
+    build_public_portfolio(PublicPortfolioRequest(workspace=workspace))
+    render_html(RenderHtmlRequest(workspace=workspace))
+
+    restricted_artifacts = (
+        paths.master_profile_json_path.read_text(encoding="utf-8"),
+        paths.master_profile_md_path.read_text(encoding="utf-8"),
+        paths.portfolio_draft_path.read_text(encoding="utf-8"),
+        paths.portfolio_public_json_path.read_text(encoding="utf-8"),
+        paths.portfolio_html_path.read_text(encoding="utf-8"),
+    )
+    for artifact in restricted_artifacts:
+        assert "Reviewed visual deliverable" in artifact
+    for profile_artifact in restricted_artifacts[:2]:
+        assert "Safe vision summary" in profile_artifact
+    restricted_outputs = "\n".join(restricted_artifacts)
+    for forbidden in (
+        "Raw vision observation must remain private",
+        prepared.id,
+        source_uri,
+        "derived/vision",
+        applied.result_hash,
+        "codex-app-vision-v1",
+        str(paths.root),
+    ):
+        assert forbidden not in restricted_outputs
+    with repository._read_connection() as connection:
+        restricted_rows = connection.execute(
+            """
+            SELECT kind, input_manifest
+            FROM artifacts
+            WHERE kind IN (
+                'master_profile', 'portfolio_draft',
+                'portfolio_public', 'portfolio_html'
+            )
+            ORDER BY id
+            """
+        ).fetchall()
+    restricted_manifests = {
+        row["kind"]: json.loads(row["input_manifest"]) for row in restricted_rows
+    }
+    for kind in (
+        "master_profile",
+        "portfolio_draft",
+        "portfolio_public",
+        "portfolio_html",
+    ):
+        assert restricted_manifests[kind]["delivery_scope"] == "restricted"
+        assert evidence_id in restricted_manifests[kind]["included_evidence_ids"]
+        assert restricted_manifests[kind]["portfolio_project_evidence_ids"] == [
+            evidence_id
+        ]
+
+    policy = json.loads(paths.artifact_approval_path.read_text(encoding="utf-8"))
+    for kind in ("portfolio_public_manifest", "portfolio_html"):
+        policy["artifacts"][kind].update(
+            {
+                "delivery_scope": "open_public",
+                "include_local": False,
+                "include_public_github": True,
+                "include_private_github": False,
+            }
+        )
+    paths.artifact_approval_path.write_text(json.dumps(policy), encoding="utf-8")
+
+    build_public_portfolio(PublicPortfolioRequest(workspace=workspace))
+    render_html(RenderHtmlRequest(workspace=workspace))
+
+    open_public_outputs = (
+        paths.portfolio_public_json_path.read_text(encoding="utf-8")
+        + paths.portfolio_html_path.read_text(encoding="utf-8")
+    )
+    assert "Reviewed visual deliverable" not in open_public_outputs
+    assert "Safe vision summary" not in open_public_outputs
+    assert json.loads(
+        paths.portfolio_public_json_path.read_text(encoding="utf-8")
+    )["delivery_scope"] == "open_public"
+    with repository._read_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT kind, input_manifest
+            FROM artifacts
+            WHERE kind IN ('portfolio_public', 'portfolio_html')
+            ORDER BY id DESC
+            LIMIT 2
+            """
+        ).fetchall()
+    manifests = {
+        row["kind"]: json.loads(row["input_manifest"]) for row in rows
+    }
+    assert manifests["portfolio_public"]["delivery_scope"] == "open_public"
+    assert manifests["portfolio_html"]["delivery_scope"] == "open_public"
+    assert manifests["portfolio_public"]["included_evidence_ids"] == []
+    assert manifests["portfolio_html"]["included_evidence_ids"] == []
+
+
+@pytest.mark.parametrize(
+    "status",
+    ("unsupported", "unavailable", "failed", "cancelled"),
+)
+def test_status_only_vision_request_keeps_text_only_artifacts_self_contained(
+    tmp_path,
+    monkeypatch,
+    status,
+):
+    workspace = tmp_path / "workspace"
+    source_path = tmp_path / "local" / "notes.txt"
+    source_path.parent.mkdir()
+    source_path.write_text("Approved text-only evidence", encoding="utf-8")
+    paths = WorkspacePaths.from_root(workspace)
+    write_sample_approval(paths)
+    approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    source_uri = source_path.resolve().as_uri()
+    approval["approved_source_uris"] = [source_uri]
+    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+    write_sample_artifact_policy(paths)
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    source_id = repository.upsert_source(
+        Source(
+            None,
+            SourceType.LOCAL_FILE,
+            source_uri,
+            "notes.txt",
+            None,
+            SourceStatus.APPROVED,
+        )
+    )
+    prepared = prepare_vision_analysis(
+        PrepareVisionAnalysisRequest(workspace, source_id, True)
+    )
+    result_path = tmp_path / "status-only-result.json"
+    result_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "vision-analysis-v1",
+                "request_id": prepared.id,
+                "source_content_hash": prepared.source_content_hash,
+                "adapter": "codex-app-vision-v1",
+                "status": status,
+                "reason_code": (
+                    "unsupported_format"
+                    if status == "unsupported"
+                    else "capability_unavailable"
+                ),
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert (
+        apply_vision_analysis(ApplyVisionAnalysisRequest(workspace, result_path))
+        is None
+    )
+    ingest_sources(IngestSourcesRequest(workspace=workspace))
+    generated = workspace / "web" / "portfolio" / "src" / "generated"
+    generated.mkdir(parents=True)
+    (generated / "portfolio-data.ts").write_text(
+        "export const portfolioData = { version: 1, projects: [] } as const;\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(render_html_module.subprocess, "run", _fake_build_with_generated_data)
+
+    build_profile(BuildProfileRequest(workspace=workspace))
+    draft_portfolio(DraftPortfolioRequest(workspace=workspace))
+    build_public_portfolio(PublicPortfolioRequest(workspace=workspace))
+    render_html(RenderHtmlRequest(workspace=workspace))
+
+    serialized = "\n".join(
+        (
+            paths.master_profile_json_path.read_text(encoding="utf-8"),
+            paths.master_profile_md_path.read_text(encoding="utf-8"),
+            paths.portfolio_draft_path.read_text(encoding="utf-8"),
+            paths.portfolio_public_json_path.read_text(encoding="utf-8"),
+            paths.portfolio_html_path.read_text(encoding="utf-8"),
+        )
+    )
+    assert "Approved text-only evidence" in serialized
+    with repository._read_connection() as connection:
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM vision_analyses"
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM evidence_items "
+                "WHERE stable_id LIKE 'vision-analysis:%'"
+            ).fetchone()[0]
+            == 0
+        )
+    for forbidden in (
+        prepared.id,
+        prepared.source_content_hash,
+        source_uri,
+        "codex-app-vision-v1",
+        "capability_unavailable",
+        "unsupported_format",
+        "derived/vision",
+        str(paths.root),
+        "portfolio.db",
+        "file://",
+        "http://",
+        "https://",
+        "fetch(",
     ):
         assert forbidden not in serialized
 

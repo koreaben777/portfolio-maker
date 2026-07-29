@@ -403,6 +403,166 @@ def test_history_plan_is_read_only_and_separates_private_plan_from_public_report
     assert _snapshot_count(state.repository) == 2
 
 
+def test_history_plan_selects_only_expired_unreferenced_managed_history(
+    workspace,
+) -> None:
+    state = _seed_old_unreferenced_snapshot(workspace)
+    write_sample_history_policy(state.paths)
+    with state.repository._read_connection() as connection:
+        source_id = int(
+            connection.execute(
+                "SELECT source_id FROM source_snapshots WHERE id = ?",
+                (state.old_id,),
+            ).fetchone()[0]
+        )
+        referenced_snapshot_id = int(
+            connection.execute(
+                "SELECT id FROM source_snapshots WHERE snapshot_path = ?",
+                (str(state.latest_path),),
+            ).fetchone()[0]
+        )
+    state.repository.upsert_evidence_item(
+        source_id=source_id,
+        snapshot_id=referenced_snapshot_id,
+        github_activity_id=None,
+        locator="managed:referenced-snapshot",
+        stable_id="history-verification:referenced-snapshot",
+        content_hash="1" * 64,
+        public_safe=False,
+        origin_type="local",
+        origin_visibility="private",
+    )
+    newest_path = state.paths.local_snapshots_dir / "history-current.json"
+    newest_path.write_text('{"snapshot":"current"}', encoding="utf-8")
+    state.repository.insert_source_snapshot(
+        source_id,
+        newest_path,
+        "2" * 64,
+        "text-v2",
+    )
+
+    request_rows = (
+        ("a" * 32, "completed", "excluded"),
+        ("b" * 32, "completed", "included"),
+        ("c" * 32, "completed", "pending"),
+        ("d" * 32, "unavailable", None),
+        ("e" * 32, "pending", None),
+    )
+    with state.repository._connection() as connection:
+        connection.execute(
+            "UPDATE source_snapshots SET extracted_at = '2000-01-01T00:00:00Z'"
+        )
+        for request_id, request_status, review_status in request_rows:
+            request_path = (
+                state.paths.vision_requests_dir / f"request-{request_id}.json"
+            )
+            request_path.write_text(
+                json.dumps({"version": 1, "status": request_status}),
+                encoding="utf-8",
+            )
+            connection.execute(
+                """
+                INSERT INTO vision_analysis_requests
+                    (id, source_id, source_content_hash, source_size, adapter,
+                     status, confirmation_at, requested_at, completed_at, reason_code)
+                VALUES (?, ?, ?, 1, 'codex-app-vision-v1', ?, ?, ?, ?, ?)
+                """,
+                (
+                    request_id,
+                    source_id,
+                    request_id[0] * 64,
+                    request_status,
+                    "2000-01-01T00:00:00Z",
+                    "2000-01-01T00:00:00Z",
+                    None if request_status == "pending" else "2000-01-01T00:00:00Z",
+                    "capability_unavailable"
+                    if request_status == "unavailable"
+                    else None,
+                ),
+            )
+            if review_status is None:
+                continue
+            result_content = json.dumps(
+                {"request": request_id, "review_status": review_status},
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            result_hash = sha256(result_content).hexdigest()
+            relative_path = (
+                Path("derived")
+                / "vision"
+                / f"analysis-{request_id}-{result_hash}.json"
+            )
+            (state.paths.root / relative_path).write_bytes(result_content)
+            connection.execute(
+                """
+                INSERT INTO vision_analyses
+                    (id, request_id, source_id, source_content_hash, result_hash,
+                     relative_path, adapter, status, confidence, review_status,
+                     created_at, reviewed_at)
+                VALUES (?, ?, ?, ?, ?, ?, 'codex-app-vision-v1', 'completed',
+                        'medium', ?, '2000-01-01T00:00:00Z', ?)
+                """,
+                (
+                    request_id,
+                    request_id,
+                    source_id,
+                    request_id[0] * 64,
+                    result_hash,
+                    relative_path.as_posix(),
+                    review_status,
+                    None
+                    if review_status == "pending"
+                    else "2000-01-01T00:00:00Z",
+                ),
+            )
+
+    state.paths.artifact_approval_path.write_text('{"version":1}', encoding="utf-8")
+    state.paths.semantic_index_input_dir.mkdir(parents=True)
+    state.paths.semantic_index_manifest_path.write_text(
+        '{"version":1}', encoding="utf-8"
+    )
+    state.paths.semantic_index_report_path.write_text(
+        "Synthetic semantic report", encoding="utf-8"
+    )
+    state.paths.portfolio_public_json_path.write_text(
+        '{"projects":[]}', encoding="utf-8"
+    )
+
+    result = plan_history_cleanup(HistoryPlanRequest(workspace=workspace))
+
+    assert result.candidate_count == 4
+    assert result.kinds == ("source_snapshot", "vision_analysis", "vision_request")
+    plan_path = next(state.paths.history_plans_dir.glob("plan-*.json"))
+    units = json.loads(plan_path.read_text(encoding="utf-8"))["units"]
+    assert {
+        (unit["kind"], unit["row_id"], unit["reason"]) for unit in units
+    } == {
+        (
+            "source_snapshot",
+            str(state.old_id),
+            "expired_unreferenced_snapshot",
+        ),
+        ("vision_analysis", "a" * 32, "expired_unreferenced_vision_analysis"),
+        ("vision_request", "a" * 32, "expired_finished_vision_request"),
+        ("vision_request", "d" * 32, "expired_finished_vision_request"),
+    }
+    serialized = plan_path.read_text(encoding="utf-8")
+    for excluded in (
+        state.source_uri,
+        str(state.latest_path),
+        str(newest_path),
+        state.paths.artifact_approval_path.name,
+        state.paths.semantic_index_manifest_path.name,
+        state.paths.semantic_index_report_path.name,
+        state.paths.portfolio_public_json_path.name,
+        "b" * 32,
+        "c" * 32,
+        "e" * 32,
+    ):
+        assert excluded not in serialized
+
+
 def test_history_plan_removes_private_plan_when_database_binding_fails(
     workspace,
     monkeypatch,
