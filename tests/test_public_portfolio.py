@@ -54,7 +54,7 @@ def _setup_workspace(tmp_path, approved_urls):
     return workspace, paths, repository, source_id
 
 
-def _completed_local_vision_analysis(tmp_path):
+def _completed_local_vision_analysis(tmp_path, *, confidence="medium"):
     workspace = tmp_path / "workspace"
     source_path = tmp_path / "local" / "notes.txt"
     source_path.parent.mkdir()
@@ -89,7 +89,7 @@ def _completed_local_vision_analysis(tmp_path):
                 "source_content_hash": prepared.source_content_hash,
                 "adapter": "codex-app-vision-v1",
                 "status": "completed",
-                "confidence": "medium",
+                "confidence": confidence,
                 "summary": "Safe vision summary",
                 "observations": [
                     {
@@ -146,6 +146,64 @@ def test_pending_or_excluded_vision_metadata_stays_out_of_all_artifacts(
         )
         set_vision_analysis_state(
             SetVisionAnalysisStateRequest(workspace, applied.id, "excluded")
+        )
+
+    build_profile(BuildProfileRequest(workspace=workspace))
+    draft_portfolio(DraftPortfolioRequest(workspace=workspace))
+    build_public_portfolio(PublicPortfolioRequest(workspace=workspace))
+    monkeypatch.setattr(render_html_module.subprocess, "run", _fake_build_with_generated_data)
+    render_html(RenderHtmlRequest(workspace=workspace))
+
+    serialized = "\n".join(
+        (
+            paths.master_profile_json_path.read_text(encoding="utf-8"),
+            paths.master_profile_md_path.read_text(encoding="utf-8"),
+            paths.portfolio_draft_path.read_text(encoding="utf-8"),
+            paths.portfolio_public_json_path.read_text(encoding="utf-8"),
+            paths.portfolio_html_path.read_text(encoding="utf-8"),
+        )
+    )
+    for forbidden in (
+        "Safe vision summary",
+        "Raw vision observation must remain private",
+        prepared.id,
+        source_uri,
+        "derived/vision",
+        applied.result_hash,
+        "codex-app-vision-v1",
+    ):
+        assert forbidden not in serialized
+
+
+def test_forced_low_confidence_included_analysis_stays_out_of_all_artifacts(
+    tmp_path,
+    monkeypatch,
+):
+    workspace, paths, source_uri, prepared, applied = _completed_local_vision_analysis(
+        tmp_path,
+        confidence="low",
+    )
+    repository = SQLiteRepository(paths.db_path)
+    analysis = repository.get_vision_analysis(applied.id)
+    repository.upsert_evidence_item(
+        source_id=int(analysis["source_id"]),
+        snapshot_id=None,
+        github_activity_id=None,
+        locator=f"derived:vision-analysis:{applied.id}",
+        stable_id=f"vision-analysis:{applied.id}:{applied.result_hash}",
+        content_hash=applied.result_hash,
+        public_safe=False,
+        origin_type="local",
+        origin_visibility="private",
+    )
+    with repository._connection() as connection:
+        connection.execute(
+            """
+            UPDATE vision_analyses
+            SET review_status = 'included', reviewed_at = '2026-01-01T00:00:00Z'
+            WHERE id = ?
+            """,
+            (applied.id,),
         )
 
     build_profile(BuildProfileRequest(workspace=workspace))

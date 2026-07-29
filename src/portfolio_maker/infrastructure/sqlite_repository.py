@@ -1439,6 +1439,11 @@ class SQLiteRepository:
             review_status = VisionReviewStatus(analysis.review_status)
         except (TypeError, ValueError) as error:
             raise self._semantic_error() from error
+        if (
+            review_status is VisionReviewStatus.INCLUDED
+            and result.confidence == "low"
+        ):
+            raise RepositoryError("vision analysis confidence is not eligible")
         relative_path, _, _, _, _ = self._managed_history_file_metadata(
             "vision_analysis",
             str(analysis.analysis_path),
@@ -1553,6 +1558,7 @@ class SQLiteRepository:
                  AND evidence_items.content_hash = vision_analyses.result_hash
                 WHERE vision_analyses.id = ?
                   AND vision_analyses.status = 'completed'
+                  AND vision_analyses.confidence IN ('medium', 'high')
                   AND vision_analyses.result_hash IS NOT NULL
                 """,
                 (evidence_id, analysis_id),
@@ -1644,6 +1650,11 @@ class SQLiteRepository:
                 or any(character not in "0123456789abcdef" for character in source_hash)
             ):
                 raise RepositoryError("completed vision analysis was not found")
+            if (
+                review_status is VisionReviewStatus.INCLUDED
+                and confidence == "low"
+            ):
+                raise RepositoryError("vision analysis confidence is not eligible")
             source = conn.execute(
                 "SELECT type, status FROM sources WHERE id = ?",
                 (source_id,),

@@ -384,6 +384,8 @@ def _included_vision_summary(
             or not isinstance(analysis["confidence"], str)
         ):
             return None
+        if analysis["confidence"] not in {"medium", "high"}:
+            return None
         expected_relative_path = (
             Path("derived")
             / "vision"
