@@ -1584,26 +1584,64 @@ class SQLiteRepository:
         with self._connection() as conn:
             analysis = conn.execute(
                 """
-                SELECT id, source_id, result_hash, status
-                FROM vision_analyses
-                WHERE id = ?
+                SELECT analysis.id AS analysis_id,
+                       analysis.request_id AS analysis_request_id,
+                       analysis.source_id AS analysis_source_id,
+                       analysis.source_content_hash AS analysis_source_hash,
+                       analysis.result_hash AS result_hash,
+                       analysis.relative_path AS relative_path,
+                       analysis.adapter AS analysis_adapter,
+                       analysis.status AS analysis_status,
+                       analysis.confidence AS confidence,
+                       request.id AS request_id,
+                       request.source_id AS request_source_id,
+                       request.source_content_hash AS request_source_hash,
+                       request.adapter AS request_adapter,
+                       request.status AS request_status
+                FROM vision_analyses AS analysis
+                JOIN vision_analysis_requests AS request
+                  ON request.id = analysis.request_id
+                WHERE analysis.id = ?
                 """,
                 (analysis_id,),
             ).fetchone()
             if analysis is None:
                 raise RepositoryError("vision analysis was not found")
             try:
-                source_id = self._required_int(analysis, "source_id")
+                stored_analysis_id = self._required_text(analysis, "analysis_id")
+                request_id = self._required_text(analysis, "analysis_request_id")
+                source_id = self._required_int(analysis, "analysis_source_id")
+                source_hash = self._required_text(analysis, "analysis_source_hash")
                 result_hash = self._required_text(analysis, "result_hash")
-                status = VisionRequestStatus(
-                    self._required_text(analysis, "status")
+                relative_path = self._required_text(analysis, "relative_path")
+                adapter = self._required_text(analysis, "analysis_adapter")
+                confidence = self._required_text(analysis, "confidence")
+                status = VisionRequestStatus(self._required_text(analysis, "analysis_status"))
+                stored_request_id = self._required_text(analysis, "request_id")
+                request_source_id = self._required_int(analysis, "request_source_id")
+                request_source_hash = self._required_text(analysis, "request_source_hash")
+                request_adapter = self._required_text(analysis, "request_adapter")
+                request_status = VisionRequestStatus(
+                    self._required_text(analysis, "request_status")
                 )
+                self._validate_record_identifier(request_id)
             except (KeyError, TypeError, ValueError) as error:
                 raise self._semantic_error() from error
             if (
-                status is not VisionRequestStatus.COMPLETED
+                stored_analysis_id != analysis_id
+                or status is not VisionRequestStatus.COMPLETED
+                or request_status is not VisionRequestStatus.COMPLETED
+                or request_id != stored_request_id
+                or source_id != request_source_id
+                or source_hash != request_source_hash
+                or adapter != request_adapter
+                or relative_path
+                != f"derived/vision/analysis-{request_id}-{result_hash}.json"
+                or confidence not in {"low", "medium", "high"}
                 or len(result_hash) != 64
                 or any(character not in "0123456789abcdef" for character in result_hash)
+                or len(source_hash) != 64
+                or any(character not in "0123456789abcdef" for character in source_hash)
             ):
                 raise RepositoryError("completed vision analysis was not found")
             source = conn.execute(
@@ -1617,10 +1655,9 @@ class SQLiteRepository:
                 source_status = self._required_text(source, "status")
             except (KeyError, TypeError, ValueError) as error:
                 raise self._semantic_error() from error
-            if source_type != SourceType.LOCAL_FILE.value or source_status in {
-                SourceStatus.STALE_SOURCE.value,
-                SourceStatus.SKIPPED_POLICY.value,
-                SourceStatus.EXTRACT_FAILED.value,
+            if source_type != SourceType.LOCAL_FILE.value or source_status not in {
+                SourceStatus.APPROVED.value,
+                SourceStatus.INGESTED.value,
             }:
                 raise RepositoryError("vision analysis source is not current")
             if review_status is VisionReviewStatus.INCLUDED:

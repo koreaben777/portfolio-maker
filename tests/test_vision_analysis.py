@@ -126,8 +126,68 @@ def apply_completed_vision_analysis(
     return paths, source_id, prepared, applied
 
 
+def apply_completed_vision_analysis_with_source(
+    workspace: Path,
+    tmp_path: Path,
+) -> tuple[WorkspacePaths, int, object, object, Path]:
+    paths, source_id, prepared, source_path = prepare_approved_vision_request(
+        workspace,
+        tmp_path,
+    )
+    applied = apply_vision_analysis(
+        ApplyVisionAnalysisRequest(workspace, write_vision_result(tmp_path, prepared))
+    )
+    assert applied is not None
+    return paths, source_id, prepared, applied, source_path
+
+
 def vision_evidence_stable_id(applied: object) -> str:
     return f"vision-analysis:{applied.id}:{applied.result_hash}"
+
+
+def replace_analysis_with_duplicate_key_json(
+    paths: WorkspacePaths,
+    repository: SQLiteRepository,
+    applied: object,
+    *,
+    nested: bool,
+) -> str:
+    analysis = repository.get_vision_analysis(applied.id)
+    original_path = paths.root / analysis["relative_path"]
+    original = original_path.read_text(encoding="utf-8")
+    if nested:
+        replacement = original.replace(
+            '"text":"Produced a document"',
+            '"text":"Produced a document","text":"Duplicate nested summary"',
+        )
+    else:
+        replacement = original[:-2] + ',"summary":"Duplicate top-level summary"}\n'
+    result_hash = hashlib.sha256(replacement.encode("utf-8")).hexdigest()
+    replacement_path = paths.vision_analyses_dir / (
+        f"analysis-{analysis['request_id']}-{result_hash}.json"
+    )
+    replacement_path.write_text(replacement, encoding="utf-8")
+    original_path.unlink()
+    old_stable_id = f"vision-analysis:{analysis['id']}:{analysis['result_hash']}"
+    new_stable_id = f"vision-analysis:{analysis['id']}:{result_hash}"
+    with repository._connection() as connection:
+        connection.execute(
+            """
+            UPDATE vision_analyses
+            SET result_hash = ?, relative_path = ?
+            WHERE id = ?
+            """,
+            (str(result_hash), str(replacement_path.relative_to(paths.root)), applied.id),
+        )
+        connection.execute(
+            """
+            UPDATE evidence_items
+            SET stable_id = ?, content_hash = ?
+            WHERE stable_id = ?
+            """,
+            (new_stable_id, result_hash, old_stable_id),
+        )
+    return new_stable_id
 
 
 def test_completed_pending_analysis_has_no_derived_evidence(workspace, tmp_path):
@@ -197,6 +257,178 @@ def test_repository_transition_failure_keeps_pending_analysis_without_evidence(
 
     assert repository.get_vision_analysis(applied.id)["review_status"] == "pending"
     assert repository.evidence_id_for_stable_id(vision_evidence_stable_id(applied)) is None
+
+
+@pytest.mark.parametrize("state", ("included", "excluded"))
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "source_changed",
+        "analysis_source_id",
+        "source_hash",
+        "adapter",
+        "request_id",
+        "request_status",
+        "result_hash",
+        "confidence",
+        "relative_path",
+        "missing",
+        "tampered",
+        "symlink",
+        "malformed",
+        "approval_revoked",
+        "source_status",
+    ),
+)
+def test_state_transition_rejects_stale_or_unbound_completed_analysis(
+    workspace,
+    tmp_path,
+    state,
+    mutation,
+):
+    paths, source_id, prepared, applied, source_path = (
+        apply_completed_vision_analysis_with_source(workspace, tmp_path)
+    )
+    repository = SQLiteRepository(paths.db_path)
+    original_stable_id = vision_evidence_stable_id(applied)
+    if state == "excluded":
+        set_vision_analysis_state(
+            SetVisionAnalysisStateRequest(workspace, applied.id, "included")
+        )
+    initial_state = repository.get_vision_analysis(applied.id)["review_status"]
+    initial_evidence_id = repository.evidence_id_for_stable_id(original_stable_id)
+
+    analysis = repository.get_vision_analysis(applied.id)
+    analysis_path = paths.root / analysis["relative_path"]
+    if mutation == "source_changed":
+        source_path.write_bytes(b"changed source")
+    elif mutation == "analysis_source_id":
+        alternate_path = tmp_path / "alternate-source.pdf"
+        alternate_path.write_bytes(b"alternate source")
+        alternate_id = repository.upsert_source(
+            Source(
+                None,
+                SourceType.LOCAL_FILE,
+                alternate_path.resolve().as_uri(),
+                alternate_path.name,
+                None,
+                SourceStatus.APPROVED,
+            )
+        )
+        approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+        approval["approved_source_uris"].append(alternate_path.resolve().as_uri())
+        paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+        with repository._connection() as connection:
+            connection.execute(
+                "UPDATE vision_analyses SET source_id = ? WHERE id = ?",
+                (alternate_id, applied.id),
+            )
+    elif mutation == "source_hash":
+        with repository._connection() as connection:
+            connection.execute(
+                "UPDATE vision_analyses SET source_content_hash = ? WHERE id = ?",
+                ("0" * 64, applied.id),
+            )
+    elif mutation == "adapter":
+        with repository._connection() as connection:
+            connection.execute(
+                "UPDATE vision_analyses SET adapter = ? WHERE id = ?",
+                ("other-adapter", applied.id),
+            )
+    elif mutation == "request_id":
+        mismatched = prepare_vision_analysis(
+            PrepareVisionAnalysisRequest(workspace, source_id, True)
+        )
+        with repository._connection() as connection:
+            connection.execute(
+                "UPDATE vision_analyses SET request_id = ? WHERE id = ?",
+                (mismatched.id, applied.id),
+            )
+    elif mutation == "request_status":
+        with repository._connection() as connection:
+            connection.execute(
+                "UPDATE vision_analysis_requests SET status = 'pending' WHERE id = ?",
+                (prepared.id,),
+            )
+    elif mutation == "result_hash":
+        with repository._connection() as connection:
+            connection.execute(
+                "UPDATE vision_analyses SET result_hash = ? WHERE id = ?",
+                ("0" * 64, applied.id),
+            )
+    elif mutation == "confidence":
+        with repository._connection() as connection:
+            connection.execute(
+                "UPDATE vision_analyses SET confidence = 'high' WHERE id = ?",
+                (applied.id,),
+            )
+    elif mutation == "relative_path":
+        with repository._connection() as connection:
+            connection.execute(
+                "UPDATE vision_analyses SET relative_path = ? WHERE id = ?",
+                ("reviews/source-approval.json", applied.id),
+            )
+    elif mutation == "missing":
+        analysis_path.unlink()
+    elif mutation == "tampered":
+        analysis_path.write_text("{\"tampered\": true}", encoding="utf-8")
+    elif mutation == "symlink":
+        replacement = tmp_path / "replacement-analysis.json"
+        replacement.write_bytes(analysis_path.read_bytes())
+        analysis_path.unlink()
+        analysis_path.symlink_to(replacement)
+    elif mutation == "malformed":
+        analysis_path.write_text("{\"status\": \"completed\"}", encoding="utf-8")
+    elif mutation == "approval_revoked":
+        approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+        approval["approved_source_uris"] = []
+        paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+    else:
+        with repository._connection() as connection:
+            connection.execute(
+                "UPDATE sources SET status = 'discovered' WHERE id = ?",
+                (source_id,),
+            )
+
+    with pytest.raises(VisionAnalysisError, match="vision analysis is unsafe"):
+        set_vision_analysis_state(
+            SetVisionAnalysisStateRequest(workspace, applied.id, state)
+        )
+
+    assert repository.get_vision_analysis(applied.id)["review_status"] == initial_state
+    assert repository.evidence_id_for_stable_id(original_stable_id) == initial_evidence_id
+
+
+@pytest.mark.parametrize("state", ("included", "excluded"))
+@pytest.mark.parametrize("nested", (False, True))
+def test_state_transition_rejects_duplicate_key_managed_result(
+    workspace,
+    tmp_path,
+    state,
+    nested,
+):
+    paths, _, _, applied = apply_completed_vision_analysis(workspace, tmp_path)
+    repository = SQLiteRepository(paths.db_path)
+    if state == "excluded":
+        set_vision_analysis_state(
+            SetVisionAnalysisStateRequest(workspace, applied.id, "included")
+        )
+    initial_state = repository.get_vision_analysis(applied.id)["review_status"]
+    stable_id = replace_analysis_with_duplicate_key_json(
+        paths,
+        repository,
+        applied,
+        nested=nested,
+    )
+    initial_evidence_id = repository.evidence_id_for_stable_id(stable_id)
+
+    with pytest.raises(VisionAnalysisError, match="vision analysis is unsafe"):
+        set_vision_analysis_state(
+            SetVisionAnalysisStateRequest(workspace, applied.id, state)
+        )
+
+    assert repository.get_vision_analysis(applied.id)["review_status"] == initial_state
+    assert repository.evidence_id_for_stable_id(stable_id) == initial_evidence_id
 
 
 def test_exclusion_removes_only_unreferenced_evidence_and_refuses_references(workspace, tmp_path):

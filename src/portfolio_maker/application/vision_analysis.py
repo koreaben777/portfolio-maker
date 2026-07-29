@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from pathlib import Path
 import re
 import unicodedata
 from uuid import uuid4
@@ -26,6 +27,7 @@ from portfolio_maker.domain.vision_models import (
     VisionReviewStatus,
 )
 from portfolio_maker.infrastructure.extractors import validate_approved_vision_source
+from portfolio_maker.infrastructure.managed_files import read_managed_relative_file
 from portfolio_maker.infrastructure.policy import (
     FilePolicy,
     SourcePathPolicyError,
@@ -220,24 +222,7 @@ def set_vision_analysis_state(
         repository = SQLiteRepository(paths.db_path)
         repository.initialize()
         with repository.exclusive_workspace_operation():
-            analysis = repository.get_vision_analysis(request.analysis_id)
-            if (
-                analysis["status"] != VisionRequestStatus.COMPLETED.value
-                or not _is_sha256(analysis["result_hash"])
-                or not isinstance(analysis["relative_path"], str)
-            ):
-                raise VisionAnalysisError("vision analysis is unsafe or unavailable")
-            source = _approved_local_source(repository, analysis["source_id"])
-            if (
-                source.uri not in load_approval(paths).approved_source_uris
-                or source.status
-                in {
-                    SourceStatus.STALE_SOURCE,
-                    SourceStatus.SKIPPED_POLICY,
-                    SourceStatus.EXTRACT_FAILED,
-                }
-            ):
-                raise VisionAnalysisError("vision analysis is unsafe or unavailable")
+            _validate_completed_analysis_binding(paths, repository, request.analysis_id)
             repository.set_vision_analysis_state(request.analysis_id, request.state)
         return VisionAnalysisStateResult(request.analysis_id, request.state)
     except VisionAnalysisError:
@@ -245,12 +230,86 @@ def set_vision_analysis_state(
     except (
         ApprovalMissingError,
         ApprovalFormatError,
+        SourcePathPolicyError,
         RepositoryError,
         OSError,
         TypeError,
         ValueError,
     ) as error:
         raise VisionAnalysisError("vision analysis is unsafe or unavailable") from error
+
+
+def _validate_completed_analysis_binding(
+    paths: WorkspacePaths,
+    repository: SQLiteRepository,
+    analysis_id: str,
+) -> None:
+    analysis = repository.get_vision_analysis(analysis_id)
+    request_id = analysis.get("request_id")
+    source_id = analysis.get("source_id")
+    source_hash = analysis.get("source_content_hash")
+    result_hash = analysis.get("result_hash")
+    relative_path = analysis.get("relative_path")
+    adapter = analysis.get("adapter")
+    confidence = analysis.get("confidence")
+    if (
+        analysis.get("status") != VisionRequestStatus.COMPLETED.value
+        or not _safe_identifier(request_id)
+        or type(source_id) is not int
+        or not _is_sha256(source_hash)
+        or not _is_sha256(result_hash)
+        or type(relative_path) is not str
+        or type(adapter) is not str
+        or confidence not in _CONFIDENCES
+    ):
+        raise VisionAnalysisError("vision analysis is unsafe or unavailable")
+
+    stored_request = repository.get_vision_request(request_id)
+    if (
+        stored_request["id"] != request_id
+        or stored_request["source_id"] != source_id
+        or stored_request["source_content_hash"] != source_hash
+        or stored_request["adapter"] != adapter
+        or stored_request["status"] != VisionRequestStatus.COMPLETED.value
+    ):
+        raise VisionAnalysisError("vision analysis is unsafe or unavailable")
+
+    expected_relative_path = (
+        Path("derived") / "vision" / f"analysis-{request_id}-{result_hash}.json"
+    )
+    if Path(relative_path) != expected_relative_path:
+        raise VisionAnalysisError("vision analysis is unsafe or unavailable")
+
+    source = _approved_local_source(repository, source_id)
+    approval = load_approval(paths)
+    if (
+        source.uri not in approval.approved_source_uris
+        or source.status not in {SourceStatus.APPROVED, SourceStatus.INGESTED}
+    ):
+        raise VisionAnalysisError("vision analysis is unsafe or unavailable")
+    policy = FilePolicy(
+        forbidden_paths=approval.excluded_directories,
+        excluded_file_patterns=approval.excluded_file_patterns,
+    )
+    checked = validate_approved_vision_source(source.uri, policy)
+    if checked.content_hash != source_hash:
+        raise VisionAnalysisError("vision analysis is unsafe or unavailable")
+
+    snapshot = read_managed_relative_file(paths.root, expected_relative_path)
+    if snapshot.content_hash != result_hash:
+        raise VisionAnalysisError("vision analysis is unsafe or unavailable")
+    try:
+        parsed = parse_completed_vision_result_bytes(snapshot.content)
+    except VisionAnalysisError as error:
+        raise VisionAnalysisError("vision analysis is unsafe or unavailable") from error
+    if (
+        parsed["request_id"] != request_id
+        or parsed["source_content_hash"] != source_hash
+        or parsed["adapter"] != adapter
+        or parsed["status"] != VisionRequestStatus.COMPLETED.value
+        or parsed["confidence"] != confidence
+    ):
+        raise VisionAnalysisError("vision analysis is unsafe or unavailable")
 
 
 def _approved_local_source(repository: SQLiteRepository, source_id: object) -> Source:
@@ -305,6 +364,28 @@ def parse_completed_vision_result(payload: object) -> dict[str, object]:
     if parsed["status"] != VisionRequestStatus.COMPLETED.value:
         raise VisionAnalysisError("vision result is unsafe or unavailable")
     return parsed
+
+
+def parse_completed_vision_result_bytes(content: bytes) -> dict[str, object]:
+    try:
+        payload = json.loads(
+            content.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_json_keys,
+        )
+    except VisionAnalysisError:
+        raise
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError) as error:
+        raise VisionAnalysisError("vision result is unsafe or unavailable") from error
+    return parse_completed_vision_result(payload)
+
+
+def _reject_duplicate_json_keys(pairs: list[tuple[object, object]]) -> dict[object, object]:
+    result: dict[object, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise VisionAnalysisError("vision result is unsafe or unavailable")
+        result[key] = value
+    return result
 
 
 def _require_result_header(payload: dict[str, object]) -> None:

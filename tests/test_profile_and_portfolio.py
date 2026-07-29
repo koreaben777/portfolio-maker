@@ -1,3 +1,4 @@
+import hashlib
 import json
 
 import pytest
@@ -178,6 +179,85 @@ def test_vision_projection_requires_inclusion_and_uses_only_summary(tmp_path):
             SetVisionAnalysisStateRequest(workspace, applied.id, "excluded")
         )
     assert repository.get_vision_analysis(applied.id)["review_status"] == "included"
+
+
+@pytest.mark.parametrize("nested", (False, True))
+def test_duplicate_key_included_analysis_creates_no_vision_claim(tmp_path, nested):
+    workspace, paths, source_path, prepared, applied = _completed_vision_analysis_for_profile(
+        tmp_path
+    )
+    set_vision_analysis_state(
+        SetVisionAnalysisStateRequest(workspace, applied.id, "included")
+    )
+    repository = SQLiteRepository(paths.db_path)
+    analysis = repository.get_vision_analysis(applied.id)
+    original_path = paths.root / analysis["relative_path"]
+    original = original_path.read_text(encoding="utf-8")
+    if nested:
+        replacement = original.replace(
+            '"text":"Raw observation must stay private"',
+            '"text":"Raw observation must stay private",'
+            '"text":"Duplicate nested summary"',
+        )
+    else:
+        replacement = original[:-2] + ',"summary":"Duplicate top-level summary"}\n'
+    result_hash = hashlib.sha256(replacement.encode("utf-8")).hexdigest()
+    replacement_path = paths.vision_analyses_dir / (
+        f"analysis-{analysis['request_id']}-{result_hash}.json"
+    )
+    replacement_path.write_text(replacement, encoding="utf-8")
+    original_path.unlink()
+    with repository._connection() as connection:
+        connection.execute(
+            """
+            UPDATE vision_analyses
+            SET result_hash = ?, relative_path = ?
+            WHERE id = ?
+            """,
+            (result_hash, str(replacement_path.relative_to(paths.root)), applied.id),
+        )
+        connection.execute(
+            """
+            UPDATE evidence_items
+            SET stable_id = ?, content_hash = ?
+            WHERE stable_id = ?
+            """,
+            (
+                f"vision-analysis:{applied.id}:{result_hash}",
+                result_hash,
+                f"vision-analysis:{applied.id}:{analysis['result_hash']}",
+            ),
+        )
+
+    profile_result = build_profile(BuildProfileRequest(workspace=workspace))
+    serialized = "\n".join(
+        (
+            paths.master_profile_json_path.read_text(encoding="utf-8"),
+            paths.master_profile_md_path.read_text(encoding="utf-8"),
+        )
+    )
+    assert profile_result.claim_count == 1
+    for forbidden in (
+        "Approved vision summary",
+        "Duplicate top-level summary",
+        "Duplicate nested summary",
+        "Raw observation must stay private",
+        prepared.id,
+        source_path.resolve().as_uri(),
+        "derived/vision",
+        "codex-app-vision-v1",
+    ):
+        assert forbidden not in serialized
+    with repository._read_connection() as connection:
+        vision_claim_count = connection.execute(
+            "SELECT COUNT(*) FROM career_claims WHERE text IN (?, ?, ?)",
+            (
+                "Approved vision summary",
+                "Duplicate top-level summary",
+                "Duplicate nested summary",
+            ),
+        ).fetchone()[0]
+    assert vision_claim_count == 0
 
 
 @pytest.mark.parametrize(

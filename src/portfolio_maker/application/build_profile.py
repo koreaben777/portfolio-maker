@@ -20,7 +20,7 @@ from portfolio_maker.application.project_composition import (
 )
 from portfolio_maker.application.vision_analysis import (
     VisionAnalysisError,
-    parse_completed_vision_result,
+    parse_completed_vision_result_bytes,
 )
 from portfolio_maker.domain.vision_models import VisionRequestStatus, VisionReviewStatus
 from portfolio_maker.domain.models import Source, SourceStatus, SourceType
@@ -397,8 +397,7 @@ def _included_vision_summary(
         )
         if snapshot.content_hash != analysis["result_hash"]:
             return None
-        payload = json.loads(snapshot.content.decode("utf-8"))
-        parsed = parse_completed_vision_result(payload)
+        parsed = parse_completed_vision_result_bytes(snapshot.content)
         request = repository.get_vision_request(parsed["request_id"])
         if (
             parsed["source_content_hash"] != analysis["source_content_hash"]
