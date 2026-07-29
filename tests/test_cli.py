@@ -1203,6 +1203,26 @@ def test_cli_vision_parser_exposes_exact_commands_and_arguments() -> None:
     assert state.state == "included"
 
 
+def test_cli_top_level_help_lists_history_and_vision_commands(capsys) -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        cli.build_parser().parse_args(["--help"])
+
+    captured = capsys.readouterr()
+    assert exc_info.value.code == 0
+    assert captured.err == ""
+    for command in (
+        "history-policy",
+        "history-plan",
+        "history-export",
+        "history-apply",
+        "prepare-vision-analysis",
+        "apply-vision-analysis",
+        "list-vision-analyses",
+        "set-vision-analysis-state",
+    ):
+        assert command in captured.out
+
+
 def test_cli_vision_prepare_requires_confirmation_before_any_persistence(
     workspace, capsys
 ):

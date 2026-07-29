@@ -16,8 +16,9 @@ def test_release_versions_stay_aligned() -> None:
     plugin = json.loads(Path(".codex-plugin/plugin.json").read_text(encoding="utf-8"))
     web_package = json.loads(Path("web/portfolio/package.json").read_text(encoding="utf-8"))
     web_lock = json.loads(Path("web/portfolio/package-lock.json").read_text(encoding="utf-8"))
-    expected = pyproject["project"]["version"]
+    expected = "0.2.2"
 
+    assert pyproject["project"]["version"] == expected
     assert {
         plugin["version"],
         web_package["version"],

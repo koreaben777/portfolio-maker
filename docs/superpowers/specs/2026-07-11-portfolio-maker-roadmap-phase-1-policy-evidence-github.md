@@ -1,11 +1,11 @@
 # Portfolio Maker 로드맵 Phase 1 구현 명세
 
 날짜: 2026-07-11
-상태: #4 → #2 → #1은 역사적 Phase 1 기준선이며, 현재 공개 runtime은 0.2.0 semantic index·plugin release다. 0.1.0 workspace와 CLI/artifact 경로는 호환 기준선으로 보존한다.
+상태: #4 → #2 → #1은 역사적 Phase 1 기준선이며, 현재 공개 runtime 기준선은 0.2.1이다. 0.2.2는 현재 branch의 local release candidate이며 아직 push·tag·publish·deploy하지 않았다. 0.1.0 workspace와 CLI/artifact 경로는 호환 기준선으로 보존한다.
 역사적 기준선 대상 Issue: #4 → #2 → #1
 현재 구현 slice: #12 통합 근거 정책, 일반형 #11 renderer, #13 semantic project composition, 0.2.0 계층형 semantic index/plugin
-현재 release: 0.2.1 계층형 의미 인덱스, Project Boundary Detection, multi-skill Codex plugin과 정적 HTML 안전성 patch
-다음 release 목표: 0.2.2의 #5 managed workspace snapshot·SQLite 이력 보존·정리와 #14 선택형 Codex 비전 분석 adapter
+현재 공개 runtime 기준선: 0.2.1 계층형 의미 인덱스, Project Boundary Detection, multi-skill Codex plugin과 정적 HTML 안전성 patch
+현재 local release candidate: 0.2.2의 #5 managed workspace snapshot·SQLite 이력 보존·정리와 #14 선택형 Codex 비전 분석 adapter
 후속 제품 단계: #5/#14 완료 뒤 #3 회사/JD별 맞춤 생성과 추가 source/graph adapter (`@sites`는 presentation/hosting 계층)
 
 2026-07-13 정렬 메모: #4, #2, #1 기준선, 일반형 #11 renderer, #12 통합 근거 정책, #13 composition 계층은 현재 runtime의 기반이다. 0.2.0은 이 승인 경계 위에 계층형 semantic index와 plugin workflow를 추가한다.
@@ -18,9 +18,13 @@
 
 0.2.2 구현 순서와 phase별 review gate는 [구현 계획](../plans/2026-07-16-portfolio-maker-0.2.2.md)을 따른다.
 
+2026-07-29 local release candidate 메모: Task 10의 합성 검증에서 managed history와 선택형 vision의
+artifact 격리 경계를 확인했다. 이 메모는 원격 release 또는 Issue 종료를 뜻하지 않는다. #8의 독립
+OCR·renderer·extractor는 계속 열린 후속 범위다.
+
 ## 1. 목적과 범위
 
-역사적 Phase 1 기준선인 Portfolio Maker 0.1.0은 승인된 로컬 파일에서 근거 기반 master profile과 검토용 Markdown 포트폴리오 골격을 생성했다. GitHub repository와 activity는 기본적으로 discovery metadata다. 현재 0.2.0도 같은 승인 경계를 유지하며, policy 재검증을 통과한 confirmed public repository의 activity 중 `approved_github_activity_urls`에 정확히 있는 URL만 profile과 portfolio draft의 public-safe evidence로 사용할 수 있다. 이는 자동 project narrative를 만들지 않는다.
+역사적 Phase 1 기준선인 Portfolio Maker 0.1.0은 승인된 로컬 파일에서 근거 기반 master profile과 검토용 Markdown 포트폴리오 골격을 생성했다. GitHub repository와 activity는 기본적으로 discovery metadata다. 현재 0.2.2 local release candidate도 같은 승인 경계를 유지하며, policy 재검증을 통과한 confirmed public repository의 activity 중 `approved_github_activity_urls`에 정확히 있는 URL만 profile과 portfolio draft의 public-safe evidence로 사용할 수 있다. 이는 자동 project narrative를 만들지 않는다.
 
 이번 Phase 1의 목적은 다음 두 가지다.
 
@@ -71,11 +75,11 @@
   ↓
 #13 Codex 기반 프로젝트 식별·구성·선정  0.2.0 승인 경계의 기준선
   ↓
-0.2.0 계층형 의미 인덱스·Project Boundary Detection·Codex plugin  현재 구현
+0.2.0 계층형 의미 인덱스·Project Boundary Detection·Codex plugin  현재 유지
   ↓
-#5 managed workspace 이력 보존·정리 정책                 0.2.2 최우선
+#5 managed workspace 이력 보존·정리 정책                 0.2.2 local candidate 구현·검증
   ↓
-#14 선택형 Codex 비전 분석 adapter                        0.2.2 포함
+#14 선택형 Codex 비전 분석 adapter                        0.2.2 local candidate 구현·검증
   ↓
 #3 회사/JD별 맞춤 포트폴리오
 ```

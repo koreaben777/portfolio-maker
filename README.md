@@ -1,9 +1,9 @@
 # Portfolio Maker
 
-> 현재 버전: `0.2.1`
+> 현재 로컬 릴리스 후보: `0.2.2` (아직 tag·publish·deploy하지 않음)
 >
 > 계층형 의미 인덱스, Project Boundary Detection, 명시적 automatic 모드,
-> 가역적 제외·재포함, multi-skill Codex plugin을 제공합니다.
+> 가역적 제외·재포함, managed history, 선택형 Codex 비전, multi-skill plugin을 제공합니다.
 
 승인한 내 작업 자료를 바탕으로, **근거를 확인할 수 있는 커리어 프로필**과 **검토용 포트폴리오 초안**, **public-safe 정적 HTML 포트폴리오**를 만드는 로컬 우선 도구입니다.
 
@@ -55,6 +55,8 @@ Portfolio Maker는 원본 파일을 자동으로 업로드하거나 공개하지
 - 파일·폴더 요약에서 parent/child/cross-directory 프로젝트 경계 후보 만들기
 - 모든 후보를 검토하는 review 모드 또는 `high`·`medium`을 포함하는 explicit automatic 모드 사용하기
 - 자동 포함 프로젝트를 source·evidence·index 삭제 없이 제외하고 다시 포함하기
+- 관리 snapshot·SQLite 이력을 dry-run plan, 외부 backup, exact confirmation, resume/recover로 정리하기
+- 승인 파일 하나를 명시 확인 후 Codex-native vision으로 검토하고 pending 결과를 포함·제외하기
 - source governance, semantic index, project curation/review, artifact 생성을 분리한 Codex plugin 사용하기
 
 > 현재 버전은 **근거 기반 마스터 프로필**, **검토가 필요한 포트폴리오 뼈대**, **일반형 public-safe HTML 포트폴리오**를 제공합니다. 회사·채용공고별 맞춤 문장과 서술 생성은 다음 단계입니다. 일반형 HTML 구현 세부 사항은 [구현 계획](https://github.com/koreaben777/portfolio-maker/blob/main/docs/superpowers/plans/2026-07-13-portfolio-maker-general-interactive-html-sites.md)에 기록합니다.
@@ -117,7 +119,7 @@ codex plugin add portfolio-maker@<configured-local-marketplace>
 
 marketplace 설치 경로를 사용하지 않는 source checkout에서는 repository root를 Codex app으로 열고
 `.agents/skills/portfolio-maker/SKILL.md`의 호환 entrypoint를 사용할 수 있습니다. plugin router는
-다섯 child skill을 순서대로 호출하지만, source scope·project 결정·artifact delivery 승인은 서로
+여섯 child skill을 순서대로 호출하지만, source scope·project 결정·artifact delivery 승인은 서로
 대체하지 않습니다.
 
 ### 첫 포트폴리오 튜토리얼
@@ -301,6 +303,71 @@ portfolio-maker render-html --workspace .
 .portfolio-maker/artifacts/portfolio.html
 ```
 
+#### 7. 관리 이력을 검토하고 정리하기
+
+0.2.2의 이력 정리는 원본 사용자 파일이 아니라 Portfolio Maker가 관리하는 오래된 snapshot과
+SQLite 이력만 대상으로 합니다. 정책 파일이 없으면 모든 이력을 보존합니다. 먼저 sample을 만든 뒤
+정책과 dry-run plan을 검토합니다.
+
+```bash
+portfolio-maker history-policy --workspace . --write-sample
+portfolio-maker history-plan --workspace .
+```
+
+후보가 있는 경우 출력된 `PLAN_ID`를 사용해 workspace 밖의 **비어 있는 실제 디렉터리**로
+export합니다. `.portfolio-maker/reviews/history-plans/`의 해당 private plan에서
+`confirmation_phrase`를 직접 확인하고, export 명령이 출력한 `RECEIPT`와 함께 정확히 입력한
+경우에만 적용합니다.
+
+```bash
+portfolio-maker history-export --workspace . --plan-id PLAN_ID --backup-dir BACKUP_DIRECTORY
+portfolio-maker history-apply --workspace . --plan-id PLAN_ID --export-receipt RECEIPT --confirm "CONFIRMATION"
+```
+
+중단된 실행은 새 정리 작업으로 덮어쓰지 않습니다. 출력된 `EXECUTION_ID`로 상태에 맞는 한 가지
+복구 모드만 선택합니다.
+
+```bash
+portfolio-maker history-apply --workspace . --resume EXECUTION_ID
+portfolio-maker history-apply --workspace . --recover EXECUTION_ID
+```
+
+`--resume`은 검증된 purge 또는 `VACUUM` 재개에, `--recover`는 중단 상태 판정에 사용됩니다.
+receipt·확인 문구·plan binding이 다르거나 결과가 모호하면 원본과 격리 파일을 임의로 처리하지 않고
+안전하게 중단합니다.
+
+#### 8. 선택한 파일 하나를 Codex 비전으로 검토하기
+
+비전 분석은 기본 비활성입니다. 현재 source approval을 통과한 로컬 파일 하나를 사용자가 고르고,
+Codex에 전달한다는 확인을 명시한 경우에만 private request를 준비합니다.
+
+```bash
+portfolio-maker prepare-vision-analysis --workspace . --source-id SOURCE_ID --confirm-codex-share
+```
+
+Codex app에서 `$portfolio-vision-analysis`를 사용해 그 request에 결속된 파일 하나만 현재 session의
+native capability로 검토합니다. 외부 API·OCR package·converter·fallback upload를 사용하지 않으며,
+지원할 수 없는 형식은 안전한 status-only 결과로 남깁니다. skill이 작성한 closed-schema 결과만
+적용하고 목록을 확인합니다.
+
+```bash
+portfolio-maker apply-vision-analysis --workspace . --result RESULT_FILE
+portfolio-maker list-vision-analyses --workspace .
+```
+
+`completed` 분석도 처음에는 `pending`이며 증거가 아닙니다. 사용자가 결과를 검토한 뒤 명시적으로
+포함하거나 제외해야 합니다.
+
+```bash
+portfolio-maker set-vision-analysis-state --workspace . --analysis-id ANALYSIS_ID --state included
+portfolio-maker set-vision-analysis-state --workspace . --analysis-id ANALYSIS_ID --state excluded
+```
+
+`unsupported`, `unavailable`, `failed`, `cancelled`와 low-confidence 결과는 자동 근거가 되지 않습니다.
+현재 session 검증에서는 합성 일반 이미지만 직접 이해 가능한 결과였고 PDF·문서·스프레드시트·
+프레젠테이션은 unavailable로 처리했습니다. 독립 OCR·renderer·extractor 전체는
+[Issue #8](https://github.com/koreaben777/portfolio-maker/issues/8)의 열린 후속 범위입니다.
+
 ## 개인정보와 안전
 
 - 승인 파일이 없으면 자료 수집은 시작되지 않습니다.
@@ -339,9 +406,10 @@ portfolio-maker approve --workspace . --write-sample --force
 
 두 파일명의 `public`은 호환성 이름입니다. `restricted`는 자동 인터넷 공개를 뜻하지 않으며 로컬 사용, 검증된 수신자 전달, private hosting을 위한 범위입니다. 누구나 접근 가능한 배포는 별도 `open_public` 선택과 재검증을 거쳐야 하며, 이 구현에서는 local/private origin을 거부합니다.
 
-### 0.2.0 현재 구현
+### 0.2.0에서 도입되어 유지되는 기능
 
-현재 release는 0.1.0의 승인·근거·산출물 경계를 유지하면서, 다음 기능을 추가로 제공합니다.
+현재 로컬 릴리스 후보는 0.1.0의 승인·근거·산출물 경계를 유지하면서, 0.2.0에서 도입된
+다음 기능을 계속 제공합니다.
 
 - 허용된 전체 폴더·파일 구조를 전역 개수 상한 없이 기록하는 계층형 의미 인덱스
 - 코드·문서·테스트·설정 파일의 역할 요약과 하위에서 상위로 합성하는 폴더 요약
@@ -360,19 +428,20 @@ Codex 분석은 외부 LLM API나 token 저장 없이 safe chunk를 통해 수�
 `.portfolio-maker`라는 일반 명칭이 포함돼도 허용하되, 실제 내부 workspace 경로 형태는 계속
 차단합니다.
 
-### 다음 우선 목표: 0.2.2 이력 보존·정리 정책과 선택형 Codex 비전 분석
+### 0.2.2 로컬 릴리스 후보: 이력 보존·정리 정책과 선택형 Codex 비전 분석
 
-다음 release 목표는 [Issue #5](https://github.com/koreaben777/portfolio-maker/issues/5)의
+현재 branch의 로컬 릴리스 후보는 [Issue #5](https://github.com/koreaben777/portfolio-maker/issues/5)의
 `.portfolio-maker/` 스냅샷·SQLite 이력 보존 및 정리 정책입니다. 이 기능은 사용자가 생성한
 **원본 자료를 삭제하지 않으며**, Portfolio Maker가 관리하는 snapshot과 database 이력만
 대상으로 합니다. 기본은 미리보기(dry-run)와 명시적 확인이며, 백업·복구·부분 실패 대응을
-검증한 뒤에만 실제 정리를 허용합니다.
+검증한 뒤에만 실제 정리를 허용합니다. 이 상태는 아직 원격 tag·package publish·deployment를
+의미하지 않습니다.
 
 [Issue #14](https://github.com/koreaben777/portfolio-maker/issues/14)는 0.2.2에서 사용자가 선택하고
-명시적으로 확인한 이미지·스캔 문서에 한해 Codex 비전을 호출하는 선택형 분석 adapter를 추가합니다.
-원본 이미지는 `.portfolio-maker/`에 복사하지 않고, 마스킹된 구조화 분석과 provenance·검토 상태만
-기존 evidence 정책을 통해 다룹니다. Codex 비전의 불가·실패·낮은 신뢰도는 자동 artifact 근거가 되지
-않습니다.
+명시적으로 확인한 승인 로컬 파일 하나를 현재 Codex App session의 native capability로 검토하는
+선택형 분석 adapter를 추가합니다. 원본 파일은 `.portfolio-maker/`에 복사하지 않고, 마스킹된
+구조화 분석과 provenance·검토 상태만 기존 evidence 정책을 통해 다룹니다. capability 불가·실패·
+낮은 신뢰도는 자동 artifact 근거가 되지 않습니다.
 
 [Issue #8](https://github.com/koreaben777/portfolio-maker/issues/8)의 독립적 OCR·이미지 자료 추출은
 후속 범위로 유지합니다. Codex가 대화에서 이미지와 여러 형식을 이해할 수 있는 것과 별도로, 제품은

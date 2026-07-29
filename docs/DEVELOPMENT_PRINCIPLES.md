@@ -20,10 +20,11 @@ source scope와 제외 정책
 
 현재 동작과 승인된 미래 설계를 구분한다.
 
-- 현재 공개 runtime: 0.2.1
+- 현재 공개 runtime 기준선: 0.2.1
+- 현재 local release candidate: 0.2.2 (#5 managed history, #14 선택형 Codex 비전)
 - 호환 기준선: 0.1.0 workspace와 기존 CLI/artifact 경로
-- 다음 release 목표: 0.2.2의 managed workspace snapshot·SQLite 이력 보존·정리 (#5)와 선택형 Codex 비전 분석 adapter (#14)
-- 다음 제품 확장 순서: #5/#14 이후 회사·JD 맞춤 artifact와 별도 source/graph adapter
+- release 상태: 0.2.2 후보는 현재 branch에서 검증됐지만 아직 push·tag·publish·deploy하지 않음
+- 다음 제품 확장 순서: 회사·JD 맞춤 artifact와 별도 source/graph adapter
 - 0.2.0 권위 명세: [0.2.0 계층형 의미 인덱스·플러그인 설계](superpowers/specs/2026-07-14-portfolio-maker-0.2.0-semantic-index-plugin-design.md)
 - 0.2.2 권위 명세: [0.2.2 managed history·Codex vision 설계](superpowers/specs/2026-07-16-portfolio-maker-0.2.2-storage-vision-design.md)
 - 0.2.2 구현 계획: [task·test·review gate](superpowers/plans/2026-07-16-portfolio-maker-0.2.2.md)
@@ -50,9 +51,9 @@ source scope와 제외 정책
 
 구현된 기능은 반드시 현재 code, test, 실제 artifact로 확인한 뒤 설명한다.
 
-### 2.2 현재 0.2.1 runtime
+### 2.2 현재 0.2.2 local release candidate
 
-현재 0.2.1 runtime은 다음 기능을 제공한다.
+현재 0.2.2 local release candidate는 0.2.1 기능을 보존하고 다음 기능을 제공한다.
 
 - global local file-count cap을 대체하는 hierarchical semantic index
 - file semantic extraction과 bottom-up directory summary
@@ -63,14 +64,20 @@ source scope와 제외 정책
 - source-independent node/provenance model과 additive migration
 - responsibility-based multi-skill Codex plugin
 - full automated validation과 보호된 사용자 자료를 제외한 선택 scan-root smoke test
+- Portfolio Maker가 관리하는 snapshot·SQLite 이력의 dry-run plan, workspace 밖 export,
+  exact confirmation, quarantine, resume/recover
+- 명시 확인된 승인 로컬 파일 하나를 현재 Codex App capability로 분석하고 pending 검토 뒤
+  포함·제외하는 선택형 vision adapter
 
-0.2.0에서 도입한 semantic index, project composition, plugin, artifact projection은 현재 release의 기능이다.
+0.2.0에서 도입한 semantic index, project composition, plugin, artifact projection은 현재 local
+release candidate의 기능이다.
 다만 smoke는 선택한 repository subtree에 한정되므로 전체 사용자 home이나 live GitHub 데이터의
-성능 보증으로 확대하지 않는다. 회사·JD 맞춤 artifact와 외부 source/graph adapter는 별도 release다.
+성능 보증으로 확대하지 않는다. 0.2.2 후보는 원격 release 완료가 아니며, 회사·JD 맞춤 artifact와
+외부 source/graph adapter는 별도 release다.
 
 ### 2.3 후속 범위
 
-0.2.2는 [#5](https://github.com/koreaben777/portfolio-maker/issues/5)의 managed workspace 이력 보존·정리 정책을 최우선으로 하고, 그 경계 위에서 [#14](https://github.com/koreaben777/portfolio-maker/issues/14)의 선택형 Codex 비전 분석 adapter를 제공한다. 이 release는 원본 사용자 source를 삭제하지 않으며, snapshot·SQLite 이력에 한정한 dry-run, 명시 확인, 백업·복구, 부분 실패·재시도 경계를 먼저 확정한다. 비전 adapter는 기본 비활성이며, 사용자가 선택한 승인 source를 Codex에 분석하도록 명시 확인한 경우에만 실행한다. raw visual input을 workspace에 복사하지 않고 마스킹된 구조화 분석, provenance, 검토 상태만 관리하며, adapter 불가·실패·낮은 신뢰도는 자동 artifact 근거가 될 수 없다.
+0.2.2 후보는 [#5](https://github.com/koreaben777/portfolio-maker/issues/5)의 managed workspace 이력 보존·정리 정책과 [#14](https://github.com/koreaben777/portfolio-maker/issues/14)의 선택형 Codex 비전 분석 adapter를 포함한다. 이 release candidate는 원본 사용자 source를 삭제하지 않으며, snapshot·SQLite 이력에 한정한 dry-run, 명시 확인, 백업·복구, 부분 실패·재시도 경계를 구현한다. 비전 adapter는 기본 비활성이며, 사용자가 선택한 승인 source를 Codex에 분석하도록 명시 확인한 경우에만 실행한다. raw visual input을 workspace에 복사하지 않고 마스킹된 구조화 분석, provenance, 검토 상태만 관리하며, adapter 불가·실패·낮은 신뢰도는 자동 artifact 근거가 될 수 없다.
 
 personal evidence knowledge graph, portfolio semantic ontology, Google Drive, 독립 OCR·이미지 자료 처리 (#8), semantic search, MCP/App, 회사·JD 맞춤 artifact는 별도 Issue와 설계를 통해 확장한다. Codex App이 대화 표면에서 이미지·다양한 파일을 이해할 수 있어도, 제품 runtime에는 승인 범위, 추출물의 provenance·신뢰도, 민감 정보 마스킹, 재처리와 보존·삭제 이력을 명시적으로 구현해야 한다. #14는 그 경계를 따르는 Codex 전용 선택형 adapter이며, #8의 독립적 OCR/이미지 추출 전체가 구현된 것으로 표현하지 않는다. 0.2.0 문서에 미래 확장점이 있다는 이유만으로 현재 제공 기능처럼 표현하지 않는다.
 
