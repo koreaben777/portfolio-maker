@@ -1,0 +1,4 @@
+interface:
+  display_name: "Portfolio Vision Analysis"
+  short_description: "Analyze one explicitly approved source with Codex vision"
+  default_prompt: "$portfolio-vision-analysis로 명시적으로 승인한 소스 하나를 안전하게 분석해줘"

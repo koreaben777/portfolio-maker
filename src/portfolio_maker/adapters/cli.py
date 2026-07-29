@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import unicodedata
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -26,6 +27,12 @@ from portfolio_maker.application.semantic_index import (
     SemanticIndexError,
     apply_semantic_index,
     prepare_semantic_index,
+)
+from portfolio_maker.application.vision_analysis import (
+    VisionAnalysisError,
+    apply_vision_analysis,
+    prepare_vision_analysis,
+    set_vision_analysis_state,
 )
 from portfolio_maker.application.project_composition import (
     ProjectCompositionError,
@@ -52,7 +59,10 @@ from portfolio_maker.application.models import (
     ComposeProjectsV2Request,
     PrepareProjectReviewRequest,
     ApplySemanticIndexRequest,
+    ApplyVisionAnalysisRequest,
     PrepareSemanticIndexRequest,
+    PrepareVisionAnalysisRequest,
+    SetVisionAnalysisStateRequest,
 )
 from portfolio_maker.infrastructure.github_connector import GitHubDiscoveryError
 from portfolio_maker.infrastructure.local_discovery import DiscoveryRootError
@@ -137,6 +147,27 @@ def build_parser() -> argparse.ArgumentParser:
     apply_index = subparsers.add_parser("apply-semantic-index")
     apply_index.add_argument("--workspace", type=Path, default=Path("."))
 
+    prepare_vision = subparsers.add_parser("prepare-vision-analysis")
+    prepare_vision.add_argument("--workspace", type=Path, default=Path("."))
+    prepare_vision.add_argument("--source-id", type=int, required=True)
+    prepare_vision.add_argument("--confirm-codex-share", action="store_true")
+
+    apply_vision = subparsers.add_parser("apply-vision-analysis")
+    apply_vision.add_argument("--workspace", type=Path, default=Path("."))
+    apply_vision.add_argument("--result", type=Path, required=True)
+
+    list_vision = subparsers.add_parser("list-vision-analyses")
+    list_vision.add_argument("--workspace", type=Path, default=Path("."))
+
+    set_vision_state = subparsers.add_parser("set-vision-analysis-state")
+    set_vision_state.add_argument("--workspace", type=Path, default=Path("."))
+    set_vision_state.add_argument("--analysis-id", required=True)
+    set_vision_state.add_argument(
+        "--state",
+        choices=("included", "excluded"),
+        required=True,
+    )
+
     run_mvp = subparsers.add_parser("run-mvp")
     run_mvp.add_argument("--workspace", type=Path, default=Path("."))
     run_mvp.add_argument("--home", type=Path, default=Path.home())
@@ -152,6 +183,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _main(argv)
     except HistoryError as error:
         print(_safe_history_error_message(error), file=sys.stderr)
+        return 1
+    except VisionAnalysisError as error:
+        print(_safe_vision_error_message(error), file=sys.stderr)
         return 1
     except (
         ApprovalMissingError,
@@ -380,6 +414,94 @@ def _main(argv: Sequence[str] | None = None) -> int:
         print("Semantic index applied.")
         return 0
 
+    if args.command == "prepare-vision-analysis":
+        if args.confirm_codex_share is not True:
+            raise VisionAnalysisError("Codex analysis confirmation is required")
+        result = prepare_vision_analysis(
+            PrepareVisionAnalysisRequest(
+                workspace=args.workspace,
+                source_id=args.source_id,
+                confirm_codex_share=True,
+            )
+        )
+        request_id = _safe_vision_identifier(result.id)
+        status = _safe_vision_choice(result.status, {"pending"})
+        print(f"Vision request: {request_id}")
+        print(f"Status: {status}")
+        return 0
+
+    if args.command == "apply-vision-analysis":
+        result = apply_vision_analysis(
+            ApplyVisionAnalysisRequest(
+                workspace=args.workspace,
+                result_path=args.result,
+            )
+        )
+        if result is None:
+            print("Vision result recorded.")
+            return 0
+        analysis_id = _safe_vision_identifier(result.id)
+        review_status = _safe_vision_choice(result.review_status, {"pending"})
+        try:
+            repository = SQLiteRepository(
+                WorkspacePaths.from_root(args.workspace).db_path
+            )
+            repository.initialize()
+            analysis = repository.get_vision_analysis(analysis_id)
+        except (RepositoryError, OSError) as error:
+            raise VisionAnalysisError("vision result is unsafe or unavailable") from error
+        confidence = _safe_vision_choice(
+            analysis.get("confidence"),
+            {"low", "medium", "high"},
+        )
+        print(f"Vision analysis: {analysis_id}")
+        print(f"Review state: {review_status}")
+        print(f"Confidence: {confidence}")
+        return 0
+
+    if args.command == "list-vision-analyses":
+        try:
+            repository = SQLiteRepository(
+                WorkspacePaths.from_root(args.workspace).db_path
+            )
+            repository.initialize()
+            analyses = repository.list_vision_analyses()
+            safe_rows = [
+                (
+                    _safe_vision_identifier(analysis.get("id")),
+                    _safe_vision_choice(analysis.get("status"), {"completed"}),
+                    _safe_vision_choice(
+                        analysis.get("review_status"),
+                        {"pending", "included", "excluded"},
+                    ),
+                    _safe_vision_choice(
+                        analysis.get("confidence"),
+                        {"low", "medium", "high"},
+                    ),
+                )
+                for analysis in analyses
+            ]
+        except (RepositoryError, OSError) as error:
+            raise VisionAnalysisError("vision analyses are unsafe or unavailable") from error
+        print(f"Vision analyses: {len(safe_rows)}")
+        for row in safe_rows:
+            print("\t".join(row))
+        return 0
+
+    if args.command == "set-vision-analysis-state":
+        result = set_vision_analysis_state(
+            SetVisionAnalysisStateRequest(
+                workspace=args.workspace,
+                analysis_id=args.analysis_id,
+                state=args.state,
+            )
+        )
+        analysis_id = _safe_vision_identifier(result.analysis_id)
+        state = _safe_vision_choice(result.state, {"included", "excluded"})
+        print(f"Vision analysis: {analysis_id}")
+        print(f"Review state: {state}")
+        return 0
+
     if args.command == "run-mvp":
         result = discover_sources(
             DiscoverSourcesRequest(
@@ -457,3 +579,33 @@ def _safe_history_error_message(error: HistoryError) -> str:
     if "/" in message or "\\" in message or "file:" in message.casefold():
         return "managed history command failed safely"
     return message
+
+
+def _safe_vision_error_message(error: VisionAnalysisError) -> str:
+    if "confirmation" in str(error).casefold():
+        return "Codex analysis confirmation is required"
+    return "vision command failed safely"
+
+
+def _safe_vision_identifier(value: object) -> str:
+    if (
+        type(value) is not str
+        or not value
+        or len(value) > 128
+        or value in {".", ".."}
+        or "/" in value
+        or "\\" in value
+        or any(
+            unicodedata.category(character).startswith("C")
+            for character in value
+        )
+    ):
+        raise VisionAnalysisError("vision output is unsafe")
+    return value
+
+
+def _safe_vision_choice(value: object, allowed: set[str]) -> str:
+    normalized = value.value if hasattr(value, "value") else value
+    if type(normalized) is not str or normalized not in allowed:
+        raise VisionAnalysisError("vision output is unsafe")
+    return normalized

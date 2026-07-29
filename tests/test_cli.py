@@ -3,17 +3,23 @@ from __future__ import annotations
 import json
 import sqlite3
 import hashlib
+from pathlib import Path
+import shutil
+import subprocess
 from types import SimpleNamespace
 
 from portfolio_maker.application.approval import write_sample_approval
 from portfolio_maker.application.artifact_approval import write_sample_artifact_policy
 from portfolio_maker.application.history import HistoryError
+import portfolio_maker.application.render_html as render_html_module
+from portfolio_maker.application.vision_analysis import VisionAnalysisError
 from portfolio_maker.adapters import cli
 from portfolio_maker.adapters.cli import main
 from portfolio_maker.domain.history_models import CleanupExecutionState
+from portfolio_maker.domain.vision_models import VisionRequestStatus, VisionReviewStatus
 from portfolio_maker.domain.semantic_models import boundary_fingerprint
 from portfolio_maker.domain.models import Source, SourceStatus, SourceType
-from portfolio_maker.infrastructure.sqlite_repository import SQLiteRepository
+from portfolio_maker.infrastructure.sqlite_repository import RepositoryError, SQLiteRepository
 from portfolio_maker.workspace import WorkspacePaths
 
 
@@ -1051,6 +1057,502 @@ def test_cli_history_apply_rejects_missing_partial_and_mixed_modes_before_servic
         assert "Traceback" not in captured.err
 
     assert invoked == []
+
+
+def _approved_vision_source(workspace: Path) -> tuple[WorkspacePaths, int, Path]:
+    source_path = workspace / "synthetic-approved.bin"
+    source_path.write_bytes(b"synthetic binary input")
+    paths = WorkspacePaths.from_root(workspace)
+    write_sample_approval(paths)
+    approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    approval["approved_source_uris"] = [source_path.resolve().as_uri()]
+    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    source_id = repository.upsert_source(
+        Source(
+            None,
+            SourceType.LOCAL_FILE,
+            source_path.resolve().as_uri(),
+            source_path.name,
+            None,
+            SourceStatus.APPROVED,
+        )
+    )
+    return paths, source_id, source_path
+
+
+def _fake_vision_sites_build(*args, **kwargs):
+    temporary_site = Path(kwargs["cwd"])
+    dist = temporary_site / "dist"
+    (dist / "assets").mkdir(parents=True)
+    generated = temporary_site / "src" / "generated" / "portfolio-data.ts"
+    (dist / "index.html").write_text(
+        '<script type="module" src="./assets/main.js"></script>\n'
+        + generated.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    (dist / "assets" / "main.js").write_text(
+        "document.body.dataset.ready = 'true';",
+        encoding="utf-8",
+    )
+    return subprocess.CompletedProcess(args[0], 0)
+
+
+def test_cli_vision_parser_exposes_exact_commands_and_arguments() -> None:
+    parser = cli.build_parser()
+    help_text = parser.format_help()
+
+    for command in (
+        "prepare-vision-analysis",
+        "apply-vision-analysis",
+        "list-vision-analyses",
+        "set-vision-analysis-state",
+    ):
+        assert command in help_text
+
+    prepare = parser.parse_args(
+        [
+            "prepare-vision-analysis",
+            "--workspace",
+            "synthetic-workspace",
+            "--source-id",
+            "7",
+            "--confirm-codex-share",
+        ]
+    )
+    assert prepare.workspace == Path("synthetic-workspace")
+    assert prepare.source_id == 7
+    assert prepare.confirm_codex_share is True
+
+    apply = parser.parse_args(
+        [
+            "apply-vision-analysis",
+            "--workspace",
+            "synthetic-workspace",
+            "--result",
+            "synthetic-result.json",
+        ]
+    )
+    assert apply.workspace == Path("synthetic-workspace")
+    assert apply.result == Path("synthetic-result.json")
+
+    listed = parser.parse_args(
+        ["list-vision-analyses", "--workspace", "synthetic-workspace"]
+    )
+    assert listed.workspace == Path("synthetic-workspace")
+
+    state = parser.parse_args(
+        [
+            "set-vision-analysis-state",
+            "--workspace",
+            "synthetic-workspace",
+            "--analysis-id",
+            "analysis-safe",
+            "--state",
+            "included",
+        ]
+    )
+    assert state.analysis_id == "analysis-safe"
+    assert state.state == "included"
+
+
+def test_cli_vision_prepare_requires_confirmation_before_any_persistence(
+    workspace, capsys
+):
+    paths, source_id, source_path = _approved_vision_source(workspace)
+
+    assert main(
+        [
+            "prepare-vision-analysis",
+            "--workspace",
+            str(workspace),
+            "--source-id",
+            str(source_id),
+        ]
+    ) == 1
+
+    captured = capsys.readouterr()
+    repository = SQLiteRepository(paths.db_path)
+    with repository._read_connection() as connection:
+        request_count = connection.execute(
+            "SELECT COUNT(*) FROM vision_analysis_requests"
+        ).fetchone()[0]
+    assert request_count == 0
+    assert list(paths.vision_requests_dir.iterdir()) == []
+    assert captured.out == ""
+    assert "confirmation" in captured.err.casefold()
+    assert str(workspace) not in captured.err
+    assert source_path.resolve().as_uri() not in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_cli_vision_prepare_routes_typed_request_and_safe_output(
+    workspace, monkeypatch, capsys
+):
+    received = []
+
+    def prepare(request):
+        received.append(request)
+        return SimpleNamespace(id="request-safe", status=VisionRequestStatus.PENDING)
+
+    monkeypatch.setattr(cli, "prepare_vision_analysis", prepare)
+
+    assert main(
+        [
+            "prepare-vision-analysis",
+            "--workspace",
+            str(workspace),
+            "--source-id",
+            "23",
+            "--confirm-codex-share",
+        ]
+    ) == 0
+
+    captured = capsys.readouterr()
+    assert captured.out == "Vision request: request-safe\nStatus: pending\n"
+    assert captured.err == ""
+    assert received[0].workspace == workspace
+    assert received[0].source_id == 23
+    assert received[0].confirm_codex_share is True
+    assert str(workspace) not in captured.out
+    assert "23" not in captured.out
+
+
+def test_cli_vision_apply_completed_and_status_only_outputs_are_safe(
+    workspace, tmp_path, monkeypatch, capsys
+):
+    received = []
+    rows = {
+        "analysis-safe": {
+            "confidence": "medium",
+            "source_id": 91,
+            "result_hash": "f" * 64,
+            "relative_path": "derived/vision/private.json",
+            "adapter": "codex-app-vision-v1",
+        }
+    }
+
+    class FakeRepository:
+        def __init__(self, db_path):
+            self.db_path = db_path
+
+        def initialize(self):
+            return None
+
+        def get_vision_analysis(self, analysis_id):
+            return rows[analysis_id]
+
+    def apply(request):
+        received.append(request)
+        if request.result_path.name == "status-only.json":
+            return None
+        return SimpleNamespace(
+            id="analysis-safe",
+            review_status=VisionReviewStatus.PENDING,
+            result_hash="f" * 64,
+            analysis_path=workspace / "private-analysis.json",
+        )
+
+    monkeypatch.setattr(cli, "apply_vision_analysis", apply)
+    monkeypatch.setattr(cli, "SQLiteRepository", FakeRepository)
+
+    completed_path = tmp_path / "completed.json"
+    assert main(
+        [
+            "apply-vision-analysis",
+            "--workspace",
+            str(workspace),
+            "--result",
+            str(completed_path),
+        ]
+    ) == 0
+    completed = capsys.readouterr()
+    assert completed.out == (
+        "Vision analysis: analysis-safe\n"
+        "Review state: pending\n"
+        "Confidence: medium\n"
+    )
+    assert completed.err == ""
+
+    status_path = tmp_path / "status-only.json"
+    assert main(
+        [
+            "apply-vision-analysis",
+            "--workspace",
+            str(workspace),
+            "--result",
+            str(status_path),
+        ]
+    ) == 0
+    status_only = capsys.readouterr()
+    assert status_only.out == "Vision result recorded.\n"
+    assert status_only.err == ""
+
+    assert [request.result_path for request in received] == [
+        completed_path,
+        status_path,
+    ]
+    serialized = completed.out + status_only.out
+    for forbidden in (
+        str(workspace),
+        str(completed_path),
+        str(status_path),
+        "f" * 64,
+        "codex-app-vision-v1",
+        "derived/vision",
+        "91",
+    ):
+        assert forbidden not in serialized
+
+
+def test_cli_vision_list_is_deterministic_and_allowlist_only(
+    workspace, monkeypatch, capsys
+):
+    rows = [
+        {
+            "id": "analysis-a",
+            "request_id": "request-private-a",
+            "source_id": 41,
+            "source_content_hash": "a" * 64,
+            "result_hash": "b" * 64,
+            "relative_path": "derived/vision/private-a.json",
+            "adapter": "codex-app-vision-v1",
+            "status": "completed",
+            "confidence": "medium",
+            "review_status": "pending",
+        },
+        {
+            "id": "analysis-b",
+            "request_id": "request-private-b",
+            "source_id": 42,
+            "source_content_hash": "c" * 64,
+            "result_hash": "d" * 64,
+            "relative_path": "derived/vision/private-b.json",
+            "adapter": "codex-app-vision-v1",
+            "status": "completed",
+            "confidence": "high",
+            "review_status": "included",
+        },
+    ]
+
+    class FakeRepository:
+        def __init__(self, db_path):
+            self.db_path = db_path
+
+        def initialize(self):
+            return None
+
+        def list_vision_analyses(self):
+            return rows
+
+    monkeypatch.setattr(cli, "SQLiteRepository", FakeRepository)
+
+    assert main(["list-vision-analyses", "--workspace", str(workspace)]) == 0
+
+    captured = capsys.readouterr()
+    assert captured.out == (
+        "Vision analyses: 2\n"
+        "analysis-a\tcompleted\tpending\tmedium\n"
+        "analysis-b\tcompleted\tincluded\thigh\n"
+    )
+    assert captured.err == ""
+    assert captured.out.index("analysis-a") < captured.out.index("analysis-b")
+    for forbidden in (
+        str(workspace),
+        "request-private",
+        "derived/vision",
+        "codex-app-vision-v1",
+        "a" * 64,
+        "b" * 64,
+        "41",
+        "42",
+    ):
+        assert forbidden not in captured.out
+
+
+def test_cli_vision_state_routes_include_and_exclude(
+    workspace, monkeypatch, capsys
+):
+    received = []
+
+    def set_state(request):
+        received.append(request)
+        return SimpleNamespace(analysis_id=request.analysis_id, state=request.state)
+
+    monkeypatch.setattr(cli, "set_vision_analysis_state", set_state)
+
+    for state in ("included", "excluded"):
+        assert main(
+            [
+                "set-vision-analysis-state",
+                "--workspace",
+                str(workspace),
+                "--analysis-id",
+                "analysis-safe",
+                "--state",
+                state,
+            ]
+        ) == 0
+        captured = capsys.readouterr()
+        assert captured.out == (
+            f"Vision analysis: analysis-safe\nReview state: {state}\n"
+        )
+        assert captured.err == ""
+
+    assert [request.state for request in received] == ["included", "excluded"]
+
+
+def test_cli_vision_controlled_failure_redacts_private_details(
+    workspace, monkeypatch, capsys
+):
+    private_locator = str(workspace / "private-result.json")
+    private_hash = "e" * 64
+
+    def fail(_request):
+        raise VisionAnalysisError(
+            f"failed at {private_locator} {private_hash} codex-app-vision-v1 observation"
+        )
+
+    monkeypatch.setattr(cli, "apply_vision_analysis", fail)
+
+    assert main(
+        [
+            "apply-vision-analysis",
+            "--workspace",
+            str(workspace),
+            "--result",
+            private_locator,
+        ]
+    ) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "vision command failed safely\n"
+    for forbidden in (
+        private_locator,
+        private_hash,
+        "codex-app-vision-v1",
+        "observation",
+        "Traceback",
+    ):
+        assert forbidden not in captured.err
+
+
+def test_cli_vision_repository_failure_redacts_private_details(
+    workspace, monkeypatch, capsys
+):
+    private_locator = str(workspace / ".portfolio-maker" / "portfolio.db")
+
+    class FailingRepository:
+        def __init__(self, db_path):
+            self.db_path = db_path
+
+        def initialize(self):
+            raise RepositoryError(f"database failed at {private_locator}")
+
+    monkeypatch.setattr(cli, "SQLiteRepository", FailingRepository)
+
+    assert main(["list-vision-analyses", "--workspace", str(workspace)]) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "vision command failed safely\n"
+    assert private_locator not in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_cli_vision_capability_unavailable_smoke_keeps_artifacts_empty_and_safe(
+    workspace, monkeypatch, capsys
+):
+    paths, source_id, source_path = _approved_vision_source(workspace)
+    repository_root = Path(__file__).resolve().parents[1]
+    shutil.copytree(
+        repository_root / "web" / "portfolio",
+        workspace / "web" / "portfolio",
+        ignore=shutil.ignore_patterns("node_modules", "dist"),
+    )
+    monkeypatch.setattr(
+        render_html_module.subprocess,
+        "run",
+        _fake_vision_sites_build,
+    )
+
+    assert main(
+        [
+            "prepare-vision-analysis",
+            "--workspace",
+            str(workspace),
+            "--source-id",
+            str(source_id),
+            "--confirm-codex-share",
+        ]
+    ) == 0
+    prepared_output = capsys.readouterr()
+    request_id = prepared_output.out.splitlines()[0].split(": ", 1)[1]
+    repository = SQLiteRepository(paths.db_path)
+    request = repository.get_vision_request(request_id)
+
+    result_path = workspace / "synthetic-status-only.json"
+    result_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "vision-analysis-v1",
+                "request_id": request_id,
+                "source_content_hash": request["source_content_hash"],
+                "adapter": "codex-app-vision-v1",
+                "status": "unavailable",
+                "reason_code": "capability_unavailable",
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert main(
+        [
+            "apply-vision-analysis",
+            "--workspace",
+            str(workspace),
+            "--result",
+            str(result_path),
+        ]
+    ) == 0
+    assert capsys.readouterr().out == "Vision result recorded.\n"
+
+    for command in ("build-profile", "draft-portfolio", "render-html"):
+        assert main([command, "--workspace", str(workspace)]) == 0
+        capsys.readouterr()
+
+    repository = SQLiteRepository(paths.db_path)
+    assert repository.list_vision_analyses() == []
+    with repository._read_connection() as connection:
+        vision_evidence = connection.execute(
+            "SELECT COUNT(*) FROM evidence_items WHERE stable_id LIKE 'vision-analysis:%'"
+        ).fetchone()[0]
+        vision_claims = connection.execute(
+            "SELECT COUNT(*) FROM career_claims"
+        ).fetchone()[0]
+    assert vision_evidence == 0
+    assert vision_claims == 0
+    serialized = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in (
+            paths.master_profile_json_path,
+            paths.master_profile_md_path,
+            paths.portfolio_draft_path,
+            paths.portfolio_public_json_path,
+            paths.portfolio_html_path,
+        )
+    )
+    for forbidden in (
+        source_path.resolve().as_uri(),
+        str(source_path.resolve()),
+        str(workspace.resolve()),
+        request_id,
+        request["source_content_hash"],
+        "codex-app-vision-v1",
+        "capability_unavailable",
+    ):
+        assert forbidden not in serialized
 
 
 def test_cli_history_error_is_controlled_and_never_leaks_locator(

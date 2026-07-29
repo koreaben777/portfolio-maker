@@ -7,6 +7,11 @@ description: Use when generating, validating, previewing, or preparing delivery 
 
 Use this skill for the artifact layer only. Source discovery, source approval, semantic indexing, and project review remain separate authorities. A filename containing `public` never grants public delivery permission.
 
+Vision input is limited to already included derived evidence selected through
+the current source and artifact policy. This skill does not read raw source,
+request, result, or pending/excluded analysis material. It never opens the
+request/result payload or promotes a pending or excluded analysis.
+
 ## Required Gates
 
 Run every gate against the current workspace state. Do not reuse an old policy hash, project review input, project approval, or generated artifact after changing an approval or policy.

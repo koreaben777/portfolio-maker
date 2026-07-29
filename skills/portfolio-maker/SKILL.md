@@ -14,22 +14,28 @@ specialized child skills by name; do not perform their work in this router.
 Before each handoff, inspect only the current managed workspace state needed to
 decide whether the next gate is satisfied. Do not read raw files, source
 content, snapshots, databases, credentials, private URLs, or unapproved
-review material from this router. Do not duplicate a child skill's schema,
-policy, or validation rules; load and follow the named child skill instead.
+review material from this router. The router may pass only a selected source ID
+or request ID to `$portfolio-vision-analysis`; it must not read raw source,
+request, or result material. Do not duplicate a child skill's schema, policy,
+or validation rules; load and follow the named child skill instead.
 
 Always route these stages in this order:
 
 1. `$portfolio-source-governance` first. Confirm the exact approved scope,
    exclusions, source policy, and current policy state before discovery or
    indexing.
-2. `$portfolio-semantic-index` next. Invoke it only when governance has
+2. `$portfolio-vision-analysis` is an optional stage after governance. Invoke
+   it only for one explicitly selected approved source after separate
+   Codex-share confirmation. Skip it for text-only workflows; vision is not a
+   prerequisite for semantic indexing or artifacts.
+3. `$portfolio-semantic-index` next. Invoke it only when governance has
    produced current approved inputs for the semantic-index workflow.
-3. `$portfolio-project-curation` next. Invoke it only with the current safe
+4. `$portfolio-project-curation` next. Invoke it only with the current safe
    semantic review input, never with raw sources or arbitrary evidence.
-4. `$portfolio-project-review` next. Preserve the explicit review mode. Pass
+5. `$portfolio-project-review` next. Preserve the explicit review mode. Pass
    `automatic` only when the user explicitly requested automatic decisions;
    otherwise use review/manual handling.
-5. `$portfolio-artifacts` last. Invoke it only after current policy, evidence,
+6. `$portfolio-artifacts` last. Invoke it only after current policy, evidence,
    project-review, and artifact-approval gates are satisfied.
 
 If any required policy, managed input, approval, or hash is missing or stale,
@@ -60,9 +66,10 @@ return a synthetic deployment URL. Keep restricted output restricted and ask
 for a separate explicit delivery choice after the child artifact workflow has
 validated the local result.
 
-The five child skills are the authorities for their own stage:
+The six child skills are the authorities for their own stage:
 
 - `$portfolio-source-governance`
+- `$portfolio-vision-analysis`
 - `$portfolio-semantic-index`
 - `$portfolio-project-curation`
 - `$portfolio-project-review`
