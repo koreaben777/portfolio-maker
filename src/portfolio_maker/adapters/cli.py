@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-import unicodedata
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -590,15 +589,8 @@ def _safe_vision_error_message(error: VisionAnalysisError) -> str:
 def _safe_vision_identifier(value: object) -> str:
     if (
         type(value) is not str
-        or not value
-        or len(value) > 128
-        or value in {".", ".."}
-        or "/" in value
-        or "\\" in value
-        or any(
-            unicodedata.category(character).startswith("C")
-            for character in value
-        )
+        or len(value) != 32
+        or any(character not in "0123456789abcdef" for character in value)
     ):
         raise VisionAnalysisError("vision output is unsafe")
     return value

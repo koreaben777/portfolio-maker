@@ -8,11 +8,21 @@ import shutil
 import subprocess
 from types import SimpleNamespace
 
+import pytest
+
 from portfolio_maker.application.approval import write_sample_approval
 from portfolio_maker.application.artifact_approval import write_sample_artifact_policy
 from portfolio_maker.application.history import HistoryError
+from portfolio_maker.application.models import (
+    ApplyVisionAnalysisRequest,
+    PrepareVisionAnalysisRequest,
+)
 import portfolio_maker.application.render_html as render_html_module
-from portfolio_maker.application.vision_analysis import VisionAnalysisError
+from portfolio_maker.application.vision_analysis import (
+    VisionAnalysisError,
+    apply_vision_analysis,
+    prepare_vision_analysis,
+)
 from portfolio_maker.adapters import cli
 from portfolio_maker.adapters.cli import main
 from portfolio_maker.domain.history_models import CleanupExecutionState
@@ -21,6 +31,11 @@ from portfolio_maker.domain.semantic_models import boundary_fingerprint
 from portfolio_maker.domain.models import Source, SourceStatus, SourceType
 from portfolio_maker.infrastructure.sqlite_repository import RepositoryError, SQLiteRepository
 from portfolio_maker.workspace import WorkspacePaths
+
+
+CANONICAL_VISION_REQUEST_ID = "1" * 32
+CANONICAL_VISION_ANALYSIS_ID = "2" * 32
+SECOND_CANONICAL_VISION_ANALYSIS_ID = "3" * 32
 
 
 def approve_semantic_root(workspace, root) -> None:
@@ -1099,6 +1114,37 @@ def _fake_vision_sites_build(*args, **kwargs):
     return subprocess.CompletedProcess(args[0], 0)
 
 
+def _completed_vision_analysis(workspace: Path) -> tuple[WorkspacePaths, str]:
+    paths, source_id, _ = _approved_vision_source(workspace)
+    prepared = prepare_vision_analysis(
+        PrepareVisionAnalysisRequest(workspace, source_id, True)
+    )
+    result_path = workspace / "completed-vision-result.json"
+    result_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "vision-analysis-v1",
+                "request_id": prepared.id,
+                "source_content_hash": prepared.source_content_hash,
+                "adapter": "codex-app-vision-v1",
+                "status": "completed",
+                "confidence": "medium",
+                "summary": "Synthetic completed analysis",
+                "observations": [],
+                "requires_manual_review": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    applied = apply_vision_analysis(
+        ApplyVisionAnalysisRequest(workspace, result_path)
+    )
+    assert applied is not None
+    assert len(applied.id) == 32
+    assert all(character in "0123456789abcdef" for character in applied.id)
+    return paths, applied.id
+
+
 def test_cli_vision_parser_exposes_exact_commands_and_arguments() -> None:
     parser = cli.build_parser()
     help_text = parser.format_help()
@@ -1148,12 +1194,12 @@ def test_cli_vision_parser_exposes_exact_commands_and_arguments() -> None:
             "--workspace",
             "synthetic-workspace",
             "--analysis-id",
-            "analysis-safe",
+            CANONICAL_VISION_ANALYSIS_ID,
             "--state",
             "included",
         ]
     )
-    assert state.analysis_id == "analysis-safe"
+    assert state.analysis_id == CANONICAL_VISION_ANALYSIS_ID
     assert state.state == "included"
 
 
@@ -1194,7 +1240,10 @@ def test_cli_vision_prepare_routes_typed_request_and_safe_output(
 
     def prepare(request):
         received.append(request)
-        return SimpleNamespace(id="request-safe", status=VisionRequestStatus.PENDING)
+        return SimpleNamespace(
+            id=CANONICAL_VISION_REQUEST_ID,
+            status=VisionRequestStatus.PENDING,
+        )
 
     monkeypatch.setattr(cli, "prepare_vision_analysis", prepare)
 
@@ -1210,7 +1259,9 @@ def test_cli_vision_prepare_routes_typed_request_and_safe_output(
     ) == 0
 
     captured = capsys.readouterr()
-    assert captured.out == "Vision request: request-safe\nStatus: pending\n"
+    assert captured.out == (
+        f"Vision request: {CANONICAL_VISION_REQUEST_ID}\nStatus: pending\n"
+    )
     assert captured.err == ""
     assert received[0].workspace == workspace
     assert received[0].source_id == 23
@@ -1224,7 +1275,7 @@ def test_cli_vision_apply_completed_and_status_only_outputs_are_safe(
 ):
     received = []
     rows = {
-        "analysis-safe": {
+        CANONICAL_VISION_ANALYSIS_ID: {
             "confidence": "medium",
             "source_id": 91,
             "result_hash": "f" * 64,
@@ -1248,7 +1299,7 @@ def test_cli_vision_apply_completed_and_status_only_outputs_are_safe(
         if request.result_path.name == "status-only.json":
             return None
         return SimpleNamespace(
-            id="analysis-safe",
+            id=CANONICAL_VISION_ANALYSIS_ID,
             review_status=VisionReviewStatus.PENDING,
             result_hash="f" * 64,
             analysis_path=workspace / "private-analysis.json",
@@ -1269,7 +1320,7 @@ def test_cli_vision_apply_completed_and_status_only_outputs_are_safe(
     ) == 0
     completed = capsys.readouterr()
     assert completed.out == (
-        "Vision analysis: analysis-safe\n"
+        f"Vision analysis: {CANONICAL_VISION_ANALYSIS_ID}\n"
         "Review state: pending\n"
         "Confidence: medium\n"
     )
@@ -1311,7 +1362,7 @@ def test_cli_vision_list_is_deterministic_and_allowlist_only(
 ):
     rows = [
         {
-            "id": "analysis-a",
+            "id": CANONICAL_VISION_ANALYSIS_ID,
             "request_id": "request-private-a",
             "source_id": 41,
             "source_content_hash": "a" * 64,
@@ -1323,7 +1374,7 @@ def test_cli_vision_list_is_deterministic_and_allowlist_only(
             "review_status": "pending",
         },
         {
-            "id": "analysis-b",
+            "id": SECOND_CANONICAL_VISION_ANALYSIS_ID,
             "request_id": "request-private-b",
             "source_id": 42,
             "source_content_hash": "c" * 64,
@@ -1353,11 +1404,13 @@ def test_cli_vision_list_is_deterministic_and_allowlist_only(
     captured = capsys.readouterr()
     assert captured.out == (
         "Vision analyses: 2\n"
-        "analysis-a\tcompleted\tpending\tmedium\n"
-        "analysis-b\tcompleted\tincluded\thigh\n"
+        f"{CANONICAL_VISION_ANALYSIS_ID}\tcompleted\tpending\tmedium\n"
+        f"{SECOND_CANONICAL_VISION_ANALYSIS_ID}\tcompleted\tincluded\thigh\n"
     )
     assert captured.err == ""
-    assert captured.out.index("analysis-a") < captured.out.index("analysis-b")
+    assert captured.out.index(CANONICAL_VISION_ANALYSIS_ID) < captured.out.index(
+        SECOND_CANONICAL_VISION_ANALYSIS_ID
+    )
     for forbidden in (
         str(workspace),
         "request-private",
@@ -1389,18 +1442,149 @@ def test_cli_vision_state_routes_include_and_exclude(
                 "--workspace",
                 str(workspace),
                 "--analysis-id",
-                "analysis-safe",
+                CANONICAL_VISION_ANALYSIS_ID,
                 "--state",
                 state,
             ]
         ) == 0
         captured = capsys.readouterr()
         assert captured.out == (
-            f"Vision analysis: analysis-safe\nReview state: {state}\n"
+            f"Vision analysis: {CANONICAL_VISION_ANALYSIS_ID}\n"
+            f"Review state: {state}\n"
         )
         assert captured.err == ""
 
     assert [request.state for request in received] == ["included", "excluded"]
+
+
+@pytest.mark.parametrize(
+    "stored_id",
+    (
+        "a" * 64,
+        "file:synthetic-private",
+        "http:synthetic-private",
+        "synthetic/private",
+        "synthetic\\private",
+        "synthetic\u202eprivate",
+    ),
+    ids=("sha256", "file-uri", "http-uri", "slash", "backslash", "unicode-control"),
+)
+def test_cli_vision_list_rejects_noncanonical_real_sqlite_identifier(
+    workspace, stored_id, capsys
+):
+    paths, canonical_id = _completed_vision_analysis(workspace)
+    repository = SQLiteRepository(paths.db_path)
+    with repository._connection() as connection:
+        connection.execute(
+            "UPDATE vision_analyses SET id = ? WHERE id = ?",
+            (stored_id, canonical_id),
+        )
+
+    assert main(["list-vision-analyses", "--workspace", str(workspace)]) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "vision command failed safely\n"
+    assert stored_id not in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_cli_vision_list_accepts_canonical_real_sqlite_identifier(
+    workspace, capsys
+):
+    _, canonical_id = _completed_vision_analysis(workspace)
+
+    assert main(["list-vision-analyses", "--workspace", str(workspace)]) == 0
+
+    captured = capsys.readouterr()
+    assert captured.out == (
+        "Vision analyses: 1\n"
+        f"{canonical_id}\tcompleted\tpending\tmedium\n"
+    )
+    assert captured.err == ""
+
+
+@pytest.mark.parametrize(
+    ("projection", "malformed_id"),
+    (
+        ("prepare", "a" * 64),
+        ("apply", "file:synthetic-private"),
+        ("state", "http:synthetic-private"),
+    ),
+)
+def test_cli_vision_rejects_noncanonical_service_identifier(
+    workspace, tmp_path, monkeypatch, capsys, projection, malformed_id
+):
+    if projection == "prepare":
+        monkeypatch.setattr(
+            cli,
+            "prepare_vision_analysis",
+            lambda _request: SimpleNamespace(
+                id=malformed_id,
+                status=VisionRequestStatus.PENDING,
+            ),
+        )
+        command = [
+            "prepare-vision-analysis",
+            "--workspace",
+            str(workspace),
+            "--source-id",
+            "7",
+            "--confirm-codex-share",
+        ]
+    elif projection == "apply":
+        class FakeRepository:
+            def __init__(self, _db_path):
+                pass
+
+            def initialize(self):
+                return None
+
+            def get_vision_analysis(self, _analysis_id):
+                return {"confidence": "medium"}
+
+        monkeypatch.setattr(
+            cli,
+            "apply_vision_analysis",
+            lambda _request: SimpleNamespace(
+                id=malformed_id,
+                review_status=VisionReviewStatus.PENDING,
+            ),
+        )
+        monkeypatch.setattr(cli, "SQLiteRepository", FakeRepository)
+        command = [
+            "apply-vision-analysis",
+            "--workspace",
+            str(workspace),
+            "--result",
+            str(tmp_path / "synthetic-result.json"),
+        ]
+    else:
+        monkeypatch.setattr(
+            cli,
+            "set_vision_analysis_state",
+            lambda _request: SimpleNamespace(
+                analysis_id=malformed_id,
+                state="included",
+            ),
+        )
+        command = [
+            "set-vision-analysis-state",
+            "--workspace",
+            str(workspace),
+            "--analysis-id",
+            CANONICAL_VISION_ANALYSIS_ID,
+            "--state",
+            "included",
+        ]
+
+    assert main(command) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "vision command failed safely\n"
+    assert malformed_id not in captured.err
+    assert "Traceback" not in captured.err
 
 
 def test_cli_vision_controlled_failure_redacts_private_details(
