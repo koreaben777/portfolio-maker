@@ -8,10 +8,19 @@ from portfolio_maker.application.build_profile import build_profile
 from portfolio_maker.application.draft_portfolio import draft_portfolio
 from portfolio_maker.application.ingestion import ingest_sources
 from portfolio_maker.application.models import (
+    ApplyVisionAnalysisRequest,
     BuildProfileRequest,
     BuildProfileResult,
     DraftPortfolioRequest,
     IngestSourcesRequest,
+    PrepareVisionAnalysisRequest,
+    SetVisionAnalysisStateRequest,
+)
+from portfolio_maker.application.vision_analysis import (
+    VisionAnalysisError,
+    apply_vision_analysis,
+    prepare_vision_analysis,
+    set_vision_analysis_state,
 )
 from portfolio_maker.domain.models import GitHubActivity, Source, SourceStatus, SourceType
 from portfolio_maker.infrastructure.extractors import extract_text
@@ -71,6 +80,207 @@ def _setup_approved_github_activity(tmp_path, activity_url):
         )
     )
     return workspace, paths, repository, source_id
+
+
+def _completed_vision_analysis_for_profile(tmp_path):
+    workspace = tmp_path / "workspace"
+    source_path = tmp_path / "source.txt"
+    source_path.write_text("Original approved source text", encoding="utf-8")
+    paths = WorkspacePaths.from_root(workspace)
+    write_sample_approval(paths)
+    approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    approval["approved_source_uris"] = [source_path.resolve().as_uri()]
+    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    source_id = repository.upsert_source(
+        Source(
+            None,
+            SourceType.LOCAL_FILE,
+            source_path.resolve().as_uri(),
+            "source.txt",
+            None,
+            SourceStatus.APPROVED,
+        )
+    )
+    prepared = prepare_vision_analysis(
+        PrepareVisionAnalysisRequest(workspace, source_id, True)
+    )
+    result_path = tmp_path / "vision-result.json"
+    result_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "vision-analysis-v1",
+                "request_id": prepared.id,
+                "source_content_hash": prepared.source_content_hash,
+                "adapter": "codex-app-vision-v1",
+                "status": "completed",
+                "confidence": "medium",
+                "summary": "Approved vision summary",
+                "observations": [
+                    {
+                        "kind": "technology",
+                        "text": "Raw observation must stay private",
+                        "confidence": "medium",
+                    }
+                ],
+                "requires_manual_review": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    applied = apply_vision_analysis(ApplyVisionAnalysisRequest(workspace, result_path))
+    assert applied is not None
+    ingest_sources(IngestSourcesRequest(workspace=workspace))
+    return workspace, paths, source_path, prepared, applied
+
+
+def test_vision_projection_requires_inclusion_and_uses_only_summary(tmp_path):
+    workspace, paths, source_path, prepared, applied = _completed_vision_analysis_for_profile(
+        tmp_path
+    )
+
+    build_profile(BuildProfileRequest(workspace=workspace))
+    pending_profile = paths.master_profile_json_path.read_text(encoding="utf-8")
+    assert "Approved vision summary" not in pending_profile
+
+    set_vision_analysis_state(
+        SetVisionAnalysisStateRequest(workspace, applied.id, "included")
+    )
+    build_profile(BuildProfileRequest(workspace=workspace))
+    profile_json = paths.master_profile_json_path.read_text(encoding="utf-8")
+    profile_markdown = paths.master_profile_md_path.read_text(encoding="utf-8")
+
+    assert "Approved vision summary" in profile_json
+    assert "Approved vision summary" in profile_markdown
+    for forbidden in (
+        "Raw observation must stay private",
+        prepared.id,
+        source_path.resolve().as_uri(),
+        str(paths.vision_analyses_dir),
+        applied.result_hash,
+        "codex-app-vision-v1",
+    ):
+        assert forbidden not in profile_json
+        assert forbidden not in profile_markdown
+
+    build_profile(BuildProfileRequest(workspace=workspace))
+    repository = SQLiteRepository(paths.db_path)
+    with repository._read_connection() as connection:
+        count = connection.execute(
+            "SELECT COUNT(*) FROM career_claims WHERE text = ?",
+            ("Approved vision summary",),
+        ).fetchone()[0]
+    assert count == 1
+
+    with pytest.raises(VisionAnalysisError, match="vision analysis is unsafe"):
+        set_vision_analysis_state(
+            SetVisionAnalysisStateRequest(workspace, applied.id, "excluded")
+        )
+    assert repository.get_vision_analysis(applied.id)["review_status"] == "included"
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "alternate_path",
+        "wrong_root",
+        "traversal",
+        "absolute",
+        "missing",
+        "symlink",
+        "tampered",
+        "request_mismatch",
+        "source_hash_mismatch",
+        "source_changed",
+        "adapter_mismatch",
+        "approval_revoked",
+    ),
+)
+def test_vision_projection_skips_unsafe_included_analysis_file(tmp_path, mutation):
+    workspace, paths, source_path, _, applied = _completed_vision_analysis_for_profile(
+        tmp_path
+    )
+    set_vision_analysis_state(
+        SetVisionAnalysisStateRequest(workspace, applied.id, "included")
+    )
+    repository = SQLiteRepository(paths.db_path)
+    analysis = repository.get_vision_analysis(applied.id)
+    analysis_path = paths.root / analysis["relative_path"]
+    if mutation == "alternate_path":
+        alternate = paths.vision_analyses_dir / "alternate.json"
+        alternate.write_bytes(analysis_path.read_bytes())
+        replacement = "derived/vision/alternate.json"
+    elif mutation == "wrong_root":
+        replacement = "reviews/source-approval.json"
+    elif mutation == "traversal":
+        replacement = "../reviews/source-approval.json"
+    elif mutation == "absolute":
+        replacement = str(paths.vision_analyses_dir / "absolute.json")
+    elif mutation == "missing":
+        analysis_path.unlink()
+        replacement = analysis["relative_path"]
+    elif mutation == "symlink":
+        replacement_path = tmp_path / "replacement.json"
+        replacement_path.write_bytes(analysis_path.read_bytes())
+        analysis_path.unlink()
+        analysis_path.symlink_to(replacement_path)
+        replacement = analysis["relative_path"]
+    elif mutation == "tampered":
+        analysis_path.write_text("{\"tampered\": true}", encoding="utf-8")
+        replacement = analysis["relative_path"]
+    elif mutation == "source_changed":
+        source_path.write_text("Changed source text", encoding="utf-8")
+        replacement = analysis["relative_path"]
+    elif mutation == "adapter_mismatch":
+        replacement = analysis["relative_path"]
+        with repository._connection() as connection:
+            connection.execute(
+                "UPDATE vision_analyses SET adapter = ? WHERE id = ?",
+                ("different-adapter", applied.id),
+            )
+    elif mutation == "request_mismatch":
+        mismatched = prepare_vision_analysis(
+            PrepareVisionAnalysisRequest(workspace, analysis["source_id"], True)
+        )
+        mismatch_path = paths.vision_analyses_dir / (
+            f"analysis-{mismatched.id}-{analysis['result_hash']}.json"
+        )
+        mismatch_path.write_bytes(analysis_path.read_bytes())
+        replacement = str(mismatch_path.relative_to(paths.root))
+        with repository._connection() as connection:
+            connection.execute(
+                "UPDATE vision_analyses SET request_id = ? WHERE id = ?",
+                (mismatched.id, applied.id),
+            )
+    elif mutation == "source_hash_mismatch":
+        replacement = analysis["relative_path"]
+        with repository._connection() as connection:
+            connection.execute(
+                "UPDATE vision_analyses SET source_content_hash = ? WHERE id = ?",
+                ("0" * 64, applied.id),
+            )
+    elif mutation == "approval_revoked":
+        replacement = analysis["relative_path"]
+        approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+        approval["approved_source_uris"] = []
+        paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+    with repository._connection() as connection:
+        connection.execute(
+            "UPDATE vision_analyses SET relative_path = ? WHERE id = ?",
+            (replacement, applied.id),
+        )
+
+    profile_result = build_profile(BuildProfileRequest(workspace=workspace))
+
+    serialized = paths.master_profile_json_path.read_text(encoding="utf-8")
+    assert "Approved vision summary" not in serialized
+    if mutation in {"source_changed", "approval_revoked"}:
+        assert "Original approved source text" not in serialized
+        assert profile_result.claim_count == 0
+    else:
+        assert "Original approved source text" in serialized
+        assert profile_result.claim_count == 1
 
 
 def test_build_profile_treats_github_sources_as_discovery_only_in_mvp(tmp_path):

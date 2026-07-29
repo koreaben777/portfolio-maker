@@ -4,10 +4,28 @@ import json
 from pathlib import Path
 import subprocess
 
+import pytest
 from portfolio_maker.application.approval import write_sample_approval
-from portfolio_maker.application.models import PublicPortfolioRequest, RenderHtmlRequest
+from portfolio_maker.application.build_profile import build_profile
+from portfolio_maker.application.draft_portfolio import draft_portfolio
+from portfolio_maker.application.ingestion import ingest_sources
+from portfolio_maker.application.models import (
+    ApplyVisionAnalysisRequest,
+    BuildProfileRequest,
+    DraftPortfolioRequest,
+    IngestSourcesRequest,
+    PrepareVisionAnalysisRequest,
+    PublicPortfolioRequest,
+    RenderHtmlRequest,
+    SetVisionAnalysisStateRequest,
+)
 from portfolio_maker.application.public_portfolio import build_public_portfolio
 from portfolio_maker.application.render_html import render_html
+from portfolio_maker.application.vision_analysis import (
+    apply_vision_analysis,
+    prepare_vision_analysis,
+    set_vision_analysis_state,
+)
 import portfolio_maker.application.render_html as render_html_module
 from portfolio_maker.domain.models import GitHubActivity, Source, SourceStatus, SourceType
 from portfolio_maker.infrastructure.sqlite_repository import SQLiteRepository
@@ -34,6 +52,127 @@ def _setup_workspace(tmp_path, approved_urls):
         )
     )
     return workspace, paths, repository, source_id
+
+
+def _completed_local_vision_analysis(tmp_path):
+    workspace = tmp_path / "workspace"
+    source_path = tmp_path / "local" / "notes.txt"
+    source_path.parent.mkdir()
+    source_path.write_text("Approved local text evidence", encoding="utf-8")
+    paths = WorkspacePaths.from_root(workspace)
+    write_sample_approval(paths)
+    approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    source_uri = source_path.resolve().as_uri()
+    approval["approved_source_uris"] = [source_uri]
+    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    source_id = repository.upsert_source(
+        Source(
+            None,
+            SourceType.LOCAL_FILE,
+            source_uri,
+            "notes.txt",
+            None,
+            SourceStatus.APPROVED,
+        )
+    )
+    prepared = prepare_vision_analysis(
+        PrepareVisionAnalysisRequest(workspace, source_id, True)
+    )
+    result_path = tmp_path / "vision-result.json"
+    result_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "vision-analysis-v1",
+                "request_id": prepared.id,
+                "source_content_hash": prepared.source_content_hash,
+                "adapter": "codex-app-vision-v1",
+                "status": "completed",
+                "confidence": "medium",
+                "summary": "Safe vision summary",
+                "observations": [
+                    {
+                        "kind": "technology",
+                        "text": "Raw vision observation must remain private",
+                        "confidence": "medium",
+                    }
+                ],
+                "requires_manual_review": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    applied = apply_vision_analysis(ApplyVisionAnalysisRequest(workspace, result_path))
+    assert applied is not None
+    ingest_sources(IngestSourcesRequest(workspace=workspace))
+    generated = workspace / "web" / "portfolio" / "src" / "generated"
+    generated.mkdir(parents=True)
+    (generated / "portfolio-data.ts").write_text(
+        "export const portfolioData = { version: 1, projects: [] } as const;\n",
+        encoding="utf-8",
+    )
+    return workspace, paths, source_uri, prepared, applied
+
+
+def _fake_build_with_generated_data(*args, **kwargs):
+    temporary_site = Path(kwargs["cwd"])
+    dist = temporary_site / "dist"
+    (dist / "assets").mkdir(parents=True)
+    generated = temporary_site / "src" / "generated" / "portfolio-data.ts"
+    (dist / "index.html").write_text(
+        '<script type="module" src="./assets/main.js"></script>\n'
+        + generated.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    (dist / "assets" / "main.js").write_text(
+        "document.body.dataset.ready = 'true';", encoding="utf-8"
+    )
+    return subprocess.CompletedProcess(args[0], 0)
+
+
+@pytest.mark.parametrize("review_state", ("pending", "excluded"))
+def test_pending_or_excluded_vision_metadata_stays_out_of_all_artifacts(
+    tmp_path,
+    monkeypatch,
+    review_state,
+):
+    workspace, paths, source_uri, prepared, applied = _completed_local_vision_analysis(
+        tmp_path
+    )
+    if review_state == "excluded":
+        set_vision_analysis_state(
+            SetVisionAnalysisStateRequest(workspace, applied.id, "included")
+        )
+        set_vision_analysis_state(
+            SetVisionAnalysisStateRequest(workspace, applied.id, "excluded")
+        )
+
+    build_profile(BuildProfileRequest(workspace=workspace))
+    draft_portfolio(DraftPortfolioRequest(workspace=workspace))
+    build_public_portfolio(PublicPortfolioRequest(workspace=workspace))
+    monkeypatch.setattr(render_html_module.subprocess, "run", _fake_build_with_generated_data)
+    render_html(RenderHtmlRequest(workspace=workspace))
+
+    serialized = "\n".join(
+        (
+            paths.master_profile_json_path.read_text(encoding="utf-8"),
+            paths.master_profile_md_path.read_text(encoding="utf-8"),
+            paths.portfolio_draft_path.read_text(encoding="utf-8"),
+            paths.portfolio_public_json_path.read_text(encoding="utf-8"),
+            paths.portfolio_html_path.read_text(encoding="utf-8"),
+        )
+    )
+    for forbidden in (
+        "Safe vision summary",
+        "Raw vision observation must remain private",
+        prepared.id,
+        source_uri,
+        "derived/vision",
+        applied.result_hash,
+        "codex-app-vision-v1",
+    ):
+        assert forbidden not in serialized
 
 
 def test_build_public_portfolio_writes_safe_manifest_and_timeline(tmp_path):

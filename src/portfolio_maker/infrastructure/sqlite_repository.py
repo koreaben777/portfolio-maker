@@ -1570,9 +1570,131 @@ class SQLiteRepository:
                 (utc_now(), analysis_id),
             )
 
+    def set_vision_analysis_state(self, analysis_id: str, state: str) -> None:
+        self._validate_record_identifier(analysis_id)
+        try:
+            review_status = VisionReviewStatus(state)
+        except (TypeError, ValueError) as error:
+            raise self._semantic_error() from error
+        if review_status not in {
+            VisionReviewStatus.INCLUDED,
+            VisionReviewStatus.EXCLUDED,
+        }:
+            raise RepositoryError("vision analysis review state is invalid")
+        with self._connection() as conn:
+            analysis = conn.execute(
+                """
+                SELECT id, source_id, result_hash, status
+                FROM vision_analyses
+                WHERE id = ?
+                """,
+                (analysis_id,),
+            ).fetchone()
+            if analysis is None:
+                raise RepositoryError("vision analysis was not found")
+            try:
+                source_id = self._required_int(analysis, "source_id")
+                result_hash = self._required_text(analysis, "result_hash")
+                status = VisionRequestStatus(
+                    self._required_text(analysis, "status")
+                )
+            except (KeyError, TypeError, ValueError) as error:
+                raise self._semantic_error() from error
+            if (
+                status is not VisionRequestStatus.COMPLETED
+                or len(result_hash) != 64
+                or any(character not in "0123456789abcdef" for character in result_hash)
+            ):
+                raise RepositoryError("completed vision analysis was not found")
+            source = conn.execute(
+                "SELECT type, status FROM sources WHERE id = ?",
+                (source_id,),
+            ).fetchone()
+            if source is None:
+                raise RepositoryError("vision analysis source was not found")
+            try:
+                source_type = self._required_text(source, "type")
+                source_status = self._required_text(source, "status")
+            except (KeyError, TypeError, ValueError) as error:
+                raise self._semantic_error() from error
+            if source_type != SourceType.LOCAL_FILE.value or source_status in {
+                SourceStatus.STALE_SOURCE.value,
+                SourceStatus.SKIPPED_POLICY.value,
+                SourceStatus.EXTRACT_FAILED.value,
+            }:
+                raise RepositoryError("vision analysis source is not current")
+            if review_status is VisionReviewStatus.INCLUDED:
+                locator = f"derived:vision-analysis:{analysis_id}"
+                stable_id = f"vision-analysis:{analysis_id}:{result_hash}"
+                if {"origin_type", "origin_visibility"} <= self._table_columns(
+                    conn, "evidence_items"
+                ):
+                    conn.execute(
+                        """
+                        INSERT INTO evidence_items
+                            (source_id, snapshot_id, github_activity_id, locator, stable_id,
+                             content_hash, public_safe, origin_type, origin_visibility)
+                        VALUES (?, NULL, NULL, ?, ?, ?, 0, 'local', 'private')
+                        ON CONFLICT(stable_id) DO UPDATE SET
+                            source_id = excluded.source_id,
+                            snapshot_id = excluded.snapshot_id,
+                            github_activity_id = excluded.github_activity_id,
+                            locator = excluded.locator,
+                            content_hash = excluded.content_hash,
+                            public_safe = excluded.public_safe,
+                            origin_type = excluded.origin_type,
+                            origin_visibility = excluded.origin_visibility
+                        """,
+                        (source_id, locator, stable_id, result_hash),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        INSERT INTO evidence_items
+                            (source_id, snapshot_id, github_activity_id, locator, stable_id,
+                             content_hash, public_safe)
+                        VALUES (?, NULL, NULL, ?, ?, ?, 0)
+                        ON CONFLICT(stable_id) DO UPDATE SET
+                            source_id = excluded.source_id,
+                            snapshot_id = excluded.snapshot_id,
+                            github_activity_id = excluded.github_activity_id,
+                            locator = excluded.locator,
+                            content_hash = excluded.content_hash,
+                            public_safe = excluded.public_safe
+                        """,
+                        (source_id, locator, stable_id, result_hash),
+                    )
+            else:
+                self._exclude_unreferenced_vision_analysis(conn, analysis_id)
+            cursor = conn.execute(
+                """
+                UPDATE vision_analyses
+                SET review_status = ?, reviewed_at = ?
+                WHERE id = ? AND status = 'completed'
+                """,
+                (review_status.value, utc_now(), analysis_id),
+            )
+            if cursor.rowcount != 1:
+                raise RepositoryError("completed vision analysis was not found")
+
     def exclude_unreferenced_vision_analysis(self, analysis_id: str) -> None:
         with self._connection() as conn:
-            row = conn.execute(
+            self._exclude_unreferenced_vision_analysis(conn, analysis_id)
+            conn.execute(
+                """
+                UPDATE vision_analyses
+                SET review_status = 'excluded', reviewed_at = ?
+                WHERE id = ?
+                """,
+                (utc_now(), analysis_id),
+            )
+
+    def _exclude_unreferenced_vision_analysis(
+        self,
+        conn: sqlite3.Connection,
+        analysis_id: str,
+    ) -> None:
+        row = conn.execute(
                 """
                 SELECT vision_analyses.id,
                        EXISTS (
@@ -1612,24 +1734,16 @@ class SQLiteRepository:
                 """,
                 (analysis_id,),
             ).fetchone()
-            if row is None:
-                raise RepositoryError("completed vision analysis was not found")
-            try:
-                claim_referenced = self._required_boolean(row, "claim_referenced")
-                project_referenced = self._required_boolean(row, "project_referenced")
-            except (KeyError, TypeError, ValueError) as error:
-                raise self._semantic_error() from error
-            if claim_referenced or project_referenced:
-                raise RepositoryError("vision analysis evidence is still referenced")
-            self._delete_unreferenced_vision_evidence(conn, analysis_id)
-            conn.execute(
-                """
-                UPDATE vision_analyses
-                SET review_status = 'excluded', reviewed_at = ?
-                WHERE id = ?
-                """,
-                (utc_now(), analysis_id),
-            )
+        if row is None:
+            raise RepositoryError("completed vision analysis was not found")
+        try:
+            claim_referenced = self._required_boolean(row, "claim_referenced")
+            project_referenced = self._required_boolean(row, "project_referenced")
+        except (KeyError, TypeError, ValueError) as error:
+            raise self._semantic_error() from error
+        if claim_referenced or project_referenced:
+            raise RepositoryError("vision analysis evidence is still referenced")
+        self._delete_unreferenced_vision_evidence(conn, analysis_id)
 
     @staticmethod
     def _delete_unreferenced_vision_evidence(

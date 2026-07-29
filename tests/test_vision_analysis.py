@@ -13,11 +13,13 @@ from portfolio_maker.application.approval import write_sample_approval
 from portfolio_maker.application.models import (
     ApplyVisionAnalysisRequest,
     PrepareVisionAnalysisRequest,
+    SetVisionAnalysisStateRequest,
 )
 from portfolio_maker.application.vision_analysis import (
     VisionAnalysisError,
     apply_vision_analysis,
     prepare_vision_analysis,
+    set_vision_analysis_state,
 )
 from portfolio_maker.domain.models import Source, SourceStatus, SourceType
 from portfolio_maker.domain.vision_models import VisionRequestStatus, VisionReviewStatus
@@ -110,6 +112,163 @@ def analysis_count(repository: SQLiteRepository) -> int:
 def evidence_count(repository: SQLiteRepository) -> int:
     with repository._read_connection() as connection:
         return int(connection.execute("SELECT COUNT(*) FROM evidence_items").fetchone()[0])
+
+
+def apply_completed_vision_analysis(
+    workspace: Path,
+    tmp_path: Path,
+) -> tuple[WorkspacePaths, int, object, object]:
+    paths, source_id, prepared, _ = prepare_approved_vision_request(workspace, tmp_path)
+    applied = apply_vision_analysis(
+        ApplyVisionAnalysisRequest(workspace, write_vision_result(tmp_path, prepared))
+    )
+    assert applied is not None
+    return paths, source_id, prepared, applied
+
+
+def vision_evidence_stable_id(applied: object) -> str:
+    return f"vision-analysis:{applied.id}:{applied.result_hash}"
+
+
+def test_completed_pending_analysis_has_no_derived_evidence(workspace, tmp_path):
+    paths, _, _, applied = apply_completed_vision_analysis(workspace, tmp_path)
+    repository = SQLiteRepository(paths.db_path)
+
+    assert repository.get_vision_analysis(applied.id)["review_status"] == "pending"
+    assert repository.evidence_id_for_stable_id(vision_evidence_stable_id(applied)) is None
+    assert evidence_count(repository) == 0
+
+
+def test_explicit_inclusion_creates_one_exact_derived_evidence(workspace, tmp_path):
+    paths, source_id, _, applied = apply_completed_vision_analysis(workspace, tmp_path)
+    repository = SQLiteRepository(paths.db_path)
+
+    result = set_vision_analysis_state(
+        SetVisionAnalysisStateRequest(workspace, applied.id, "included")
+    )
+    evidence_id = repository.evidence_id_for_stable_id(vision_evidence_stable_id(applied))
+
+    assert result.analysis_id == applied.id
+    assert result.state == "included"
+    assert repository.get_vision_analysis(applied.id)["review_status"] == "included"
+    assert evidence_id is not None
+    with repository._read_connection() as connection:
+        evidence = connection.execute(
+            """
+            SELECT source_id, locator, stable_id, content_hash, public_safe,
+                   origin_type, origin_visibility
+            FROM evidence_items WHERE id = ?
+            """,
+            (evidence_id,),
+        ).fetchone()
+    assert tuple(evidence) == (
+        source_id,
+        f"derived:vision-analysis:{applied.id}",
+        vision_evidence_stable_id(applied),
+        applied.result_hash,
+        0,
+        "local",
+        "private",
+    )
+
+    set_vision_analysis_state(SetVisionAnalysisStateRequest(workspace, applied.id, "included"))
+    assert evidence_count(repository) == 1
+
+
+def test_repository_transition_failure_keeps_pending_analysis_without_evidence(
+    workspace, tmp_path
+):
+    paths, _, _, applied = apply_completed_vision_analysis(workspace, tmp_path)
+    repository = SQLiteRepository(paths.db_path)
+    with repository._connection() as connection:
+        connection.execute(
+            """
+            CREATE TRIGGER reject_vision_review_transition
+            BEFORE UPDATE OF review_status ON vision_analyses
+            BEGIN
+                SELECT RAISE(ABORT, 'synthetic transition failure');
+            END
+            """
+        )
+    with pytest.raises(VisionAnalysisError, match="vision analysis is unsafe"):
+        set_vision_analysis_state(
+            SetVisionAnalysisStateRequest(workspace, applied.id, "included")
+        )
+
+    assert repository.get_vision_analysis(applied.id)["review_status"] == "pending"
+    assert repository.evidence_id_for_stable_id(vision_evidence_stable_id(applied)) is None
+
+
+def test_exclusion_removes_only_unreferenced_evidence_and_refuses_references(workspace, tmp_path):
+    paths, source_id, _, applied = apply_completed_vision_analysis(workspace, tmp_path)
+    repository = SQLiteRepository(paths.db_path)
+    set_vision_analysis_state(SetVisionAnalysisStateRequest(workspace, applied.id, "included"))
+    stable_id = vision_evidence_stable_id(applied)
+    evidence_id = repository.evidence_id_for_stable_id(stable_id)
+    assert evidence_id is not None
+    unrelated_evidence_id = repository.upsert_evidence_item(
+        source_id=source_id,
+        snapshot_id=None,
+        github_activity_id=None,
+        locator="derived:unrelated",
+        stable_id="unrelated-evidence",
+        content_hash=None,
+        public_safe=False,
+        origin_type="local",
+        origin_visibility="private",
+    )
+
+    result = set_vision_analysis_state(
+        SetVisionAnalysisStateRequest(workspace, applied.id, "excluded")
+    )
+    assert result.state == "excluded"
+    assert repository.get_vision_analysis(applied.id)["review_status"] == "excluded"
+    assert repository.evidence_id_for_stable_id(stable_id) is None
+    assert repository.evidence_id_for_stable_id("unrelated-evidence") == unrelated_evidence_id
+
+    set_vision_analysis_state(SetVisionAnalysisStateRequest(workspace, applied.id, "included"))
+    evidence_id = repository.evidence_id_for_stable_id(stable_id)
+    assert evidence_id is not None
+    project_id = repository.upsert_project(f"local:{source_id}", public_safe=False)
+    claim_id = repository.upsert_career_claim(project_id, "Reviewed a safe summary", False)
+    repository.link_claim_evidence(claim_id, evidence_id, "direct")
+
+    with pytest.raises(VisionAnalysisError, match="vision analysis is unsafe"):
+        set_vision_analysis_state(
+            SetVisionAnalysisStateRequest(workspace, applied.id, "excluded")
+        )
+    assert repository.get_vision_analysis(applied.id)["review_status"] == "included"
+    assert repository.evidence_id_for_stable_id(stable_id) == evidence_id
+
+
+@pytest.mark.parametrize(
+    ("analysis_id", "state"),
+    (
+        ("unknown-analysis", "included"),
+        (".", "included"),
+        ("", "excluded"),
+        ("pending", "included"),
+        ("pending", "excluded"),
+        ("pending", "automatic"),
+    ),
+)
+def test_state_changes_require_a_completed_known_analysis(
+    workspace,
+    tmp_path,
+    analysis_id,
+    state,
+):
+    paths, _, prepared, _ = prepare_approved_vision_request(workspace, tmp_path)
+    repository = SQLiteRepository(paths.db_path)
+    resolved_id = prepared.id if analysis_id == "pending" else analysis_id
+
+    with pytest.raises(VisionAnalysisError, match="vision analysis is unsafe"):
+        set_vision_analysis_state(
+            SetVisionAnalysisStateRequest(workspace, resolved_id, state)
+        )
+
+    assert repository.get_vision_request(prepared.id)["status"] == "pending"
+    assert evidence_count(repository) == 0
 
 
 def test_apply_completed_result_masks_secret_and_starts_pending(workspace, tmp_path):

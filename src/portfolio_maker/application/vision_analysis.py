@@ -14,11 +14,13 @@ from portfolio_maker.application.approval import (
 from portfolio_maker.application.models import (
     ApplyVisionAnalysisRequest,
     PrepareVisionAnalysisRequest,
+    SetVisionAnalysisStateRequest,
 )
-from portfolio_maker.domain.models import Source, SourceType
+from portfolio_maker.domain.models import Source, SourceStatus, SourceType
 from portfolio_maker.domain.vision_models import (
     AppliedVisionAnalysisResult,
     PreparedVisionRequest,
+    VisionAnalysisStateResult,
     VisionAnalysisResult,
     VisionRequestStatus,
     VisionReviewStatus,
@@ -203,6 +205,54 @@ def apply_vision_analysis(
         raise VisionAnalysisError("vision result is unsafe or unavailable") from error
 
 
+def set_vision_analysis_state(
+    request: SetVisionAnalysisStateRequest,
+) -> VisionAnalysisStateResult:
+    if (
+        not _safe_identifier(request.analysis_id)
+        or request.state
+        not in {VisionReviewStatus.INCLUDED.value, VisionReviewStatus.EXCLUDED.value}
+    ):
+        raise VisionAnalysisError("vision analysis is unsafe or unavailable")
+    try:
+        paths = WorkspacePaths.from_root(request.workspace)
+        paths.ensure()
+        repository = SQLiteRepository(paths.db_path)
+        repository.initialize()
+        with repository.exclusive_workspace_operation():
+            analysis = repository.get_vision_analysis(request.analysis_id)
+            if (
+                analysis["status"] != VisionRequestStatus.COMPLETED.value
+                or not _is_sha256(analysis["result_hash"])
+                or not isinstance(analysis["relative_path"], str)
+            ):
+                raise VisionAnalysisError("vision analysis is unsafe or unavailable")
+            source = _approved_local_source(repository, analysis["source_id"])
+            if (
+                source.uri not in load_approval(paths).approved_source_uris
+                or source.status
+                in {
+                    SourceStatus.STALE_SOURCE,
+                    SourceStatus.SKIPPED_POLICY,
+                    SourceStatus.EXTRACT_FAILED,
+                }
+            ):
+                raise VisionAnalysisError("vision analysis is unsafe or unavailable")
+            repository.set_vision_analysis_state(request.analysis_id, request.state)
+        return VisionAnalysisStateResult(request.analysis_id, request.state)
+    except VisionAnalysisError:
+        raise
+    except (
+        ApprovalMissingError,
+        ApprovalFormatError,
+        RepositoryError,
+        OSError,
+        TypeError,
+        ValueError,
+    ) as error:
+        raise VisionAnalysisError("vision analysis is unsafe or unavailable") from error
+
+
 def _approved_local_source(repository: SQLiteRepository, source_id: object) -> Source:
     if type(source_id) is not int:
         raise VisionAnalysisError("approved source is unsafe or unavailable")
@@ -248,6 +298,13 @@ def _parse_vision_result(payload: object) -> dict[str, object]:
             raise VisionAnalysisError("vision result is unsafe or unavailable")
         return payload
     raise VisionAnalysisError("vision result is unsafe or unavailable")
+
+
+def parse_completed_vision_result(payload: object) -> dict[str, object]:
+    parsed = _parse_vision_result(payload)
+    if parsed["status"] != VisionRequestStatus.COMPLETED.value:
+        raise VisionAnalysisError("vision result is unsafe or unavailable")
+    return parsed
 
 
 def _require_result_header(payload: dict[str, object]) -> None:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import json
+from pathlib import Path
 
 from portfolio_maker.application.approval import SourceApproval, load_approval
 from portfolio_maker.application.artifact_approval import (
@@ -17,10 +18,18 @@ from portfolio_maker.application.project_composition import (
     build_project_projections,
     project_provenance_manifest,
 )
+from portfolio_maker.application.vision_analysis import (
+    VisionAnalysisError,
+    parse_completed_vision_result,
+)
+from portfolio_maker.domain.vision_models import VisionRequestStatus, VisionReviewStatus
 from portfolio_maker.domain.models import Source, SourceStatus, SourceType
 from portfolio_maker.infrastructure.artifacts import write_json, write_markdown
 from portfolio_maker.infrastructure.extractors import extract_approved_text
-from portfolio_maker.infrastructure.managed_files import remove_managed_file
+from portfolio_maker.infrastructure.managed_files import (
+    read_managed_relative_file,
+    remove_managed_file,
+)
 from portfolio_maker.infrastructure.presentation import (
     markdown_text,
     normalize_label,
@@ -31,7 +40,7 @@ from portfolio_maker.infrastructure.policy import (
     SourcePathPolicyError,
     mask_public_value,
 )
-from portfolio_maker.infrastructure.sqlite_repository import SQLiteRepository
+from portfolio_maker.infrastructure.sqlite_repository import RepositoryError, SQLiteRepository
 from portfolio_maker.infrastructure.snapshots import load_valid_local_snapshot
 from portfolio_maker.workspace import WorkspacePaths
 
@@ -61,7 +70,6 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
     evidence_ids: list[int] = []
     claim_ids: list[int] = []
     github_source_repositories: dict[int, str] = {}
-    source_by_id = {source.id: source for source in repository.list_sources() if source.id is not None}
 
     for source in repository.list_sources(status=SourceStatus.INGESTED):
         if (
@@ -136,6 +144,47 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
                 "evidence_id": evidence_id,
                 "evidence_uri": f"local-evidence:{evidence_id}",
                 "evidence_snapshot": f"local-snapshot:{snapshot_metadata[0]}",
+            }
+        )
+
+    source_by_id = {
+        source.id: source for source in repository.list_sources() if source.id is not None
+    }
+    for analysis in repository.list_vision_analyses(VisionReviewStatus.INCLUDED):
+        source = source_by_id.get(analysis["source_id"])
+        if (
+            source is None
+            or source.type is not SourceType.LOCAL_FILE
+            or selection_service.decision_for_source(source, pool_request) is not None
+        ):
+            continue
+        summary = _included_vision_summary(paths, repository, analysis, source)
+        if summary is None:
+            continue
+        evidence_id = repository.evidence_id_for_stable_id(
+            f"vision-analysis:{analysis['id']}:{analysis['result_hash']}"
+        )
+        if evidence_id is None:
+            continue
+        project_id = repository.upsert_project(f"local:{source.id}", public_safe=False)
+        claim_id = repository.upsert_career_claim(project_id, summary, public_safe=False)
+        repository.link_claim_evidence(claim_id, evidence_id, "direct")
+        if selection_service.decision_for_source(source, selection_request) is not None:
+            continue
+        if source not in sources:
+            sources.append(source)
+        evidence_ids.append(evidence_id)
+        claim_ids.append(claim_id)
+        claims.append(
+            {
+                "claim_type": "vision_analysis",
+                "text": summary,
+                "confidence": analysis["confidence"],
+                "public_safe": False,
+                "claim_id": claim_id,
+                "evidence_id": evidence_id,
+                "evidence_uri": f"local-evidence:{evidence_id}",
+                "evidence_snapshot": None,
             }
         )
 
@@ -316,6 +365,64 @@ def build_profile(request: BuildProfileRequest) -> BuildProfileResult:
         claim_ids=tuple(claim_ids),
         evidence_ids=tuple(evidence_ids),
     )
+
+
+def _included_vision_summary(
+    paths: WorkspacePaths,
+    repository: SQLiteRepository,
+    analysis: dict[str, object],
+    source: Source,
+) -> str | None:
+    try:
+        if (
+            analysis["status"] != VisionRequestStatus.COMPLETED.value
+            or analysis["review_status"] != VisionReviewStatus.INCLUDED.value
+            or not isinstance(analysis["id"], str)
+            or not isinstance(analysis["request_id"], str)
+            or not isinstance(analysis["relative_path"], str)
+            or not isinstance(analysis["result_hash"], str)
+            or not isinstance(analysis["confidence"], str)
+        ):
+            return None
+        expected_relative_path = (
+            Path("derived")
+            / "vision"
+            / f"analysis-{analysis['request_id']}-{analysis['result_hash']}.json"
+        )
+        if Path(analysis["relative_path"]) != expected_relative_path:
+            return None
+        snapshot = read_managed_relative_file(
+            paths.root,
+            Path(analysis["relative_path"]),
+        )
+        if snapshot.content_hash != analysis["result_hash"]:
+            return None
+        payload = json.loads(snapshot.content.decode("utf-8"))
+        parsed = parse_completed_vision_result(payload)
+        request = repository.get_vision_request(parsed["request_id"])
+        if (
+            parsed["source_content_hash"] != analysis["source_content_hash"]
+            or parsed["adapter"] != analysis["adapter"]
+            or parsed["confidence"] != analysis["confidence"]
+            or request["id"] != analysis["request_id"]
+            or request["source_id"] != source.id
+            or request["source_content_hash"] != analysis["source_content_hash"]
+            or request["adapter"] != analysis["adapter"]
+            or request["status"] != VisionRequestStatus.COMPLETED.value
+        ):
+            return None
+        summary = safe_local_public_label(mask_public_value(parsed["summary"]))
+        return summary or None
+    except (
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        VisionAnalysisError,
+        RepositoryError,
+        OSError,
+        TypeError,
+        ValueError,
+    ):
+        return None
 
 
 def _snapshot_evidence(display_name: str, text: str) -> str | None:
