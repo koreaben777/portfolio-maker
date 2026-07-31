@@ -31,7 +31,16 @@ from portfolio_maker.domain.models import (
     SourceStatus,
     SourceType,
 )
-from portfolio_maker.domain.semantic_models import SemanticEdge, SemanticNode
+from portfolio_maker.domain.semantic_models import (
+    AnalysisStatus,
+    SemanticCoverage,
+    SemanticEdge,
+    SemanticFacts,
+    SemanticImportReceipt,
+    SemanticNode,
+    SemanticNodeDisposition,
+    SemanticNodeKind,
+)
 from portfolio_maker.domain.vision_models import (
     AppliedVisionAnalysisResult,
     PreparedVisionRequest,
@@ -195,6 +204,12 @@ CREATE TABLE IF NOT EXISTS semantic_nodes (
     evidence_ids_json TEXT NOT NULL DEFAULT '[]',
     analysis_status TEXT NOT NULL,
     analyzer_version TEXT NOT NULL,
+    semantic_disposition TEXT NOT NULL DEFAULT 'structural_only',
+    semantic_facts_json TEXT NOT NULL DEFAULT '{}',
+    analysis_protocol TEXT NOT NULL DEFAULT 'legacy-v1',
+    skip_reason TEXT,
+    child_node_ids_json TEXT NOT NULL DEFAULT '[]',
+    coverage_json TEXT NOT NULL DEFAULT '{}',
     PRIMARY KEY (revision_id, node_id)
 );
 
@@ -216,6 +231,19 @@ CREATE TABLE IF NOT EXISTS semantic_edges (
     to_node_id TEXT NOT NULL,
     confidence TEXT,
     PRIMARY KEY (revision_id, from_node_id, relation, to_node_id)
+);
+
+CREATE TABLE IF NOT EXISTS semantic_import_receipts (
+    revision_id TEXT NOT NULL,
+    chunk_index INTEGER NOT NULL,
+    chunk_sha256 TEXT NOT NULL,
+    locator_chunk_sha256 TEXT NOT NULL,
+    node_ids_sha256 TEXT NOT NULL,
+    node_count INTEGER NOT NULL,
+    imported_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (revision_id, chunk_index),
+    FOREIGN KEY (revision_id)
+      REFERENCES semantic_index_revisions(id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS vision_analysis_requests (
@@ -1105,6 +1133,7 @@ class SQLiteRepository:
             self._ensure_origin_columns(conn)
             self._ensure_portfolio_project_decision_columns(conn)
             self._ensure_history_cleanup_plan_columns(conn)
+            self._ensure_semantic_import_schema(conn)
 
     @staticmethod
     def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
@@ -1112,6 +1141,42 @@ class SQLiteRepository:
             SQLiteRepository._required_text(row, "name")
             for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
         }
+
+    @classmethod
+    def _ensure_semantic_import_schema(cls, conn: sqlite3.Connection) -> None:
+        columns = cls._table_columns(conn, "semantic_nodes")
+        additions = (
+            (
+                "semantic_disposition",
+                "TEXT NOT NULL DEFAULT 'structural_only'",
+            ),
+            ("semantic_facts_json", "TEXT NOT NULL DEFAULT '{}'"),
+            ("analysis_protocol", "TEXT NOT NULL DEFAULT 'legacy-v1'"),
+            ("skip_reason", "TEXT"),
+            ("child_node_ids_json", "TEXT NOT NULL DEFAULT '[]'"),
+            ("coverage_json", "TEXT NOT NULL DEFAULT '{}'"),
+        )
+        for column, declaration in additions:
+            if column not in columns:
+                conn.execute(
+                    f"ALTER TABLE semantic_nodes ADD COLUMN {column} {declaration}"
+                )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS semantic_import_receipts (
+                revision_id TEXT NOT NULL,
+                chunk_index INTEGER NOT NULL,
+                chunk_sha256 TEXT NOT NULL,
+                locator_chunk_sha256 TEXT NOT NULL,
+                node_ids_sha256 TEXT NOT NULL,
+                node_count INTEGER NOT NULL,
+                imported_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (revision_id, chunk_index),
+                FOREIGN KEY (revision_id)
+                  REFERENCES semantic_index_revisions(id) ON DELETE CASCADE
+            )
+            """
+        )
 
     @classmethod
     def _ensure_legacy_normalized_columns(cls, conn: sqlite3.Connection) -> None:
@@ -3196,6 +3261,729 @@ class SQLiteRepository:
                 (revision_id, source_id, policy_hash, analyzer_version),
             )
 
+    @staticmethod
+    def _semantic_facts_payload(facts: SemanticFacts) -> dict[str, list[str]]:
+        return {
+            "purpose_signals": list(facts.purpose_signals),
+            "parent_context_signals": list(facts.parent_context_signals),
+            "independence_signals": list(facts.independence_signals),
+            "triviality_signals": list(facts.triviality_signals),
+            "grounding_signal_ids": list(facts.grounding_signal_ids),
+        }
+
+    @staticmethod
+    def _semantic_coverage_payload(
+        coverage: SemanticCoverage,
+    ) -> dict[str, int | str]:
+        return {
+            "node_count": coverage.node_count,
+            "content_node_count": coverage.content_node_count,
+            "structural_only_count": coverage.structural_only_count,
+            "failed_count": coverage.failed_count,
+            "node_ids_sha256": coverage.node_ids_sha256,
+        }
+
+    @staticmethod
+    def _semantic_sha256(value: object) -> bool:
+        return (
+            isinstance(value, str)
+            and len(value) == 64
+            and all(character in "0123456789abcdef" for character in value)
+        )
+
+    @classmethod
+    def _validate_v2_semantic_node(
+        cls,
+        node: SemanticNode,
+        *,
+        source_id: str,
+    ) -> None:
+        facts = cls._semantic_facts_payload(node.semantic_facts)
+        coverage = cls._semantic_coverage_payload(node.coverage)
+        text_arrays = (
+            node.semantic_roles,
+            node.topics,
+            node.semantic_facts.purpose_signals,
+            node.semantic_facts.parent_context_signals,
+            node.semantic_facts.independence_signals,
+            node.semantic_facts.triviality_signals,
+            node.semantic_facts.grounding_signal_ids,
+            node.child_node_ids,
+        )
+        if (
+            not node.node_id
+            or node.source_id != source_id
+            or node.analysis_protocol != "codex-semantic-v2"
+            or node.analyzer_version != "semantic-input-v2"
+            or not node.display_name
+            or not node.relative_hierarchy
+            or any(
+                len(values) != len(set(values))
+                or any(not isinstance(value, str) or not value for value in values)
+                for values in text_arrays
+            )
+            or tuple(sorted(node.child_node_ids)) != node.child_node_ids
+            or tuple(sorted(node.evidence_ids)) != node.evidence_ids
+            or len(node.evidence_ids) != len(set(node.evidence_ids))
+            or any(type(value) is not int or value < 1 for value in node.evidence_ids)
+            or any(
+                type(coverage[key]) is not int or int(coverage[key]) < 0
+                for key in (
+                    "node_count",
+                    "content_node_count",
+                    "structural_only_count",
+                    "failed_count",
+                )
+            )
+            or int(coverage["node_count"]) < 1
+            or not cls._semantic_sha256(coverage["node_ids_sha256"])
+            or (
+                node.semantic_disposition
+                is SemanticNodeDisposition.ANALYZED
+                and (
+                    not node.semantic_summary
+                    or not facts["grounding_signal_ids"]
+                )
+            )
+            or (
+                node.semantic_disposition
+                is not SemanticNodeDisposition.ANALYZED
+                and (
+                    node.semantic_summary
+                    or node.semantic_roles
+                    or node.topics
+                    or any(facts.values())
+                )
+            )
+        ):
+            raise RepositoryError("semantic revision graph is invalid")
+
+    @classmethod
+    def _semantic_node_values(
+        cls,
+        revision_id: str,
+        node: SemanticNode,
+    ) -> tuple[object, ...]:
+        return (
+            revision_id,
+            node.node_id,
+            node.source_id,
+            node.node_kind.value,
+            node.parent_node_id,
+            node.display_name,
+            node.relative_hierarchy,
+            node.content_fingerprint,
+            node.semantic_summary,
+            json.dumps(node.semantic_roles),
+            json.dumps(node.topics),
+            json.dumps(node.evidence_ids),
+            node.analysis_status.value,
+            node.analyzer_version,
+            node.semantic_disposition.value,
+            json.dumps(
+                cls._semantic_facts_payload(node.semantic_facts),
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            node.analysis_protocol,
+            node.skip_reason,
+            json.dumps(node.child_node_ids),
+            json.dumps(
+                cls._semantic_coverage_payload(node.coverage),
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        )
+
+    @staticmethod
+    def _semantic_node_insert_sql() -> str:
+        return """
+            INSERT INTO semantic_nodes (
+                revision_id, node_id, source_id, node_kind, parent_node_id,
+                display_name, relative_hierarchy, content_fingerprint,
+                semantic_summary, semantic_roles_json, topics_json,
+                evidence_ids_json, analysis_status, analyzer_version,
+                semantic_disposition, semantic_facts_json, analysis_protocol,
+                skip_reason, child_node_ids_json, coverage_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """
+
+    def import_semantic_revision_chunk(
+        self,
+        revision_id: str,
+        chunk_index: int,
+        chunk_sha256: str,
+        locator_chunk_sha256: str,
+        node_ids_sha256: str,
+        nodes: tuple[SemanticNode, ...],
+        locators: dict[str, tuple[str, int | None, int | None]],
+        edges: tuple[SemanticEdge, ...],
+    ) -> None:
+        if (
+            not revision_id
+            or type(chunk_index) is not int
+            or chunk_index < 1
+            or not self._semantic_sha256(chunk_sha256)
+            or not self._semantic_sha256(locator_chunk_sha256)
+            or not self._semantic_sha256(node_ids_sha256)
+            or not nodes
+        ):
+            raise RepositoryError("semantic import receipt is invalid")
+        expected_receipt = SemanticImportReceipt(
+            revision_id=revision_id,
+            chunk_index=chunk_index,
+            chunk_sha256=chunk_sha256,
+            locator_chunk_sha256=locator_chunk_sha256,
+            node_ids_sha256=node_ids_sha256,
+            node_count=len(nodes),
+        )
+        node_ids = tuple(node.node_id for node in nodes)
+        if (
+            len(node_ids) != len(set(node_ids))
+            or set(locators) != set(node_ids)
+            or sha256(
+                json.dumps(
+                    list(node_ids),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            != node_ids_sha256
+        ):
+            raise RepositoryError("semantic revision graph is invalid")
+
+        with self._connection() as conn:
+            revision = conn.execute(
+                """
+                SELECT source_id, analyzer_version, status
+                FROM semantic_index_revisions
+                WHERE id = ?
+                """,
+                (revision_id,),
+            ).fetchone()
+            if (
+                revision is None
+                or self._required_text(revision, "status") != "staging"
+                or self._required_text(revision, "analyzer_version")
+                != "semantic-input-v2"
+            ):
+                raise RepositoryError("semantic revision is not staging")
+            source_id = self._required_text(revision, "source_id")
+            for node in nodes:
+                self._validate_v2_semantic_node(node, source_id=source_id)
+
+            edge_by_child: dict[str, SemanticEdge] = {}
+            for edge in edges:
+                if (
+                    edge.revision_id != revision_id
+                    or edge.relation != "contains"
+                    or edge.confidence is not None
+                    or edge.to_node_id not in node_ids
+                    or edge.to_node_id in edge_by_child
+                ):
+                    raise RepositoryError("semantic revision graph is invalid")
+                edge_by_child[edge.to_node_id] = edge
+            if any(
+                (
+                    node.parent_node_id is None
+                    and node.node_id in edge_by_child
+                )
+                or (
+                    node.parent_node_id is not None
+                    and (
+                        node.node_id not in edge_by_child
+                        or edge_by_child[node.node_id].from_node_id
+                        != node.parent_node_id
+                    )
+                )
+                for node in nodes
+            ):
+                raise RepositoryError("semantic revision graph is invalid")
+
+            receipt_row = conn.execute(
+                """
+                SELECT revision_id, chunk_index, chunk_sha256,
+                       locator_chunk_sha256, node_ids_sha256, node_count
+                FROM semantic_import_receipts
+                WHERE revision_id = ? AND chunk_index = ?
+                """,
+                (revision_id, chunk_index),
+            ).fetchone()
+            if receipt_row is not None:
+                existing = self._semantic_import_receipt_from_row(receipt_row)
+                if existing != expected_receipt:
+                    raise RepositoryError("semantic import receipt conflicts")
+                self._validate_imported_semantic_chunk(
+                    conn,
+                    revision_id,
+                    nodes,
+                    locators,
+                    edges,
+                )
+                return
+
+            for node in nodes:
+                conn.execute(
+                    self._semantic_node_insert_sql(),
+                    self._semantic_node_values(revision_id, node),
+                )
+                locator, device, inode = locators[node.node_id]
+                if (
+                    not isinstance(locator, str)
+                    or not locator
+                    or device is not None
+                    and (type(device) is not int or device < 0)
+                    or inode is not None
+                    and (type(inode) is not int or inode < 0)
+                ):
+                    raise RepositoryError("semantic node locator is invalid")
+                conn.execute(
+                    """
+                    INSERT INTO semantic_node_locators
+                        (revision_id, node_id, locator, device, inode)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (revision_id, node.node_id, locator, device, inode),
+                )
+            for edge in edges:
+                conn.execute(
+                    """
+                    INSERT INTO semantic_edges
+                        (revision_id, from_node_id, relation, to_node_id, confidence)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        revision_id,
+                        edge.from_node_id,
+                        edge.relation,
+                        edge.to_node_id,
+                        edge.confidence,
+                    ),
+                )
+            self._validate_imported_semantic_chunk(
+                conn,
+                revision_id,
+                nodes,
+                locators,
+                edges,
+            )
+            conn.execute(
+                """
+                INSERT INTO semantic_import_receipts (
+                    revision_id, chunk_index, chunk_sha256,
+                    locator_chunk_sha256, node_ids_sha256, node_count
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    revision_id,
+                    chunk_index,
+                    chunk_sha256,
+                    locator_chunk_sha256,
+                    node_ids_sha256,
+                    len(nodes),
+                ),
+            )
+
+    @classmethod
+    def _semantic_import_receipt_from_row(
+        cls,
+        row: sqlite3.Row,
+    ) -> SemanticImportReceipt:
+        receipt = SemanticImportReceipt(
+            revision_id=cls._required_text(row, "revision_id"),
+            chunk_index=cls._required_int(row, "chunk_index"),
+            chunk_sha256=cls._required_text(row, "chunk_sha256"),
+            locator_chunk_sha256=cls._required_text(
+                row, "locator_chunk_sha256"
+            ),
+            node_ids_sha256=cls._required_text(row, "node_ids_sha256"),
+            node_count=cls._required_int(row, "node_count"),
+        )
+        if (
+            receipt.chunk_index < 1
+            or receipt.node_count < 1
+            or not cls._semantic_sha256(receipt.chunk_sha256)
+            or not cls._semantic_sha256(receipt.locator_chunk_sha256)
+            or not cls._semantic_sha256(receipt.node_ids_sha256)
+        ):
+            raise cls._semantic_error()
+        return receipt
+
+    @classmethod
+    def _validate_imported_semantic_chunk(
+        cls,
+        conn: sqlite3.Connection,
+        revision_id: str,
+        nodes: tuple[SemanticNode, ...],
+        locators: dict[str, tuple[str, int | None, int | None]],
+        edges: tuple[SemanticEdge, ...],
+    ) -> None:
+        for node in nodes:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM semantic_nodes
+                WHERE revision_id = ? AND node_id = ?
+                """,
+                (revision_id, node.node_id),
+            ).fetchone()
+            if (
+                row is None
+                or tuple(row[key] for key in (
+                    "revision_id",
+                    "node_id",
+                    "source_id",
+                    "node_kind",
+                    "parent_node_id",
+                    "display_name",
+                    "relative_hierarchy",
+                    "content_fingerprint",
+                    "semantic_summary",
+                    "semantic_roles_json",
+                    "topics_json",
+                    "evidence_ids_json",
+                    "analysis_status",
+                    "analyzer_version",
+                    "semantic_disposition",
+                    "semantic_facts_json",
+                    "analysis_protocol",
+                    "skip_reason",
+                    "child_node_ids_json",
+                    "coverage_json",
+                ))
+                != cls._semantic_node_values(revision_id, node)
+            ):
+                raise RepositoryError("semantic imported rows are invalid")
+            locator_row = conn.execute(
+                """
+                SELECT locator, device, inode
+                FROM semantic_node_locators
+                WHERE revision_id = ? AND node_id = ?
+                """,
+                (revision_id, node.node_id),
+            ).fetchone()
+            if (
+                locator_row is None
+                or (
+                    locator_row["locator"],
+                    locator_row["device"],
+                    locator_row["inode"],
+                )
+                != locators[node.node_id]
+            ):
+                raise RepositoryError("semantic imported rows are invalid")
+        actual_edges = {
+            (
+                cls._required_text(row, "from_node_id"),
+                cls._required_text(row, "relation"),
+                cls._required_text(row, "to_node_id"),
+                cls._optional_text(row, "confidence"),
+            )
+            for row in conn.execute(
+                """
+                SELECT from_node_id, relation, to_node_id, confidence
+                FROM semantic_edges
+                WHERE revision_id = ?
+                  AND to_node_id IN (
+                      SELECT value FROM json_each(?)
+                  )
+                """,
+                (revision_id, json.dumps([node.node_id for node in nodes])),
+            ).fetchall()
+        }
+        expected_edges = {
+            (
+                edge.from_node_id,
+                edge.relation,
+                edge.to_node_id,
+                edge.confidence,
+            )
+            for edge in edges
+        }
+        if actual_edges != expected_edges:
+            raise RepositoryError("semantic imported rows are invalid")
+
+    def list_semantic_import_receipts(
+        self,
+        revision_id: str,
+    ) -> tuple[SemanticImportReceipt, ...]:
+        with self._read_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT revision_id, chunk_index, chunk_sha256,
+                       locator_chunk_sha256, node_ids_sha256, node_count
+                FROM semantic_import_receipts
+                WHERE revision_id = ?
+                ORDER BY chunk_index
+                """,
+                (revision_id,),
+            ).fetchall()
+        try:
+            return tuple(
+                self._semantic_import_receipt_from_row(row) for row in rows
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise self._semantic_error() from error
+
+    def activate_imported_semantic_revision(
+        self,
+        revision_id: str,
+        expected_receipts: tuple[SemanticImportReceipt, ...],
+        expected_node_count: int,
+        expected_edge_count: int,
+        source_id: str,
+        policy_hash: str,
+        analyzer_version: str,
+    ) -> None:
+        if (
+            not revision_id
+            or not source_id
+            or not self._semantic_sha256(policy_hash)
+            or analyzer_version != "semantic-input-v2"
+            or type(expected_node_count) is not int
+            or expected_node_count < 1
+            or type(expected_edge_count) is not int
+            or expected_edge_count < 0
+            or tuple(
+                receipt.chunk_index for receipt in expected_receipts
+            )
+            != tuple(range(1, len(expected_receipts) + 1))
+            or sum(receipt.node_count for receipt in expected_receipts)
+            != expected_node_count
+        ):
+            raise RepositoryError("semantic import activation is invalid")
+
+        with self._connection() as conn:
+            revision = conn.execute(
+                """
+                SELECT source_id, policy_hash, analyzer_version, status
+                FROM semantic_index_revisions
+                WHERE id = ?
+                """,
+                (revision_id,),
+            ).fetchone()
+            if (
+                revision is None
+                or self._required_text(revision, "source_id") != source_id
+                or self._required_text(revision, "policy_hash") != policy_hash
+                or self._required_text(revision, "analyzer_version")
+                != analyzer_version
+                or self._required_text(revision, "status")
+                not in {"staging", "active"}
+            ):
+                raise RepositoryError("semantic import activation is invalid")
+            status = self._required_text(revision, "status")
+            active_count_row = conn.execute(
+                """
+                SELECT COUNT(*) AS active_count
+                FROM semantic_index_revisions
+                WHERE source_id = ? AND status = 'active'
+                """,
+                (source_id,),
+            ).fetchone()
+            active_count = (
+                self._required_int(active_count_row, "active_count")
+                if active_count_row is not None
+                else -1
+            )
+            if active_count > 1 or (
+                status == "active" and active_count != 1
+            ):
+                raise RepositoryError("semantic import activation is invalid")
+
+            receipt_rows = conn.execute(
+                """
+                SELECT revision_id, chunk_index, chunk_sha256,
+                       locator_chunk_sha256, node_ids_sha256, node_count
+                FROM semantic_import_receipts
+                WHERE revision_id = ?
+                ORDER BY chunk_index
+                """,
+                (revision_id,),
+            ).fetchall()
+            actual_receipts = tuple(
+                self._semantic_import_receipt_from_row(row)
+                for row in receipt_rows
+            )
+            if actual_receipts != expected_receipts:
+                raise RepositoryError("semantic import activation is invalid")
+
+            counts = conn.execute(
+                """
+                SELECT
+                    (SELECT COUNT(*) FROM semantic_nodes WHERE revision_id = ?) AS nodes,
+                    (SELECT COUNT(*) FROM semantic_node_locators WHERE revision_id = ?) AS locators,
+                    (SELECT COUNT(*) FROM semantic_edges WHERE revision_id = ?) AS edges
+                """,
+                (revision_id, revision_id, revision_id),
+            ).fetchone()
+            if (
+                counts is None
+                or self._required_int(counts, "nodes") != expected_node_count
+                or self._required_int(counts, "locators")
+                != expected_node_count
+                or self._required_int(counts, "edges") != expected_edge_count
+                or expected_edge_count != expected_node_count - 1
+            ):
+                raise RepositoryError("semantic import activation is invalid")
+
+            node_rows = conn.execute(
+                """
+                SELECT *
+                FROM semantic_nodes
+                WHERE revision_id = ?
+                ORDER BY relative_hierarchy, node_id
+                """,
+                (revision_id,),
+            )
+            root_count = 0
+            hydrated_count = 0
+            for row in node_rows:
+                node = self._semantic_node_from_row(row)
+                self._validate_v2_semantic_node(node, source_id=source_id)
+                root_count += int(node.parent_node_id is None)
+                hydrated_count += 1
+            if hydrated_count != expected_node_count or root_count != 1:
+                raise RepositoryError("semantic import activation is invalid")
+
+            invalid_parent_count = conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM semantic_nodes AS child
+                LEFT JOIN semantic_nodes AS parent
+                  ON parent.revision_id = child.revision_id
+                 AND parent.node_id = child.parent_node_id
+                WHERE child.revision_id = ?
+                  AND child.parent_node_id IS NOT NULL
+                  AND parent.node_id IS NULL
+                """,
+                (revision_id,),
+            ).fetchone()
+            invalid_edge_count = conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM semantic_edges AS edge
+                LEFT JOIN semantic_nodes AS child
+                  ON child.revision_id = edge.revision_id
+                 AND child.node_id = edge.to_node_id
+                WHERE edge.revision_id = ?
+                  AND (
+                      edge.relation != 'contains'
+                      OR edge.confidence IS NOT NULL
+                      OR child.node_id IS NULL
+                      OR child.parent_node_id != edge.from_node_id
+                  )
+                """,
+                (revision_id,),
+            ).fetchone()
+            missing_edge_count = conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM semantic_nodes AS child
+                LEFT JOIN semantic_edges AS edge
+                  ON edge.revision_id = child.revision_id
+                 AND edge.from_node_id = child.parent_node_id
+                 AND edge.relation = 'contains'
+                 AND edge.to_node_id = child.node_id
+                WHERE child.revision_id = ?
+                  AND child.parent_node_id IS NOT NULL
+                  AND edge.to_node_id IS NULL
+                """,
+                (revision_id,),
+            ).fetchone()
+            child_binding_count = conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM semantic_edges AS edge
+                JOIN semantic_nodes AS parent
+                  ON parent.revision_id = edge.revision_id
+                 AND parent.node_id = edge.from_node_id
+                WHERE edge.revision_id = ?
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM json_each(parent.child_node_ids_json)
+                      WHERE json_each.value = edge.to_node_id
+                  )
+                """,
+                (revision_id,),
+            ).fetchone()
+            listed_child_count = conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM semantic_nodes AS parent
+                JOIN json_each(parent.child_node_ids_json) AS child_id
+                LEFT JOIN semantic_edges AS edge
+                  ON edge.revision_id = parent.revision_id
+                 AND edge.from_node_id = parent.node_id
+                 AND edge.relation = 'contains'
+                 AND edge.to_node_id = child_id.value
+                WHERE parent.revision_id = ?
+                  AND edge.to_node_id IS NULL
+                """,
+                (revision_id,),
+            ).fetchone()
+            if any(
+                row is None or row[0] != 0
+                for row in (
+                    invalid_parent_count,
+                    invalid_edge_count,
+                    missing_edge_count,
+                    child_binding_count,
+                    listed_child_count,
+                )
+            ):
+                raise RepositoryError("semantic import activation is invalid")
+
+            reachable_count = conn.execute(
+                """
+                WITH RECURSIVE reachable(node_id) AS (
+                    SELECT node_id
+                    FROM semantic_nodes
+                    WHERE revision_id = ? AND parent_node_id IS NULL
+                    UNION
+                    SELECT edge.to_node_id
+                    FROM semantic_edges AS edge
+                    JOIN reachable
+                      ON reachable.node_id = edge.from_node_id
+                    WHERE edge.revision_id = ?
+                      AND edge.relation = 'contains'
+                )
+                SELECT COUNT(*) AS reachable_count
+                FROM reachable
+                """,
+                (revision_id, revision_id),
+            ).fetchone()
+            if (
+                reachable_count is None
+                or self._required_int(
+                    reachable_count,
+                    "reachable_count",
+                )
+                != expected_node_count
+            ):
+                raise RepositoryError("semantic import activation is invalid")
+
+            if status == "active":
+                return
+            conn.execute(
+                """
+                UPDATE semantic_index_revisions
+                SET status = 'superseded'
+                WHERE source_id = ? AND status = 'active'
+                """,
+                (source_id,),
+            )
+            result = conn.execute(
+                """
+                UPDATE semantic_index_revisions
+                SET status = 'active', completed_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND status = 'staging'
+                """,
+                (revision_id,),
+            )
+            if result.rowcount != 1:
+                raise RepositoryError("semantic import activation is invalid")
+
     def replace_semantic_revision_graph(
         self,
         revision_id: str,
@@ -3424,6 +4212,112 @@ class SQLiteRepository:
         except (KeyError, TypeError, ValueError) as error:
             raise self._semantic_error() from error
 
+    @classmethod
+    def _semantic_node_from_row(cls, row: sqlite3.Row) -> SemanticNode:
+        facts_value = json.loads(cls._required_text(row, "semantic_facts_json"))
+        coverage_value = json.loads(cls._required_text(row, "coverage_json"))
+        if facts_value == {}:
+            facts = SemanticFacts()
+        elif (
+            isinstance(facts_value, dict)
+            and set(facts_value)
+            == {
+                "purpose_signals",
+                "parent_context_signals",
+                "independence_signals",
+                "triviality_signals",
+                "grounding_signal_ids",
+            }
+            and all(
+                isinstance(value, list)
+                and all(isinstance(item, str) for item in value)
+                for value in facts_value.values()
+            )
+        ):
+            facts = SemanticFacts(
+                purpose_signals=tuple(facts_value["purpose_signals"]),
+                parent_context_signals=tuple(
+                    facts_value["parent_context_signals"]
+                ),
+                independence_signals=tuple(
+                    facts_value["independence_signals"]
+                ),
+                triviality_signals=tuple(facts_value["triviality_signals"]),
+                grounding_signal_ids=tuple(
+                    facts_value["grounding_signal_ids"]
+                ),
+            )
+        else:
+            raise TypeError("semantic_facts_json must be exact semantic facts")
+        if coverage_value == {}:
+            coverage = SemanticCoverage()
+        elif (
+            isinstance(coverage_value, dict)
+            and set(coverage_value)
+            == {
+                "node_count",
+                "content_node_count",
+                "structural_only_count",
+                "failed_count",
+                "node_ids_sha256",
+            }
+            and all(
+                type(coverage_value[key]) is int
+                for key in (
+                    "node_count",
+                    "content_node_count",
+                    "structural_only_count",
+                    "failed_count",
+                )
+            )
+            and isinstance(coverage_value["node_ids_sha256"], str)
+        ):
+            coverage = SemanticCoverage(
+                node_count=coverage_value["node_count"],
+                content_node_count=coverage_value["content_node_count"],
+                structural_only_count=coverage_value[
+                    "structural_only_count"
+                ],
+                failed_count=coverage_value["failed_count"],
+                node_ids_sha256=coverage_value["node_ids_sha256"],
+            )
+        else:
+            raise TypeError("coverage_json must be exact semantic coverage")
+        return SemanticNode(
+            node_id=cls._required_text(row, "node_id"),
+            source_id=cls._required_text(row, "source_id"),
+            node_kind=SemanticNodeKind(cls._required_text(row, "node_kind")),
+            parent_node_id=cls._optional_text(row, "parent_node_id"),
+            display_name=cls._required_text(row, "display_name"),
+            relative_hierarchy=cls._required_text(row, "relative_hierarchy"),
+            content_fingerprint=cls._optional_text(
+                row, "content_fingerprint"
+            ),
+            semantic_summary=cls._required_text(row, "semantic_summary"),
+            semantic_roles=tuple(
+                cls._required_text_list(row, "semantic_roles_json")
+            ),
+            topics=tuple(cls._required_text_list(row, "topics_json")),
+            evidence_ids=tuple(
+                cls._required_int_list(row, "evidence_ids_json")
+            ),
+            analysis_status=AnalysisStatus(
+                cls._required_text(row, "analysis_status")
+            ),
+            analyzer_version=cls._required_text(row, "analyzer_version"),
+            updated_at="",
+            semantic_disposition=SemanticNodeDisposition(
+                cls._required_text(row, "semantic_disposition")
+            ),
+            semantic_facts=facts,
+            analysis_protocol=cls._required_text(row, "analysis_protocol"),
+            skip_reason=cls._optional_text(row, "skip_reason"),
+            child_node_ids=tuple(
+                cls._required_text_list(row, "child_node_ids_json")
+            ),
+            coverage=coverage,
+        )
+
     def list_semantic_nodes(self, revision_id: str) -> list[dict[str, object]]:
         with self._read_connection() as conn:
             rows = conn.execute(
@@ -3431,7 +4325,9 @@ class SQLiteRepository:
                 SELECT node_id, source_id, node_kind, parent_node_id, display_name,
                        relative_hierarchy, content_fingerprint, semantic_summary,
                        semantic_roles_json, topics_json, evidence_ids_json,
-                       analysis_status, analyzer_version
+                       analysis_status, analyzer_version, semantic_disposition,
+                       semantic_facts_json, analysis_protocol, skip_reason,
+                       child_node_ids_json, coverage_json
                 FROM semantic_nodes
                 WHERE revision_id = ?
                 ORDER BY relative_hierarchy, node_id
@@ -3441,21 +4337,35 @@ class SQLiteRepository:
         try:
             return [
                 {
-                    "node_id": self._required_text(row, "node_id"),
-                    "source_id": self._required_text(row, "source_id"),
-                    "node_kind": self._required_text(row, "node_kind"),
-                    "parent_node_id": self._optional_text(row, "parent_node_id"),
-                    "display_name": self._required_text(row, "display_name"),
-                    "relative_hierarchy": self._required_text(row, "relative_hierarchy"),
-                    "content_fingerprint": self._optional_text(row, "content_fingerprint"),
-                    "semantic_summary": self._required_text(row, "semantic_summary"),
-                    "semantic_roles": self._required_text_list(row, "semantic_roles_json"),
-                    "topics": self._required_text_list(row, "topics_json"),
-                    "evidence_ids": self._required_int_list(row, "evidence_ids_json"),
-                    "analysis_status": self._required_text(row, "analysis_status"),
-                    "analyzer_version": self._required_text(row, "analyzer_version"),
+                    "node_id": node.node_id,
+                    "source_id": node.source_id,
+                    "node_kind": node.node_kind.value,
+                    "parent_node_id": node.parent_node_id,
+                    "display_name": node.display_name,
+                    "relative_hierarchy": node.relative_hierarchy,
+                    "content_fingerprint": node.content_fingerprint,
+                    "semantic_summary": node.semantic_summary,
+                    "semantic_roles": list(node.semantic_roles),
+                    "topics": list(node.topics),
+                    "evidence_ids": list(node.evidence_ids),
+                    "analysis_status": node.analysis_status.value,
+                    "analyzer_version": node.analyzer_version,
+                    "semantic_disposition": node.semantic_disposition.value,
+                    "semantic_facts": self._semantic_facts_payload(
+                        node.semantic_facts
+                    )
+                    if node.analysis_protocol == "codex-semantic-v2"
+                    else {},
+                    "analysis_protocol": node.analysis_protocol,
+                    "skip_reason": node.skip_reason,
+                    "child_node_ids": list(node.child_node_ids),
+                    "coverage": self._semantic_coverage_payload(node.coverage)
+                    if node.analysis_protocol == "codex-semantic-v2"
+                    else {},
                 }
-                for row in rows
+                for node in (
+                    self._semantic_node_from_row(row) for row in rows
+                )
             ]
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
             raise self._semantic_error() from error

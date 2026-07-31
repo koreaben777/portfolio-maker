@@ -41,6 +41,7 @@ class WorkspacePaths:
     semantic_work_output_dir: Path
     semantic_work_receipts_dir: Path
     semantic_final_dir: Path
+    semantic_activation_receipt_path: Path
     master_profile_json_path: Path
     master_profile_md_path: Path
     portfolio_draft_path: Path
@@ -89,6 +90,9 @@ class WorkspacePaths:
             semantic_work_output_dir=reviews_dir / "semantic-index" / "work-output",
             semantic_work_receipts_dir=reviews_dir / "semantic-index" / "receipts",
             semantic_final_dir=reviews_dir / "semantic-index" / "final",
+            semantic_activation_receipt_path=(
+                reviews_dir / "semantic-index" / "activation-receipt.json"
+            ),
             master_profile_json_path=artifacts_dir / "master-profile.json",
             master_profile_md_path=artifacts_dir / "master-profile.md",
             portfolio_draft_path=artifacts_dir / "portfolio-draft.md",

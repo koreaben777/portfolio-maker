@@ -2,9 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import sqlite3
+import stat
+import tempfile
+from collections.abc import Iterator, Mapping, MutableMapping
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from urllib.parse import unquote, urlparse
 from uuid import uuid4
 
@@ -22,18 +27,27 @@ from portfolio_maker.application.models import (
 )
 from portfolio_maker.application.semantic_work import (
     STRUCTURAL_CHUNK_SIZE,
+    _OutputBinding,
+    _ReceiptBinding,
     build_semantic_work_plan,
     semantic_work_plan_payload,
+    structural_chunk_name,
 )
 from portfolio_maker.domain.semantic_models import (
     AnalysisStatus,
+    SemanticCoverage,
+    SemanticEdge,
+    SemanticFacts,
+    SemanticImportReceipt,
     SemanticNode,
+    SemanticNodeDisposition,
     SemanticNodeKind,
 )
 from portfolio_maker.domain.models import SourceStatus, SourceType
 from portfolio_maker.infrastructure.extractors import extract_approved_text
 from portfolio_maker.infrastructure.managed_files import (
     ensure_managed_directory,
+    open_managed_directory,
     read_managed_bytes,
     remove_managed_file,
     write_managed_text,
@@ -57,7 +71,10 @@ from portfolio_maker.infrastructure.semantic_crawler import (
     StructuralEntry,
     crawl_local_structure,
 )
-from portfolio_maker.infrastructure.sqlite_repository import SQLiteRepository
+from portfolio_maker.infrastructure.sqlite_repository import (
+    RepositoryError,
+    SQLiteRepository,
+)
 from portfolio_maker.infrastructure.snapshots import load_valid_local_snapshot
 from portfolio_maker.workspace import WorkspacePaths
 
@@ -81,13 +98,436 @@ _RELATIVE_FILE_LOCATOR = re.compile(
 )
 _CHUNK_FILENAME = re.compile(r"chunk-\d{4,}\.json")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
-
-
+_FINGERPRINT = re.compile(r"sha256:[0-9a-f]{64}")
+_SAFE_IDENTIFIER = re.compile(r"[A-Za-z0-9:._-]+")
+_FINAL_MANIFEST_KEYS = {
+    "version",
+    "protocol",
+    "revision_id",
+    "source_id",
+    "policy_hash",
+    "analyzer_version",
+    "work_plan_sha256",
+    "node_assignment_sha256",
+    "receipt_file_sha256s",
+    "chunk_sha256s",
+    "chunk_node_counts",
+    "chunk_count",
+    "node_count",
+    "analysis_node_count",
+    "structural_node_count",
+    "node_ids_sha256",
+    "manifest_sha256",
+}
+_FINAL_NODE_KEYS = {
+    "result_kind",
+    "node_id",
+    "source_id",
+    "parent_node_id",
+    "kind",
+    "display_name",
+    "relative_hierarchy",
+    "content_fingerprint",
+    "semantic_summary",
+    "semantic_roles",
+    "topics",
+    "semantic_facts",
+    "semantic_disposition",
+    "analysis_status",
+    "child_node_ids",
+    "skip_reason",
+    "evidence_ids",
+    "coverage",
+}
+_SEMANTIC_FACT_KEYS = {
+    "purpose_signals",
+    "parent_context_signals",
+    "independence_signals",
+    "triviality_signals",
+    "grounding_signal_ids",
+}
+_COVERAGE_KEYS = {
+    "node_count",
+    "content_node_count",
+    "structural_only_count",
+    "failed_count",
+    "node_ids_sha256",
+}
+_ACTIVATION_RECEIPT_KEYS = {
+    "version",
+    "protocol",
+    "revision_id",
+    "source_id",
+    "policy_hash",
+    "final_manifest_sha256",
+    "chunk_count",
+    "node_count",
+    "active",
+}
+_V2_INPUT_MANIFEST_KEYS = {
+    "version",
+    "protocol",
+    "revision_id",
+    "source_id",
+    "policy_hash",
+    "analyzer_version",
+    "capsule_chunk_sha256s",
+    "work_plan_sha256",
+    "node_count",
+    "work_unit_count",
+    "managed_input_bytes",
+    "analysis_target_count",
+    "structural_only_count",
+}
+_WORK_PLAN_KEYS = {
+    "version",
+    "revision_id",
+    "policy_hash",
+    "protocol",
+    "node_count",
+    "analysis_target_count",
+    "structural_owner_count",
+    "work_unit_count",
+    "max_work_unit_bytes",
+    "reduce_fan_in",
+    "node_assignment_sha256",
+    "units",
+}
 @dataclass(frozen=True)
 class _PreparedNode:
     node: SemanticNode
     locator: tuple[str, int | None, int | None]
     chunk_node: dict[str, object]
+
+
+class _ScratchCapsuleMapping(Mapping[str, dict[str, object]]):
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self._connection = connection
+
+    def __getitem__(self, node_id: str) -> dict[str, object]:
+        row = self._connection.execute(
+            """
+            SELECT capsule_json
+            FROM capsules
+            WHERE node_id = ? AND capsule_json IS NOT NULL
+            """,
+            (node_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(node_id)
+        value = json.loads(row["capsule_json"])
+        if type(value) is not dict:
+            raise KeyError(node_id)
+        return value
+
+    def __iter__(self) -> Iterator[str]:
+        rows = self._connection.execute(
+            """
+            SELECT node_id
+            FROM capsules
+            WHERE capsule_json IS NOT NULL
+            ORDER BY node_id
+            """
+        )
+        for row in rows:
+            yield str(row["node_id"])
+
+    def __len__(self) -> int:
+        row = self._connection.execute(
+            "SELECT COUNT(*) AS count FROM capsules WHERE capsule_json IS NOT NULL"
+        ).fetchone()
+        return int(row["count"])
+
+
+class _ScratchReceiptMapping(MutableMapping[str, _ReceiptBinding]):
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self._connection = connection
+
+    def __getitem__(self, unit_id: str) -> _ReceiptBinding:
+        row = self._connection.execute(
+            """
+            SELECT input_sha256, output_sha256, output_payload_json,
+                   dependency_output_sha256s_json, receipt_content
+            FROM receipts
+            WHERE unit_id = ?
+            """,
+            (unit_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(unit_id)
+        payload = json.loads(row["output_payload_json"])
+        dependency_hashes = json.loads(
+            row["dependency_output_sha256s_json"]
+        )
+        if type(payload) is not dict or type(dependency_hashes) is not list:
+            raise KeyError(unit_id)
+        return _ReceiptBinding(
+            input_sha256=str(row["input_sha256"]),
+            output=_OutputBinding(
+                output_sha256=str(row["output_sha256"]),
+                payload=payload,
+                content=b"",
+                validated=None,
+            ),
+            dependency_output_sha256s=tuple(
+                str(value) for value in dependency_hashes
+            ),
+            content=bytes(row["receipt_content"]),
+        )
+
+    def __setitem__(self, unit_id: str, value: _ReceiptBinding) -> None:
+        if not isinstance(value, _ReceiptBinding):
+            raise TypeError("invalid semantic receipt scratch value")
+        self._connection.execute(
+            """
+            INSERT INTO receipts (
+                unit_id, input_sha256, output_sha256, output_payload_json,
+                dependency_output_sha256s_json, receipt_content
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                unit_id,
+                value.input_sha256,
+                value.output.output_sha256,
+                _canonical_json(value.output.payload),
+                _canonical_json(list(value.dependency_output_sha256s)),
+                value.content,
+            ),
+        )
+
+    def __delitem__(self, unit_id: str) -> None:
+        cursor = self._connection.execute(
+            "DELETE FROM receipts WHERE unit_id = ?",
+            (unit_id,),
+        )
+        if cursor.rowcount != 1:
+            raise KeyError(unit_id)
+
+    def __iter__(self) -> Iterator[str]:
+        rows = self._connection.execute(
+            "SELECT unit_id FROM receipts ORDER BY unit_id"
+        )
+        for row in rows:
+            yield str(row["unit_id"])
+
+    def __len__(self) -> int:
+        row = self._connection.execute(
+            "SELECT COUNT(*) AS count FROM receipts"
+        ).fetchone()
+        return int(row["count"])
+
+
+class _SemanticBindingScratch:
+    def __init__(self) -> None:
+        self._directory: tempfile.TemporaryDirectory[str] | None = None
+        self._connection: sqlite3.Connection | None = None
+
+    def __enter__(self) -> _SemanticBindingScratch:
+        self._directory = tempfile.TemporaryDirectory(
+            prefix="portfolio-maker-semantic-binding-"
+        )
+        try:
+            directory = Path(self._directory.name)
+            os.chmod(directory, 0o700)
+            database_path = directory / "binding.db"
+            descriptor = os.open(
+                database_path,
+                os.O_RDWR | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+            os.close(descriptor)
+            self._connection = sqlite3.connect(database_path)
+            self._connection.row_factory = sqlite3.Row
+            _observe_v2_binding_scratch(database_path)
+            self._connection.executescript(
+                """
+                CREATE TABLE capsules (
+                    node_id TEXT PRIMARY KEY,
+                    relative_hierarchy TEXT NOT NULL,
+                    disposition TEXT NOT NULL,
+                    capsule_json TEXT,
+                    owner_kind TEXT,
+                    owner_id TEXT
+                );
+                CREATE TABLE plan_owners (
+                    node_id TEXT PRIMARY KEY,
+                    owner_unit_id TEXT NOT NULL
+                );
+                CREATE TABLE receipts (
+                    unit_id TEXT PRIMARY KEY,
+                    input_sha256 TEXT NOT NULL,
+                    output_sha256 TEXT NOT NULL,
+                    output_payload_json TEXT NOT NULL,
+                    dependency_output_sha256s_json TEXT NOT NULL,
+                    receipt_content BLOB NOT NULL
+                );
+                """
+            )
+            return self
+        except Exception:
+            self.__exit__()
+            raise
+
+    def __exit__(self, *args: object) -> None:
+        try:
+            if self._connection is not None:
+                self._connection.close()
+                self._connection = None
+        finally:
+            if self._directory is not None:
+                self._directory.cleanup()
+                self._directory = None
+
+    @property
+    def connection(self) -> sqlite3.Connection:
+        if self._connection is None:
+            raise RuntimeError("semantic binding scratch is not open")
+        return self._connection
+
+    @property
+    def capsules(self) -> Mapping[str, dict[str, object]]:
+        return _ScratchCapsuleMapping(self.connection)
+
+    @property
+    def receipts(self) -> MutableMapping[str, _ReceiptBinding]:
+        return _ScratchReceiptMapping(self.connection)
+
+    def insert_plan_owner(self, node_id: str, owner_unit_id: str) -> None:
+        try:
+            self.connection.execute(
+                """
+                INSERT INTO plan_owners (node_id, owner_unit_id)
+                VALUES (?, ?)
+                """,
+                (node_id, owner_unit_id),
+            )
+        except sqlite3.IntegrityError as error:
+            raise SemanticIndexError(
+                "semantic work plan is invalid"
+            ) from error
+
+    def plan_owner(self, node_id: str) -> str | None:
+        row = self.connection.execute(
+            """
+            SELECT owner_unit_id
+            FROM plan_owners
+            WHERE node_id = ?
+            """,
+            (node_id,),
+        ).fetchone()
+        return None if row is None else str(row["owner_unit_id"])
+
+    def plan_owner_count(self) -> int:
+        row = self.connection.execute(
+            "SELECT COUNT(*) AS count FROM plan_owners"
+        ).fetchone()
+        return int(row["count"])
+
+    def insert_capsule(
+        self,
+        capsule: dict[str, object],
+        *,
+        owner_id: str | None,
+    ) -> None:
+        disposition = str(capsule.get("semantic_disposition", ""))
+        is_analysis = disposition == "analysis_required"
+        if is_analysis != (owner_id is not None):
+            raise SemanticIndexError("semantic work ownership is invalid")
+        try:
+            self.connection.execute(
+                """
+                INSERT INTO capsules (
+                    node_id, relative_hierarchy, disposition, capsule_json,
+                    owner_kind, owner_id
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(capsule["node_id"]),
+                    str(capsule.get("relative_hierarchy", "")),
+                    disposition,
+                    _canonical_json(capsule) if is_analysis else None,
+                    "semantic_work_unit" if is_analysis else None,
+                    owner_id,
+                ),
+            )
+        except sqlite3.IntegrityError as error:
+            raise SemanticIndexError(
+                "semantic work capsule input is invalid"
+            ) from error
+
+    def assign_structural_chunks(self) -> None:
+        rows = self.connection.execute(
+            """
+            SELECT node_id, disposition
+            FROM capsules
+            ORDER BY relative_hierarchy, node_id
+            """
+        )
+        for index, row in enumerate(rows):
+            if row["disposition"] == "analysis_required":
+                continue
+            self.connection.execute(
+                """
+                UPDATE capsules
+                SET owner_kind = 'private_structural_chunk', owner_id = ?
+                WHERE node_id = ?
+                """,
+                (structural_chunk_name(index), row["node_id"]),
+            )
+
+    def assignment_sha256(self) -> str:
+        digest = hashlib.sha256()
+        digest.update(b"[")
+        first = True
+        rows = self.connection.execute(
+            """
+            SELECT node_id, owner_kind, owner_id
+            FROM capsules
+            ORDER BY node_id
+            """
+        )
+        for row in rows:
+            if row["owner_kind"] is None or row["owner_id"] is None:
+                raise SemanticIndexError("semantic work ownership is invalid")
+            if not first:
+                digest.update(b",")
+            digest.update(
+                _canonical_json(
+                    (
+                        str(row["node_id"]),
+                        str(row["owner_kind"]),
+                        str(row["owner_id"]),
+                    )
+                ).encode("utf-8")
+            )
+            first = False
+        digest.update(b"]")
+        return digest.hexdigest()
+
+    def counts(self) -> tuple[int, int]:
+        row = self.connection.execute(
+            """
+            SELECT COUNT(*) AS total,
+                   SUM(CASE WHEN disposition = 'analysis_required'
+                            THEN 1 ELSE 0 END) AS analysis
+            FROM capsules
+            """
+        ).fetchone()
+        return int(row["total"]), int(row["analysis"] or 0)
+
+
+def _observe_v2_capsule_chunk(
+    capsule_count: int,
+    chunk_byte_count: int,
+    managed_input_bytes: int,
+) -> None:
+    del capsule_count, chunk_byte_count, managed_input_bytes
+
+
+def _observe_v2_binding_scratch(database_path: Path) -> None:
+    del database_path
 
 
 def prepare_semantic_index(
@@ -204,6 +644,24 @@ def apply_semantic_index(
     paths = WorkspacePaths.from_root(request.workspace)
     repository = SQLiteRepository(paths.db_path)
     repository.initialize()
+    try:
+        final_manifest_content = read_managed_bytes(
+            paths.semantic_final_dir / "manifest.json"
+        )
+    except FileNotFoundError:
+        final_manifest_content = None
+    except OSError as error:
+        raise SemanticIndexError("semantic final output is invalid") from error
+    if final_manifest_content is not None:
+        try:
+            return _apply_v2_semantic_index(
+                paths,
+                repository,
+            )
+        except RepositoryError as error:
+            raise SemanticIndexError(
+                "semantic index repository state is invalid"
+            ) from error
 
     with repository._repository_critical_section():
         published = _read_published_semantic_input_unlocked(paths)
@@ -229,6 +687,942 @@ def apply_semantic_index(
         partial_count=sum(status is AnalysisStatus.PARTIAL for status in statuses),
         failed_count=sum(status is AnalysisStatus.FAILED for status in statuses),
     )
+
+
+def _apply_v2_semantic_index(
+    paths: WorkspacePaths,
+    repository: SQLiteRepository,
+) -> ApplySemanticIndexResult:
+    with repository._repository_critical_section():
+        final_manifest_content = _read_managed_content(
+            paths.semantic_final_dir / "manifest.json",
+            "semantic final manifest",
+        )
+        manifest = _parse_v2_final_manifest(final_manifest_content)
+        approval = load_approval(paths)
+        if manifest["policy_hash"] != _policy_hash(approval):
+            raise SemanticIndexError(
+                "semantic index approval policy has changed"
+            )
+        _validate_v2_input_and_work_bindings(paths, manifest)
+        expected_final_names = {
+            "manifest.json",
+            *{
+                f"chunk-{index:04}.json"
+                for index in range(1, int(manifest["chunk_count"]) + 1)
+            },
+        }
+        if (
+            _managed_regular_file_names(paths.semantic_final_dir)
+            != expected_final_names
+        ):
+            raise SemanticIndexError("semantic final output is invalid")
+        locator_dir = paths.semantic_revision_locator_dir(
+            str(manifest["revision_id"])
+        )
+        expected_locator_names = expected_final_names - {"manifest.json"}
+        if _managed_regular_file_names(locator_dir) != expected_locator_names:
+            raise SemanticIndexError("semantic private locator state is invalid")
+
+        target_receipt = _activation_receipt_payload(
+            manifest,
+            final_manifest_content,
+        )
+        current_active = repository.get_active_semantic_revision(
+            str(manifest["source_id"])
+        )
+        _validate_existing_activation_receipt(
+            paths,
+            current_active,
+            target_receipt,
+        )
+        target_already_active = (
+            current_active is not None
+            and current_active["id"] == manifest["revision_id"]
+        )
+
+        approved_roots = _approved_root_paths(approval)
+        root_locator: Path | None = None
+        previous_key: tuple[str, str] | None = None
+        global_node_digest = hashlib.sha256()
+        global_node_digest.update(b"[")
+        first_node = True
+        node_count = 0
+        analysis_count = 0
+        complete_count = 0
+        partial_count = 0
+        failed_count = 0
+        expected_receipts: list[SemanticImportReceipt] = []
+
+        chunk_sha256s = manifest["chunk_sha256s"]
+        chunk_node_counts = manifest["chunk_node_counts"]
+        assert isinstance(chunk_sha256s, list)
+        assert isinstance(chunk_node_counts, list)
+        for index, (expected_hash, expected_count) in enumerate(
+            zip(chunk_sha256s, chunk_node_counts, strict=True),
+            start=1,
+        ):
+            chunk_path = (
+                paths.semantic_final_dir / f"chunk-{index:04}.json"
+            )
+            locator_path = locator_dir / f"chunk-{index:04}.json"
+            chunk_content = _read_managed_content(
+                chunk_path,
+                "semantic final output",
+            )
+            locator_content = _read_managed_content(
+                locator_path,
+                "semantic private locator state",
+            )
+            if hashlib.sha256(chunk_content).hexdigest() != expected_hash:
+                raise SemanticIndexError("semantic final output is invalid")
+            chunk = _decode_canonical_object(
+                chunk_content,
+                "semantic final output",
+            )
+            locator_chunk = _decode_canonical_object(
+                locator_content,
+                "semantic private locator state",
+            )
+            raw_nodes = chunk.get("nodes")
+            raw_locators = locator_chunk.get("locators")
+            if (
+                set(chunk)
+                != {
+                    "version",
+                    "protocol",
+                    "revision_id",
+                    "chunk_index",
+                    "nodes",
+                }
+                or chunk.get("version") != 2
+                or chunk.get("protocol") != "codex-semantic-v2"
+                or chunk.get("revision_id") != manifest["revision_id"]
+                or chunk.get("chunk_index") != index
+                or type(raw_nodes) is not list
+                or not raw_nodes
+                or len(raw_nodes) > 1_000
+                or len(raw_nodes) != expected_count
+                or set(locator_chunk)
+                != {"version", "revision_id", "locators"}
+                or locator_chunk.get("version") != 2
+                or locator_chunk.get("revision_id")
+                != manifest["revision_id"]
+                or type(raw_locators) is not list
+                or len(raw_locators) != len(raw_nodes)
+            ):
+                raise SemanticIndexError("semantic final output is invalid")
+
+            nodes: list[SemanticNode] = []
+            locators: dict[str, tuple[str, int | None, int | None]] = {}
+            edges: list[SemanticEdge] = []
+            chunk_node_ids: list[str] = []
+            for raw_node, raw_locator in zip(
+                raw_nodes,
+                raw_locators,
+                strict=True,
+            ):
+                node = _parse_v2_final_node(raw_node, manifest)
+                key = (node.relative_hierarchy, node.node_id)
+                if previous_key is not None and key <= previous_key:
+                    raise SemanticIndexError(
+                        "semantic final node ordering is invalid"
+                    )
+                previous_key = key
+                if not first_node:
+                    global_node_digest.update(b",")
+                global_node_digest.update(
+                    _canonical_json(node.node_id).encode("utf-8")
+                )
+                first_node = False
+                node_count += 1
+                analysis_count += int(
+                    node.semantic_disposition
+                    is SemanticNodeDisposition.ANALYZED
+                )
+                complete_count += int(
+                    node.analysis_status is AnalysisStatus.COMPLETE
+                )
+                partial_count += int(
+                    node.analysis_status is AnalysisStatus.PARTIAL
+                )
+                failed_count += int(
+                    node.analysis_status is AnalysisStatus.FAILED
+                )
+
+                locator = _parse_v2_locator(raw_locator, node.node_id)
+                locator_path_value = Path(locator[0])
+                if node.parent_node_id is None:
+                    if (
+                        root_locator is not None
+                        or node.relative_hierarchy != "."
+                        or locator_path_value not in approved_roots
+                    ):
+                        raise SemanticIndexError(
+                            "semantic private locator state is invalid"
+                        )
+                    root_locator = locator_path_value
+                else:
+                    if root_locator is None:
+                        raise SemanticIndexError(
+                            "semantic private locator state is invalid"
+                        )
+                    relative = PurePosixPath(node.relative_hierarchy)
+                    expected_locator = root_locator.joinpath(*relative.parts)
+                    if locator_path_value != expected_locator:
+                        raise SemanticIndexError(
+                            "semantic private locator state is invalid"
+                        )
+                    edges.append(
+                        SemanticEdge(
+                            revision_id=str(manifest["revision_id"]),
+                            from_node_id=node.parent_node_id,
+                            relation="contains",
+                            to_node_id=node.node_id,
+                        )
+                    )
+                nodes.append(node)
+                locators[node.node_id] = locator
+                chunk_node_ids.append(node.node_id)
+
+            chunk_node_ids_sha256 = hashlib.sha256(
+                _canonical_json(chunk_node_ids).encode("utf-8")
+            ).hexdigest()
+            receipt = SemanticImportReceipt(
+                revision_id=str(manifest["revision_id"]),
+                chunk_index=index,
+                chunk_sha256=str(expected_hash),
+                locator_chunk_sha256=hashlib.sha256(
+                    locator_content
+                ).hexdigest(),
+                node_ids_sha256=chunk_node_ids_sha256,
+                node_count=len(nodes),
+            )
+            expected_receipts.append(receipt)
+            if not target_already_active:
+                repository.import_semantic_revision_chunk(
+                    revision_id=receipt.revision_id,
+                    chunk_index=receipt.chunk_index,
+                    chunk_sha256=receipt.chunk_sha256,
+                    locator_chunk_sha256=receipt.locator_chunk_sha256,
+                    node_ids_sha256=receipt.node_ids_sha256,
+                    nodes=tuple(nodes),
+                    locators=locators,
+                    edges=tuple(edges),
+                )
+
+        global_node_digest.update(b"]")
+        if (
+            root_locator is None
+            or node_count != manifest["node_count"]
+            or analysis_count != manifest["analysis_node_count"]
+            or node_count - analysis_count
+            != manifest["structural_node_count"]
+            or global_node_digest.hexdigest()
+            != manifest["node_ids_sha256"]
+        ):
+            raise SemanticIndexError("semantic final node coverage is invalid")
+
+        repository.activate_imported_semantic_revision(
+            revision_id=str(manifest["revision_id"]),
+            expected_receipts=tuple(expected_receipts),
+            expected_node_count=node_count,
+            expected_edge_count=node_count - 1,
+            source_id=str(manifest["source_id"]),
+            policy_hash=str(manifest["policy_hash"]),
+            analyzer_version=str(manifest["analyzer_version"]),
+        )
+        try:
+            _publish_activation_receipt(paths, target_receipt)
+        except OSError as error:
+            raise SemanticIndexError(
+                "semantic index activation receipt is unavailable"
+            ) from error
+
+    return ApplySemanticIndexResult(
+        revision_id=str(manifest["revision_id"]),
+        active=True,
+        complete_count=complete_count,
+        partial_count=partial_count,
+        failed_count=failed_count,
+    )
+
+
+def _parse_v2_final_manifest(content: bytes) -> dict[str, object]:
+    manifest = _decode_canonical_object(content, "semantic final manifest")
+    unsigned = dict(manifest)
+    manifest_sha256 = unsigned.pop("manifest_sha256", None)
+    chunk_sha256s = manifest.get("chunk_sha256s")
+    chunk_node_counts = manifest.get("chunk_node_counts")
+    receipt_hashes = manifest.get("receipt_file_sha256s")
+    if (
+        set(manifest) != _FINAL_MANIFEST_KEYS
+        or manifest.get("version") != 2
+        or manifest.get("protocol") != "codex-semantic-v2"
+        or not _is_safe_identifier(manifest.get("revision_id"))
+        or not _is_safe_identifier(manifest.get("source_id"))
+        or not _is_sha256(manifest.get("policy_hash"))
+        or manifest.get("analyzer_version") != "semantic-input-v2"
+        or not _is_sha256(manifest.get("work_plan_sha256"))
+        or not _is_sha256(manifest.get("node_assignment_sha256"))
+        or not _is_sha256(manifest.get("node_ids_sha256"))
+        or not _is_sha256(manifest_sha256)
+        or hashlib.sha256(
+            _canonical_json(unsigned).encode("utf-8")
+        ).hexdigest()
+        != manifest_sha256
+        or type(chunk_sha256s) is not list
+        or not chunk_sha256s
+        or not all(_is_sha256(value) for value in chunk_sha256s)
+        or type(chunk_node_counts) is not list
+        or len(chunk_node_counts) != len(chunk_sha256s)
+        or not all(
+            type(value) is int and 1 <= value <= 1_000
+            for value in chunk_node_counts
+        )
+        or type(receipt_hashes) is not list
+        or not all(_is_sha256(value) for value in receipt_hashes)
+        or not _is_positive_int(manifest.get("chunk_count"))
+        or manifest["chunk_count"] != len(chunk_sha256s)
+        or not _is_positive_int(manifest.get("node_count"))
+        or manifest["node_count"] != sum(chunk_node_counts)
+        or not _is_nonnegative_int(manifest.get("analysis_node_count"))
+        or not _is_nonnegative_int(manifest.get("structural_node_count"))
+        or manifest["analysis_node_count"]
+        + manifest["structural_node_count"]
+        != manifest["node_count"]
+    ):
+        raise SemanticIndexError("semantic final manifest is invalid")
+    return manifest
+
+
+def _validate_v2_input_and_work_bindings(
+    paths: WorkspacePaths,
+    manifest: dict[str, object],
+) -> None:
+    from portfolio_maker.application.semantic_work import (
+        SemanticWorkError,
+        _VerifiedState,
+        _evaluate_lifecycle,
+        _validate_capsule_contract,
+        _validate_plan_structure,
+        _validate_unit_capsule_binding,
+    )
+
+    input_manifest_content = _read_managed_content(
+        paths.semantic_index_manifest_path,
+        "semantic work manifest",
+    )
+    input_manifest = _decode_canonical_object(
+        input_manifest_content,
+        "semantic work manifest",
+    )
+    if (
+        set(input_manifest) != _V2_INPUT_MANIFEST_KEYS
+        or input_manifest.get("version") != 2
+        or input_manifest.get("protocol") != "codex-semantic-v2"
+        or input_manifest.get("revision_id") != manifest["revision_id"]
+        or input_manifest.get("source_id") != manifest["source_id"]
+        or input_manifest.get("policy_hash") != manifest["policy_hash"]
+        or input_manifest.get("analyzer_version")
+        != manifest["analyzer_version"]
+        or input_manifest.get("work_plan_sha256")
+        != manifest["work_plan_sha256"]
+        or input_manifest.get("node_count") != manifest["node_count"]
+        or input_manifest.get("analysis_target_count")
+        != manifest["analysis_node_count"]
+        or input_manifest.get("structural_only_count")
+        != manifest["structural_node_count"]
+        or not _is_positive_int(input_manifest.get("node_count"))
+        or not _is_positive_int(input_manifest.get("work_unit_count"))
+        or not _is_positive_int(input_manifest.get("managed_input_bytes"))
+        or not _is_nonnegative_int(
+            input_manifest.get("analysis_target_count")
+        )
+        or not _is_nonnegative_int(
+            input_manifest.get("structural_only_count")
+        )
+        or input_manifest["analysis_target_count"]
+        + input_manifest["structural_only_count"]
+        != input_manifest["node_count"]
+    ):
+        raise SemanticIndexError("semantic work manifest is invalid")
+    capsule_hashes = input_manifest.get("capsule_chunk_sha256s")
+    if (
+        type(capsule_hashes) is not list
+        or not capsule_hashes
+        or not all(_is_sha256(value) for value in capsule_hashes)
+    ):
+        raise SemanticIndexError("semantic work manifest is invalid")
+    expected_capsule_names = {
+        f"chunk-{index:04}.json"
+        for index in range(1, len(capsule_hashes) + 1)
+    }
+    if (
+        _managed_regular_file_names(paths.semantic_index_input_dir)
+        != expected_capsule_names
+    ):
+        raise SemanticIndexError("semantic work capsule input is invalid")
+
+    plan_content = _read_managed_content(
+        paths.semantic_work_plan_path,
+        "semantic work plan",
+    )
+    plan = _decode_canonical_object(plan_content, "semantic work plan")
+    units = plan.get("units")
+    if (
+        hashlib.sha256(plan_content).hexdigest()
+        != manifest["work_plan_sha256"]
+        or set(plan) != _WORK_PLAN_KEYS
+        or plan.get("version") != 2
+        or plan.get("protocol") != "codex-semantic-v2"
+        or plan.get("revision_id") != manifest["revision_id"]
+        or plan.get("policy_hash") != manifest["policy_hash"]
+        or plan.get("node_count") != manifest["node_count"]
+        or plan.get("node_assignment_sha256")
+        != manifest["node_assignment_sha256"]
+        or type(units) is not list
+        or plan.get("work_unit_count") != len(units)
+    ):
+        raise SemanticIndexError("semantic work plan is invalid")
+    managed_input_bytes = len(plan_content)
+    try:
+        with _SemanticBindingScratch() as scratch:
+            try:
+                verified_units = _validate_plan_structure(
+                    plan,
+                    input_manifest,
+                    owner_sink=scratch.insert_plan_owner,
+                )
+            except SemanticWorkError as error:
+                raise SemanticIndexError(str(error)) from error
+            unit_by_id = {unit.unit_id: unit for unit in verified_units}
+            for index, expected_hash in enumerate(capsule_hashes, start=1):
+                content = _read_managed_content(
+                    paths.semantic_index_input_dir / f"chunk-{index:04}.json",
+                    "semantic work capsule input",
+                )
+                managed_input_bytes += len(content)
+                if hashlib.sha256(content).hexdigest() != expected_hash:
+                    raise SemanticIndexError(
+                        "semantic work capsule input is invalid"
+                    )
+                chunk = _decode_canonical_object(
+                    content,
+                    "semantic work capsule input",
+                )
+                raw_capsules = chunk.get("capsules")
+                if (
+                    set(chunk) != {"version", "revision_id", "capsules"}
+                    or chunk.get("version") != 2
+                    or chunk.get("revision_id") != manifest["revision_id"]
+                    or type(raw_capsules) is not list
+                ):
+                    raise SemanticIndexError(
+                        "semantic work capsule input is invalid"
+                    )
+                _observe_v2_capsule_chunk(
+                    len(raw_capsules),
+                    len(content),
+                    managed_input_bytes,
+                )
+                for raw_capsule in raw_capsules:
+                    try:
+                        capsule = _validate_capsule_contract(raw_capsule)
+                    except SemanticWorkError as error:
+                        raise SemanticIndexError(str(error)) from error
+                    node_id = str(capsule["node_id"])
+                    owner_id = scratch.plan_owner(node_id)
+                    if owner_id is not None:
+                        try:
+                            _validate_unit_capsule_binding(
+                                unit_by_id[owner_id],
+                                capsule,
+                                input_manifest,
+                            )
+                        except SemanticWorkError as error:
+                            raise SemanticIndexError(str(error)) from error
+                    scratch.insert_capsule(capsule, owner_id=owner_id)
+
+            scratch.assign_structural_chunks()
+            node_count, analysis_count = scratch.counts()
+            owner_count = scratch.plan_owner_count()
+            if (
+                node_count != input_manifest["node_count"]
+                or analysis_count != input_manifest["analysis_target_count"]
+                or node_count - analysis_count
+                != input_manifest["structural_only_count"]
+                or analysis_count != owner_count
+                or len(verified_units) != input_manifest["work_unit_count"]
+                or managed_input_bytes
+                != input_manifest["managed_input_bytes"]
+                or scratch.assignment_sha256()
+                != plan["node_assignment_sha256"]
+            ):
+                raise SemanticIndexError(
+                    "semantic work manifest counts are invalid"
+                )
+
+            verified_state = _VerifiedState(
+                paths=paths,
+                revision_id=str(input_manifest["revision_id"]),
+                source_id=str(input_manifest["source_id"]),
+                policy_hash=str(input_manifest["policy_hash"]),
+                analyzer_version=str(input_manifest["analyzer_version"]),
+                work_plan_sha256=str(input_manifest["work_plan_sha256"]),
+                node_assignment_sha256=str(plan["node_assignment_sha256"]),
+                node_count=int(input_manifest["node_count"]),
+                analysis_node_count=int(
+                    input_manifest["analysis_target_count"]
+                ),
+                structural_node_count=int(
+                    input_manifest["structural_only_count"]
+                ),
+                max_work_unit_bytes=int(plan["max_work_unit_bytes"]),
+                capsules=scratch.capsules,
+                units=verified_units,
+                unit_by_id=unit_by_id,
+            )
+            try:
+                lifecycle = _evaluate_lifecycle(
+                    verified_state,
+                    scratch.receipts,
+                )
+            except SemanticWorkError as error:
+                raise SemanticIndexError(str(error)) from error
+            if (
+                lifecycle.invalid_count
+                or lifecycle.ready_unit_ids
+                or len(lifecycle.valid_receipts) != len(verified_units)
+            ):
+                raise SemanticIndexError("semantic work receipts are invalid")
+
+            unit_ids = [unit.unit_id for unit in verified_units]
+            expected_receipt_names = {
+                f"{unit_id}.json" for unit_id in unit_ids
+            }
+            if (
+                _managed_regular_file_names(paths.semantic_work_receipts_dir)
+                != expected_receipt_names
+            ):
+                raise SemanticIndexError("semantic work receipts are invalid")
+            receipt_hashes = [
+                hashlib.sha256(
+                    _read_managed_content(
+                        paths.semantic_work_receipts_dir
+                        / f"{unit_id}.json",
+                        "semantic work receipt",
+                    )
+                ).hexdigest()
+                for unit_id in unit_ids
+            ]
+            if receipt_hashes != manifest["receipt_file_sha256s"]:
+                raise SemanticIndexError("semantic work receipts are invalid")
+    except SemanticIndexError:
+        raise
+    except (OSError, sqlite3.Error) as error:
+        raise SemanticIndexError(
+            "semantic work binding validation is unavailable"
+        ) from error
+
+
+def _parse_v2_final_node(
+    value: object,
+    manifest: dict[str, object],
+) -> SemanticNode:
+    if type(value) is not dict or set(value) != _FINAL_NODE_KEYS:
+        raise SemanticIndexError("semantic final node is invalid")
+    facts_value = value.get("semantic_facts")
+    coverage_value = value.get("coverage")
+    roles = value.get("semantic_roles")
+    topics = value.get("topics")
+    child_ids = value.get("child_node_ids")
+    evidence_ids = value.get("evidence_ids")
+    if (
+        value.get("result_kind") != "node"
+        or not _is_safe_identifier(value.get("node_id"))
+        or value.get("source_id") != manifest["source_id"]
+        or value.get("parent_node_id") is not None
+        and not _is_safe_identifier(value.get("parent_node_id"))
+        or value.get("kind")
+        not in {kind.value for kind in SemanticNodeKind}
+        or not _is_safe_presentation_text(value.get("display_name"))
+        or not _is_safe_relative_hierarchy(value.get("relative_hierarchy"))
+        or value.get("content_fingerprint") is not None
+        and (
+            not isinstance(value.get("content_fingerprint"), str)
+            or _FINGERPRINT.fullmatch(
+                str(value.get("content_fingerprint"))
+            )
+            is None
+        )
+        or not isinstance(value.get("semantic_summary"), str)
+        or value.get("semantic_disposition")
+        not in {
+            disposition.value for disposition in SemanticNodeDisposition
+        }
+        or value.get("analysis_status")
+        not in {status.value for status in AnalysisStatus}
+        or value.get("skip_reason") is not None
+        and not _is_safe_identifier(value.get("skip_reason"))
+        or not _is_unique_text_list(roles, safe=True)
+        or not _is_unique_text_list(topics, safe=True)
+        or not _is_unique_text_list(child_ids, identifier=True)
+        or child_ids != sorted(child_ids)
+        or type(evidence_ids) is not list
+        or any(type(item) is not int or item < 1 for item in evidence_ids)
+        or evidence_ids != sorted(set(evidence_ids))
+        or type(facts_value) is not dict
+        or set(facts_value) != _SEMANTIC_FACT_KEYS
+        or not all(
+            _is_unique_text_list(
+                facts_value[key],
+                identifier=(key == "grounding_signal_ids"),
+                safe=(key != "grounding_signal_ids"),
+            )
+            for key in _SEMANTIC_FACT_KEYS
+        )
+        or type(coverage_value) is not dict
+        or set(coverage_value) != _COVERAGE_KEYS
+        or not all(
+            _is_nonnegative_int(coverage_value.get(key))
+            for key in (
+                "node_count",
+                "content_node_count",
+                "structural_only_count",
+                "failed_count",
+            )
+        )
+        or coverage_value["node_count"] < 1
+        or not _is_sha256(coverage_value.get("node_ids_sha256"))
+    ):
+        raise SemanticIndexError("semantic final node is invalid")
+
+    disposition = SemanticNodeDisposition(
+        str(value["semantic_disposition"])
+    )
+    summary = str(value["semantic_summary"])
+    if disposition is SemanticNodeDisposition.ANALYZED:
+        if not summary or not facts_value["grounding_signal_ids"]:
+            raise SemanticIndexError("semantic final node is invalid")
+        _require_exact_safe_text(summary)
+    elif (
+        summary
+        or roles
+        or topics
+        or any(facts_value[key] for key in _SEMANTIC_FACT_KEYS)
+    ):
+        raise SemanticIndexError("semantic final node is invalid")
+
+    return SemanticNode(
+        node_id=str(value["node_id"]),
+        source_id=str(value["source_id"]),
+        node_kind=SemanticNodeKind(str(value["kind"])),
+        parent_node_id=(
+            str(value["parent_node_id"])
+            if value["parent_node_id"] is not None
+            else None
+        ),
+        display_name=str(value["display_name"]),
+        relative_hierarchy=str(value["relative_hierarchy"]),
+        content_fingerprint=(
+            str(value["content_fingerprint"])
+            if value["content_fingerprint"] is not None
+            else None
+        ),
+        semantic_summary=summary,
+        semantic_roles=tuple(roles),
+        topics=tuple(topics),
+        evidence_ids=tuple(evidence_ids),
+        analysis_status=AnalysisStatus(str(value["analysis_status"])),
+        analyzer_version=str(manifest["analyzer_version"]),
+        updated_at="",
+        semantic_disposition=disposition,
+        semantic_facts=SemanticFacts(
+            purpose_signals=tuple(facts_value["purpose_signals"]),
+            parent_context_signals=tuple(
+                facts_value["parent_context_signals"]
+            ),
+            independence_signals=tuple(
+                facts_value["independence_signals"]
+            ),
+            triviality_signals=tuple(
+                facts_value["triviality_signals"]
+            ),
+            grounding_signal_ids=tuple(
+                facts_value["grounding_signal_ids"]
+            ),
+        ),
+        analysis_protocol="codex-semantic-v2",
+        skip_reason=(
+            str(value["skip_reason"])
+            if value["skip_reason"] is not None
+            else None
+        ),
+        child_node_ids=tuple(child_ids),
+        coverage=SemanticCoverage(
+            node_count=int(coverage_value["node_count"]),
+            content_node_count=int(
+                coverage_value["content_node_count"]
+            ),
+            structural_only_count=int(
+                coverage_value["structural_only_count"]
+            ),
+            failed_count=int(coverage_value["failed_count"]),
+            node_ids_sha256=str(coverage_value["node_ids_sha256"]),
+        ),
+    )
+
+
+def _parse_v2_locator(
+    value: object,
+    expected_node_id: str,
+) -> tuple[str, int | None, int | None]:
+    if (
+        type(value) is not dict
+        or set(value) != {"node_id", "locator", "device", "inode"}
+        or value.get("node_id") != expected_node_id
+        or not isinstance(value.get("locator"), str)
+        or not value["locator"]
+        or not Path(value["locator"]).is_absolute()
+        or value.get("device") is not None
+        and not _is_nonnegative_int(value.get("device"))
+        or value.get("inode") is not None
+        and not _is_nonnegative_int(value.get("inode"))
+    ):
+        raise SemanticIndexError("semantic private locator state is invalid")
+    return (
+        str(value["locator"]),
+        value["device"],
+        value["inode"],
+    )
+
+
+def _activation_receipt_payload(
+    manifest: dict[str, object],
+    manifest_content: bytes,
+) -> dict[str, object]:
+    return {
+        "version": 2,
+        "protocol": "codex-semantic-v2",
+        "revision_id": manifest["revision_id"],
+        "source_id": manifest["source_id"],
+        "policy_hash": manifest["policy_hash"],
+        "final_manifest_sha256": hashlib.sha256(
+            manifest_content
+        ).hexdigest(),
+        "chunk_count": manifest["chunk_count"],
+        "node_count": manifest["node_count"],
+        "active": True,
+    }
+
+
+def _validate_existing_activation_receipt(
+    paths: WorkspacePaths,
+    current_active: dict[str, str | None] | None,
+    target: dict[str, object],
+) -> None:
+    try:
+        content = read_managed_bytes(paths.semantic_activation_receipt_path)
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise SemanticIndexError(
+            "semantic index activation receipt is invalid"
+        ) from error
+    receipt = _decode_canonical_object(
+        content,
+        "semantic index activation receipt",
+    )
+    if (
+        set(receipt) != _ACTIVATION_RECEIPT_KEYS
+        or receipt.get("version") != 2
+        or receipt.get("protocol") != "codex-semantic-v2"
+        or receipt.get("active") is not True
+        or not _is_safe_identifier(receipt.get("revision_id"))
+        or not _is_safe_identifier(receipt.get("source_id"))
+        or not _is_sha256(receipt.get("policy_hash"))
+        or not _is_sha256(receipt.get("final_manifest_sha256"))
+        or not _is_positive_int(receipt.get("chunk_count"))
+        or not _is_positive_int(receipt.get("node_count"))
+        or current_active is None
+        or receipt.get("revision_id") != current_active["id"]
+        or receipt.get("source_id") != current_active["source_id"]
+        or receipt.get("policy_hash") != current_active["policy_hash"]
+        or (
+            current_active["id"] == target["revision_id"]
+            and receipt != target
+        )
+    ):
+        raise SemanticIndexError(
+            "semantic index activation receipt is invalid"
+        )
+
+
+def _publish_activation_receipt(
+    paths: WorkspacePaths,
+    payload: dict[str, object],
+) -> None:
+    content = _canonical_json(payload)
+    try:
+        existing = read_managed_bytes(
+            paths.semantic_activation_receipt_path
+        )
+    except FileNotFoundError:
+        existing = None
+    if existing == content.encode("utf-8"):
+        return
+    write_managed_text(paths.semantic_activation_receipt_path, content)
+
+
+def _approved_root_paths(approval: SourceApproval) -> set[Path]:
+    roots: set[Path] = set()
+    for uri in approval.approved_source_uris:
+        parsed = urlparse(uri)
+        if (
+            parsed.scheme != "file"
+            or parsed.netloc
+            or parsed.query
+            or parsed.fragment
+        ):
+            continue
+        path = Path(unquote(parsed.path))
+        if path.is_absolute() and path.as_uri() == uri:
+            roots.add(path)
+    if not roots:
+        raise SemanticIndexError("semantic index root is not approved")
+    return roots
+
+
+def _managed_regular_file_names(directory: Path) -> set[str]:
+    try:
+        descriptor = open_managed_directory(directory)
+    except OSError as error:
+        raise SemanticIndexError("semantic managed directory is invalid") from error
+    try:
+        names = set(os.listdir(descriptor))
+        for name in names:
+            metadata = os.stat(
+                name,
+                dir_fd=descriptor,
+                follow_symlinks=False,
+            )
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                raise SemanticIndexError(
+                    "semantic managed directory is invalid"
+                )
+        return names
+    except OSError as error:
+        raise SemanticIndexError("semantic managed directory is invalid") from error
+    finally:
+        os.close(descriptor)
+
+
+def _read_managed_content(path: Path, label: str) -> bytes:
+    try:
+        return read_managed_bytes(path)
+    except (OSError, UnicodeError) as error:
+        raise SemanticIndexError(f"{label} is invalid") from error
+
+
+def _decode_canonical_object(
+    content: bytes,
+    label: str,
+) -> dict[str, object]:
+    def reject_duplicates(pairs):
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate JSON key")
+            result[key] = value
+        return result
+
+    try:
+        value = json.loads(
+            content.decode("utf-8"),
+            object_pairs_hook=reject_duplicates,
+        )
+    except (UnicodeError, json.JSONDecodeError, ValueError, RecursionError) as error:
+        raise SemanticIndexError(f"{label} is invalid") from error
+    if (
+        type(value) is not dict
+        or content != _canonical_json(value).encode("utf-8")
+    ):
+        raise SemanticIndexError(f"{label} is invalid")
+    return value
+
+
+def _is_safe_identifier(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and _SAFE_IDENTIFIER.fullmatch(value) is not None
+    )
+
+
+def _is_positive_int(value: object) -> bool:
+    return type(value) is int and value > 0
+
+
+def _is_nonnegative_int(value: object) -> bool:
+    return type(value) is int and value >= 0
+
+
+def _is_safe_presentation_text(value: object) -> bool:
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        return _safe_output_text(value, "semantic text") == value
+    except SemanticIndexError:
+        return False
+
+
+def _is_safe_relative_hierarchy(value: object) -> bool:
+    if (
+        not isinstance(value, str)
+        or not value
+        or "\\" in value
+        or contains_unicode_control(value)
+        or contains_hidden_secret_shaped_public_value(value)
+        or mask_public_value(value) != value
+        or "://" in value
+        or value.startswith(("/", "~/"))
+        or ".portfolio-maker" in value.casefold()
+        or "portfolio.db" in value.casefold()
+    ):
+        return False
+    if value == ".":
+        return True
+    path = PurePosixPath(value)
+    return (
+        not path.is_absolute()
+        and str(path) == value
+        and all(part not in {"", ".", ".."} for part in path.parts)
+    )
+
+
+def _is_unique_text_list(
+    value: object,
+    *,
+    identifier: bool = False,
+    safe: bool = False,
+) -> bool:
+    if (
+        type(value) is not list
+        or len(value) != len(set(value))
+        or not all(isinstance(item, str) and item for item in value)
+    ):
+        return False
+    if identifier and not all(_is_safe_identifier(item) for item in value):
+        return False
+    if safe and not all(_is_safe_presentation_text(item) for item in value):
+        return False
+    return True
+
+
+def _require_exact_safe_text(value: str) -> None:
+    if _safe_output_text(value, "semantic text") != value:
+        raise SemanticIndexError("semantic final node is invalid")
 
 
 def _parse_input_manifest(manifest_text: str | None) -> dict[str, object]:

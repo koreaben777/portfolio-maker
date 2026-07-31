@@ -5,7 +5,7 @@ import json
 import re
 import stat
 import unicodedata
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Mapping, MutableMapping
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path, PurePosixPath
@@ -95,6 +95,23 @@ _UNIT_KEYS = {
     "template_sha256",
     "template_byte_count",
 }
+_CAPSULE_KEYS = {
+    "node_id",
+    "parent_node_id",
+    "kind",
+    "display_name",
+    "relative_hierarchy",
+    "content_fingerprint",
+    "analysis_status",
+    "semantic_disposition",
+    "roles",
+    "child_node_ids",
+    "signals",
+    "skip_reason",
+    "evidence_ids",
+    "coverage",
+}
+_SIGNAL_KEYS = {"signal_id", "kind", "text"}
 _INPUT_KEYS = {
     "version",
     "revision_id",
@@ -198,9 +215,9 @@ class _VerifiedState:
     analysis_node_count: int
     structural_node_count: int
     max_work_unit_bytes: int
-    capsules: dict[str, dict[str, object]]
+    capsules: Mapping[str, dict[str, object]]
     units: tuple[_VerifiedUnit, ...]
-    unit_by_id: dict[str, _VerifiedUnit]
+    unit_by_id: Mapping[str, _VerifiedUnit]
 
 
 @dataclass(frozen=True)
@@ -208,7 +225,7 @@ class _OutputBinding:
     output_sha256: str
     payload: dict[str, object]
     content: bytes
-    validated: ValidatedSemanticWorkOutput
+    validated: ValidatedSemanticWorkOutput | None
 
 
 @dataclass(frozen=True)
@@ -221,7 +238,7 @@ class _ReceiptBinding:
 
 @dataclass(frozen=True)
 class _LifecycleEvaluation:
-    valid_receipts: dict[str, _ReceiptBinding]
+    valid_receipts: Mapping[str, _ReceiptBinding]
     ready_unit_ids: tuple[str, ...]
     invalid_count: int
     undeclared_artifact_count: int
@@ -755,7 +772,10 @@ def _validated_analysis_results(
         receipt = evaluation.valid_receipts.get(unit.unit_id)
         if receipt is None:
             raise SemanticWorkError("semantic work lifecycle is incomplete")
-        for result in receipt.output.validated.node_results:
+        validated = receipt.output.validated
+        if validated is None:
+            raise SemanticWorkError("semantic work lifecycle is invalid")
+        for result in validated.node_results:
             if result.node_id in results:
                 raise SemanticWorkError("semantic final node coverage is invalid")
             results[result.node_id] = result
@@ -1152,6 +1172,65 @@ def _is_valid_coverage(value: object) -> bool:
     )
 
 
+def _validate_capsule_contract(
+    value: object,
+) -> dict[str, object]:
+    if type(value) is not dict or set(value) != _CAPSULE_KEYS:
+        raise SemanticWorkError("semantic work capsule input is invalid")
+    parent_node_id = value.get("parent_node_id")
+    content_fingerprint = value.get("content_fingerprint")
+    signals = value.get("signals")
+    skip_reason = value.get("skip_reason")
+    if (
+        not _is_safe_identifier(value.get("node_id"))
+        or parent_node_id is not None
+        and not _is_safe_identifier(parent_node_id)
+        or value.get("kind")
+        not in {kind.value for kind in SemanticNodeKind}
+        or not _is_safe_presentation_text(value.get("display_name"))
+        or not _is_safe_relative_hierarchy(
+            value.get("relative_hierarchy")
+        )
+        or content_fingerprint is not None
+        and (
+            type(content_fingerprint) is not str
+            or _FINGERPRINT.fullmatch(content_fingerprint) is None
+        )
+        or value.get("analysis_status")
+        not in {status.value for status in AnalysisStatus}
+        or value.get("semantic_disposition") not in _VALID_DISPOSITIONS
+        or not _is_unique_text_list(value.get("roles"))
+        or not _is_unique_identifier_list(value.get("child_node_ids"))
+        or type(signals) is not list
+        or not _is_unique_int_list(value.get("evidence_ids"))
+        or skip_reason is not None
+        and not _is_safe_identifier(skip_reason)
+        or not _is_valid_coverage(value.get("coverage"))
+    ):
+        raise SemanticWorkError("semantic work capsule input is invalid")
+    signal_ids: set[str] = set()
+    for signal in signals:
+        if (
+            type(signal) is not dict
+            or set(signal) != _SIGNAL_KEYS
+            or type(signal.get("signal_id")) is not str
+            or _FINGERPRINT.fullmatch(str(signal.get("signal_id"))) is None
+            or signal.get("signal_id") in signal_ids
+            or signal.get("kind") != "masked_text"
+            or type(signal.get("text")) is not str
+            or not signal.get("text")
+            or len(str(signal.get("text"))) > 8_192
+            or contains_hidden_secret_shaped_public_value(
+                str(signal.get("text"))
+            )
+            or mask_public_value(str(signal.get("text")))
+            != signal.get("text")
+        ):
+            raise SemanticWorkError("semantic work capsule input is invalid")
+        signal_ids.add(str(signal["signal_id"]))
+    return value
+
+
 def _inspect_final_directory(directory: Path) -> set[str]:
     try:
         entries = tuple(directory.iterdir())
@@ -1310,15 +1389,22 @@ def _load_verified_state(
             or type(chunk.get("capsules")) is not list
         ):
             raise SemanticWorkError("semantic work capsule input is invalid")
-        for capsule in chunk["capsules"]:
-            if type(capsule) is not dict:
-                raise SemanticWorkError("semantic work capsule input is invalid")
-            node_id = capsule.get("node_id")
-            if (
-                not _is_nonempty_text(node_id)
-                or node_id in capsules
-                or capsule.get("semantic_disposition") not in _VALID_DISPOSITIONS
-            ):
+        for raw_capsule in chunk["capsules"]:
+            try:
+                capsule = _validate_capsule_contract(raw_capsule)
+            except SemanticWorkError as error:
+                if (
+                    type(raw_capsule) is dict
+                    and raw_capsule.get("semantic_disposition")
+                    in _VALID_DISPOSITIONS
+                    - {SemanticDisposition.ANALYSIS_REQUIRED.value}
+                ):
+                    raise SemanticWorkError(
+                        "semantic private structural state is invalid"
+                    ) from error
+                raise
+            node_id = str(capsule["node_id"])
+            if node_id in capsules:
                 raise SemanticWorkError("semantic work capsule input is invalid")
             capsules[node_id] = capsule
         chunk_contents.append(content)
@@ -1357,98 +1443,26 @@ def _load_verified_state(
 def _validate_plan(
     plan: dict[str, object],
     manifest: dict[str, object],
-    capsules: dict[str, dict[str, object]],
+    capsules: Mapping[str, dict[str, object]],
 ) -> tuple[_VerifiedUnit, ...]:
-    if (
-        set(plan) != _PLAN_KEYS
-        or plan.get("version") != 2
-        or plan.get("revision_id") != manifest["revision_id"]
-        or plan.get("policy_hash") != manifest["policy_hash"]
-        or plan.get("protocol") != "codex-semantic-v2"
-        or plan.get("node_count") != manifest["node_count"]
-        or plan.get("analysis_target_count")
-        != manifest["analysis_target_count"]
-        or plan.get("structural_owner_count")
-        != manifest["structural_only_count"]
-        or plan.get("work_unit_count") != manifest["work_unit_count"]
-        or plan.get("max_work_unit_bytes") != MAX_WORK_UNIT_BYTES
-        or plan.get("reduce_fan_in") != REDUCE_FAN_IN
-        or not _is_sha256(plan.get("node_assignment_sha256"))
-        or type(plan.get("units")) is not list
-    ):
-        raise SemanticWorkError("semantic work plan is invalid")
-    verified_units: list[_VerifiedUnit] = []
-    known_unit_ids: set[str] = set()
     semantic_owners: dict[str, str] = {}
-    for index, raw_unit in enumerate(plan["units"], start=1):
-        if type(raw_unit) is not dict or set(raw_unit) != _UNIT_KEYS:
+
+    def record_owner(node_id: str, unit_id: str) -> None:
+        if node_id in semantic_owners:
             raise SemanticWorkError("semantic work plan is invalid")
-        unit_id = raw_unit.get("unit_id")
-        stage = raw_unit.get("stage")
-        target_node_ids = raw_unit.get("target_node_ids")
-        dependency_unit_ids = raw_unit.get("dependency_unit_ids")
-        if (
-            unit_id != f"unit-{index:06}"
-            or unit_id in known_unit_ids
-            or stage not in _VALID_STAGES
-            or type(target_node_ids) is not list
-            or type(dependency_unit_ids) is not list
-            or not all(_is_nonempty_text(value) for value in target_node_ids)
-            or not all(
-                _is_unit_id(value) and value in known_unit_ids
-                for value in dependency_unit_ids
-            )
-            or len(set(target_node_ids)) != len(target_node_ids)
-            or len(set(dependency_unit_ids)) != len(dependency_unit_ids)
-            or len(dependency_unit_ids) > REDUCE_FAN_IN
-            or not _is_sha256(raw_unit.get("template_sha256"))
-            or not _is_positive_int(raw_unit.get("template_byte_count"))
-        ):
-            raise SemanticWorkError("semantic work plan is invalid")
-        if stage == SemanticWorkStage.REDUCE.value:
-            if target_node_ids:
-                raise SemanticWorkError("semantic work plan is invalid")
-        elif len(target_node_ids) != 1:
-            raise SemanticWorkError("semantic work plan is invalid")
-        for node_id in target_node_ids:
+        semantic_owners[node_id] = unit_id
+
+    verified_units = _validate_plan_structure(
+        plan,
+        manifest,
+        owner_sink=record_owner,
+    )
+    for unit in verified_units:
+        for node_id in unit.target_node_ids:
             capsule = capsules.get(node_id)
-            if (
-                capsule is None
-                or capsule.get("semantic_disposition")
-                != SemanticDisposition.ANALYSIS_REQUIRED.value
-                or node_id in semantic_owners
-                or not _stage_matches_capsule(stage, capsule)
-            ):
+            if capsule is None:
                 raise SemanticWorkError("semantic work plan is invalid")
-            semantic_owners[node_id] = unit_id
-        template = {
-            "version": 2,
-            "revision_id": manifest["revision_id"],
-            "unit_id": unit_id,
-            "stage": stage,
-            "target_node_ids": target_node_ids,
-            "dependency_unit_ids": dependency_unit_ids,
-            "capsules": [capsules[node_id] for node_id in target_node_ids],
-        }
-        template_bytes = _canonical_json_bytes(template)
-        if (
-            len(template_bytes) != raw_unit["template_byte_count"]
-            or len(template_bytes) > MAX_WORK_UNIT_BYTES
-            or hashlib.sha256(template_bytes).hexdigest()
-            != raw_unit["template_sha256"]
-        ):
-            raise SemanticWorkError("semantic work plan is invalid")
-        verified_units.append(
-            _VerifiedUnit(
-                unit_id=unit_id,
-                stage=str(stage),
-                target_node_ids=tuple(target_node_ids),
-                dependency_unit_ids=tuple(dependency_unit_ids),
-                template_sha256=str(raw_unit["template_sha256"]),
-                template_byte_count=int(raw_unit["template_byte_count"]),
-            )
-        )
-        known_unit_ids.add(unit_id)
+            _validate_unit_capsule_binding(unit, capsule, manifest)
 
     semantic_nodes = {
         node_id
@@ -1492,7 +1506,118 @@ def _validate_plan(
         != plan["structural_owner_count"]
     ):
         raise SemanticWorkError("semantic work ownership is invalid")
+    return verified_units
+
+
+def _validate_plan_structure(
+    plan: dict[str, object],
+    manifest: dict[str, object],
+    *,
+    owner_sink: Callable[[str, str], None],
+) -> tuple[_VerifiedUnit, ...]:
+    if (
+        set(plan) != _PLAN_KEYS
+        or plan.get("version") != 2
+        or plan.get("revision_id") != manifest["revision_id"]
+        or plan.get("policy_hash") != manifest["policy_hash"]
+        or plan.get("protocol") != "codex-semantic-v2"
+        or plan.get("node_count") != manifest["node_count"]
+        or plan.get("analysis_target_count")
+        != manifest["analysis_target_count"]
+        or plan.get("structural_owner_count")
+        != manifest["structural_only_count"]
+        or plan.get("work_unit_count") != manifest["work_unit_count"]
+        or plan.get("max_work_unit_bytes") != MAX_WORK_UNIT_BYTES
+        or plan.get("reduce_fan_in") != REDUCE_FAN_IN
+        or not _is_sha256(plan.get("node_assignment_sha256"))
+        or type(plan.get("units")) is not list
+    ):
+        raise SemanticWorkError("semantic work plan is invalid")
+    verified_units: list[_VerifiedUnit] = []
+    known_unit_ids: set[str] = set()
+    for index, raw_unit in enumerate(plan["units"], start=1):
+        if type(raw_unit) is not dict or set(raw_unit) != _UNIT_KEYS:
+            raise SemanticWorkError("semantic work plan is invalid")
+        unit_id = raw_unit.get("unit_id")
+        stage = raw_unit.get("stage")
+        target_node_ids = raw_unit.get("target_node_ids")
+        dependency_unit_ids = raw_unit.get("dependency_unit_ids")
+        if (
+            unit_id != f"unit-{index:06}"
+            or unit_id in known_unit_ids
+            or stage not in _VALID_STAGES
+            or type(target_node_ids) is not list
+            or type(dependency_unit_ids) is not list
+            or not all(_is_nonempty_text(value) for value in target_node_ids)
+            or not all(
+                _is_unit_id(value) and value in known_unit_ids
+                for value in dependency_unit_ids
+            )
+            or len(set(target_node_ids)) != len(target_node_ids)
+            or len(set(dependency_unit_ids)) != len(dependency_unit_ids)
+            or len(dependency_unit_ids) > REDUCE_FAN_IN
+            or not _is_sha256(raw_unit.get("template_sha256"))
+            or not _is_positive_int(raw_unit.get("template_byte_count"))
+        ):
+            raise SemanticWorkError("semantic work plan is invalid")
+        if stage == SemanticWorkStage.REDUCE.value:
+            if target_node_ids:
+                raise SemanticWorkError("semantic work plan is invalid")
+        elif len(target_node_ids) != 1:
+            raise SemanticWorkError("semantic work plan is invalid")
+        for node_id in target_node_ids:
+            owner_sink(str(node_id), str(unit_id))
+        verified_unit = _VerifiedUnit(
+            unit_id=unit_id,
+            stage=str(stage),
+            target_node_ids=tuple(target_node_ids),
+            dependency_unit_ids=tuple(dependency_unit_ids),
+            template_sha256=str(raw_unit["template_sha256"]),
+            template_byte_count=int(raw_unit["template_byte_count"]),
+        )
+        if not verified_unit.target_node_ids:
+            _validate_unit_template(verified_unit, (), manifest)
+        verified_units.append(verified_unit)
+        known_unit_ids.add(unit_id)
     return tuple(verified_units)
+
+
+def _validate_unit_capsule_binding(
+    unit: _VerifiedUnit,
+    capsule: dict[str, object],
+    manifest: dict[str, object],
+) -> None:
+    if (
+        capsule.get("semantic_disposition")
+        != SemanticDisposition.ANALYSIS_REQUIRED.value
+        or not _stage_matches_capsule(unit.stage, capsule)
+    ):
+        raise SemanticWorkError("semantic work plan is invalid")
+    _validate_unit_template(unit, (capsule,), manifest)
+
+
+def _validate_unit_template(
+    unit: _VerifiedUnit,
+    capsules: tuple[dict[str, object], ...],
+    manifest: dict[str, object],
+) -> None:
+    template = {
+        "version": 2,
+        "revision_id": manifest["revision_id"],
+        "unit_id": unit.unit_id,
+        "stage": unit.stage,
+        "target_node_ids": list(unit.target_node_ids),
+        "dependency_unit_ids": list(unit.dependency_unit_ids),
+        "capsules": list(capsules),
+    }
+    template_bytes = _canonical_json_bytes(template)
+    if (
+        len(template_bytes) != unit.template_byte_count
+        or len(template_bytes) > MAX_WORK_UNIT_BYTES
+        or hashlib.sha256(template_bytes).hexdigest()
+        != unit.template_sha256
+    ):
+        raise SemanticWorkError("semantic work plan is invalid")
 
 
 def _validate_staging_revision(
@@ -1518,7 +1643,10 @@ def _validate_staging_revision(
         raise SemanticWorkError("semantic work revision is not staging")
 
 
-def _evaluate_lifecycle(state: _VerifiedState) -> _LifecycleEvaluation:
+def _evaluate_lifecycle(
+    state: _VerifiedState,
+    receipt_store: MutableMapping[str, _ReceiptBinding] | None = None,
+) -> _LifecycleEvaluation:
     input_names = _directory_entry_names(state.paths.semantic_work_input_dir)
     output_names = _directory_entry_names(state.paths.semantic_work_output_dir)
     receipt_names = _directory_entry_names(state.paths.semantic_work_receipts_dir)
@@ -1527,7 +1655,9 @@ def _evaluate_lifecycle(state: _VerifiedState) -> _LifecycleEvaluation:
         len(names - expected_names)
         for names in (input_names, output_names, receipt_names)
     )
-    valid_receipts: dict[str, _ReceiptBinding] = {}
+    valid_receipts: MutableMapping[str, _ReceiptBinding] = (
+        {} if receipt_store is None else receipt_store
+    )
     invalid_units: set[str] = set()
     ready_unit_ids: list[str] = []
     for unit in state.units:
@@ -1587,7 +1717,7 @@ def _evaluate_lifecycle(state: _VerifiedState) -> _LifecycleEvaluation:
 def _materialized_input(
     state: _VerifiedState,
     unit: _VerifiedUnit,
-    valid_receipts: dict[str, _ReceiptBinding],
+    valid_receipts: Mapping[str, _ReceiptBinding],
 ) -> dict[str, object]:
     dependencies = [
         {
@@ -1658,7 +1788,7 @@ def _dependency_coverage(
 def _read_expected_input(
     state: _VerifiedState,
     unit: _VerifiedUnit,
-    valid_receipts: dict[str, _ReceiptBinding],
+    valid_receipts: Mapping[str, _ReceiptBinding],
 ) -> tuple[dict[str, object], bytes]:
     expected = _materialized_input(state, unit, valid_receipts)
     expected_content = _canonical_json_bytes(expected)
@@ -1681,7 +1811,7 @@ def _read_valid_output(
     state: _VerifiedState,
     unit: _VerifiedUnit,
     input_payload: dict[str, object],
-    valid_receipts: dict[str, _ReceiptBinding],
+    valid_receipts: Mapping[str, _ReceiptBinding],
 ) -> _OutputBinding:
     content = _read_required(
         _unit_path(state.paths.semantic_work_output_dir, unit.unit_id),
@@ -1730,7 +1860,7 @@ def _read_valid_output(
 def _read_valid_receipt(
     state: _VerifiedState,
     unit: _VerifiedUnit,
-    valid_receipts: dict[str, _ReceiptBinding],
+    valid_receipts: Mapping[str, _ReceiptBinding],
 ) -> _ReceiptBinding:
     input_payload, _ = _read_expected_input(state, unit, valid_receipts)
     output = _read_valid_output(
@@ -1776,7 +1906,7 @@ def _receipt_payload(
     unit: _VerifiedUnit,
     input_payload: dict[str, object],
     output: _OutputBinding,
-    valid_receipts: dict[str, _ReceiptBinding],
+    valid_receipts: Mapping[str, _ReceiptBinding],
 ) -> dict[str, object]:
     payload: dict[str, object] = {
         "version": 2,

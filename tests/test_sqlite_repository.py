@@ -20,8 +20,12 @@ from portfolio_maker.domain.history_models import (
 from portfolio_maker.domain.models import GitHubActivity, Source, SourceStatus, SourceType
 from portfolio_maker.domain.semantic_models import (
     AnalysisStatus,
+    SemanticCoverage,
     SemanticEdge,
+    SemanticFacts,
+    SemanticImportReceipt,
     SemanticNode,
+    SemanticNodeDisposition,
     SemanticNodeKind,
 )
 from portfolio_maker.domain.vision_models import (
@@ -61,6 +65,9 @@ def test_workspace_paths_create_expected_directories(workspace):
     assert paths.semantic_work_output_dir.is_dir()
     assert paths.semantic_work_receipts_dir.is_dir()
     assert paths.semantic_final_dir.is_dir()
+    assert paths.semantic_activation_receipt_path == (
+        paths.semantic_index_dir / "activation-receipt.json"
+    )
     assert not paths.db_path.exists()
     assert not paths.master_profile_json_path.exists()
     assert not paths.master_profile_md_path.exists()
@@ -93,6 +100,90 @@ def test_initialize_creates_history_and_vision_tables(workspace) -> None:
         "history_cleanup_plans",
         "history_cleanup_journal_entries",
     } <= repository.table_names()
+
+
+def test_schema_adds_protocol_and_import_receipts(workspace: Path) -> None:
+    repository = SQLiteRepository(WorkspacePaths.from_root(workspace).db_path)
+
+    repository.initialize()
+
+    assert {
+        "semantic_disposition",
+        "semantic_facts_json",
+        "analysis_protocol",
+        "skip_reason",
+        "child_node_ids_json",
+        "coverage_json",
+    } <= column_names(repository, "semantic_nodes")
+    assert "semantic_import_receipts" in repository.table_names()
+
+
+def test_legacy_active_semantic_revision_gains_lossless_defaults_without_rewrite(
+    workspace: Path,
+) -> None:
+    paths = WorkspacePaths.from_root(workspace)
+    paths.ensure()
+    with sqlite3.connect(paths.db_path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE semantic_index_revisions (
+                id TEXT PRIMARY KEY,
+                source_id TEXT NOT NULL,
+                policy_hash TEXT NOT NULL,
+                analyzer_version TEXT NOT NULL,
+                status TEXT NOT NULL,
+                started_at TEXT,
+                completed_at TEXT
+            );
+            CREATE TABLE semantic_nodes (
+                revision_id TEXT NOT NULL,
+                node_id TEXT NOT NULL,
+                source_id TEXT NOT NULL,
+                node_kind TEXT NOT NULL,
+                parent_node_id TEXT,
+                display_name TEXT NOT NULL,
+                relative_hierarchy TEXT NOT NULL,
+                content_fingerprint TEXT,
+                semantic_summary TEXT NOT NULL DEFAULT '',
+                semantic_roles_json TEXT NOT NULL DEFAULT '[]',
+                topics_json TEXT NOT NULL DEFAULT '[]',
+                evidence_ids_json TEXT NOT NULL DEFAULT '[]',
+                analysis_status TEXT NOT NULL,
+                analyzer_version TEXT NOT NULL,
+                PRIMARY KEY (revision_id, node_id)
+            );
+            INSERT INTO semantic_index_revisions (
+                id, source_id, policy_hash, analyzer_version, status
+            ) VALUES (
+                'legacy-active', 'legacy-source',
+                'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                'semantic-input-v1', 'active'
+            );
+            INSERT INTO semantic_nodes (
+                revision_id, node_id, source_id, node_kind, display_name,
+                relative_hierarchy, semantic_summary, analysis_status,
+                analyzer_version
+            ) VALUES (
+                'legacy-active', 'legacy-node', 'legacy-source', 'file',
+                'README.md', 'README.md', 'Legacy summary', 'complete',
+                'semantic-input-v1'
+            );
+            """
+        )
+
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+
+    active = repository.get_active_semantic_revision("legacy-source")
+    assert active is not None
+    assert active["id"] == "legacy-active"
+    node = repository.list_semantic_nodes("legacy-active")[0]
+    assert node["semantic_summary"] == "Legacy summary"
+    assert node["analysis_protocol"] == "legacy-v1"
+    assert node["semantic_disposition"] == "structural_only"
+    assert node["semantic_facts"] == {}
+    assert node["child_node_ids"] == []
+    assert node["coverage"] == {}
 
 
 def test_legacy_database_adds_history_vision_schema_without_rewriting_rows(workspace) -> None:
@@ -1889,6 +1980,618 @@ def test_failed_staging_semantic_revision_keeps_previous_active(workspace) -> No
     assert active["id"] == "rev-1"
 
 
+def _v2_semantic_node(
+    *,
+    node_id: str,
+    parent_node_id: str | None,
+    child_node_ids: tuple[str, ...],
+    relative_hierarchy: str,
+) -> SemanticNode:
+    analyzed = relative_hierarchy != "."
+    return SemanticNode(
+        node_id=node_id,
+        source_id="source-v2",
+        node_kind=(
+            SemanticNodeKind.FILE if analyzed else SemanticNodeKind.SOURCE
+        ),
+        parent_node_id=parent_node_id,
+        display_name="README.md" if analyzed else "approved-root",
+        relative_hierarchy=relative_hierarchy,
+        content_fingerprint="sha256:" + "c" * 64 if analyzed else None,
+        semantic_summary=(
+            "검증된 근거를 사용해 포트폴리오 기능을 설명한다" if analyzed else ""
+        ),
+        semantic_roles=("documentation",) if analyzed else (),
+        topics=("portfolio",) if analyzed else (),
+        evidence_ids=(1,) if analyzed else (),
+        analysis_status=AnalysisStatus.COMPLETE,
+        analyzer_version="semantic-input-v2",
+        updated_at="",
+        semantic_disposition=(
+            SemanticNodeDisposition.ANALYZED
+            if analyzed
+            else SemanticNodeDisposition.STRUCTURAL_ONLY
+        ),
+        semantic_facts=SemanticFacts(
+            purpose_signals=(
+                ("승인된 근거를 사용자 설명에 연결한다",) if analyzed else ()
+            ),
+            grounding_signal_ids=(
+                ("sha256:" + "d" * 64,) if analyzed else ()
+            ),
+        ),
+        analysis_protocol="codex-semantic-v2",
+        skip_reason=None,
+        child_node_ids=child_node_ids,
+        coverage=SemanticCoverage(
+            node_count=1 + len(child_node_ids),
+            content_node_count=1 if analyzed else len(child_node_ids),
+            structural_only_count=0 if analyzed else 1,
+            failed_count=0,
+            node_ids_sha256="e" * 64,
+        ),
+    )
+
+
+def _import_v2_chunk(
+    repository: SQLiteRepository,
+    revision_id: str,
+    chunk_index: int,
+    nodes: tuple[SemanticNode, ...],
+    locators: dict[str, tuple[str, int | None, int | None]],
+    edges: tuple[SemanticEdge, ...],
+) -> SemanticImportReceipt:
+    node_ids_sha256 = sha256(
+        json.dumps(
+            [node.node_id for node in nodes],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    receipt = SemanticImportReceipt(
+        revision_id=revision_id,
+        chunk_index=chunk_index,
+        chunk_sha256=f"{chunk_index:064x}",
+        locator_chunk_sha256=f"{chunk_index + 10:064x}",
+        node_ids_sha256=node_ids_sha256,
+        node_count=len(nodes),
+    )
+    repository.import_semantic_revision_chunk(
+        revision_id=receipt.revision_id,
+        chunk_index=receipt.chunk_index,
+        chunk_sha256=receipt.chunk_sha256,
+        locator_chunk_sha256=receipt.locator_chunk_sha256,
+        node_ids_sha256=receipt.node_ids_sha256,
+        nodes=nodes,
+        locators=locators,
+        edges=edges,
+    )
+    return receipt
+
+
+def test_semantic_chunk_import_is_exactly_idempotent_and_conflicts_roll_back(
+    workspace: Path,
+) -> None:
+    repository = SQLiteRepository(WorkspacePaths.from_root(workspace).db_path)
+    repository.initialize()
+    repository.create_semantic_revision(
+        "revision-v2",
+        "source-v2",
+        "a" * 64,
+        "semantic-input-v2",
+    )
+    root = _v2_semantic_node(
+        node_id="node-root",
+        parent_node_id=None,
+        child_node_ids=("node-readme",),
+        relative_hierarchy=".",
+    )
+    readme = _v2_semantic_node(
+        node_id="node-readme",
+        parent_node_id="node-root",
+        child_node_ids=(),
+        relative_hierarchy="README.md",
+    )
+    receipt = _import_v2_chunk(
+        repository,
+        "revision-v2",
+        1,
+        (root, readme),
+        {
+            "node-root": ("/synthetic/approved-root", 1, 10),
+            "node-readme": ("/synthetic/approved-root/README.md", 1, 11),
+        },
+        (
+            SemanticEdge(
+                "revision-v2",
+                "node-root",
+                "contains",
+                "node-readme",
+            ),
+        ),
+    )
+
+    _import_v2_chunk(
+        repository,
+        "revision-v2",
+        1,
+        (root, readme),
+        {
+            "node-root": ("/synthetic/approved-root", 1, 10),
+            "node-readme": ("/synthetic/approved-root/README.md", 1, 11),
+        },
+        (
+            SemanticEdge(
+                "revision-v2",
+                "node-root",
+                "contains",
+                "node-readme",
+            ),
+        ),
+    )
+    with pytest.raises(RepositoryError, match="semantic import receipt"):
+        repository.import_semantic_revision_chunk(
+            revision_id="revision-v2",
+            chunk_index=1,
+            chunk_sha256="f" * 64,
+            locator_chunk_sha256=receipt.locator_chunk_sha256,
+            node_ids_sha256=receipt.node_ids_sha256,
+            nodes=(root, readme),
+            locators={
+                "node-root": ("/synthetic/approved-root", 1, 10),
+                "node-readme": (
+                    "/synthetic/approved-root/README.md",
+                    1,
+                    11,
+                ),
+            },
+            edges=(
+                SemanticEdge(
+                    "revision-v2",
+                    "node-root",
+                    "contains",
+                    "node-readme",
+                ),
+            ),
+        )
+
+    assert repository.list_semantic_import_receipts("revision-v2") == (receipt,)
+    assert len(repository.list_semantic_nodes("revision-v2")) == 2
+
+
+def test_semantic_chunk_import_rejects_duplicate_cross_chunk_ownership(
+    workspace: Path,
+) -> None:
+    repository = SQLiteRepository(WorkspacePaths.from_root(workspace).db_path)
+    repository.initialize()
+    repository.create_semantic_revision(
+        "revision-v2",
+        "source-v2",
+        "a" * 64,
+        "semantic-input-v2",
+    )
+    root = _v2_semantic_node(
+        node_id="node-root",
+        parent_node_id=None,
+        child_node_ids=(),
+        relative_hierarchy=".",
+    )
+    first_receipt = _import_v2_chunk(
+        repository,
+        "revision-v2",
+        1,
+        (root,),
+        {"node-root": ("/synthetic/approved-root", 1, 10)},
+        (),
+    )
+
+    with pytest.raises(RepositoryError):
+        _import_v2_chunk(
+            repository,
+            "revision-v2",
+            2,
+            (root,),
+            {"node-root": ("/synthetic/replaced-root", 2, 20)},
+            (),
+        )
+
+    assert repository.list_semantic_import_receipts("revision-v2") == (
+        first_receipt,
+    )
+    assert tuple(
+        node["node_id"]
+        for node in repository.list_semantic_nodes("revision-v2")
+    ) == ("node-root",)
+
+
+@pytest.mark.parametrize(
+    "locator",
+    (
+        ("/synthetic/approved-root", -1, 10),
+        ("/synthetic/approved-root", 1, -1),
+    ),
+)
+def test_semantic_chunk_import_rejects_invalid_locator_identity(
+    workspace: Path,
+    locator: tuple[str, int, int],
+) -> None:
+    repository = SQLiteRepository(WorkspacePaths.from_root(workspace).db_path)
+    repository.initialize()
+    repository.create_semantic_revision(
+        "revision-v2",
+        "source-v2",
+        "a" * 64,
+        "semantic-input-v2",
+    )
+    root = _v2_semantic_node(
+        node_id="node-root",
+        parent_node_id=None,
+        child_node_ids=(),
+        relative_hierarchy=".",
+    )
+
+    with pytest.raises(RepositoryError, match="locator"):
+        _import_v2_chunk(
+            repository,
+            "revision-v2",
+            1,
+            (root,),
+            {"node-root": locator},
+            (),
+        )
+
+    assert repository.list_semantic_import_receipts("revision-v2") == ()
+    assert repository.list_semantic_nodes("revision-v2") == []
+
+
+def test_semantic_activation_requires_exact_receipts_and_preserves_previous_active(
+    workspace: Path,
+) -> None:
+    repository = SQLiteRepository(WorkspacePaths.from_root(workspace).db_path)
+    repository.initialize()
+    repository.create_semantic_revision(
+        "revision-v1",
+        "source-v2",
+        "a" * 64,
+        "semantic-input-v1",
+    )
+    repository.activate_semantic_revision("revision-v1")
+    repository.create_semantic_revision(
+        "revision-v2",
+        "source-v2",
+        "a" * 64,
+        "semantic-input-v2",
+    )
+    root = _v2_semantic_node(
+        node_id="node-root",
+        parent_node_id=None,
+        child_node_ids=("node-readme",),
+        relative_hierarchy=".",
+    )
+    readme = _v2_semantic_node(
+        node_id="node-readme",
+        parent_node_id="node-root",
+        child_node_ids=(),
+        relative_hierarchy="README.md",
+    )
+    receipt = _import_v2_chunk(
+        repository,
+        "revision-v2",
+        1,
+        (root, readme),
+        {
+            "node-root": ("/synthetic/approved-root", 1, 10),
+            "node-readme": ("/synthetic/approved-root/README.md", 1, 11),
+        },
+        (
+            SemanticEdge(
+                "revision-v2",
+                "node-root",
+                "contains",
+                "node-readme",
+            ),
+        ),
+    )
+
+    with pytest.raises(RepositoryError, match="semantic import"):
+        repository.activate_imported_semantic_revision(
+            revision_id="revision-v2",
+            expected_receipts=(),
+            expected_node_count=2,
+            expected_edge_count=1,
+            source_id="source-v2",
+            policy_hash="a" * 64,
+            analyzer_version="semantic-input-v2",
+        )
+    assert repository.get_active_semantic_revision("source-v2")["id"] == "revision-v1"
+
+    repository.activate_imported_semantic_revision(
+        revision_id="revision-v2",
+        expected_receipts=(receipt,),
+        expected_node_count=2,
+        expected_edge_count=1,
+        source_id="source-v2",
+        policy_hash="a" * 64,
+        analyzer_version="semantic-input-v2",
+    )
+    repository.activate_imported_semantic_revision(
+        revision_id="revision-v2",
+        expected_receipts=(receipt,),
+        expected_node_count=2,
+        expected_edge_count=1,
+        source_id="source-v2",
+        policy_hash="a" * 64,
+        analyzer_version="semantic-input-v2",
+    )
+
+    assert repository.get_active_semantic_revision("source-v2")["id"] == "revision-v2"
+
+
+def test_semantic_activation_rejects_parent_child_binding_drift(
+    workspace: Path,
+) -> None:
+    repository = SQLiteRepository(WorkspacePaths.from_root(workspace).db_path)
+    repository.initialize()
+    repository.create_semantic_revision(
+        "revision-v1",
+        "source-v2",
+        "a" * 64,
+        "semantic-input-v1",
+    )
+    repository.activate_semantic_revision("revision-v1")
+    repository.create_semantic_revision(
+        "revision-v2",
+        "source-v2",
+        "a" * 64,
+        "semantic-input-v2",
+    )
+    root = _v2_semantic_node(
+        node_id="node-root",
+        parent_node_id=None,
+        child_node_ids=("node-readme",),
+        relative_hierarchy=".",
+    )
+    readme = _v2_semantic_node(
+        node_id="node-readme",
+        parent_node_id="node-root",
+        child_node_ids=(),
+        relative_hierarchy="README.md",
+    )
+    first_receipt = _import_v2_chunk(
+        repository,
+        "revision-v2",
+        1,
+        (root,),
+        {"node-root": ("/synthetic/approved-root", 1, 10)},
+        (),
+    )
+    second_receipt = _import_v2_chunk(
+        repository,
+        "revision-v2",
+        2,
+        (readme,),
+        {"node-readme": ("/synthetic/approved-root/README.md", 1, 11)},
+        (
+            SemanticEdge(
+                "revision-v2",
+                "node-root",
+                "contains",
+                "node-readme",
+            ),
+        ),
+    )
+    with repository._connection() as connection:
+        connection.execute(
+            """
+            UPDATE semantic_nodes
+            SET child_node_ids_json = '[]'
+            WHERE revision_id = 'revision-v2' AND node_id = 'node-root'
+            """
+        )
+
+    with pytest.raises(RepositoryError, match="semantic import activation"):
+        repository.activate_imported_semantic_revision(
+            revision_id="revision-v2",
+            expected_receipts=(first_receipt, second_receipt),
+            expected_node_count=2,
+            expected_edge_count=1,
+            source_id="source-v2",
+            policy_hash="a" * 64,
+            analyzer_version="semantic-input-v2",
+        )
+
+    assert repository.get_active_semantic_revision("source-v2")["id"] == "revision-v1"
+    assert repository.list_semantic_import_receipts("revision-v2") == (
+        first_receipt,
+        second_receipt,
+    )
+
+
+def test_semantic_activation_rejects_disconnected_self_cycle(
+    workspace: Path,
+) -> None:
+    repository = SQLiteRepository(WorkspacePaths.from_root(workspace).db_path)
+    repository.initialize()
+    repository.create_semantic_revision(
+        "revision-v1",
+        "source-v2",
+        "a" * 64,
+        "semantic-input-v1",
+    )
+    repository.activate_semantic_revision("revision-v1")
+    repository.create_semantic_revision(
+        "revision-v2",
+        "source-v2",
+        "a" * 64,
+        "semantic-input-v2",
+    )
+    root = _v2_semantic_node(
+        node_id="node-root",
+        parent_node_id=None,
+        child_node_ids=(),
+        relative_hierarchy=".",
+    )
+    cycle = _v2_semantic_node(
+        node_id="node-cycle",
+        parent_node_id="node-cycle",
+        child_node_ids=("node-cycle",),
+        relative_hierarchy="cycle.md",
+    )
+    receipt = _import_v2_chunk(
+        repository,
+        "revision-v2",
+        1,
+        (root, cycle),
+        {
+            "node-root": ("/synthetic/approved-root", 1, 10),
+            "node-cycle": ("/synthetic/approved-root/cycle.md", 1, 11),
+        },
+        (
+            SemanticEdge(
+                "revision-v2",
+                "node-cycle",
+                "contains",
+                "node-cycle",
+            ),
+        ),
+    )
+
+    with pytest.raises(RepositoryError, match="activation"):
+        repository.activate_imported_semantic_revision(
+            revision_id="revision-v2",
+            expected_receipts=(receipt,),
+            expected_node_count=2,
+            expected_edge_count=1,
+            source_id="source-v2",
+            policy_hash="a" * 64,
+            analyzer_version="semantic-input-v2",
+        )
+
+    assert repository.get_active_semantic_revision("source-v2")["id"] == "revision-v1"
+    with repository._read_connection() as connection:
+        status = connection.execute(
+            "SELECT status FROM semantic_index_revisions WHERE id = 'revision-v2'"
+        ).fetchone()["status"]
+    assert status == "staging"
+
+
+def test_semantic_active_replay_rejects_multiple_active_revisions(
+    workspace: Path,
+) -> None:
+    repository = SQLiteRepository(WorkspacePaths.from_root(workspace).db_path)
+    repository.initialize()
+    repository.create_semantic_revision(
+        "revision-v1",
+        "source-v2",
+        "a" * 64,
+        "semantic-input-v1",
+    )
+    repository.activate_semantic_revision("revision-v1")
+    repository.create_semantic_revision(
+        "revision-v2",
+        "source-v2",
+        "a" * 64,
+        "semantic-input-v2",
+    )
+    root = _v2_semantic_node(
+        node_id="node-root",
+        parent_node_id=None,
+        child_node_ids=(),
+        relative_hierarchy=".",
+    )
+    receipt = _import_v2_chunk(
+        repository,
+        "revision-v2",
+        1,
+        (root,),
+        {"node-root": ("/synthetic/approved-root", 1, 10)},
+        (),
+    )
+    repository.activate_imported_semantic_revision(
+        revision_id="revision-v2",
+        expected_receipts=(receipt,),
+        expected_node_count=1,
+        expected_edge_count=0,
+        source_id="source-v2",
+        policy_hash="a" * 64,
+        analyzer_version="semantic-input-v2",
+    )
+    with repository._connection() as connection:
+        connection.execute(
+            """
+            UPDATE semantic_index_revisions
+            SET status = 'active'
+            WHERE id = 'revision-v1'
+            """
+        )
+
+    with pytest.raises(RepositoryError, match="activation"):
+        repository.activate_imported_semantic_revision(
+            revision_id="revision-v2",
+            expected_receipts=(receipt,),
+            expected_node_count=1,
+            expected_edge_count=0,
+            source_id="source-v2",
+            policy_hash="a" * 64,
+            analyzer_version="semantic-input-v2",
+        )
+
+
+def test_sqlite_repository_reopens_existing_database_after_staged_import(
+    workspace: Path,
+) -> None:
+    paths = WorkspacePaths.from_root(workspace)
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    repository.create_semantic_revision(
+        "revision-v2",
+        "source-v2",
+        "a" * 64,
+        "semantic-input-v2",
+    )
+    root = _v2_semantic_node(
+        node_id="node-root",
+        parent_node_id=None,
+        child_node_ids=("node-readme",),
+        relative_hierarchy=".",
+    )
+    readme = _v2_semantic_node(
+        node_id="node-readme",
+        parent_node_id="node-root",
+        child_node_ids=(),
+        relative_hierarchy="README.md",
+    )
+    _import_v2_chunk(
+        repository,
+        "revision-v2",
+        1,
+        (root,),
+        {"node-root": ("/synthetic/approved-root", 1, 10)},
+        (),
+    )
+    _import_v2_chunk(
+        repository,
+        "revision-v2",
+        2,
+        (readme,),
+        {"node-readme": ("/synthetic/approved-root/README.md", 1, 11)},
+        (
+            SemanticEdge(
+                "revision-v2",
+                "node-root",
+                "contains",
+                "node-readme",
+            ),
+        ),
+    )
+
+    reopened = SQLiteRepository(paths.db_path)
+    reopened.initialize()
+
+    assert len(reopened.list_semantic_import_receipts("revision-v2")) == 2
+    assert len(reopened.list_semantic_nodes("revision-v2")) == 2
+
+
 def test_semantic_revision_graph_persists_locator_separately_from_listed_nodes(workspace) -> None:
     repository = SQLiteRepository(WorkspacePaths.from_root(workspace).db_path)
     repository.initialize()
@@ -1932,6 +2635,12 @@ def test_semantic_revision_graph_persists_locator_separately_from_listed_nodes(w
             "evidence_ids": [1],
             "analysis_status": "complete",
             "analyzer_version": "semantic-v1",
+            "semantic_disposition": "structural_only",
+            "semantic_facts": {},
+            "analysis_protocol": "legacy-v1",
+            "skip_reason": None,
+            "child_node_ids": [],
+            "coverage": {},
         }
     ]
 

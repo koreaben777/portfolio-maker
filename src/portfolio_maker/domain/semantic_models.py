@@ -28,6 +28,41 @@ class RevisionStatus(StrEnum):
     FAILED = "failed"
 
 
+class SemanticNodeDisposition(StrEnum):
+    ANALYZED = "analyzed"
+    STRUCTURAL_ONLY = "structural_only"
+    UNSUPPORTED = "unsupported"
+    UNREADABLE = "unreadable"
+
+
+@dataclass(frozen=True)
+class SemanticFacts:
+    purpose_signals: tuple[str, ...] = ()
+    parent_context_signals: tuple[str, ...] = ()
+    independence_signals: tuple[str, ...] = ()
+    triviality_signals: tuple[str, ...] = ()
+    grounding_signal_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class SemanticCoverage:
+    node_count: int = 0
+    content_node_count: int = 0
+    structural_only_count: int = 0
+    failed_count: int = 0
+    node_ids_sha256: str = ""
+
+
+@dataclass(frozen=True)
+class SemanticImportReceipt:
+    revision_id: str
+    chunk_index: int
+    chunk_sha256: str
+    locator_chunk_sha256: str
+    node_ids_sha256: str
+    node_count: int
+
+
 def _stable_hash(namespace: str, *parts: str) -> str:
     canonical = "\0".join((namespace, *parts)).encode("utf-8")
     return f"sha256:{hashlib.sha256(canonical).hexdigest()}"
@@ -61,6 +96,14 @@ class SemanticNode:
     analysis_status: AnalysisStatus
     analyzer_version: str
     updated_at: str
+    semantic_disposition: SemanticNodeDisposition = (
+        SemanticNodeDisposition.STRUCTURAL_ONLY
+    )
+    semantic_facts: SemanticFacts = SemanticFacts()
+    analysis_protocol: str = "legacy-v1"
+    skip_reason: str | None = None
+    child_node_ids: tuple[str, ...] = ()
+    coverage: SemanticCoverage = SemanticCoverage()
 
 
 @dataclass(frozen=True)
