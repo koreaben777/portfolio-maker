@@ -3,11 +3,16 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import stat
+import unicodedata
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from portfolio_maker.application.models import (
+    FinalizeSemanticIndexRequest,
+    FinalizeSemanticIndexResult,
     NextSemanticWorkRequest,
     NextSemanticWorkResult,
     SemanticIndexStatusRequest,
@@ -17,9 +22,12 @@ from portfolio_maker.application.models import (
 )
 from portfolio_maker.application.semantic_quality import (
     SemanticQualityError,
+    ValidatedSemanticNodeResult,
+    ValidatedSemanticWorkOutput,
     validate_semantic_work_output,
 )
 from portfolio_maker.domain.history_models import utc_now
+from portfolio_maker.domain.semantic_models import AnalysisStatus, SemanticNodeKind
 from portfolio_maker.domain.semantic_work import (
     SemanticDisposition,
     SemanticWorkPlan,
@@ -27,8 +35,14 @@ from portfolio_maker.domain.semantic_work import (
     SemanticWorkUnit,
 )
 from portfolio_maker.infrastructure.managed_files import (
+    ensure_managed_directory,
     read_managed_bytes,
+    remove_managed_file,
     write_managed_text,
+)
+from portfolio_maker.infrastructure.policy import (
+    contains_hidden_secret_shaped_public_value,
+    mask_public_value,
 )
 from portfolio_maker.infrastructure.sqlite_repository import SQLiteRepository
 from portfolio_maker.workspace import WorkspacePaths
@@ -40,7 +54,10 @@ STRUCTURAL_CHUNK_SIZE = 1_000
 _VALID_DISPOSITIONS = {disposition.value for disposition in SemanticDisposition}
 _VALID_STAGES = {stage.value for stage in SemanticWorkStage}
 _SHA256 = re.compile(r"[0-9a-f]{64}")
+_FINGERPRINT = re.compile(r"sha256:[0-9a-f]{64}")
+_SAFE_IDENTIFIER = re.compile(r"[A-Za-z0-9:._-]+")
 _UNIT_ID = re.compile(r"unit-[0-9]{6,}")
+_FINAL_CHUNK_NAME = re.compile(r"chunk-([0-9]{4,})\.json")
 _MANIFEST_KEYS = {
     "version",
     "protocol",
@@ -111,6 +128,47 @@ _RECEIPT_KEYS = {
     "validated_at",
     "receipt_sha256",
 }
+_STRUCTURAL_RECORD_KEYS = {
+    "node_id",
+    "source_id",
+    "parent_node_id",
+    "kind",
+    "display_name",
+    "relative_hierarchy",
+    "content_fingerprint",
+    "analysis_status",
+    "semantic_disposition",
+    "roles",
+    "child_node_ids",
+    "skip_reason",
+    "evidence_ids",
+    "coverage",
+}
+_COVERAGE_KEYS = {
+    "node_count",
+    "content_node_count",
+    "structural_only_count",
+    "failed_count",
+    "node_ids_sha256",
+}
+_FINAL_MANIFEST_KEYS = {
+    "version",
+    "protocol",
+    "revision_id",
+    "source_id",
+    "policy_hash",
+    "analyzer_version",
+    "work_plan_sha256",
+    "node_assignment_sha256",
+    "receipt_file_sha256s",
+    "chunk_sha256s",
+    "chunk_node_counts",
+    "chunk_count",
+    "node_count",
+    "analysis_node_count",
+    "structural_node_count",
+    "node_ids_sha256",
+}
 
 
 class SemanticWorkError(ValueError):
@@ -131,7 +189,14 @@ class _VerifiedUnit:
 class _VerifiedState:
     paths: WorkspacePaths
     revision_id: str
+    source_id: str
+    policy_hash: str
+    analyzer_version: str
+    work_plan_sha256: str
+    node_assignment_sha256: str
     node_count: int
+    analysis_node_count: int
+    structural_node_count: int
     max_work_unit_bytes: int
     capsules: dict[str, dict[str, object]]
     units: tuple[_VerifiedUnit, ...]
@@ -143,6 +208,7 @@ class _OutputBinding:
     output_sha256: str
     payload: dict[str, object]
     content: bytes
+    validated: ValidatedSemanticWorkOutput
 
 
 @dataclass(frozen=True)
@@ -150,6 +216,7 @@ class _ReceiptBinding:
     input_sha256: str
     output: _OutputBinding
     dependency_output_sha256s: tuple[str, ...]
+    content: bytes
 
 
 @dataclass(frozen=True)
@@ -158,6 +225,14 @@ class _LifecycleEvaluation:
     ready_unit_ids: tuple[str, ...]
     invalid_count: int
     undeclared_artifact_count: int
+
+
+@dataclass(frozen=True)
+class _FinalizationMetadata:
+    manifest: dict[str, object]
+    manifest_content: bytes
+    chunk_sha256s: tuple[str, ...]
+    chunk_node_counts: tuple[int, ...]
 
 
 def build_semantic_work_plan(
@@ -572,6 +647,612 @@ def validate_semantic_work(
     )
 
 
+def finalize_semantic_index(
+    request: FinalizeSemanticIndexRequest,
+) -> FinalizeSemanticIndexResult:
+    paths = WorkspacePaths.from_root(request.workspace)
+    repository = SQLiteRepository(paths.db_path)
+    try:
+        with repository._repository_critical_section():
+            ensure_managed_directory(paths.semantic_final_dir)
+            state = _load_verified_state(paths, repository)
+            _validate_current_policy(paths, state.policy_hash)
+            evaluation = _evaluate_lifecycle(state)
+            _require_complete_lifecycle(state, evaluation)
+            analyzed = _validated_analysis_results(state, evaluation)
+            metadata = _compile_finalization(state, evaluation, analyzed)
+            existing_names = _inspect_final_directory(paths.semantic_final_dir)
+            if _final_set_matches(
+                paths.semantic_final_dir,
+                existing_names,
+                metadata,
+            ):
+                return _finalization_result(paths, state, metadata)
+
+            manifest_path = paths.semantic_final_dir / "manifest.json"
+            if "manifest.json" in existing_names:
+                remove_managed_file(manifest_path)
+
+            expected_chunk_names: set[str] = set()
+            for index, nodes in enumerate(
+                _chunk_final_nodes(
+                    _iter_final_nodes(state, analyzed),
+                ),
+                start=1,
+            ):
+                name = final_chunk_name(index)
+                expected_chunk_names.add(name)
+                write_managed_text(
+                    paths.semantic_final_dir / name,
+                    _canonical_json(
+                        _final_chunk_payload(state.revision_id, index, nodes)
+                    ),
+                )
+
+            for name in sorted(existing_names - expected_chunk_names):
+                if name == "manifest.json":
+                    continue
+                remove_managed_file(paths.semantic_final_dir / name)
+
+            current_state = _load_verified_state(paths, repository)
+            _validate_current_policy(paths, current_state.policy_hash)
+            current_evaluation = _evaluate_lifecycle(current_state)
+            _require_complete_lifecycle(current_state, current_evaluation)
+            current_analyzed = _validated_analysis_results(
+                current_state,
+                current_evaluation,
+            )
+            current_metadata = _compile_finalization(
+                current_state,
+                current_evaluation,
+                current_analyzed,
+            )
+            if current_metadata != metadata or not _published_chunks_match(
+                paths.semantic_final_dir,
+                metadata,
+            ):
+                raise SemanticWorkError("semantic finalization input changed")
+
+            write_managed_text(
+                manifest_path,
+                metadata.manifest_content.decode("utf-8"),
+            )
+            return _finalization_result(paths, state, metadata)
+    except SemanticWorkError:
+        raise
+    except Exception as error:
+        raise SemanticWorkError(
+            "semantic final publication failed safely"
+        ) from error
+
+
+def final_chunk_name(index: int) -> str:
+    if type(index) is not int or index <= 0:
+        raise SemanticWorkError("semantic final chunk index is invalid")
+    return f"chunk-{index:04}.json"
+
+
+def _require_complete_lifecycle(
+    state: _VerifiedState,
+    evaluation: _LifecycleEvaluation,
+) -> None:
+    if evaluation.undeclared_artifact_count:
+        raise SemanticWorkError(
+            "semantic work lifecycle contains invalid artifacts"
+        )
+    if evaluation.invalid_count:
+        raise SemanticWorkError("semantic work lifecycle is invalid")
+    if len(evaluation.valid_receipts) != len(state.units):
+        raise SemanticWorkError("semantic work lifecycle is incomplete")
+
+
+def _validated_analysis_results(
+    state: _VerifiedState,
+    evaluation: _LifecycleEvaluation,
+) -> dict[str, ValidatedSemanticNodeResult]:
+    results: dict[str, ValidatedSemanticNodeResult] = {}
+    for unit in state.units:
+        receipt = evaluation.valid_receipts.get(unit.unit_id)
+        if receipt is None:
+            raise SemanticWorkError("semantic work lifecycle is incomplete")
+        for result in receipt.output.validated.node_results:
+            if result.node_id in results:
+                raise SemanticWorkError("semantic final node coverage is invalid")
+            results[result.node_id] = result
+    expected = {
+        node_id
+        for node_id, capsule in state.capsules.items()
+        if capsule.get("semantic_disposition")
+        == SemanticDisposition.ANALYSIS_REQUIRED.value
+    }
+    if set(results) != expected or len(results) != state.analysis_node_count:
+        raise SemanticWorkError("semantic final node coverage is invalid")
+    return results
+
+
+def _compile_finalization(
+    state: _VerifiedState,
+    evaluation: _LifecycleEvaluation,
+    analyzed: dict[str, ValidatedSemanticNodeResult],
+) -> _FinalizationMetadata:
+    chunk_sha256s: list[str] = []
+    chunk_node_counts: list[int] = []
+    node_ids_digest = hashlib.sha256()
+    node_ids_digest.update(b"[")
+    first_node = True
+    node_count = 0
+    analysis_node_count = 0
+    for index, nodes in enumerate(
+        _chunk_final_nodes(_iter_final_nodes(state, analyzed)),
+        start=1,
+    ):
+        content = _canonical_json_bytes(
+            _final_chunk_payload(state.revision_id, index, nodes)
+        )
+        chunk_sha256s.append(hashlib.sha256(content).hexdigest())
+        chunk_node_counts.append(len(nodes))
+        for node in nodes:
+            if not first_node:
+                node_ids_digest.update(b",")
+            node_ids_digest.update(_canonical_json_bytes(node["node_id"]))
+            first_node = False
+            node_count += 1
+            analysis_node_count += int(
+                node["semantic_disposition"] == "analyzed"
+            )
+    node_ids_digest.update(b"]")
+    structural_node_count = node_count - analysis_node_count
+    if (
+        node_count != state.node_count
+        or analysis_node_count != state.analysis_node_count
+        or structural_node_count != state.structural_node_count
+        or sum(chunk_node_counts) != node_count
+    ):
+        raise SemanticWorkError("semantic final node coverage is invalid")
+
+    receipt_hashes = tuple(
+        hashlib.sha256(
+            evaluation.valid_receipts[unit.unit_id].content
+        ).hexdigest()
+        for unit in state.units
+    )
+    unsigned: dict[str, object] = {
+        "version": 2,
+        "protocol": "codex-semantic-v2",
+        "revision_id": state.revision_id,
+        "source_id": state.source_id,
+        "policy_hash": state.policy_hash,
+        "analyzer_version": state.analyzer_version,
+        "work_plan_sha256": state.work_plan_sha256,
+        "node_assignment_sha256": state.node_assignment_sha256,
+        "receipt_file_sha256s": list(receipt_hashes),
+        "chunk_sha256s": chunk_sha256s,
+        "chunk_node_counts": chunk_node_counts,
+        "chunk_count": len(chunk_sha256s),
+        "node_count": node_count,
+        "analysis_node_count": analysis_node_count,
+        "structural_node_count": structural_node_count,
+        "node_ids_sha256": node_ids_digest.hexdigest(),
+    }
+    manifest = {
+        **unsigned,
+        "manifest_sha256": hashlib.sha256(
+            _canonical_json_bytes(unsigned)
+        ).hexdigest(),
+    }
+    if set(unsigned) != _FINAL_MANIFEST_KEYS:
+        raise SemanticWorkError("semantic final manifest is invalid")
+    return _FinalizationMetadata(
+        manifest=manifest,
+        manifest_content=_canonical_json_bytes(manifest),
+        chunk_sha256s=tuple(chunk_sha256s),
+        chunk_node_counts=tuple(chunk_node_counts),
+    )
+
+
+def _chunk_final_nodes(
+    nodes: Iterable[dict[str, object]],
+) -> Iterator[list[dict[str, object]]]:
+    chunk: list[dict[str, object]] = []
+    for node in nodes:
+        chunk.append(node)
+        if len(chunk) == STRUCTURAL_CHUNK_SIZE:
+            yield chunk
+            chunk = []
+    if chunk:
+        yield chunk
+
+
+def _final_chunk_payload(
+    revision_id: str,
+    index: int,
+    nodes: list[dict[str, object]],
+) -> dict[str, object]:
+    return {
+        "version": 2,
+        "protocol": "codex-semantic-v2",
+        "revision_id": revision_id,
+        "chunk_index": index,
+        "nodes": nodes,
+    }
+
+
+def _iter_final_nodes(
+    state: _VerifiedState,
+    analyzed: dict[str, ValidatedSemanticNodeResult],
+) -> Iterator[dict[str, object]]:
+    for record in _iter_verified_structural_records(state):
+        result = analyzed.get(str(record["node_id"]))
+        if result is None:
+            semantic_summary = ""
+            semantic_roles: list[str] = []
+            topics: list[str] = []
+            semantic_facts = {
+                "purpose_signals": [],
+                "parent_context_signals": [],
+                "independence_signals": [],
+                "triviality_signals": [],
+                "grounding_signal_ids": [],
+            }
+            semantic_disposition = record["semantic_disposition"]
+            analysis_status = record["analysis_status"]
+            child_node_ids = record["child_node_ids"]
+        else:
+            semantic_summary = result.semantic_summary
+            semantic_roles = list(result.semantic_roles)
+            topics = list(result.topics)
+            semantic_facts = {
+                "purpose_signals": list(result.purpose_signals),
+                "parent_context_signals": list(
+                    result.parent_context_signals
+                ),
+                "independence_signals": list(
+                    result.independence_signals
+                ),
+                "triviality_signals": list(result.triviality_signals),
+                "grounding_signal_ids": list(result.grounding_signal_ids),
+            }
+            semantic_disposition = result.semantic_disposition
+            analysis_status = result.analysis_status
+            child_node_ids = list(result.child_node_ids)
+        yield {
+            "result_kind": "node",
+            "node_id": record["node_id"],
+            "source_id": record["source_id"],
+            "parent_node_id": record["parent_node_id"],
+            "kind": record["kind"],
+            "display_name": record["display_name"],
+            "relative_hierarchy": record["relative_hierarchy"],
+            "content_fingerprint": record["content_fingerprint"],
+            "semantic_summary": semantic_summary,
+            "semantic_roles": semantic_roles,
+            "topics": topics,
+            "semantic_facts": semantic_facts,
+            "semantic_disposition": semantic_disposition,
+            "analysis_status": analysis_status,
+            "child_node_ids": child_node_ids,
+            "skip_reason": record["skip_reason"],
+            "evidence_ids": record["evidence_ids"],
+            "coverage": record["coverage"],
+        }
+
+
+def _iter_verified_structural_records(
+    state: _VerifiedState,
+) -> Iterator[dict[str, object]]:
+    directory = state.paths.semantic_revision_structural_dir(
+        state.revision_id
+    )
+    names = _directory_entry_names(directory)
+    expected_names = {
+        final_chunk_name(index)
+        for index in range(
+            1,
+            (state.node_count + STRUCTURAL_CHUNK_SIZE - 1)
+            // STRUCTURAL_CHUNK_SIZE
+            + 1,
+        )
+    }
+    if names != expected_names:
+        raise SemanticWorkError("semantic private structural state is invalid")
+
+    expected_capsules = iter(
+        sorted(
+            state.capsules.values(),
+            key=lambda capsule: (
+                str(capsule.get("relative_hierarchy", "")),
+                str(capsule.get("node_id", "")),
+            ),
+        )
+    )
+    count = 0
+    for index in range(1, len(expected_names) + 1):
+        content = _read_required(directory / final_chunk_name(index))
+        payload = _decode_object(content, "private structural state")
+        if (
+            set(payload) != {"version", "revision_id", "nodes"}
+            or payload.get("version") != 2
+            or payload.get("revision_id") != state.revision_id
+            or type(payload.get("nodes")) is not list
+            or not payload["nodes"]
+            or len(payload["nodes"]) > STRUCTURAL_CHUNK_SIZE
+            or content != _canonical_json_bytes(payload)
+        ):
+            raise SemanticWorkError(
+                "semantic private structural state is invalid"
+            )
+        for record in payload["nodes"]:
+            try:
+                capsule = next(expected_capsules)
+            except StopIteration as error:
+                raise SemanticWorkError(
+                    "semantic private structural state is invalid"
+                ) from error
+            _validate_structural_record(record, capsule, state.source_id)
+            count += 1
+            yield record
+    try:
+        next(expected_capsules)
+    except StopIteration:
+        pass
+    else:
+        raise SemanticWorkError("semantic private structural state is invalid")
+    if count != state.node_count:
+        raise SemanticWorkError("semantic private structural state is invalid")
+
+
+def _validate_structural_record(
+    record: object,
+    capsule: dict[str, object],
+    source_id: str,
+) -> None:
+    if type(record) is not dict or set(record) != _STRUCTURAL_RECORD_KEYS:
+        raise SemanticWorkError("semantic private structural state is invalid")
+    coverage = record.get("coverage")
+    if (
+        not _is_safe_identifier(source_id)
+        or record.get("source_id") != source_id
+        or not _is_safe_identifier(record.get("node_id"))
+        or record.get("node_id") != capsule.get("node_id")
+        or record.get("parent_node_id") != capsule.get("parent_node_id")
+        or record.get("parent_node_id") is not None
+        and not _is_safe_identifier(record.get("parent_node_id"))
+        or record.get("kind") != capsule.get("kind")
+        or record.get("kind")
+        not in {kind.value for kind in SemanticNodeKind}
+        or record.get("display_name") != capsule.get("display_name")
+        or not _is_safe_presentation_text(record.get("display_name"))
+        or record.get("relative_hierarchy")
+        != capsule.get("relative_hierarchy")
+        or not _is_safe_relative_hierarchy(
+            record.get("relative_hierarchy")
+        )
+        or record.get("content_fingerprint")
+        != capsule.get("content_fingerprint")
+        or record.get("content_fingerprint") is not None
+        and (
+            type(record.get("content_fingerprint")) is not str
+            or _FINGERPRINT.fullmatch(
+                str(record.get("content_fingerprint"))
+            )
+            is None
+        )
+        or record.get("analysis_status") != capsule.get("analysis_status")
+        or record.get("analysis_status")
+        not in {status.value for status in AnalysisStatus}
+        or record.get("semantic_disposition")
+        != capsule.get("semantic_disposition")
+        or record.get("semantic_disposition") not in _VALID_DISPOSITIONS
+        or record.get("roles") != capsule.get("roles")
+        or record.get("child_node_ids") != capsule.get("child_node_ids")
+        or record.get("skip_reason") != capsule.get("skip_reason")
+        or record.get("skip_reason") is not None
+        and not _is_safe_identifier(record.get("skip_reason"))
+        or record.get("evidence_ids") != capsule.get("evidence_ids")
+        or coverage != capsule.get("coverage")
+        or not _is_unique_text_list(record.get("roles"))
+        or not _is_unique_identifier_list(record.get("child_node_ids"))
+        or not _is_unique_int_list(record.get("evidence_ids"))
+        or not _is_valid_coverage(coverage)
+    ):
+        raise SemanticWorkError("semantic private structural state is invalid")
+
+
+def _is_unique_text_list(value: object) -> bool:
+    return (
+        type(value) is list
+        and all(_is_safe_presentation_text(item) for item in value)
+        and len(value) == len(set(value))
+    )
+
+
+def _is_unique_identifier_list(value: object) -> bool:
+    return (
+        type(value) is list
+        and all(_is_safe_identifier(item) for item in value)
+        and len(value) == len(set(value))
+    )
+
+
+def _is_unique_int_list(value: object) -> bool:
+    return (
+        type(value) is list
+        and all(type(item) is int and item > 0 for item in value)
+        and len(value) == len(set(value))
+    )
+
+
+def _is_safe_identifier(value: object) -> bool:
+    return (
+        type(value) is str
+        and bool(value)
+        and _SAFE_IDENTIFIER.fullmatch(value) is not None
+    )
+
+
+def _is_safe_presentation_text(value: object) -> bool:
+    return (
+        type(value) is str
+        and bool(value)
+        and value == value.strip()
+        and not any(
+            unicodedata.category(character).startswith("C")
+            for character in value
+        )
+        and not contains_hidden_secret_shaped_public_value(value)
+        and mask_public_value(value) == value
+        and "/" not in value
+        and "\\" not in value
+        and "://" not in value
+        and ".portfolio-maker" not in value.casefold()
+        and "portfolio.db" not in value.casefold()
+    )
+
+
+def _is_safe_relative_hierarchy(value: object) -> bool:
+    if type(value) is not str or not value or "\\" in value:
+        return False
+    if (
+        any(
+            unicodedata.category(character).startswith("C")
+            for character in value
+        )
+        or contains_hidden_secret_shaped_public_value(value)
+        or mask_public_value(value) != value
+        or "://" in value
+        or value.startswith(("/", "~/"))
+        or ".portfolio-maker" in value.casefold()
+        or "portfolio.db" in value.casefold()
+    ):
+        return False
+    if value == ".":
+        return True
+    path = PurePosixPath(value)
+    return (
+        not path.is_absolute()
+        and str(path) == value
+        and all(part not in {"", ".", ".."} for part in path.parts)
+    )
+
+
+def _is_valid_coverage(value: object) -> bool:
+    return (
+        type(value) is dict
+        and set(value) == _COVERAGE_KEYS
+        and all(
+            _is_nonnegative_int(value.get(key))
+            for key in (
+                "node_count",
+                "content_node_count",
+                "structural_only_count",
+                "failed_count",
+            )
+        )
+        and _is_sha256(value.get("node_ids_sha256"))
+    )
+
+
+def _inspect_final_directory(directory: Path) -> set[str]:
+    try:
+        entries = tuple(directory.iterdir())
+    except OSError as error:
+        raise SemanticWorkError("semantic final directory is invalid") from error
+    names: set[str] = set()
+    for entry in entries:
+        try:
+            metadata = entry.stat(follow_symlinks=False)
+        except OSError as error:
+            raise SemanticWorkError(
+                "semantic final directory is invalid"
+            ) from error
+        if (
+            entry.name in names
+            or (
+                entry.name != "manifest.json"
+                and _FINAL_CHUNK_NAME.fullmatch(entry.name) is None
+            )
+            or not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+        ):
+            raise SemanticWorkError("semantic final directory is invalid")
+        names.add(entry.name)
+    return names
+
+
+def _final_set_matches(
+    directory: Path,
+    names: set[str],
+    metadata: _FinalizationMetadata,
+) -> bool:
+    expected_names = {
+        "manifest.json",
+        *{
+            final_chunk_name(index)
+            for index in range(1, len(metadata.chunk_sha256s) + 1)
+        },
+    }
+    if names != expected_names:
+        return False
+    try:
+        if (
+            read_managed_bytes(directory / "manifest.json")
+            != metadata.manifest_content
+        ):
+            return False
+        return _published_chunks_match(directory, metadata)
+    except OSError as error:
+        raise SemanticWorkError("semantic final directory is invalid") from error
+
+
+def _published_chunks_match(
+    directory: Path,
+    metadata: _FinalizationMetadata,
+) -> bool:
+    names = _inspect_final_directory(directory)
+    expected_names = {
+        final_chunk_name(index)
+        for index in range(1, len(metadata.chunk_sha256s) + 1)
+    }
+    if names - {"manifest.json"} != expected_names:
+        return False
+    for index, expected_hash in enumerate(
+        metadata.chunk_sha256s,
+        start=1,
+    ):
+        content = _read_required(directory / final_chunk_name(index))
+        if hashlib.sha256(content).hexdigest() != expected_hash:
+            return False
+    return True
+
+
+def _finalization_result(
+    paths: WorkspacePaths,
+    state: _VerifiedState,
+    metadata: _FinalizationMetadata,
+) -> FinalizeSemanticIndexResult:
+    return FinalizeSemanticIndexResult(
+        revision_id=state.revision_id,
+        manifest_path=paths.semantic_final_dir / "manifest.json",
+        chunk_count=len(metadata.chunk_sha256s),
+        node_count=state.node_count,
+    )
+
+
+def _validate_current_policy(paths: WorkspacePaths, policy_hash: str) -> None:
+    try:
+        from portfolio_maker.application.semantic_index import (
+            _current_policy_hash,
+        )
+
+        current_hash = _current_policy_hash(paths)
+    except Exception as error:
+        raise SemanticWorkError(
+            "semantic work approval policy is unavailable"
+        ) from error
+    if current_hash != policy_hash:
+        raise SemanticWorkError("semantic work approval policy is stale")
+
+
 def _load_verified_state(
     paths: WorkspacePaths,
     repository: SQLiteRepository,
@@ -658,7 +1339,14 @@ def _load_verified_state(
     return _VerifiedState(
         paths=paths,
         revision_id=str(manifest["revision_id"]),
+        source_id=str(manifest["source_id"]),
+        policy_hash=str(manifest["policy_hash"]),
+        analyzer_version=str(manifest["analyzer_version"]),
+        work_plan_sha256=str(manifest["work_plan_sha256"]),
+        node_assignment_sha256=str(plan["node_assignment_sha256"]),
         node_count=int(manifest["node_count"]),
+        analysis_node_count=int(manifest["analysis_target_count"]),
+        structural_node_count=int(manifest["structural_only_count"]),
         max_work_unit_bytes=int(plan["max_work_unit_bytes"]),
         capsules=capsules,
         units=units,
@@ -1026,7 +1714,7 @@ def _read_valid_output(
     ):
         raise SemanticWorkError("semantic work output is invalid")
     try:
-        validate_semantic_work_output(input_payload, payload)
+        validated = validate_semantic_work_output(input_payload, payload)
     except SemanticQualityError as error:
         raise SemanticWorkError(
             "semantic work output fails quality validation"
@@ -1035,6 +1723,7 @@ def _read_valid_output(
         output_sha256=hashlib.sha256(content).hexdigest(),
         payload=payload,
         content=content,
+        validated=validated,
     )
 
 
@@ -1078,6 +1767,7 @@ def _read_valid_receipt(
         input_sha256=str(input_payload["input_sha256"]),
         output=output,
         dependency_output_sha256s=dependency_hashes,
+        content=content,
     )
 
 

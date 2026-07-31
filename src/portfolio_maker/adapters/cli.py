@@ -30,6 +30,7 @@ from portfolio_maker.application.semantic_index import (
 )
 from portfolio_maker.application.semantic_work import (
     SemanticWorkError,
+    finalize_semantic_index,
     next_semantic_work,
     semantic_index_status,
     validate_semantic_work,
@@ -55,6 +56,7 @@ from portfolio_maker.application.models import (
     BuildProfileRequest,
     DiscoverSourcesRequest,
     DraftPortfolioRequest,
+    FinalizeSemanticIndexRequest,
     HistoryApplyRequest,
     HistoryExecutionRequest,
     HistoryExportRequest,
@@ -171,6 +173,9 @@ def build_parser() -> argparse.ArgumentParser:
     validate_semantic = subparsers.add_parser("validate-semantic-work")
     validate_semantic.add_argument("--workspace", type=Path, default=Path("."))
     validate_semantic.add_argument("--unit-id", required=True)
+
+    finalize_semantic = subparsers.add_parser("finalize-semantic-index")
+    finalize_semantic.add_argument("--workspace", type=Path, default=Path("."))
 
     prepare_vision = subparsers.add_parser("prepare-vision-analysis")
     prepare_vision.add_argument("--workspace", type=Path, default=Path("."))
@@ -529,6 +534,16 @@ def _main(argv: Sequence[str] | None = None) -> int:
         print(f"Semantic work unit: {unit_id}")
         print(f"Receipt: {relative_path}")
         print(f"Output SHA-256: {result.output_sha256}")
+        return 0
+
+    if args.command == "finalize-semantic-index":
+        result = finalize_semantic_index(
+            FinalizeSemanticIndexRequest(workspace=args.workspace)
+        )
+        revision_id = _safe_semantic_revision(result.revision_id)
+        print(f"Semantic revision: {revision_id}")
+        print(f"Final chunks: {result.chunk_count}")
+        print(f"Nodes: {result.node_count}")
         return 0
 
     if args.command == "prepare-vision-analysis":
