@@ -73,7 +73,7 @@ _LOCATOR_TOKEN = re.compile(
 _RELATIVE_FILE_LOCATOR = re.compile(
     r"(?i)(?<![\w.-])(?:\.{1,2}[/\\\\][^\s'\"`<>)}\]]+|(?:[\w-]+[/\\\\])+[\w-]+\.[a-z][a-z0-9_-]*)"
 )
-_CHUNK_FILENAME = re.compile(r"chunk-\d{4}\.json")
+_CHUNK_FILENAME = re.compile(r"chunk-\d{4,}\.json")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 
 
@@ -305,6 +305,14 @@ def _validate_staged_structure(
     staged_by_id = {str(node["node_id"]): node for node in staged_nodes}
     if len(staged_by_id) != len(staged_nodes) or set(staged_by_id) != set(input_nodes):
         raise SemanticIndexError("semantic index input does not match the staged revision")
+    children_by_parent: dict[str, list[str]] = {}
+    for child_id, child in input_nodes.items():
+        parent_node_id = child["parent_node_id"]
+        if isinstance(parent_node_id, str):
+            children_by_parent.setdefault(parent_node_id, []).append(child_id)
+    for child_ids in children_by_parent.values():
+        child_ids.sort()
+
     for node_id, input_node in input_nodes.items():
         staged = staged_by_id[node_id]
         if (
@@ -319,11 +327,7 @@ def _validate_staged_structure(
             or staged["analyzer_version"] != manifest["analyzer_version"]
         ):
             raise SemanticIndexError("semantic index input does not match the staged revision")
-        expected_children = sorted(
-            child_id
-            for child_id, child in input_nodes.items()
-            if child["parent_node_id"] == node_id
-        )
+        expected_children = children_by_parent.get(node_id, [])
         if input_node["child_node_ids"] != expected_children:
             raise SemanticIndexError("semantic index input has invalid child references")
 

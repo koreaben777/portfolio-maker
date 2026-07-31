@@ -91,6 +91,88 @@ def write_valid_outputs(prepared) -> None:
         )
 
 
+def _two_node_input_fixture() -> dict[str, dict[str, object]]:
+    return {
+        "root": {
+            "node_id": "root",
+            "parent_node_id": None,
+            "kind": "source",
+            "display_name": "root",
+            "relative_hierarchy": ".",
+            "content_fingerprint": None,
+            "roles": [],
+            "masked_excerpt": "",
+            "analysis_status": "pending",
+            "child_node_ids": ["child"],
+        },
+        "child": {
+            "node_id": "child",
+            "parent_node_id": "root",
+            "kind": "file",
+            "display_name": "child",
+            "relative_hierarchy": "child",
+            "content_fingerprint": None,
+            "roles": [],
+            "masked_excerpt": "",
+            "analysis_status": "pending",
+            "child_node_ids": [],
+        },
+    }
+
+
+def _two_node_staged_fixture() -> list[dict[str, object]]:
+    return [
+        {
+            "node_id": node_id,
+            "source_id": "source",
+            "node_kind": node["kind"],
+            "parent_node_id": node["parent_node_id"],
+            "display_name": node["display_name"],
+            "relative_hierarchy": node["relative_hierarchy"],
+            "content_fingerprint": node["content_fingerprint"],
+            "semantic_roles": node["roles"],
+            "analysis_status": node["analysis_status"],
+            "analyzer_version": "semantic-input-v1",
+        }
+        for node_id, node in _two_node_input_fixture().items()
+    ]
+
+
+def test_semantic_index_accepts_five_digit_chunk_names() -> None:
+    for name in ("chunk-0001.json", "chunk-10000.json", "chunk-100000.json"):
+        assert semantic_index_module._CHUNK_FILENAME.fullmatch(name)
+    for name in (
+        "chunk-001.json",
+        "chunk-+10000.json",
+        "chunk--10000.json",
+        "chunk-10000-extra.json",
+        "nested/chunk-10000.json",
+        "chunk-1000a.json",
+    ):
+        assert semantic_index_module._CHUNK_FILENAME.fullmatch(name) is None
+
+
+def test_validate_staged_structure_does_not_rescan_input_for_each_node() -> None:
+    class CountingDict(dict):
+        items_calls = 0
+
+        def items(self):
+            self.items_calls += 1
+            if self.items_calls > 2:
+                raise AssertionError("input nodes were rescanned")
+            return super().items()
+
+    input_nodes = CountingDict(_two_node_input_fixture())
+
+    semantic_index_module._validate_staged_structure(
+        input_nodes,
+        _two_node_staged_fixture(),
+        {"source_id": "source", "analyzer_version": "semantic-input-v1"},
+    )
+
+    assert input_nodes.items_calls == 2
+
+
 def profile_approved_file(
     workspace: Path, tmp_path: Path
 ) -> tuple[Path, Path, WorkspacePaths, SQLiteRepository, int]:
