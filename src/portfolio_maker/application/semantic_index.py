@@ -20,9 +20,13 @@ from portfolio_maker.application.models import (
     PrepareSemanticIndexRequest,
     PrepareSemanticIndexResult,
 )
+from portfolio_maker.application.semantic_work import (
+    STRUCTURAL_CHUNK_SIZE,
+    build_semantic_work_plan,
+    semantic_work_plan_payload,
+)
 from portfolio_maker.domain.semantic_models import (
     AnalysisStatus,
-    SemanticEdge,
     SemanticNode,
     SemanticNodeKind,
 )
@@ -44,8 +48,10 @@ from portfolio_maker.infrastructure.policy import (
 from portfolio_maker.infrastructure.presentation import normalize_label
 from portfolio_maker.infrastructure.semantic_analyzers import (
     ANALYZER_VERSION,
+    FileAnalysisInput,
     analyze_file_input,
 )
+from portfolio_maker.infrastructure.semantic_capsules import build_feature_capsules
 from portfolio_maker.infrastructure.semantic_crawler import (
     StructuralCrawlRootError,
     StructuralEntry,
@@ -109,42 +115,68 @@ def prepare_semantic_index(
     approved_evidence_by_source_uri = _approved_local_evidence_by_source_uri(
         repository, approval
     )
-    prepared_nodes = _prepare_nodes(crawl.entries, approved_evidence_by_source_uri)
-    chunk_payloads = _chunk_payloads(
+    analyses, evidence_ids_by_node = _analyze_capsule_inputs(
+        crawl.entries,
+        approved_evidence_by_source_uri,
+    )
+    capsules = build_feature_capsules(
+        crawl.entries,
+        analyses,
+        revision_id=revision_id,
+        evidence_ids_by_node=evidence_ids_by_node,
+    )
+    plan = build_semantic_work_plan(
+        capsules,
+        revision_id=revision_id,
+        policy_hash=policy_hash,
+    )
+    chunk_payloads = _capsule_chunk_payloads(
         revision_id,
-        tuple(node.chunk_node for node in prepared_nodes),
+        capsules,
         request.chunk_size,
     )
     chunk_texts = tuple(_canonical_json(payload) for payload in chunk_payloads)
     chunk_sha256s = tuple(
         hashlib.sha256(text.encode("utf-8")).hexdigest() for text in chunk_texts
     )
+    plan_text = _canonical_json(semantic_work_plan_payload(plan))
+    structural_texts, locator_texts = _private_revision_chunks(
+        revision_id,
+        crawl.entries,
+        capsules,
+    )
+    managed_input_bytes = len(plan_text.encode("utf-8")) + sum(
+        len(text.encode("utf-8")) for text in chunk_texts
+    )
     manifest = {
-        "version": 1,
+        "version": 2,
+        "protocol": "codex-semantic-v2",
         "revision_id": revision_id,
         "source_id": source_id,
         "policy_hash": policy_hash,
         "analyzer_version": ANALYZER_VERSION,
-        "chunk_sha256s": list(chunk_sha256s),
-        "node_count": len(prepared_nodes),
+        "capsule_chunk_sha256s": list(chunk_sha256s),
+        "work_plan_sha256": hashlib.sha256(plan_text.encode("utf-8")).hexdigest(),
+        "node_count": len(capsules),
+        "work_unit_count": len(plan.units),
+        "managed_input_bytes": managed_input_bytes,
+        "analysis_target_count": plan.analysis_target_count,
+        "structural_only_count": plan.structural_owner_count,
     }
 
     repository.create_semantic_revision(
         revision_id, source_id, policy_hash, ANALYZER_VERSION
     )
     try:
-        repository.replace_semantic_revision_graph(
-            revision_id,
-            tuple(item.node for item in prepared_nodes),
-            {item.node.node_id: item.locator for item in prepared_nodes},
-            tuple(
-                SemanticEdge(revision_id, item.node.parent_node_id, "contains", item.node.node_id)
-                for item in prepared_nodes
-                if item.node.parent_node_id is not None
-            ),
-        )
         _publish_semantic_input(
-            repository, paths, chunk_texts, _canonical_json(manifest)
+            repository,
+            paths,
+            chunk_texts,
+            _canonical_json(manifest),
+            work_plan_text=plan_text,
+            revision_id=revision_id,
+            structural_texts=structural_texts,
+            locator_texts=locator_texts,
         )
     except Exception:
         repository.fail_semantic_revision(revision_id)
@@ -153,12 +185,16 @@ def prepare_semantic_index(
     return PrepareSemanticIndexResult(
         manifest_path=paths.semantic_index_manifest_path,
         revision_id=revision_id,
-        node_count=len(prepared_nodes),
+        node_count=len(capsules),
         chunk_count=len(chunk_texts),
         partial_count=sum(
-            item.node.analysis_status is AnalysisStatus.PARTIAL
-            for item in prepared_nodes
+            capsule["analysis_status"] == AnalysisStatus.PARTIAL.value
+            for capsule in capsules
         ),
+        work_unit_count=len(plan.units),
+        managed_input_bytes=managed_input_bytes,
+        analysis_target_count=plan.analysis_target_count,
+        structural_only_count=plan.structural_owner_count,
     )
 
 
@@ -624,6 +660,91 @@ def _prepare_nodes(
     return tuple(prepared)
 
 
+def _analyze_capsule_inputs(
+    entries: tuple[StructuralEntry, ...],
+    approved_evidence_by_source_uri: dict[str, tuple[int, ...]],
+) -> tuple[dict[str, FileAnalysisInput], dict[str, tuple[int, ...]]]:
+    analyses: dict[str, FileAnalysisInput] = {}
+    evidence_ids_by_node: dict[str, tuple[int, ...]] = {}
+    for entry in entries:
+        if (
+            entry.kind is not SemanticNodeKind.FILE
+            or entry.status is AnalysisStatus.UNSUPPORTED
+        ):
+            continue
+        analysis = analyze_file_input(entry)
+        analyses[entry.node_id] = analysis
+        try:
+            evidence_ids = approved_evidence_by_source_uri.get(
+                _canonical_file_uri(entry.absolute_path),
+                (),
+            )
+        except (FileNotFoundError, OSError, RuntimeError):
+            evidence_ids = ()
+        evidence_ids_by_node[entry.node_id] = evidence_ids
+    return analyses, evidence_ids_by_node
+
+
+def _private_revision_chunks(
+    revision_id: str,
+    entries: tuple[StructuralEntry, ...],
+    capsules: tuple[dict[str, object], ...],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    entry_by_id = {entry.node_id: entry for entry in entries}
+    structural_records: list[dict[str, object]] = []
+    locator_records: list[dict[str, object]] = []
+    for capsule in capsules:
+        node_id = str(capsule["node_id"])
+        entry = entry_by_id[node_id]
+        structural_records.append(
+            {
+                "node_id": node_id,
+                "source_id": entry.source_id,
+                "parent_node_id": capsule["parent_node_id"],
+                "kind": capsule["kind"],
+                "display_name": capsule["display_name"],
+                "relative_hierarchy": capsule["relative_hierarchy"],
+                "content_fingerprint": capsule["content_fingerprint"],
+                "analysis_status": capsule["analysis_status"],
+                "semantic_disposition": capsule["semantic_disposition"],
+                "roles": capsule["roles"],
+                "child_node_ids": capsule["child_node_ids"],
+                "skip_reason": capsule["skip_reason"],
+                "evidence_ids": capsule["evidence_ids"],
+                "coverage": capsule["coverage"],
+            }
+        )
+        locator_records.append(
+            {
+                "node_id": node_id,
+                "locator": str(entry.absolute_path),
+                "device": entry.device,
+                "inode": entry.inode,
+            }
+        )
+    return (
+        _private_chunk_texts(revision_id, "nodes", structural_records),
+        _private_chunk_texts(revision_id, "locators", locator_records),
+    )
+
+
+def _private_chunk_texts(
+    revision_id: str,
+    field: str,
+    records: list[dict[str, object]],
+) -> tuple[str, ...]:
+    return tuple(
+        _canonical_json(
+            {
+                "version": 2,
+                "revision_id": revision_id,
+                field: records[index : index + STRUCTURAL_CHUNK_SIZE],
+            }
+        )
+        for index in range(0, len(records), STRUCTURAL_CHUNK_SIZE)
+    )
+
+
 def _approved_local_evidence_by_source_uri(
     repository: SQLiteRepository,
     approval: SourceApproval,
@@ -713,12 +834,18 @@ def _canonical_file_uri_from_uri(uri: str) -> str | None:
     return canonical_uri if canonical_uri == uri else None
 
 
-def _chunk_payloads(
-    revision_id: str, nodes: tuple[dict[str, object], ...], chunk_size: int
+def _capsule_chunk_payloads(
+    revision_id: str,
+    capsules: tuple[dict[str, object], ...],
+    chunk_size: int,
 ) -> tuple[dict[str, object], ...]:
     return tuple(
-        {"version": 1, "revision_id": revision_id, "nodes": list(nodes[index:index + chunk_size])}
-        for index in range(0, len(nodes), chunk_size)
+        {
+            "version": 2,
+            "revision_id": revision_id,
+            "capsules": list(capsules[index : index + chunk_size]),
+        }
+        for index in range(0, len(capsules), chunk_size)
     )
 
 
@@ -775,6 +902,7 @@ def _redact_locators(value: str) -> str:
 class _PublishedSemanticInput:
     manifest_text: str | None
     chunk_texts: dict[Path, str]
+    work_plan_text: str | None
 
 
 def _publish_semantic_input(
@@ -782,10 +910,19 @@ def _publish_semantic_input(
     paths: WorkspacePaths,
     chunk_texts: tuple[str, ...],
     manifest_text: str,
+    *,
+    work_plan_text: str,
+    revision_id: str,
+    structural_texts: tuple[str, ...],
+    locator_texts: tuple[str, ...],
 ) -> None:
     with repository._repository_critical_section():
         ensure_managed_directory(paths.semantic_index_dir)
         ensure_managed_directory(paths.semantic_index_input_dir)
+        structural_dir = paths.semantic_revision_structural_dir(revision_id)
+        locator_dir = paths.semantic_revision_locator_dir(revision_id)
+        ensure_managed_directory(structural_dir)
+        ensure_managed_directory(locator_dir)
         previous = _read_published_semantic_input_unlocked(paths)
         current = {
             paths.semantic_index_input_dir / f"chunk-{index:04}.json": chunk_text
@@ -793,10 +930,23 @@ def _publish_semantic_input(
         }
 
         try:
+            for index, text in enumerate(structural_texts, start=1):
+                write_managed_text(
+                    structural_dir / f"chunk-{index:04}.json",
+                    text,
+                    overwrite=False,
+                )
+            for index, text in enumerate(locator_texts, start=1):
+                write_managed_text(
+                    locator_dir / f"chunk-{index:04}.json",
+                    text,
+                    overwrite=False,
+                )
             for path, chunk_text in current.items():
                 write_managed_text(path, chunk_text)
             for path in previous.chunk_texts.keys() - current.keys():
                 remove_managed_file(path)
+            write_managed_text(paths.semantic_work_plan_path, work_plan_text)
             write_managed_text(paths.semantic_index_manifest_path, manifest_text)
         except Exception:
             _restore_published_semantic_input(paths, previous, current)
@@ -813,15 +963,32 @@ def _read_published_semantic_input_unlocked(
     paths: WorkspacePaths,
 ) -> _PublishedSemanticInput:
     try:
+        work_plan_text = read_managed_bytes(paths.semantic_work_plan_path).decode(
+            "utf-8"
+        )
+    except FileNotFoundError:
+        work_plan_text = None
+    try:
         manifest_text = read_managed_bytes(paths.semantic_index_manifest_path).decode("utf-8")
     except FileNotFoundError:
-        if tuple(paths.semantic_index_input_dir.glob("chunk-*.json")):
+        if (
+            tuple(paths.semantic_index_input_dir.glob("chunk-*.json"))
+            or work_plan_text is not None
+        ):
             raise SemanticIndexError("semantic index input has unverified managed chunks")
-        return _PublishedSemanticInput(manifest_text=None, chunk_texts={})
+        return _PublishedSemanticInput(
+            manifest_text=None,
+            chunk_texts={},
+            work_plan_text=None,
+        )
 
     try:
         manifest = json.loads(manifest_text)
-        chunk_sha256s = manifest["chunk_sha256s"]
+        chunk_sha256s = (
+            manifest["capsule_chunk_sha256s"]
+            if manifest.get("version") == 2
+            else manifest["chunk_sha256s"]
+        )
     except (KeyError, TypeError, json.JSONDecodeError) as error:
         raise SemanticIndexError("semantic index manifest is invalid") from error
     if not isinstance(chunk_sha256s, list) or not all(
@@ -849,7 +1016,20 @@ def _read_published_semantic_input_unlocked(
         if hashlib.sha256(chunk_text.encode("utf-8")).hexdigest() != digest:
             raise SemanticIndexError("semantic index input has unverified managed chunks")
         chunk_texts[path] = chunk_text
-    return _PublishedSemanticInput(manifest_text=manifest_text, chunk_texts=chunk_texts)
+    if manifest.get("version") == 2:
+        work_plan_sha256 = manifest.get("work_plan_sha256")
+        if (
+            work_plan_text is None
+            or not _is_sha256(work_plan_sha256)
+            or hashlib.sha256(work_plan_text.encode("utf-8")).hexdigest()
+            != work_plan_sha256
+        ):
+            raise SemanticIndexError("semantic index work plan is invalid")
+    return _PublishedSemanticInput(
+        manifest_text=manifest_text,
+        chunk_texts=chunk_texts,
+        work_plan_text=work_plan_text,
+    )
 
 
 def _restore_published_semantic_input(
@@ -861,6 +1041,10 @@ def _restore_published_semantic_input(
         write_managed_text(path, chunk_text)
     for path in current.keys() - previous.chunk_texts.keys():
         remove_managed_file(path, missing_ok=True)
+    if previous.work_plan_text is None:
+        remove_managed_file(paths.semantic_work_plan_path, missing_ok=True)
+    else:
+        write_managed_text(paths.semantic_work_plan_path, previous.work_plan_text)
     if previous.manifest_text is None:
         remove_managed_file(paths.semantic_index_manifest_path, missing_ok=True)
     else:

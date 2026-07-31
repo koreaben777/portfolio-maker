@@ -13,7 +13,7 @@ from portfolio_maker.infrastructure.policy import mask_secrets
 from portfolio_maker.infrastructure.semantic_crawler import StructuralEntry
 
 
-ANALYZER_VERSION = "semantic-input-v1"
+ANALYZER_VERSION = "semantic-input-v2"
 ROLE_BY_NAME = {
     "readme.md": ("documentation", "project-description"),
     "dockerfile": ("configuration", "deployment"),

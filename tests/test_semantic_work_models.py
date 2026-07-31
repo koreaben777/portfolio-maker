@@ -8,6 +8,7 @@ from portfolio_maker.application.models import (
     FinalizeSemanticIndexResult,
     NextSemanticWorkRequest,
     NextSemanticWorkResult,
+    PrepareSemanticIndexResult,
     SemanticIndexStatusRequest,
     SemanticIndexStatusResult,
     ValidateSemanticWorkRequest,
@@ -44,6 +45,7 @@ def test_semantic_work_models_are_frozen_and_preserve_tuple_order() -> None:
         target_node_ids=("node-b", "node-a"),
         dependency_unit_ids=("unit-000001", "unit-000000"),
         template_sha256="a" * 64,
+        template_byte_count=512,
     )
     second = SemanticWorkUnit(
         unit_id="unit-000001",
@@ -51,6 +53,7 @@ def test_semantic_work_models_are_frozen_and_preserve_tuple_order() -> None:
         target_node_ids=("node-c",),
         dependency_unit_ids=(),
         template_sha256="b" * 64,
+        template_byte_count=256,
     )
     plan = SemanticWorkPlan(
         revision_id="rev-1",
@@ -67,6 +70,7 @@ def test_semantic_work_models_are_frozen_and_preserve_tuple_order() -> None:
 
     assert first.target_node_ids == ("node-b", "node-a")
     assert first.dependency_unit_ids == ("unit-000001", "unit-000000")
+    assert first.template_byte_count == 512
     assert plan.units == (first, second)
     with pytest.raises(FrozenInstanceError):
         first.unit_id = "changed"
@@ -94,6 +98,17 @@ def test_semantic_application_contracts_have_exact_fields_and_are_frozen(
         workspace / "manifest.json",
         4,
         9,
+    )
+    prepare_result = PrepareSemanticIndexResult(
+        workspace / "input-manifest.json",
+        "rev-1",
+        9,
+        4,
+        1,
+        6,
+        40_000,
+        5,
+        4,
     )
 
     expected_fields = (
@@ -124,6 +139,20 @@ def test_semantic_application_contracts_have_exact_fields_and_are_frozen(
         (
             finalize_result,
             ("revision_id", "manifest_path", "chunk_count", "node_count"),
+        ),
+        (
+            prepare_result,
+            (
+                "manifest_path",
+                "revision_id",
+                "node_count",
+                "chunk_count",
+                "partial_count",
+                "work_unit_count",
+                "managed_input_bytes",
+                "analysis_target_count",
+                "structural_only_count",
+            ),
         ),
     )
     for instance, field_names in expected_fields:

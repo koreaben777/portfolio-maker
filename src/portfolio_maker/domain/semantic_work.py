@@ -25,6 +25,7 @@ class SemanticWorkUnit:
     target_node_ids: tuple[str, ...]
     dependency_unit_ids: tuple[str, ...]
     template_sha256: str
+    template_byte_count: int
 
 
 @dataclass(frozen=True)

@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 import portfolio_maker.application.semantic_index as semantic_index_module
-from portfolio_maker.application.approval import write_sample_approval
+from portfolio_maker.application.approval import load_approval, write_sample_approval
 from portfolio_maker.application.artifact_approval import write_sample_artifact_policy
 from portfolio_maker.application.build_profile import build_profile
 from portfolio_maker.application.ingestion import ingest_sources
@@ -17,17 +17,17 @@ from portfolio_maker.application.models import (
     ApplySemanticIndexRequest,
     BuildProfileRequest,
     IngestSourcesRequest,
-    PrepareProjectReviewRequest,
     PrepareSemanticIndexRequest,
 )
-from portfolio_maker.application.project_boundary import prepare_project_review_v2
 from portfolio_maker.application.semantic_index import (
     SemanticIndexError,
     apply_semantic_index,
     prepare_semantic_index,
 )
+from portfolio_maker.domain.semantic_models import SemanticEdge
 from portfolio_maker.domain.models import Source, SourceStatus, SourceType
 from portfolio_maker.infrastructure.sqlite_repository import SQLiteRepository
+from portfolio_maker.infrastructure.semantic_crawler import crawl_local_structure
 from portfolio_maker.workspace import WorkspacePaths
 
 
@@ -48,8 +48,100 @@ def prepare_fixture_revision(workspace: Path, tmp_path: Path):
     (root / "README.md").write_text("Project overview", encoding="utf-8")
     (nested / "setup.md").write_text("Setup guidance", encoding="utf-8")
     approve_root(workspace, root)
-    return prepare_semantic_index(
+    prepared = prepare_semantic_index(
         PrepareSemanticIndexRequest(workspace=workspace, root=root, chunk_size=1)
+    )
+    publish_legacy_v1_fixture(workspace, root, prepared, chunk_size=1)
+    return prepared
+
+
+def read_protocol_v2_capsules(prepared) -> list[dict[str, object]]:
+    return [
+        capsule
+        for path in sorted(prepared.manifest_path.parent.joinpath("input").glob("chunk-*.json"))
+        for capsule in json.loads(path.read_text(encoding="utf-8"))["capsules"]
+    ]
+
+
+def read_private_structural_records(
+    workspace: Path,
+    revision_id: str,
+) -> list[dict[str, object]]:
+    paths = WorkspacePaths.from_root(workspace)
+    return [
+        node
+        for path in sorted(
+            paths.semantic_revision_structural_dir(revision_id).glob("chunk-*.json")
+        )
+        for node in json.loads(path.read_text(encoding="utf-8"))["nodes"]
+    ]
+
+
+def publish_legacy_v1_fixture(
+    workspace: Path,
+    root: Path,
+    prepared,
+    *,
+    chunk_size: int,
+) -> None:
+    paths = WorkspacePaths.from_root(workspace)
+    approval = load_approval(paths)
+    crawl = crawl_local_structure(root, approval)
+    prepared_nodes = semantic_index_module._prepare_nodes(crawl.entries, {})
+    repository = SQLiteRepository(paths.db_path)
+    repository.replace_semantic_revision_graph(
+        prepared.revision_id,
+        tuple(item.node for item in prepared_nodes),
+        {item.node.node_id: item.locator for item in prepared_nodes},
+        tuple(
+            SemanticEdge(
+                prepared.revision_id,
+                item.node.parent_node_id,
+                "contains",
+                item.node.node_id,
+            )
+            for item in prepared_nodes
+            if item.node.parent_node_id is not None
+        ),
+    )
+    payloads = tuple(
+        {
+            "version": 1,
+            "revision_id": prepared.revision_id,
+            "nodes": [
+                item.chunk_node
+                for item in prepared_nodes[index : index + chunk_size]
+            ],
+        }
+        for index in range(0, len(prepared_nodes), chunk_size)
+    )
+    chunk_texts = tuple(
+        semantic_index_module._canonical_json(payload) for payload in payloads
+    )
+    chunk_sha256s = [
+        hashlib.sha256(text.encode("utf-8")).hexdigest()
+        for text in chunk_texts
+    ]
+    for path in paths.semantic_index_input_dir.glob("chunk-*.json"):
+        path.unlink()
+    for index, text in enumerate(chunk_texts, start=1):
+        (paths.semantic_index_input_dir / f"chunk-{index:04}.json").write_text(
+            text,
+            encoding="utf-8",
+        )
+    paths.semantic_index_manifest_path.write_text(
+        semantic_index_module._canonical_json(
+            {
+                "version": 1,
+                "revision_id": prepared.revision_id,
+                "source_id": crawl.entries[0].source_id,
+                "policy_hash": semantic_index_module._policy_hash(approval),
+                "analyzer_version": semantic_index_module.ANALYZER_VERSION,
+                "chunk_sha256s": chunk_sha256s,
+                "node_count": len(prepared_nodes),
+            }
+        ),
+        encoding="utf-8",
     )
 
 
@@ -218,21 +310,12 @@ def test_prepare_semantic_index_links_current_approved_file_evidence_to_file_nod
         PrepareSemanticIndexRequest(workspace=workspace, root=root, chunk_size=1)
     )
 
-    staged_nodes = repository.list_semantic_nodes(prepared.revision_id)
+    capsules = read_protocol_v2_capsules(prepared)
     staged_file = next(
-        node for node in staged_nodes if node["relative_hierarchy"] == "README.md"
+        node for node in capsules if node["relative_hierarchy"] == "README.md"
     )
     assert staged_file["evidence_ids"] == [evidence_id]
-
-    write_valid_outputs(prepared)
-    apply_semantic_index(ApplySemanticIndexRequest(workspace=workspace))
-    review = prepare_project_review_v2(PrepareProjectReviewRequest(workspace=workspace))
-    review_payload = json.loads(review.input_path.read_text(encoding="utf-8"))
-    review_file = next(
-        node for node in review_payload["nodes"] if node["relative_hierarchy"] == "README.md"
-    )
-    assert review.evidence_count == 1
-    assert review_file["evidence_ids"] == [evidence_id]
+    assert repository.list_semantic_nodes(prepared.revision_id) == []
 
 
 def test_prepare_semantic_index_does_not_link_evidence_after_profiled_file_changes(
@@ -251,7 +334,7 @@ def test_prepare_semantic_index_does_not_link_evidence_after_profiled_file_chang
 
     staged_file = next(
         node
-        for node in repository.list_semantic_nodes(prepared.revision_id)
+        for node in read_protocol_v2_capsules(prepared)
         if node["relative_hierarchy"] == "README.md"
     )
     assert evidence_id not in staged_file["evidence_ids"]
@@ -276,7 +359,7 @@ def test_prepare_semantic_index_evidence_mapping_ignores_artifact_policy(
 
     staged_file = next(
         node
-        for node in repository.list_semantic_nodes(prepared.revision_id)
+        for node in read_protocol_v2_capsules(prepared)
         if node["relative_hierarchy"] == "README.md"
     )
     assert staged_file["evidence_ids"] == [evidence_id]
@@ -360,6 +443,7 @@ def test_apply_semantic_index_invalid_output_keeps_previous_active_revision(
     second = prepare_semantic_index(
         PrepareSemanticIndexRequest(workspace=workspace, root=root, chunk_size=1)
     )
+    publish_legacy_v1_fixture(workspace, root, second, chunk_size=1)
     write_valid_outputs(second)
     output_path = next(
         path
@@ -408,6 +492,7 @@ def test_apply_semantic_index_rejects_changed_approval_policy_and_keeps_previous
     second = prepare_semantic_index(
         PrepareSemanticIndexRequest(workspace=workspace, root=root, chunk_size=1)
     )
+    publish_legacy_v1_fixture(workspace, root, second, chunk_size=1)
     write_valid_outputs(second)
 
     paths = WorkspacePaths.from_root(workspace)
@@ -442,6 +527,7 @@ def test_apply_semantic_index_rejects_relative_file_locator_and_keeps_previous_a
     second = prepare_semantic_index(
         PrepareSemanticIndexRequest(workspace=workspace, root=root, chunk_size=1)
     )
+    publish_legacy_v1_fixture(workspace, root, second, chunk_size=1)
     write_valid_outputs(second)
     output_path = next((second.manifest_path.parent / "output").glob("chunk-*.json"))
     payload = json.loads(output_path.read_text(encoding="utf-8"))
@@ -500,6 +586,7 @@ def test_apply_semantic_index_preserves_partial_status(workspace: Path, tmp_path
     prepared = prepare_semantic_index(
         PrepareSemanticIndexRequest(workspace=workspace, root=root, chunk_size=1)
     )
+    publish_legacy_v1_fixture(workspace, root, prepared, chunk_size=1)
     write_valid_outputs(prepared)
 
     result = apply_semantic_index(ApplySemanticIndexRequest(workspace=workspace))
@@ -525,6 +612,7 @@ def test_apply_semantic_index_interruption_keeps_previous_active_revision(
     second = prepare_semantic_index(
         PrepareSemanticIndexRequest(workspace=workspace, root=root, chunk_size=1)
     )
+    publish_legacy_v1_fixture(workspace, root, second, chunk_size=1)
     write_valid_outputs(second)
 
     def interrupted(*args, **kwargs) -> None:
@@ -575,17 +663,23 @@ def test_prepare_semantic_index_writes_locator_free_chunks_and_staging_revision(
 
     assert set(manifest) == {
         "version",
+        "protocol",
         "revision_id",
         "source_id",
         "policy_hash",
         "analyzer_version",
-        "chunk_sha256s",
+        "capsule_chunk_sha256s",
+        "work_plan_sha256",
         "node_count",
+        "work_unit_count",
+        "managed_input_bytes",
+        "analysis_target_count",
+        "structural_only_count",
     }
-    assert manifest["version"] == 1
+    assert manifest["version"] == 2
     assert manifest["revision_id"] == result.revision_id
     assert len(chunk_paths) == result.chunk_count
-    assert len(manifest["chunk_sha256s"]) == result.chunk_count
+    assert len(manifest["capsule_chunk_sha256s"]) == result.chunk_count
     assert result.node_count > 0
     assert result.partial_count == 0
     assert str(root) not in serialized
@@ -596,12 +690,12 @@ def test_prepare_semantic_index_writes_locator_free_chunks_and_staging_revision(
     assert "credential.txt" not in serialized
 
     nodes = [
-        node
+        capsule
         for path in chunk_paths
-        for node in json.loads(path.read_text(encoding="utf-8"))["nodes"]
+        for capsule in json.loads(path.read_text(encoding="utf-8"))["capsules"]
     ]
     readme = next(node for node in nodes if node["relative_hierarchy"] == "README.md")
-    assert readme["masked_excerpt"] == (
+    assert readme["signals"][0]["text"] == (
         "API_TOKEN=[REDACTED]\nSOURCE_PATH=[REDACTED]\n"
         "CREDENTIAL=[REDACTED]\nAuthorization: [REDACTED]\n"
         "See ([REDACTED])\n# Evidence\n"
@@ -614,12 +708,122 @@ def test_prepare_semantic_index_writes_locator_free_chunks_and_staging_revision(
             "SELECT status FROM semantic_index_revisions WHERE id = ?",
             (result.revision_id,),
         ).fetchone()
-        locator_count = connection.execute(
-            "SELECT COUNT(*) FROM semantic_node_locators WHERE revision_id = ?",
+        node_count = connection.execute(
+            "SELECT COUNT(*) FROM semantic_nodes WHERE revision_id = ?",
             (result.revision_id,),
         ).fetchone()
     assert revision == ("staging",)
-    assert locator_count == (result.node_count,)
+    assert node_count == (0,)
+    private_locators = [
+        locator
+        for path in repository_paths.semantic_revision_locator_dir(
+            result.revision_id
+        ).glob("chunk-*.json")
+        for locator in json.loads(path.read_text(encoding="utf-8"))["locators"]
+    ]
+    assert len(private_locators) == result.node_count
+
+
+def test_protocol_v2_prepare_publishes_bounded_inputs_without_staging_graph(
+    workspace: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "approved-root"
+    root.mkdir()
+    (root / "README.md").write_text(
+        "OPENAI_API_KEY=sk-synthetic-placeholder\n"
+        f"SOURCE_PATH={root}/private.txt\n"
+        "# Safe evidence\nProject details",
+        encoding="utf-8",
+    )
+    (root / "empty.md").write_text("", encoding="utf-8")
+    (root / "archive.bin").write_bytes(b"\x00\x01binary")
+    approve_root(workspace, root)
+    graph_replacements: list[str] = []
+    original_replace = SQLiteRepository.replace_semantic_revision_graph
+
+    def record_graph_replacement(
+        self: SQLiteRepository,
+        revision_id: str,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        graph_replacements.append(revision_id)
+        original_replace(self, revision_id, *args, **kwargs)
+
+    monkeypatch.setattr(
+        SQLiteRepository,
+        "replace_semantic_revision_graph",
+        record_graph_replacement,
+    )
+
+    result = prepare_semantic_index(
+        PrepareSemanticIndexRequest(workspace=workspace, root=root, chunk_size=2)
+    )
+
+    paths = WorkspacePaths.from_root(workspace)
+    manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    work_plan = json.loads(paths.semantic_work_plan_path.read_text(encoding="utf-8"))
+    capsule_paths = sorted(paths.semantic_index_input_dir.glob("chunk-*.json"))
+    structural_paths = sorted(
+        paths.semantic_revision_structural_dir(result.revision_id).glob("chunk-*.json")
+    )
+    locator_paths = sorted(
+        paths.semantic_revision_locator_dir(result.revision_id).glob("chunk-*.json")
+    )
+    public_texts = [
+        result.manifest_path.read_text(encoding="utf-8"),
+        paths.semantic_work_plan_path.read_text(encoding="utf-8"),
+        *(path.read_text(encoding="utf-8") for path in capsule_paths),
+    ]
+    public_serialized = "\n".join(public_texts)
+    managed_input_bytes = sum(
+        len(text.encode("utf-8"))
+        for text in (
+            paths.semantic_work_plan_path.read_text(encoding="utf-8"),
+            *(path.read_text(encoding="utf-8") for path in capsule_paths),
+        )
+    )
+    capsules = [
+        capsule
+        for path in capsule_paths
+        for capsule in json.loads(path.read_text(encoding="utf-8"))["capsules"]
+    ]
+
+    assert manifest["version"] == 2
+    assert manifest["protocol"] == "codex-semantic-v2"
+    assert manifest["revision_id"] == result.revision_id
+    assert manifest["work_plan_sha256"] == hashlib.sha256(
+        paths.semantic_work_plan_path.read_bytes()
+    ).hexdigest()
+    assert len(manifest["capsule_chunk_sha256s"]) == result.chunk_count
+    assert work_plan["version"] == 2
+    assert work_plan["revision_id"] == result.revision_id
+    assert len(work_plan["units"]) == result.work_unit_count
+    assert result.node_count == len(capsules)
+    assert result.managed_input_bytes == managed_input_bytes
+    assert (
+        result.analysis_target_count + result.structural_only_count
+        == result.node_count
+    )
+    assert structural_paths
+    assert locator_paths
+    assert str(root) in "\n".join(
+        path.read_text(encoding="utf-8") for path in locator_paths
+    )
+    assert str(root) not in public_serialized
+    assert "sk-synthetic-placeholder" not in public_serialized
+    assert "semantic_summary" not in public_serialized
+    assert graph_replacements == []
+    repository = SQLiteRepository(paths.db_path)
+    assert repository.list_semantic_nodes(result.revision_id) == []
+    with sqlite3.connect(paths.db_path) as connection:
+        revision = connection.execute(
+            "SELECT status FROM semantic_index_revisions WHERE id = ?",
+            (result.revision_id,),
+        ).fetchone()
+    assert revision == ("staging",)
 
 
 def test_prepare_semantic_index_scans_only_the_requested_root(
@@ -663,13 +867,14 @@ def test_prepare_semantic_index_skips_unsupported_symlink_analysis(
         PrepareSemanticIndexRequest(workspace=workspace, root=root)
     )
 
-    nodes = SQLiteRepository(
-        WorkspacePaths.from_root(workspace).db_path
-    ).list_semantic_nodes(result.revision_id)
+    nodes = read_protocol_v2_capsules(result)
     broken = next(
         node for node in nodes if node["relative_hierarchy"] == "broken-link"
     )
     assert broken["analysis_status"] == "unsupported"
+    assert broken["semantic_disposition"] == "unsupported"
+    assert broken["signals"] == []
+    assert broken["roles"] == []
     assert "README.md" in analyzed
     assert "broken-link" not in analyzed
 
@@ -694,11 +899,17 @@ def test_prepare_semantic_index_skips_evidence_for_file_missing_after_analysis(
         PrepareSemanticIndexRequest(workspace=workspace, root=root)
     )
 
-    nodes = SQLiteRepository(
-        WorkspacePaths.from_root(workspace).db_path
-    ).list_semantic_nodes(result.revision_id)
-    readme = next(node for node in nodes if node["relative_hierarchy"] == "README.md")
+    structural = read_private_structural_records(workspace, result.revision_id)
+    readme = next(
+        node for node in structural if node["relative_hierarchy"] == "README.md"
+    )
     assert readme["evidence_ids"] == []
+    capsule = next(
+        node
+        for node in read_protocol_v2_capsules(result)
+        if node["relative_hierarchy"] == "README.md"
+    )
+    assert capsule["evidence_ids"] == []
 
 
 def test_prepare_semantic_index_replaces_only_prior_managed_chunks(
@@ -729,7 +940,7 @@ def test_prepare_semantic_index_replaces_only_prior_managed_chunks(
     )
 
     assert len(chunk_paths) == second.chunk_count
-    assert len(chunk_paths) == len(manifest["chunk_sha256s"])
+    assert len(chunk_paths) == len(manifest["capsule_chunk_sha256s"])
     assert "old chunk payload" not in serialized
     assert unrelated_path.read_text(encoding="utf-8") == "preserve this file"
 
@@ -796,7 +1007,11 @@ def test_prepare_semantic_index_reader_never_observes_incoherent_generation(
     assert [
         hashlib.sha256(chunk_text.encode("utf-8")).hexdigest()
         for chunk_text in published.chunk_texts.values()
-    ] == manifest["chunk_sha256s"]
+    ] == manifest["capsule_chunk_sha256s"]
+    assert published.work_plan_text is not None
+    assert hashlib.sha256(
+        published.work_plan_text.encode("utf-8")
+    ).hexdigest() == manifest["work_plan_sha256"]
     assert all(
         json.loads(chunk_text)["revision_id"] == manifest["revision_id"]
         for chunk_text in published.chunk_texts.values()
@@ -820,6 +1035,9 @@ def test_prepare_semantic_index_restores_previous_input_when_publication_fails(
     source_id = json.loads(first.manifest_path.read_text(encoding="utf-8"))["source_id"]
     input_dir = first.manifest_path.parent / "input"
     previous_manifest = first.manifest_path.read_text(encoding="utf-8")
+    previous_work_plan = WorkspacePaths.from_root(
+        workspace
+    ).semantic_work_plan_path.read_text(encoding="utf-8")
     previous_chunks = {
         path.name: path.read_text(encoding="utf-8")
         for path in input_dir.glob("chunk-*.json")
@@ -857,6 +1075,12 @@ def test_prepare_semantic_index_restores_previous_input_when_publication_fails(
         )
 
     assert first.manifest_path.read_text(encoding="utf-8") == previous_manifest
+    assert (
+        WorkspacePaths.from_root(workspace).semantic_work_plan_path.read_text(
+            encoding="utf-8"
+        )
+        == previous_work_plan
+    )
     assert {
         path.name: path.read_text(encoding="utf-8")
         for path in input_dir.glob("chunk-*.json")

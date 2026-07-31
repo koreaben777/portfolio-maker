@@ -157,6 +157,10 @@ class PrepareSemanticIndexResult:
     node_count: int
     chunk_count: int
     partial_count: int
+    work_unit_count: int
+    managed_input_bytes: int
+    analysis_target_count: int
+    structural_only_count: int
 
 
 @dataclass(frozen=True)
