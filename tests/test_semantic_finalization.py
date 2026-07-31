@@ -63,6 +63,10 @@ FINAL_MANIFEST_KEYS = {
     "policy_hash",
     "analyzer_version",
     "work_plan_sha256",
+    "input_manifest_sha256",
+    "directory_timeout_seconds",
+    "timed_out_directory_count",
+    "unreadable_directory_count",
     "node_assignment_sha256",
     "receipt_file_sha256s",
     "chunk_sha256s",
@@ -423,6 +427,15 @@ def test_finalize_manifest_is_content_free_and_exactly_hash_bound(
         manifest["analysis_node_count"] + manifest["structural_node_count"]
         == manifest["node_count"]
     )
+    input_manifest = json.loads(
+        completed_finalization.paths.semantic_index_manifest_path.read_text(
+            encoding="utf-8"
+        )
+    )
+    assert manifest["input_manifest_sha256"] == input_manifest["manifest_sha256"]
+    assert manifest["directory_timeout_seconds"] == 30.0
+    assert manifest["timed_out_directory_count"] == 0
+    assert manifest["unreadable_directory_count"] == 0
 
     chunk_paths = [
         completed_finalization.paths.semantic_final_dir
@@ -544,6 +557,11 @@ def test_finalize_rejects_coherently_rebound_structural_locator_text(
             break
     assert structural_node_id is not None
     assert changed_chunk_index is not None
+    unsigned_manifest = dict(manifest)
+    unsigned_manifest.pop("manifest_sha256")
+    manifest["manifest_sha256"] = _sha256(
+        _canonical_bytes(unsigned_manifest)
+    )
     write_managed_text(manifest_path, _canonical_text(manifest))
 
     structural_path = next(

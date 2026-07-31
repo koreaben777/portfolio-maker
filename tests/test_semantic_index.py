@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+import multiprocessing
 import sqlite3
 import threading
 from pathlib import Path
@@ -675,6 +677,10 @@ def test_prepare_semantic_index_writes_locator_free_chunks_and_staging_revision(
         "managed_input_bytes",
         "analysis_target_count",
         "structural_only_count",
+        "directory_timeout_seconds",
+        "timed_out_directory_count",
+        "unreadable_directory_count",
+        "manifest_sha256",
     }
     assert manifest["version"] == 2
     assert manifest["revision_id"] == result.revision_id
@@ -844,6 +850,204 @@ def test_prepare_semantic_index_scans_only_the_requested_root(
         for path in result.manifest_path.parent.joinpath("input").glob("chunk-*.json")
     )
     assert "not-in-scope.md" not in serialized
+
+
+@pytest.mark.parametrize(
+    "value",
+    [True, "1", math.nan, math.inf, -math.inf, 0, -1, 300.01],
+)
+def test_prepare_rejects_invalid_directory_timeout_before_workspace_write(
+    tmp_path: Path,
+    value: object,
+) -> None:
+    workspace = tmp_path / "workspace"
+    root = tmp_path / "root"
+    workspace.mkdir()
+    root.mkdir()
+
+    with pytest.raises(SemanticIndexError, match="directory timeout"):
+        prepare_semantic_index(
+            PrepareSemanticIndexRequest(
+                workspace=workspace,
+                root=root,
+                directory_timeout_seconds=value,
+            )
+        )
+
+    assert not (workspace / ".portfolio-maker").exists()
+
+
+def test_prepare_root_timeout_is_controlled_without_semantic_publication(
+    workspace: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "approved-root"
+    root.mkdir()
+    approve_root(workspace, root)
+
+    def root_timeout(*_args, **_kwargs):
+        from portfolio_maker.infrastructure.semantic_crawler import (
+            StructuralCrawlRootTimeoutError,
+        )
+
+        raise StructuralCrawlRootTimeoutError("synthetic timeout")
+
+    monkeypatch.setattr(semantic_index_module, "crawl_local_structure", root_timeout)
+
+    with pytest.raises(SemanticIndexError, match="timed out"):
+        prepare_semantic_index(
+            PrepareSemanticIndexRequest(workspace=workspace, root=root)
+        )
+
+    paths = WorkspacePaths.from_root(workspace)
+    assert not paths.semantic_index_manifest_path.exists()
+    assert not paths.semantic_work_plan_path.exists()
+    assert not paths.semantic_index_report_path.exists()
+    assert not (paths.raw_dir / "semantic-index").exists()
+    assert not paths.db_path.exists()
+
+
+def test_prepare_worker_failure_is_controlled_without_semantic_publication(
+    workspace: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "approved-root"
+    root.mkdir()
+    approve_root(workspace, root)
+
+    def worker_failure(*_args, **_kwargs):
+        from portfolio_maker.infrastructure.semantic_crawler import (
+            StructuralCrawlWorkerError,
+        )
+
+        raise StructuralCrawlWorkerError(
+            f"synthetic worker failure at {root}"
+        )
+
+    monkeypatch.setattr(
+        semantic_index_module,
+        "crawl_local_structure",
+        worker_failure,
+    )
+
+    with pytest.raises(SemanticIndexError) as captured:
+        prepare_semantic_index(
+            PrepareSemanticIndexRequest(workspace=workspace, root=root)
+        )
+
+    assert str(captured.value) == "semantic index crawl failed safely"
+    assert str(root) not in str(captured.value)
+    paths = WorkspacePaths.from_root(workspace)
+    assert not paths.semantic_index_manifest_path.exists()
+    assert not paths.semantic_work_plan_path.exists()
+    assert not paths.semantic_index_report_path.exists()
+    assert not (paths.raw_dir / "semantic-index").exists()
+    assert not paths.db_path.exists()
+
+
+def test_prepare_manifest_binds_crawl_watchdog_aggregates(
+    workspace: Path,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "approved-root"
+    root.mkdir()
+    (root / "README.md").write_text("evidence", encoding="utf-8")
+    approve_root(workspace, root)
+
+    result = prepare_semantic_index(
+        PrepareSemanticIndexRequest(
+            workspace=workspace,
+            root=root,
+            directory_timeout_seconds=12.5,
+        )
+    )
+    manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+
+    assert manifest["directory_timeout_seconds"] == 12.5
+    assert manifest["timed_out_directory_count"] == 0
+    assert manifest["unreadable_directory_count"] == 0
+    assert len(manifest["manifest_sha256"]) == 64
+    assert result.directory_timeout_seconds == 12.5
+    assert result.timed_out_directory_count == 0
+    assert result.unreadable_directory_count == 0
+
+
+def test_prepare_child_timeout_is_bound_and_responsive_rerun_is_fresh(
+    workspace: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "approved-root"
+    blocked = root / "blocked"
+    sibling = root / "sibling"
+    blocked.mkdir(parents=True)
+    sibling.mkdir()
+    (blocked / "hidden.md").write_text("hidden", encoding="utf-8")
+    (sibling / "visible.md").write_text("visible", encoding="utf-8")
+    approve_root(workspace, root)
+    original_crawl = crawl_local_structure
+
+    def controlled_crawl(root_path, approval, **kwargs):
+        from portfolio_maker.infrastructure.semantic_crawler import (
+            _materialize_directory,
+        )
+
+        def enumerator(path: Path):
+            if path.name == "blocked":
+                threading.Event().wait()
+            return _materialize_directory(path)
+
+        return original_crawl(
+            root_path,
+            approval,
+            directory_timeout_seconds=kwargs["directory_timeout_seconds"],
+            _process_context=multiprocessing.get_context("fork"),
+            _enumerator=enumerator,
+        )
+
+    monkeypatch.setattr(
+        semantic_index_module,
+        "crawl_local_structure",
+        controlled_crawl,
+    )
+    timed_out = prepare_semantic_index(
+        PrepareSemanticIndexRequest(
+            workspace=workspace,
+            root=root,
+            directory_timeout_seconds=0.05,
+        )
+    )
+    manifest = json.loads(timed_out.manifest_path.read_text(encoding="utf-8"))
+    capsules = read_protocol_v2_capsules(timed_out)
+
+    assert timed_out.timed_out_directory_count == 1
+    assert timed_out.unreadable_directory_count == 1
+    assert manifest["timed_out_directory_count"] == 1
+    assert next(
+        capsule for capsule in capsules
+        if capsule["relative_hierarchy"] == "blocked"
+    )["analysis_status"] == "unreadable"
+    assert all(
+        capsule["relative_hierarchy"] != "blocked/hidden.md"
+        for capsule in capsules
+    )
+    assert any(
+        capsule["relative_hierarchy"] == "sibling/visible.md"
+        for capsule in capsules
+    )
+
+    monkeypatch.setattr(
+        semantic_index_module,
+        "crawl_local_structure",
+        original_crawl,
+    )
+    responsive = prepare_semantic_index(
+        PrepareSemanticIndexRequest(workspace=workspace, root=root)
+    )
+    assert responsive.revision_id != timed_out.revision_id
+    assert responsive.timed_out_directory_count == 0
 
 
 def test_prepare_semantic_index_skips_unsupported_symlink_analysis(
@@ -1016,6 +1220,31 @@ def test_prepare_semantic_index_reader_never_observes_incoherent_generation(
         json.loads(chunk_text)["revision_id"] == manifest["revision_id"]
         for chunk_text in published.chunk_texts.values()
     )
+
+
+def test_published_semantic_input_reader_rejects_v2_manifest_self_hash_tamper(
+    workspace: Path,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "approved-root"
+    root.mkdir()
+    (root / "README.md").write_text("Project overview", encoding="utf-8")
+    approve_root(workspace, root)
+    prepared = prepare_semantic_index(
+        PrepareSemanticIndexRequest(workspace=workspace, root=root)
+    )
+    paths = WorkspacePaths.from_root(workspace)
+    manifest = json.loads(
+        prepared.manifest_path.read_text(encoding="utf-8")
+    )
+    manifest["directory_timeout_seconds"] = 12.5
+    prepared.manifest_path.write_text(
+        semantic_index_module._canonical_json(manifest),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SemanticIndexError, match="manifest"):
+        semantic_index_module._read_published_semantic_input(paths)
 
 
 def test_prepare_semantic_index_restores_previous_input_when_publication_fails(

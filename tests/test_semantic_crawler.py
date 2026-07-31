@@ -1,16 +1,50 @@
 from __future__ import annotations
 
+import multiprocessing
 import os
+import signal
+import threading
 from pathlib import Path
 
 import pytest
 
+import portfolio_maker.infrastructure.semantic_crawler as semantic_crawler_module
 from portfolio_maker.application.approval import SourceApproval
 from portfolio_maker.domain.semantic_models import AnalysisStatus, SemanticNodeKind
 from portfolio_maker.infrastructure.semantic_crawler import (
     StructuralCrawlRootError,
     crawl_local_structure,
 )
+
+
+def _blocking_directory_enumerator(path: Path):
+    if path.name == "blocked":
+        threading.Event().wait()
+    return semantic_crawler_module._materialize_directory(path)
+
+
+def _always_blocking_directory_enumerator(_path: Path):
+    threading.Event().wait()
+
+
+def _termination_resistant_directory_enumerator(_path: Path):
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    threading.Event().wait()
+
+
+def _crashing_directory_enumerator(_path: Path):
+    os._exit(73)
+
+
+def _malformed_worker_main(connection, _enumerator):
+    connection.send(
+        {
+            "protocol": "portfolio-semantic-directory-v1",
+            "status": "ready",
+        }
+    )
+    connection.recv()
+    connection.send({"protocol": "wrong", "status": "ok", "entries": []})
 
 
 def approval_for(root: Path, *, excluded: tuple[Path, ...] = ()) -> SourceApproval:
@@ -53,31 +87,175 @@ def test_excluded_directory_is_pruned_without_child_names(tmp_path: Path) -> Non
     assert all("secret-plan" not in error.relative_hierarchy for error in result.errors)
 
 
-def test_unreadable_directory_is_reported_as_partial_error(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_unreadable_directory_is_reported_as_partial_error(tmp_path: Path) -> None:
     root = tmp_path / "root"
     blocked = root / "blocked"
     blocked.mkdir(parents=True)
     (blocked / "hidden.md").write_text("hidden", encoding="utf-8")
-    original_scandir = os.scandir
-
-    def denied_scandir(path: str | bytes | os.PathLike[str] | os.PathLike[bytes]):
+    def denied_enumerator(path: Path):
         if Path(path) == blocked:
             raise PermissionError("permission denied")
-        return original_scandir(path)
+        return semantic_crawler_module._materialize_directory(path)
 
-    monkeypatch.setattr(
-        "portfolio_maker.infrastructure.semantic_crawler.os.scandir", denied_scandir
+    result = crawl_local_structure(
+        root,
+        approval_for(root),
+        _process_context=multiprocessing.get_context("fork"),
+        _enumerator=denied_enumerator,
     )
-
-    result = crawl_local_structure(root, approval_for(root))
 
     assert "blocked/hidden.md" not in {entry.relative_hierarchy for entry in result.entries}
     assert [(error.relative_hierarchy, error.status) for error in result.errors] == [
         ("blocked", AnalysisStatus.UNREADABLE)
     ]
 
+
+def test_blocked_directory_is_bounded_and_sibling_continues_without_worker_leak(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    blocked = root / "blocked"
+    sibling = root / "sibling"
+    blocked.mkdir(parents=True)
+    sibling.mkdir()
+    (blocked / "hidden.md").write_text("hidden", encoding="utf-8")
+    (sibling / "visible.md").write_text("visible", encoding="utf-8")
+    context = multiprocessing.get_context("fork")
+    before = {process.pid for process in multiprocessing.active_children()}
+
+    result = crawl_local_structure(
+        root,
+        approval_for(root),
+        directory_timeout_seconds=0.2,
+        _process_context=context,
+        _enumerator=_blocking_directory_enumerator,
+    )
+
+    relative_entries = {entry.relative_hierarchy: entry for entry in result.entries}
+    assert relative_entries["blocked"].status is AnalysisStatus.UNREADABLE
+    assert "blocked/hidden.md" not in relative_entries
+    assert "sibling/visible.md" in relative_entries
+    assert result.timed_out_directory_count == 1
+    assert result.unreadable_directory_count == 1
+    assert [error.timed_out for error in result.errors] == [True]
+    assert {process.pid for process in multiprocessing.active_children()} == before
+
+
+def test_root_timeout_is_distinct_and_reaps_worker(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    context = multiprocessing.get_context("fork")
+    before = {process.pid for process in multiprocessing.active_children()}
+
+    with pytest.raises(semantic_crawler_module.StructuralCrawlRootTimeoutError):
+        crawl_local_structure(
+            root,
+            approval_for(root),
+            directory_timeout_seconds=0.05,
+            _process_context=context,
+            _enumerator=_always_blocking_directory_enumerator,
+        )
+
+    assert {process.pid for process in multiprocessing.active_children()} == before
+
+
+def test_worker_crash_and_malformed_protocol_fail_closed(tmp_path: Path) -> None:
+    directory = tmp_path / "directory"
+    directory.mkdir()
+    context = multiprocessing.get_context("fork")
+
+    with semantic_crawler_module._DirectoryEnumerationWorker(
+        process_context=context,
+        enumerator=_crashing_directory_enumerator,
+    ) as worker:
+        with pytest.raises(
+            semantic_crawler_module.StructuralCrawlWorkerError,
+            match="failed safely",
+        ):
+            worker.enumerate(directory, timeout_seconds=0.2)
+
+    with semantic_crawler_module._DirectoryEnumerationWorker(
+        process_context=context,
+        enumerator=semantic_crawler_module._materialize_directory,
+        worker_target=_malformed_worker_main,
+    ) as worker:
+        with pytest.raises(
+            semantic_crawler_module.StructuralCrawlWorkerError,
+            match="failed safely",
+        ):
+            worker.enumerate(directory, timeout_seconds=0.2)
+
+
+def test_worker_reuses_successful_process_and_replaces_timed_out_process(
+    tmp_path: Path,
+) -> None:
+    responsive = tmp_path / "responsive"
+    blocked = tmp_path / "blocked"
+    responsive.mkdir()
+    blocked.mkdir()
+    context = multiprocessing.get_context("fork")
+
+    with semantic_crawler_module._DirectoryEnumerationWorker(
+        process_context=context,
+        enumerator=_blocking_directory_enumerator,
+    ) as worker:
+        first_pid = worker.pid
+        assert not worker.enumerate(
+            responsive,
+            timeout_seconds=0.2,
+        ).timed_out
+        assert worker.pid == first_pid
+        assert worker.enumerate(blocked, timeout_seconds=0.05).timed_out
+        assert worker.pid != first_pid
+        assert not worker.enumerate(
+            responsive,
+            timeout_seconds=0.2,
+        ).timed_out
+
+
+def test_worker_timeout_escalates_to_kill_and_reaps_process(
+    tmp_path: Path,
+) -> None:
+    directory = tmp_path / "directory"
+    directory.mkdir()
+    context = multiprocessing.get_context("fork")
+    before = {process.pid for process in multiprocessing.active_children()}
+
+    with semantic_crawler_module._DirectoryEnumerationWorker(
+        process_context=context,
+        enumerator=_termination_resistant_directory_enumerator,
+    ) as worker:
+        timed_out_pid = worker.pid
+        assert worker.enumerate(directory, timeout_seconds=0.05).timed_out
+        assert worker.pid != timed_out_pid
+
+    assert {process.pid for process in multiprocessing.active_children()} == before
+
+
+def test_worker_is_reaped_when_caller_is_interrupted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    directory = tmp_path / "directory"
+    directory.mkdir()
+    context = multiprocessing.get_context("fork")
+    before = {process.pid for process in multiprocessing.active_children()}
+
+    with pytest.raises(KeyboardInterrupt):
+        with semantic_crawler_module._DirectoryEnumerationWorker(
+            process_context=context,
+            enumerator=_always_blocking_directory_enumerator,
+        ) as worker:
+            monkeypatch.setattr(
+                semantic_crawler_module,
+                "wait",
+                lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                    KeyboardInterrupt()
+                ),
+            )
+            worker.enumerate(directory, timeout_seconds=0.2)
+
+    assert {process.pid for process in multiprocessing.active_children()} == before
 
 def test_broken_and_directory_symlinks_are_not_followed(tmp_path: Path) -> None:
     root = tmp_path / "root"

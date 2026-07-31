@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import sqlite3
@@ -67,7 +68,10 @@ from portfolio_maker.infrastructure.semantic_analyzers import (
 )
 from portfolio_maker.infrastructure.semantic_capsules import build_feature_capsules
 from portfolio_maker.infrastructure.semantic_crawler import (
+    MAX_DIRECTORY_TIMEOUT_SECONDS,
     StructuralCrawlRootError,
+    StructuralCrawlRootTimeoutError,
+    StructuralCrawlWorkerError,
     StructuralEntry,
     crawl_local_structure,
 )
@@ -108,6 +112,10 @@ _FINAL_MANIFEST_KEYS = {
     "policy_hash",
     "analyzer_version",
     "work_plan_sha256",
+    "input_manifest_sha256",
+    "directory_timeout_seconds",
+    "timed_out_directory_count",
+    "unreadable_directory_count",
     "node_assignment_sha256",
     "receipt_file_sha256s",
     "chunk_sha256s",
@@ -178,6 +186,10 @@ _V2_INPUT_MANIFEST_KEYS = {
     "managed_input_bytes",
     "analysis_target_count",
     "structural_only_count",
+    "directory_timeout_seconds",
+    "timed_out_directory_count",
+    "unreadable_directory_count",
+    "manifest_sha256",
 }
 _WORK_PLAN_KEYS = {
     "version",
@@ -530,9 +542,23 @@ def _observe_v2_binding_scratch(database_path: Path) -> None:
     del database_path
 
 
+def _validated_directory_timeout(value: object) -> float:
+    if (
+        type(value) not in {int, float}
+        or not math.isfinite(value)
+        or value <= 0
+        or value > MAX_DIRECTORY_TIMEOUT_SECONDS
+    ):
+        raise SemanticIndexError("semantic index directory timeout is invalid")
+    return float(value)
+
+
 def prepare_semantic_index(
     request: PrepareSemanticIndexRequest,
 ) -> PrepareSemanticIndexResult:
+    directory_timeout_seconds = _validated_directory_timeout(
+        request.directory_timeout_seconds
+    )
     if not isinstance(request.chunk_size, int) or isinstance(request.chunk_size, bool) or request.chunk_size <= 0:
         raise SemanticIndexError("semantic index chunk size must be positive")
 
@@ -541,7 +567,15 @@ def prepare_semantic_index(
     approval = load_approval(paths)
     _validate_approved_root(request.root, approval)
     try:
-        crawl = crawl_local_structure(request.root, approval)
+        crawl = crawl_local_structure(
+            request.root,
+            approval,
+            directory_timeout_seconds=directory_timeout_seconds,
+        )
+    except StructuralCrawlRootTimeoutError as error:
+        raise SemanticIndexError("semantic index root crawl timed out") from error
+    except StructuralCrawlWorkerError as error:
+        raise SemanticIndexError("semantic index crawl failed safely") from error
     except StructuralCrawlRootError as error:
         raise SemanticIndexError("semantic index root is invalid") from error
     if not crawl.entries:
@@ -588,7 +622,7 @@ def prepare_semantic_index(
     managed_input_bytes = len(plan_text.encode("utf-8")) + sum(
         len(text.encode("utf-8")) for text in chunk_texts
     )
-    manifest = {
+    unsigned_manifest: dict[str, object] = {
         "version": 2,
         "protocol": "codex-semantic-v2",
         "revision_id": revision_id,
@@ -602,6 +636,15 @@ def prepare_semantic_index(
         "managed_input_bytes": managed_input_bytes,
         "analysis_target_count": plan.analysis_target_count,
         "structural_only_count": plan.structural_owner_count,
+        "directory_timeout_seconds": directory_timeout_seconds,
+        "timed_out_directory_count": crawl.timed_out_directory_count,
+        "unreadable_directory_count": crawl.unreadable_directory_count,
+    }
+    manifest = {
+        **unsigned_manifest,
+        "manifest_sha256": hashlib.sha256(
+            _canonical_json(unsigned_manifest).encode("utf-8")
+        ).hexdigest(),
     }
 
     repository.create_semantic_revision(
@@ -635,6 +678,9 @@ def prepare_semantic_index(
         managed_input_bytes=managed_input_bytes,
         analysis_target_count=plan.analysis_target_count,
         structural_only_count=plan.structural_owner_count,
+        directory_timeout_seconds=directory_timeout_seconds,
+        timed_out_directory_count=crawl.timed_out_directory_count,
+        unreadable_directory_count=crawl.unreadable_directory_count,
     )
 
 
@@ -964,6 +1010,7 @@ def _parse_v2_final_manifest(content: bytes) -> dict[str, object]:
         or not _is_sha256(manifest.get("policy_hash"))
         or manifest.get("analyzer_version") != "semantic-input-v2"
         or not _is_sha256(manifest.get("work_plan_sha256"))
+        or not _is_sha256(manifest.get("input_manifest_sha256"))
         or not _is_sha256(manifest.get("node_assignment_sha256"))
         or not _is_sha256(manifest.get("node_ids_sha256"))
         or not _is_sha256(manifest_sha256)
@@ -988,6 +1035,19 @@ def _parse_v2_final_manifest(content: bytes) -> dict[str, object]:
         or manifest["node_count"] != sum(chunk_node_counts)
         or not _is_nonnegative_int(manifest.get("analysis_node_count"))
         or not _is_nonnegative_int(manifest.get("structural_node_count"))
+        or not _is_valid_directory_timeout(
+            manifest.get("directory_timeout_seconds")
+        )
+        or not _is_nonnegative_int(
+            manifest.get("timed_out_directory_count")
+        )
+        or not _is_nonnegative_int(
+            manifest.get("unreadable_directory_count")
+        )
+        or manifest["timed_out_directory_count"]
+        > manifest["unreadable_directory_count"]
+        or manifest["unreadable_directory_count"]
+        > manifest["node_count"]
         or manifest["analysis_node_count"]
         + manifest["structural_node_count"]
         != manifest["node_count"]
@@ -1017,11 +1077,11 @@ def _validate_v2_input_and_work_bindings(
         input_manifest_content,
         "semantic work manifest",
     )
+    input_manifest_sha256 = _validated_v2_input_manifest_sha256(
+        input_manifest,
+    )
     if (
-        set(input_manifest) != _V2_INPUT_MANIFEST_KEYS
-        or input_manifest.get("version") != 2
-        or input_manifest.get("protocol") != "codex-semantic-v2"
-        or input_manifest.get("revision_id") != manifest["revision_id"]
+        input_manifest.get("revision_id") != manifest["revision_id"]
         or input_manifest.get("source_id") != manifest["source_id"]
         or input_manifest.get("policy_hash") != manifest["policy_hash"]
         or input_manifest.get("analyzer_version")
@@ -1033,18 +1093,13 @@ def _validate_v2_input_and_work_bindings(
         != manifest["analysis_node_count"]
         or input_manifest.get("structural_only_count")
         != manifest["structural_node_count"]
-        or not _is_positive_int(input_manifest.get("node_count"))
-        or not _is_positive_int(input_manifest.get("work_unit_count"))
-        or not _is_positive_int(input_manifest.get("managed_input_bytes"))
-        or not _is_nonnegative_int(
-            input_manifest.get("analysis_target_count")
-        )
-        or not _is_nonnegative_int(
-            input_manifest.get("structural_only_count")
-        )
-        or input_manifest["analysis_target_count"]
-        + input_manifest["structural_only_count"]
-        != input_manifest["node_count"]
+        or input_manifest_sha256 != manifest["input_manifest_sha256"]
+        or input_manifest.get("directory_timeout_seconds")
+        != manifest["directory_timeout_seconds"]
+        or input_manifest.get("timed_out_directory_count")
+        != manifest["timed_out_directory_count"]
+        or input_manifest.get("unreadable_directory_count")
+        != manifest["unreadable_directory_count"]
     ):
         raise SemanticIndexError("semantic work manifest is invalid")
     capsule_hashes = input_manifest.get("capsule_chunk_sha256s")
@@ -1170,6 +1225,16 @@ def _validate_v2_input_and_work_bindings(
                 policy_hash=str(input_manifest["policy_hash"]),
                 analyzer_version=str(input_manifest["analyzer_version"]),
                 work_plan_sha256=str(input_manifest["work_plan_sha256"]),
+                input_manifest_sha256=str(input_manifest_sha256),
+                directory_timeout_seconds=float(
+                    input_manifest["directory_timeout_seconds"]
+                ),
+                timed_out_directory_count=int(
+                    input_manifest["timed_out_directory_count"]
+                ),
+                unreadable_directory_count=int(
+                    input_manifest["unreadable_directory_count"]
+                ),
                 node_assignment_sha256=str(plan["node_assignment_sha256"]),
                 node_count=int(input_manifest["node_count"]),
                 analysis_node_count=int(
@@ -1566,6 +1631,60 @@ def _is_positive_int(value: object) -> bool:
 
 def _is_nonnegative_int(value: object) -> bool:
     return type(value) is int and value >= 0
+
+
+def _is_valid_directory_timeout(value: object) -> bool:
+    return (
+        type(value) in {int, float}
+        and math.isfinite(value)
+        and 0 < value <= MAX_DIRECTORY_TIMEOUT_SECONDS
+    )
+
+
+def _validated_v2_input_manifest_sha256(
+    manifest: dict[str, object],
+) -> str:
+    unsigned = dict(manifest)
+    manifest_sha256 = unsigned.pop("manifest_sha256", None)
+    capsule_hashes = manifest.get("capsule_chunk_sha256s")
+    if (
+        set(manifest) != _V2_INPUT_MANIFEST_KEYS
+        or manifest.get("version") != 2
+        or manifest.get("protocol") != "codex-semantic-v2"
+        or not _is_safe_identifier(manifest.get("revision_id"))
+        or not _is_safe_identifier(manifest.get("source_id"))
+        or not _is_sha256(manifest.get("policy_hash"))
+        or not _is_safe_identifier(manifest.get("analyzer_version"))
+        or type(capsule_hashes) is not list
+        or not capsule_hashes
+        or not all(_is_sha256(value) for value in capsule_hashes)
+        or not _is_sha256(manifest.get("work_plan_sha256"))
+        or not _is_positive_int(manifest.get("node_count"))
+        or not _is_positive_int(manifest.get("work_unit_count"))
+        or not _is_positive_int(manifest.get("managed_input_bytes"))
+        or not _is_nonnegative_int(manifest.get("analysis_target_count"))
+        or not _is_nonnegative_int(manifest.get("structural_only_count"))
+        or manifest["analysis_target_count"]
+        + manifest["structural_only_count"]
+        != manifest["node_count"]
+        or not _is_valid_directory_timeout(
+            manifest.get("directory_timeout_seconds")
+        )
+        or not _is_nonnegative_int(
+            manifest.get("timed_out_directory_count")
+        )
+        or not _is_nonnegative_int(
+            manifest.get("unreadable_directory_count")
+        )
+        or manifest["timed_out_directory_count"]
+        > manifest["unreadable_directory_count"]
+        or manifest["unreadable_directory_count"] > manifest["node_count"]
+        or not _is_sha256(manifest_sha256)
+        or hashlib.sha256(_canonical_json(unsigned).encode("utf-8")).hexdigest()
+        != manifest_sha256
+    ):
+        raise SemanticIndexError("semantic index manifest is invalid")
+    return str(manifest_sha256)
 
 
 def _is_safe_presentation_text(value: object) -> bool:
@@ -2378,6 +2497,10 @@ def _read_published_semantic_input_unlocked(
 
     try:
         manifest = json.loads(manifest_text)
+        if type(manifest) is not dict:
+            raise TypeError
+        if manifest.get("version") == 2:
+            _validated_v2_input_manifest_sha256(manifest)
         chunk_sha256s = (
             manifest["capsule_chunk_sha256s"]
             if manifest.get("version") == 2

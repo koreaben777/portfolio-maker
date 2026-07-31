@@ -13,6 +13,7 @@ import portfolio_maker.application.semantic_index as semantic_index_module
 import portfolio_maker.application.semantic_work as semantic_work_module
 from portfolio_maker.application.approval import write_sample_approval
 from portfolio_maker.application.models import (
+    FinalizeSemanticIndexRequest,
     NextSemanticWorkRequest,
     PrepareSemanticIndexRequest,
     SemanticIndexStatusRequest,
@@ -22,6 +23,7 @@ from portfolio_maker.application.semantic_index import prepare_semantic_index
 from portfolio_maker.application.semantic_work import (
     SemanticWorkError,
     build_semantic_work_plan,
+    finalize_semantic_index,
     next_semantic_work,
     semantic_index_status,
     semantic_work_plan_payload,
@@ -50,6 +52,14 @@ def _canonical_text(payload: object) -> str:
 
 def _sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _signed_input_manifest(payload: dict[str, object]) -> dict[str, object]:
+    unsigned = dict(payload)
+    return {
+        **unsigned,
+        "manifest_sha256": _sha256_text(_canonical_text(unsigned)),
+    }
 
 
 def _approve_root(workspace: Path, root: Path) -> None:
@@ -560,6 +570,37 @@ def test_status_rejects_tampered_lifecycle_artifacts(
     assert status.complete is False
 
 
+@pytest.mark.parametrize("operation", ("status", "next", "finalize"))
+def test_semantic_lifecycle_rejects_crawl_watchdog_manifest_tamper(
+    prepared_work: PreparedWork,
+    operation: str,
+) -> None:
+    manifest = json.loads(
+        prepared_work.paths.semantic_index_manifest_path.read_text(
+            encoding="utf-8"
+        )
+    )
+    manifest["directory_timeout_seconds"] = 12.5
+    write_managed_text(
+        prepared_work.paths.semantic_index_manifest_path,
+        _canonical_text(manifest),
+    )
+
+    with pytest.raises(SemanticWorkError, match="manifest"):
+        if operation == "status":
+            semantic_index_status(
+                SemanticIndexStatusRequest(prepared_work.workspace)
+            )
+        elif operation == "next":
+            next_semantic_work(
+                NextSemanticWorkRequest(prepared_work.workspace)
+            )
+        else:
+            finalize_semantic_index(
+                FinalizeSemanticIndexRequest(prepared_work.workspace)
+            )
+
+
 def test_validation_rejects_duplicate_key_output_without_receipt(
     prepared_work: PreparedWork,
 ) -> None:
@@ -794,7 +835,7 @@ def _write_synthetic_v2_binding_state(
         )
     plan_text = _canonical_text(semantic_work_plan_payload(plan))
     write_managed_text(paths.semantic_work_plan_path, plan_text)
-    input_manifest = {
+    input_manifest = _signed_input_manifest({
         "version": 2,
         "protocol": "codex-semantic-v2",
         "revision_id": revision_id,
@@ -811,7 +852,10 @@ def _write_synthetic_v2_binding_state(
         + sum(len(text.encode("utf-8")) for text in capsule_texts),
         "analysis_target_count": plan.analysis_target_count,
         "structural_only_count": plan.structural_owner_count,
-    }
+        "directory_timeout_seconds": 30.0,
+        "timed_out_directory_count": 0,
+        "unreadable_directory_count": 0,
+    })
     write_managed_text(
         paths.semantic_index_manifest_path,
         _canonical_text(input_manifest),
@@ -828,6 +872,10 @@ def _write_synthetic_v2_binding_state(
         "policy_hash": policy_hash,
         "analyzer_version": "semantic-input-v2",
         "work_plan_sha256": _sha256_text(plan_text),
+        "input_manifest_sha256": input_manifest["manifest_sha256"],
+        "directory_timeout_seconds": 30.0,
+        "timed_out_directory_count": 0,
+        "unreadable_directory_count": 0,
         "node_assignment_sha256": plan.node_assignment_sha256,
         "node_count": len(capsules),
         "analysis_node_count": plan.analysis_target_count,
@@ -843,7 +891,7 @@ def _rewrite_synthetic_capsule_chunk(
     paths: WorkspacePaths,
     chunk_index: int,
     mutate,
-) -> None:
+) -> str:
     chunk_path = (
         paths.semantic_index_input_dir / f"chunk-{chunk_index:04}.json"
     )
@@ -867,10 +915,14 @@ def _rewrite_synthetic_capsule_chunk(
         )
         for index in range(1, len(manifest["capsule_chunk_sha256s"]) + 1)
     )
+    unsigned = dict(manifest)
+    unsigned.pop("manifest_sha256")
+    manifest["manifest_sha256"] = _sha256_text(_canonical_text(unsigned))
     write_managed_text(
         paths.semantic_index_manifest_path,
         _canonical_text(manifest),
     )
+    return str(manifest["manifest_sha256"])
 
 
 def _accept_synthetic_receipts(
@@ -911,7 +963,7 @@ def test_status_has_no_global_cap_for_10001_units(workspace: Path) -> None:
     )
     plan_text = _canonical_text(semantic_work_plan_payload(plan))
     manifest_text = _canonical_text(
-        {
+        _signed_input_manifest({
             "version": 2,
             "protocol": "codex-semantic-v2",
             "revision_id": revision_id,
@@ -925,7 +977,10 @@ def test_status_has_no_global_cap_for_10001_units(workspace: Path) -> None:
             "managed_input_bytes": len(chunk_text.encode()) + len(plan_text.encode()),
             "analysis_target_count": len(capsules),
             "structural_only_count": 0,
-        }
+            "directory_timeout_seconds": 30.0,
+            "timed_out_directory_count": 0,
+            "unreadable_directory_count": 0,
+        })
     )
     write_managed_text(paths.semantic_index_input_dir / "chunk-0001.json", chunk_text)
     write_managed_text(paths.semantic_work_plan_path, plan_text)
@@ -1017,7 +1072,7 @@ def test_v2_apply_rejects_rehashed_inexact_capsule_contract(
         paths,
         capsules,
     )
-    _rewrite_synthetic_capsule_chunk(
+    final_manifest["input_manifest_sha256"] = _rewrite_synthetic_capsule_chunk(
         paths,
         1,
         lambda raw_capsules: mutate(raw_capsules[1]),
@@ -1086,7 +1141,11 @@ def test_v2_apply_rejects_capsule_plan_ownership_mismatch(
             raw_capsules[0]["semantic_disposition"] = "structural_only"
             raw_capsules[0]["skip_reason"] = "no_text_signal"
 
-    _rewrite_synthetic_capsule_chunk(paths, 1, mutate)
+    final_manifest["input_manifest_sha256"] = _rewrite_synthetic_capsule_chunk(
+        paths,
+        1,
+        mutate,
+    )
     _accept_synthetic_receipts(monkeypatch, len(plan.units))
 
     with pytest.raises(
@@ -1121,7 +1180,7 @@ def test_v2_apply_rejects_duplicate_capsule_across_chunks(
         ).read_text(encoding="utf-8")
     )
     duplicate = first_chunk["capsules"][1]
-    _rewrite_synthetic_capsule_chunk(
+    final_manifest["input_manifest_sha256"] = _rewrite_synthetic_capsule_chunk(
         paths,
         2,
         lambda raw_capsules: raw_capsules.__setitem__(0, duplicate),
@@ -1207,7 +1266,7 @@ def test_v2_apply_binding_validation_keeps_only_one_capsule_chunk_in_memory(
         )
     plan_text = _canonical_text(semantic_work_plan_payload(plan))
     write_managed_text(paths.semantic_work_plan_path, plan_text)
-    input_manifest = {
+    input_manifest = _signed_input_manifest({
         "version": 2,
         "protocol": "codex-semantic-v2",
         "revision_id": revision_id,
@@ -1224,7 +1283,10 @@ def test_v2_apply_binding_validation_keeps_only_one_capsule_chunk_in_memory(
         + sum(len(text.encode("utf-8")) for text in capsule_texts),
         "analysis_target_count": 10_001,
         "structural_only_count": 0,
-    }
+        "directory_timeout_seconds": 30.0,
+        "timed_out_directory_count": 0,
+        "unreadable_directory_count": 0,
+    })
     write_managed_text(
         paths.semantic_index_manifest_path,
         _canonical_text(input_manifest),
@@ -1236,6 +1298,10 @@ def test_v2_apply_binding_validation_keeps_only_one_capsule_chunk_in_memory(
         "policy_hash": policy_hash,
         "analyzer_version": "semantic-input-v2",
         "work_plan_sha256": _sha256_text(plan_text),
+        "input_manifest_sha256": input_manifest["manifest_sha256"],
+        "directory_timeout_seconds": 30.0,
+        "timed_out_directory_count": 0,
+        "unreadable_directory_count": 0,
         "node_assignment_sha256": plan.node_assignment_sha256,
         "node_count": len(capsules),
         "analysis_node_count": 10_001,

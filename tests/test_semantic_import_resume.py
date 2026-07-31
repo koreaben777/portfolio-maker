@@ -535,6 +535,11 @@ def test_v2_apply_rejects_malformed_work_plan_binding_before_import(
         prepared.paths.semantic_index_manifest_path.read_text(encoding="utf-8")
     )
     input_manifest["work_plan_sha256"] = plan_hash
+    unsigned_input_manifest = dict(input_manifest)
+    unsigned_input_manifest.pop("manifest_sha256")
+    input_manifest["manifest_sha256"] = hashlib.sha256(
+        _canonical_bytes(unsigned_input_manifest)
+    ).hexdigest()
     write_managed_text(
         prepared.paths.semantic_index_manifest_path,
         _canonical_text(input_manifest),
@@ -544,6 +549,9 @@ def test_v2_apply_rejects_malformed_work_plan_binding_before_import(
         final_manifest_path.read_text(encoding="utf-8")
     )
     final_manifest["work_plan_sha256"] = plan_hash
+    final_manifest["input_manifest_sha256"] = input_manifest[
+        "manifest_sha256"
+    ]
     unsigned = {
         key: value
         for key, value in final_manifest.items()
@@ -563,6 +571,38 @@ def test_v2_apply_rejects_malformed_work_plan_binding_before_import(
     repository = SQLiteRepository(prepared.paths.db_path)
     active = repository.get_active_semantic_revision(
         final_manifest["source_id"]
+    )
+    assert active is not None
+    assert active["id"] == previous_id
+
+
+def test_v2_apply_rejects_rehashed_crawl_watchdog_binding_drift(
+    workspace: Path,
+    tmp_path: Path,
+) -> None:
+    prepared, _ = _prepare_completed_v2(workspace, tmp_path)
+    previous_id = _activate_previous_revision(prepared)
+    manifest_path = prepared.paths.semantic_index_manifest_path
+    input_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    input_manifest["timed_out_directory_count"] = 1
+    input_manifest["unreadable_directory_count"] = 1
+    unsigned = dict(input_manifest)
+    unsigned.pop("manifest_sha256")
+    input_manifest["manifest_sha256"] = hashlib.sha256(
+        _canonical_bytes(unsigned)
+    ).hexdigest()
+    write_managed_text(manifest_path, _canonical_text(input_manifest))
+
+    with pytest.raises(SemanticIndexError, match="manifest"):
+        apply_semantic_index(ApplySemanticIndexRequest(workspace=workspace))
+
+    repository = SQLiteRepository(prepared.paths.db_path)
+    active = repository.get_active_semantic_revision(
+        json.loads(
+            (prepared.paths.semantic_final_dir / "manifest.json").read_text(
+                encoding="utf-8"
+            )
+        )["source_id"]
     )
     assert active is not None
     assert active["id"] == previous_id

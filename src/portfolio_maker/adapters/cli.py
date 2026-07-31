@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from collections.abc import Sequence
 from dataclasses import asdict
@@ -82,6 +83,10 @@ from portfolio_maker.infrastructure.local_discovery import DiscoveryRootError
 from portfolio_maker.infrastructure.managed_files import write_managed_text
 from portfolio_maker.infrastructure.sqlite_repository import RepositoryError
 from portfolio_maker.infrastructure.sqlite_repository import SQLiteRepository
+from portfolio_maker.infrastructure.semantic_crawler import (
+    DEFAULT_DIRECTORY_TIMEOUT_SECONDS,
+    MAX_DIRECTORY_TIMEOUT_SECONDS,
+)
 from portfolio_maker.workspace import WorkspacePaths
 
 
@@ -156,6 +161,11 @@ def build_parser() -> argparse.ArgumentParser:
     prepare_index = subparsers.add_parser("prepare-semantic-index")
     prepare_index.add_argument("--workspace", type=Path, default=Path("."))
     prepare_index.add_argument("--root", type=Path, required=True)
+    prepare_index.add_argument(
+        "--directory-timeout-seconds",
+        type=_directory_timeout_argument,
+        default=DEFAULT_DIRECTORY_TIMEOUT_SECONDS,
+    )
 
     apply_index = subparsers.add_parser("apply-semantic-index")
     apply_index.add_argument("--workspace", type=Path, default=Path("."))
@@ -428,7 +438,11 @@ def _main(argv: Sequence[str] | None = None) -> int:
     if args.command == "prepare-semantic-index":
         try:
             result = prepare_semantic_index(
-                PrepareSemanticIndexRequest(workspace=args.workspace, root=args.root)
+                PrepareSemanticIndexRequest(
+                    workspace=args.workspace,
+                    root=args.root,
+                    directory_timeout_seconds=args.directory_timeout_seconds,
+                )
             )
             _write_prepared_semantic_index_report(
                 WorkspacePaths.from_root(args.workspace),
@@ -446,6 +460,18 @@ def _main(argv: Sequence[str] | None = None) -> int:
         print(f"Managed input bytes: {result.managed_input_bytes}")
         print(f"Analysis targets: {result.analysis_target_count}")
         print(f"Structural only: {result.structural_only_count}")
+        print(
+            "Directory timeout seconds: "
+            f"{result.directory_timeout_seconds}"
+        )
+        print(
+            "Timed-out directories: "
+            f"{result.timed_out_directory_count}"
+        )
+        print(
+            "Unreadable directories: "
+            f"{result.unreadable_directory_count}"
+        )
         return 0
 
     if args.command == "apply-semantic-index":
@@ -675,10 +701,32 @@ def _write_prepared_semantic_index_report(
             f"Structural only: {result.structural_only_count}",
             f"Managed input bytes: {result.managed_input_bytes}",
             f"Partial: {result.partial_count}",
+            f"Directory timeout seconds: {result.directory_timeout_seconds}",
+            f"Timed-out directories: {result.timed_out_directory_count}",
+            f"Unreadable directories: {result.unreadable_directory_count}",
             "",
         )
     )
     write_managed_text(paths.semantic_index_report_path, report)
+
+
+def _directory_timeout_argument(value: str) -> float:
+    try:
+        timeout = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "directory timeout must be a finite positive number"
+        ) from error
+    if (
+        not math.isfinite(timeout)
+        or timeout <= 0
+        or timeout > MAX_DIRECTORY_TIMEOUT_SECONDS
+    ):
+        raise argparse.ArgumentTypeError(
+            "directory timeout must be a finite positive number no greater "
+            f"than {MAX_DIRECTORY_TIMEOUT_SECONDS:g}"
+        )
+    return timeout
 
 
 def _write_applied_semantic_index_report(

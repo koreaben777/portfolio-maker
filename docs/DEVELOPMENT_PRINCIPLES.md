@@ -161,6 +161,10 @@ command 하나마다 skill을 만들거나 같은 application logic을 여러 sk
 - semantic prepare는 locator-free 구조와 `Work units`, `Managed input bytes` 견적만
   게시한다. source 승인과 별도로 사용자의 명시적 Codex 의미 실행 승인을 받은 뒤에만
   managed work input을 읽는다.
+- semantic prepare의 directory materialization은 [crawl watchdog 계약](superpowers/specs/2026-07-31-portfolio-maker-semantic-crawl-watchdog-design-addendum.md)에
+  따라 재사용 가능한 cancellable worker와 유한한 디렉터리별 deadline을 사용한다. 하위
+  timeout은 unreadable node로 격리하고, root timeout이나 worker protocol 오류는 managed
+  semantic output 없이 fail closed한다.
 - 의미 실행은 dependency-ready unit 하나씩 수행하고 matching output을 production
   validator로 검증해 receipt를 받은 뒤 진행한다. 중단은 마지막 유효 receipt 다음부터
   재개하며, generic·token-only·ungrounded 결과는 활성 revision이 될 수 없다.

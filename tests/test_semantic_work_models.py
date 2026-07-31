@@ -152,6 +152,9 @@ def test_semantic_application_contracts_have_exact_fields_and_are_frozen(
                 "managed_input_bytes",
                 "analysis_target_count",
                 "structural_only_count",
+                "directory_timeout_seconds",
+                "timed_out_directory_count",
+                "unreadable_directory_count",
             ),
         ),
     )

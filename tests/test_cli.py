@@ -332,6 +332,8 @@ def test_cli_prepare_semantic_index_reports_chunks_without_locator_values(
             str(workspace),
             "--root",
             str(root),
+            "--directory-timeout-seconds",
+            "12.5",
         ]
     )
 
@@ -350,9 +352,45 @@ def test_cli_prepare_semantic_index_reports_chunks_without_locator_values(
     assert "Work units: 510" in report_text
     assert "Analysis targets: 502" in report_text
     assert "Structural only: 0" in report_text
+    assert "Directory timeout seconds: 12.5" in captured.out
+    assert "Timed-out directories: 0" in captured.out
+    assert "Unreadable directories: 0" in captured.out
+    assert "Directory timeout seconds: 12.5" in report_text
+    assert "Timed-out directories: 0" in report_text
+    assert "Unreadable directories: 0" in report_text
     assert "Managed input bytes:" in report_text
     assert str(workspace) not in report_text
     assert str(root) not in report_text
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["not-a-number", "nan", "inf", "0", "-1", "300.01"],
+)
+def test_cli_rejects_invalid_directory_timeout_before_workspace_write(
+    tmp_path: Path,
+    value: str,
+) -> None:
+    workspace = tmp_path / "workspace"
+    root = tmp_path / "root"
+    workspace.mkdir()
+    root.mkdir()
+
+    with pytest.raises(SystemExit) as error:
+        main(
+            [
+                "prepare-semantic-index",
+                "--workspace",
+                str(workspace),
+                "--root",
+                str(root),
+                "--directory-timeout-seconds",
+                value,
+            ]
+        )
+
+    assert error.value.code == 2
+    assert not (workspace / ".portfolio-maker").exists()
 
 
 def test_cli_apply_semantic_index_is_controlled_when_output_missing(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import stat
 import unicodedata
@@ -45,6 +46,9 @@ from portfolio_maker.infrastructure.policy import (
     mask_public_value,
 )
 from portfolio_maker.infrastructure.sqlite_repository import SQLiteRepository
+from portfolio_maker.infrastructure.semantic_crawler import (
+    MAX_DIRECTORY_TIMEOUT_SECONDS,
+)
 from portfolio_maker.workspace import WorkspacePaths
 
 
@@ -72,6 +76,10 @@ _MANIFEST_KEYS = {
     "managed_input_bytes",
     "analysis_target_count",
     "structural_only_count",
+    "directory_timeout_seconds",
+    "timed_out_directory_count",
+    "unreadable_directory_count",
+    "manifest_sha256",
 }
 _PLAN_KEYS = {
     "version",
@@ -176,6 +184,10 @@ _FINAL_MANIFEST_KEYS = {
     "policy_hash",
     "analyzer_version",
     "work_plan_sha256",
+    "input_manifest_sha256",
+    "directory_timeout_seconds",
+    "timed_out_directory_count",
+    "unreadable_directory_count",
     "node_assignment_sha256",
     "receipt_file_sha256s",
     "chunk_sha256s",
@@ -210,6 +222,10 @@ class _VerifiedState:
     policy_hash: str
     analyzer_version: str
     work_plan_sha256: str
+    input_manifest_sha256: str
+    directory_timeout_seconds: float
+    timed_out_directory_count: int
+    unreadable_directory_count: int
     node_assignment_sha256: str
     node_count: int
     analysis_node_count: int
@@ -844,6 +860,10 @@ def _compile_finalization(
         "policy_hash": state.policy_hash,
         "analyzer_version": state.analyzer_version,
         "work_plan_sha256": state.work_plan_sha256,
+        "input_manifest_sha256": state.input_manifest_sha256,
+        "directory_timeout_seconds": state.directory_timeout_seconds,
+        "timed_out_directory_count": state.timed_out_directory_count,
+        "unreadable_directory_count": state.unreadable_directory_count,
         "node_assignment_sha256": state.node_assignment_sha256,
         "receipt_file_sha256s": list(receipt_hashes),
         "chunk_sha256s": chunk_sha256s,
@@ -1338,6 +1358,8 @@ def _load_verified_state(
 ) -> _VerifiedState:
     manifest_content = _read_required(paths.semantic_index_manifest_path)
     manifest = _decode_object(manifest_content, "manifest")
+    unsigned_manifest = dict(manifest)
+    manifest_sha256 = unsigned_manifest.pop("manifest_sha256", None)
     if set(manifest) != _MANIFEST_KEYS:
         raise SemanticWorkError("semantic work manifest is invalid")
     if (
@@ -1353,6 +1375,21 @@ def _load_verified_state(
         or not _is_nonnegative_int(manifest.get("managed_input_bytes"))
         or not _is_nonnegative_int(manifest.get("analysis_target_count"))
         or not _is_nonnegative_int(manifest.get("structural_only_count"))
+        or not _is_valid_directory_timeout(
+            manifest.get("directory_timeout_seconds")
+        )
+        or not _is_nonnegative_int(
+            manifest.get("timed_out_directory_count")
+        )
+        or not _is_nonnegative_int(
+            manifest.get("unreadable_directory_count")
+        )
+        or manifest["timed_out_directory_count"]
+        > manifest["unreadable_directory_count"]
+        or manifest["unreadable_directory_count"] > manifest["node_count"]
+        or not _is_sha256(manifest_sha256)
+        or hashlib.sha256(_canonical_json_bytes(unsigned_manifest)).hexdigest()
+        != manifest_sha256
     ):
         raise SemanticWorkError("semantic work manifest is invalid")
     chunk_sha256s = manifest.get("capsule_chunk_sha256s")
@@ -1429,6 +1466,16 @@ def _load_verified_state(
         policy_hash=str(manifest["policy_hash"]),
         analyzer_version=str(manifest["analyzer_version"]),
         work_plan_sha256=str(manifest["work_plan_sha256"]),
+        input_manifest_sha256=str(manifest_sha256),
+        directory_timeout_seconds=float(
+            manifest["directory_timeout_seconds"]
+        ),
+        timed_out_directory_count=int(
+            manifest["timed_out_directory_count"]
+        ),
+        unreadable_directory_count=int(
+            manifest["unreadable_directory_count"]
+        ),
         node_assignment_sha256=str(plan["node_assignment_sha256"]),
         node_count=int(manifest["node_count"]),
         analysis_node_count=int(manifest["analysis_target_count"]),
@@ -2008,6 +2055,14 @@ def _is_nonempty_text(value: object) -> bool:
 
 def _is_nonnegative_int(value: object) -> bool:
     return type(value) is int and value >= 0
+
+
+def _is_valid_directory_timeout(value: object) -> bool:
+    return (
+        type(value) in {int, float}
+        and math.isfinite(value)
+        and 0 < value <= MAX_DIRECTORY_TIMEOUT_SECONDS
+    )
 
 
 def _is_positive_int(value: object) -> bool:

@@ -219,9 +219,18 @@ Codex 의미 실행을 별도로 승인받아 한 work unit씩 재개 가능하�
 
 ```bash
 portfolio-maker ingest --workspace .
-portfolio-maker prepare-semantic-index --workspace . --root <confirmed-root>
+portfolio-maker prepare-semantic-index --workspace . --root <confirmed-root> \
+  --directory-timeout-seconds 30
 portfolio-maker semantic-index-status --workspace . --format json
 ```
+
+디렉터리별 기본 제한 시간은 30초이며, 느린 로컬 저장소에는 300초 이하의 유한한
+양수로 조정할 수 있습니다. 하위 디렉터리 timeout은 해당 node만 `unreadable`로 남기고
+후속 sibling을 계속 처리하며, scan root timeout은 semantic revision이나 managed input을
+게시하지 않고 controlled error로 종료합니다. prepare 출력에는 설정된 제한 시간과
+timeout/unreadable 합계만 표시되고 directory 이름이나 locator는 표시되지 않습니다.
+상세 계약은 [crawl watchdog 설계 보충](docs/superpowers/specs/2026-07-31-portfolio-maker-semantic-crawl-watchdog-design-addendum.md)과
+[TDD 계획](docs/superpowers/plans/2026-07-31-portfolio-maker-semantic-crawl-watchdog.md)을 따릅니다.
 
 status의 `Work units`와 `Managed input bytes`는 안전한 실행 견적입니다. 이 견적을
 확인한 뒤에도 source 승인과 별도로 **Codex 의미 실행 승인**이 필요합니다. 승인 전에는
