@@ -29,6 +29,8 @@ source scope와 제외 정책
 - 0.2.2 권위 명세: [0.2.2 managed history·Codex vision 설계](superpowers/specs/2026-07-16-portfolio-maker-0.2.2-storage-vision-design.md)
 - 0.2.2 구현 계획: [task·test·review gate](superpowers/plans/2026-07-16-portfolio-maker-0.2.2.md)
 - 현재 semantic composition 기준선: [Codex 기반 프로젝트 구성 설계](superpowers/specs/2026-07-14-codex-assisted-project-composition-design.md)
+- 현재 resumable semantic 실행 계약: [2026-07-31 교정 설계](superpowers/specs/2026-07-31-portfolio-maker-resumable-codex-semantic-index-design.md)와 [구현 계획](superpowers/plans/2026-07-31-portfolio-maker-resumable-codex-semantic-index.md)
+- 현재 합성 검증 기록: [grounded semantic workflow 검증](reviews/2026-07-31-resumable-codex-semantic-index-verification.md)
 - 공개 사용자 안내: [README](../README.md)
 - 특정 변경의 검증 근거: `docs/reviews/`
 
@@ -156,6 +158,17 @@ command 하나마다 skill을 만들거나 같은 application logic을 여러 sk
 - cross-directory grouping은 explicit rationale과 counter signal을 남긴다.
 - `.git`, README, manifest 하나는 supporting signal이지 project 판정 그 자체가 아니다.
 - file 수는 confidence의 직접 점수나 최소 조건이 아니다.
+- semantic prepare는 locator-free 구조와 `Work units`, `Managed input bytes` 견적만
+  게시한다. source 승인과 별도로 사용자의 명시적 Codex 의미 실행 승인을 받은 뒤에만
+  managed work input을 읽는다.
+- 의미 실행은 dependency-ready unit 하나씩 수행하고 matching output을 production
+  validator로 검증해 receipt를 받은 뒤 진행한다. 중단은 마지막 유효 receipt 다음부터
+  재개하며, generic·token-only·ungrounded 결과는 활성 revision이 될 수 없다.
+- complete receipt 집합만 finalize하고, apply 검증 후 locator-free chunked
+  project-review v3를 준비한다. v3 project curation은 candidate v2 schema를 유지할 수
+  있지만 raw source, locator 또는 비선택 evidence를 다시 읽지 않는다.
+- semantic completion은 source/evidence, artifact, project, delivery, Sites/Git/push,
+  deploy 또는 release approval로 승격되지 않는다.
 
 review mode에서는 user decision 전 candidate를 materialize하지 않는다. explicit automatic mode에서는 high와 medium을 포함하고, medium은 review recommended로 표시한다. low, conflict, stale, policy failure는 review/unassigned에 남긴다.
 

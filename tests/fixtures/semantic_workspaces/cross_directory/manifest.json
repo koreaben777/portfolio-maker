@@ -6,6 +6,55 @@
     "portfolio/backend/README.md": "Synthetic backend implementation.",
     "portfolio/frontend/README.md": "Synthetic frontend implementation."
   },
+  "semantic_meaning": {
+    "default": {
+      "semantic_summary": "포트폴리오 서비스의 백엔드와 프론트엔드 기능을 공개 활동 근거와 함께 설명한다.",
+      "semantic_roles": ["portfolio-delivery-component"],
+      "topics": ["포트폴리오 전달", "공개 근거"],
+      "purpose_signals": ["구현 기능과 공개 활동 근거를 하나의 전달 흐름으로 연결한다."],
+      "parent_context_signals": ["포트폴리오 제품의 교차 디렉터리 구성을 지원한다."],
+      "independence_signals": [],
+      "triviality_signals": []
+    },
+    "aggregate": {
+      "semantic_summary": "백엔드와 프론트엔드 결과를 결합해 포트폴리오 제품의 통합 전달 근거를 구성한다.",
+      "semantic_roles": ["portfolio-delivery-aggregate"],
+      "topics": ["교차 디렉터리 통합"],
+      "purpose_signals": ["직접 하위 결과를 제품 단위의 전달 근거로 결합한다."],
+      "parent_context_signals": [],
+      "independence_signals": [],
+      "triviality_signals": []
+    },
+    "by_hierarchy": {
+      ".": {
+        "semantic_summary": "백엔드와 프론트엔드 구현을 공개 활동 근거와 연결해 하나의 포트폴리오 제품으로 제시한다.",
+        "semantic_roles": ["portfolio-product"],
+        "topics": ["포트폴리오 제품", "공개 활동 근거"],
+        "purpose_signals": ["서로 다른 구현 디렉터리를 하나의 검증 가능한 제품 설명으로 연결한다."],
+        "parent_context_signals": [],
+        "independence_signals": [],
+        "triviality_signals": []
+      },
+      "portfolio/backend": {
+        "semantic_summary": "백엔드 구현은 포트폴리오 데이터 처리와 근거 제공 기능을 담당한다.",
+        "semantic_roles": ["portfolio-backend"],
+        "topics": ["포트폴리오 백엔드"],
+        "purpose_signals": ["승인된 포트폴리오 데이터를 처리해 표현 계층에 제공한다."],
+        "parent_context_signals": ["프론트엔드와 함께 하나의 제품 경계를 구성한다."],
+        "independence_signals": [],
+        "triviality_signals": []
+      },
+      "portfolio/frontend": {
+        "semantic_summary": "프론트엔드 구현은 승인된 포트폴리오 근거를 방문자에게 탐색 가능한 형태로 보여준다.",
+        "semantic_roles": ["portfolio-frontend"],
+        "topics": ["포트폴리오 프론트엔드"],
+        "purpose_signals": ["검증된 프로젝트와 근거를 방문자용 화면에 표현한다."],
+        "parent_context_signals": ["백엔드와 함께 하나의 제품 경계를 구성한다."],
+        "independence_signals": [],
+        "triviality_signals": []
+      }
+    }
+  },
   "synthetic_codex_candidate": {
     "id": "candidate-cross-directory",
     "project_id": "cross-directory-project",

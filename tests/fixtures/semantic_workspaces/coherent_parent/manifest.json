@@ -6,6 +6,46 @@
     "services/api/README.md": "Synthetic insurance retrieval service.",
     "services/graph/README.md": "Synthetic insurance graph service."
   },
+  "semantic_meaning": {
+    "default": {
+      "semantic_summary": "보험 약관 근거를 검색하고 관계를 검증해 답변의 출처를 설명한다.",
+      "semantic_roles": ["insurance-evidence-component"],
+      "topics": ["보험 약관 검색", "근거 관계 검증"],
+      "purpose_signals": ["승인된 보험 근거를 검증 가능한 답변으로 연결한다."],
+      "parent_context_signals": ["보험 RAG 서비스의 근거 흐름을 지원한다."],
+      "independence_signals": [],
+      "triviality_signals": []
+    },
+    "aggregate": {
+      "semantic_summary": "검색 서비스와 그래프 서비스를 결합해 하나의 보험 근거 분석 흐름을 구성한다.",
+      "semantic_roles": ["insurance-evidence-aggregate"],
+      "topics": ["보험 RAG 통합"],
+      "purpose_signals": ["직접 하위 결과를 보험 근거 분석 흐름으로 결합한다."],
+      "parent_context_signals": [],
+      "independence_signals": [],
+      "triviality_signals": []
+    },
+    "by_hierarchy": {
+      ".": {
+        "semantic_summary": "보험 약관 검색과 그래프 관계 검증을 하나의 근거 기반 답변 제품으로 제공한다.",
+        "semantic_roles": ["insurance-rag-product"],
+        "topics": ["보험 RAG", "출처 기반 답변"],
+        "purpose_signals": ["보험 약관과 관계 근거를 함께 검증해 답변을 생성한다."],
+        "parent_context_signals": [],
+        "independence_signals": [],
+        "triviality_signals": []
+      },
+      "services": {
+        "semantic_summary": "검색과 그래프 하위 서비스를 결합해 보험 답변의 근거를 검증한다.",
+        "semantic_roles": ["insurance-service-group"],
+        "topics": ["보험 검색 서비스", "그래프 근거 서비스"],
+        "purpose_signals": ["두 하위 서비스를 하나의 보험 근거 처리 경계로 운영한다."],
+        "parent_context_signals": ["보험 RAG 제품의 핵심 서비스 경계를 구성한다."],
+        "independence_signals": [],
+        "triviality_signals": []
+      }
+    }
+  },
   "synthetic_codex_candidate": {
     "id": "candidate-insurance-rag-chatbot",
     "project_id": "insurance-rag-chatbot",

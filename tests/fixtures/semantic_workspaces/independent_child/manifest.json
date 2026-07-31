@@ -7,6 +7,46 @@
     "workspace/playmcp/README.md": "Synthetic PlayMCP contest project.",
     "workspace/other/README.md": "Synthetic unrelated project."
   },
+  "semantic_meaning": {
+    "default": {
+      "semantic_summary": "여러 실험 프로젝트를 공유 작업공간에서 관리하면서 각 목적과 경계를 구분한다.",
+      "semantic_roles": ["multi-project-workspace-component"],
+      "topics": ["프로젝트 경계 검토", "공유 작업공간"],
+      "purpose_signals": ["공유 구조 안에서 서로 다른 프로젝트 목적을 식별한다."],
+      "parent_context_signals": ["상위 작업공간의 프로젝트 구분을 지원한다."],
+      "independence_signals": [],
+      "triviality_signals": []
+    },
+    "aggregate": {
+      "semantic_summary": "직접 하위 프로젝트 신호를 결합해 공유 작업공간의 경계 판단 근거를 제공한다.",
+      "semantic_roles": ["workspace-boundary-aggregate"],
+      "topics": ["프로젝트 경계 집계"],
+      "purpose_signals": ["하위 결과를 독립 프로젝트 검토에 필요한 근거로 결합한다."],
+      "parent_context_signals": [],
+      "independence_signals": [],
+      "triviality_signals": []
+    },
+    "by_hierarchy": {
+      ".": {
+        "semantic_summary": "공유 작업공간에 포함된 여러 프로젝트의 목적과 독립 실행 경계를 구분한다.",
+        "semantic_roles": ["multi-project-workspace"],
+        "topics": ["다중 프로젝트 구성"],
+        "purpose_signals": ["각 하위 프로젝트가 공유 구조와 독립 목적을 함께 갖는지 평가한다."],
+        "parent_context_signals": [],
+        "independence_signals": [],
+        "triviality_signals": []
+      },
+      "workspace/playmcp": {
+        "semantic_summary": "PlayMCP 공모전 출품 기능을 공유 작업공간과 분리된 제품 단위로 제공한다.",
+        "semantic_roles": ["contest-product"],
+        "topics": ["PlayMCP 공모전", "독립 제품 실행"],
+        "purpose_signals": ["공모전 제출과 시연을 위한 기능을 하나의 제품으로 제공한다."],
+        "parent_context_signals": ["공유 작업공간 안에서 별도 프로젝트 경계를 형성한다."],
+        "independence_signals": ["별도 공모전 목적과 실행 수명주기를 독립적으로 가진다."],
+        "triviality_signals": []
+      }
+    }
+  },
   "synthetic_codex_candidate": {
     "id": "candidate-playmcp-contest",
     "project_id": "playmcp-contest",

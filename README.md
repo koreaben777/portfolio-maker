@@ -213,36 +213,53 @@ portfolio-maker approve --workspace . --write-sample-artifact-policy
 
 #### 5. 의미 있는 포트폴리오 project를 구성하기
 
-0.2.0 semantic project path에서는 먼저 승인된 scan root의 safe semantic index를 준비하고
-적용합니다. `<confirmed-root>`는 discovery에서 사용자가 선택하고 승인한 동일한 root로 바꿉니다.
+현재 semantic project path는 승인된 scan root의 안전한 구조를 먼저 준비한 뒤,
+Codex 의미 실행을 별도로 승인받아 한 work unit씩 재개 가능하게 처리합니다.
+`<confirmed-root>`는 discovery에서 사용자가 선택하고 승인한 동일한 root로 바꿉니다.
 
 ```bash
 portfolio-maker ingest --workspace .
 portfolio-maker prepare-semantic-index --workspace . --root <confirmed-root>
+portfolio-maker semantic-index-status --workspace . --format json
 ```
 
-Codex의 `portfolio-semantic-index` skill은 managed input chunk만 읽어 output chunk를 작성합니다.
-그 뒤 hash·coverage 검증을 거쳐 index를 적용합니다.
+status의 `Work units`와 `Managed input bytes`는 안전한 실행 견적입니다. 이 견적을
+확인한 뒤에도 source 승인과 별도로 **Codex 의미 실행 승인**이 필요합니다. 승인 전에는
+`next-semantic-work`를 실행하거나 managed input을 읽지 않습니다.
+
+승인 후 `portfolio-semantic-index` skill은 준비된 unit을 한 번에 하나만 처리합니다.
+CLI가 반환한 managed input만 읽고 matching managed output만 쓴 뒤 production validator가
+receipt를 발행해야 다음 unit으로 이동합니다. 중단되면 status를 다시 확인하고 마지막 유효
+receipt 다음 unit부터 재개합니다.
 
 ```bash
+portfolio-maker next-semantic-work --workspace .
+portfolio-maker validate-semantic-work --workspace . --unit-id <returned-unit-id>
+portfolio-maker semantic-index-status --workspace . --format json
+portfolio-maker finalize-semantic-index --workspace .
 portfolio-maker apply-semantic-index --workspace .
-portfolio-maker prepare-project-review --workspace . --version v2
+portfolio-maker prepare-project-review --workspace . --version v3
 ```
 
-Codex에게는 다음처럼 요청합니다. Codex는 지정된 v2 review bundle만 읽어 후보 파일을 작성하며,
+`next-semantic-work`부터 `validate-semantic-work`까지는 status가 complete가 될 때까지
+반복합니다. generic 문구, filename/token/template 추론, stale policy, dependency/receipt
+불일치는 fail closed이며 이전 active revision을 유지합니다. `finalize-semantic-index`는
+완전한 receipt 집합만 final chunk로 만들고, `apply-semantic-index`가 검증된 revision만
+활성화합니다.
+
+v3 project review는 locator-free manifest와 262,144-byte 이하의 input chunk를 만듭니다.
+Codex는 v3 chunk를 bottom-up으로 검토하고 최종 candidate v2 schema를 계속 사용할 수 있지만,
 원본 파일·로컬 경로·private GitHub URL을 다시 탐색하거나 추론해서는 안 됩니다.
 
 ```text
 $portfolio-maker
-`.portfolio-maker/reviews/project-review-input-v2.json`만 근거로 읽고,
+`.portfolio-maker/reviews/project-review-v3/manifest.json`과 선언된 input chunk만 읽고,
 의미 있는 작업 단위의 후보를 `.portfolio-maker/reviews/project-candidates.json`과
 `.portfolio-maker/reviews/project-candidates.md`에 작성해 주세요. 각 후보는 검토 필요 상태로
 두고, 확신이 없거나 작은 단발성 근거는 unassigned로 남겨 주세요.
 ```
 
-Codex는 `.portfolio-maker/reviews/project-review-input-v2.json`만 읽어
-`project-candidates.json`과 `project-candidates.md`를 작성할 수 있습니다. candidate는
-검토 보조물일 뿐 database truth가 아닙니다. v2에서는 후보를 검토한 뒤 다음 명령으로
+candidate는 검토 보조물일 뿐 database truth가 아닙니다. 후보를 검토한 뒤 다음 명령으로
 `review_required` 결정을 materialize하고, 사용자가 `set-project-state`로 각 project를
 `included` 또는 `excluded`로 결정합니다.
 
@@ -421,8 +438,15 @@ portfolio-maker approve --workspace . --write-sample --force
 
 0.2.0 자동 포함은 evidence 승인, delivery scope 또는 공개 배포 승인을 대신하지 않습니다. 의미
 index와 후보는 분석·검토 계층이며, 실제 project와 artifact는 기존 승인 및 현재 policy의 교집합으로
-materialize됩니다. `portfolio-maker prepare-semantic-index`와 `apply-semantic-index` 사이의
-Codex 분석은 외부 LLM API나 token 저장 없이 safe chunk를 통해 수행합니다.
+materialize됩니다. 현재 재개 가능한 `codex-semantic-v2` 계약은
+[2026-07-31 교정 설계](docs/superpowers/specs/2026-07-31-portfolio-maker-resumable-codex-semantic-index-design.md),
+[구현 계획](docs/superpowers/plans/2026-07-31-portfolio-maker-resumable-codex-semantic-index.md),
+[합성 검증 기록](docs/reviews/2026-07-31-resumable-codex-semantic-index-verification.md)을
+따릅니다. CLI는 외부 LLM API를 호출하거나 token을 저장하지 않습니다.
+
+의미 인덱스 완료는 source/evidence 승인, artifact inclusion, project 결정, delivery scope,
+Sites/Git 또는 push, deployment, release 승인을 대신하지 않습니다. 별도 full-home pilot은
+fresh candidate와 사용자 승인을 다시 받은 뒤에만 시작할 수 있으며 아직 재개하지 않았습니다.
 
 `0.2.1`은 정적 HTML 안전성 검사를 보완한 patch release입니다. 근거 텍스트에
 `.portfolio-maker`라는 일반 명칭이 포함돼도 허용하되, 실제 내부 workspace 경로 형태는 계속

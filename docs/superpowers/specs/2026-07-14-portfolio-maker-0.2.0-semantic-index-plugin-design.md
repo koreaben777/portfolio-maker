@@ -4,6 +4,14 @@
 상태: 0.2.0 현재 구현·검증 계약
 추적 범위: Issue #13 후속 확장 및 현재 0.2.0 릴리스
 
+> [!IMPORTANT]
+> 이 문서의 protocol-v1 일괄 chunk 교환과 full-home 준비 완료 표현은 historical
+> baseline이다. 현재 재개 가능한 실행 계약은
+> [2026-07-31 교정 설계](2026-07-31-portfolio-maker-resumable-codex-semantic-index-design.md),
+> [구현 계획](../plans/2026-07-31-portfolio-maker-resumable-codex-semantic-index.md),
+> [검증 기록](../../reviews/2026-07-31-resumable-codex-semantic-index-verification.md)을
+> 따른다. 별도 사용자 승인 full-home pilot은 아직 재개하지 않았다.
+
 ## 1. 기획 요약
 
 역사적 0.1.0의 Codex 기반 semantic project composition은 승인된 evidence를 사람이 이해할 수 있는 프로젝트로 묶는 안전한 검토·승인 계층을 제공했다. 당시 입력은 평면적인 evidence 목록이고 local discovery는 최대 500개 후보에서 멈췄기 때문에 폴더의 상하위 맥락이 사라질 수 있었다. 0.2.0 current path는 이 한계를 계층형 semantic index로 보완한다.

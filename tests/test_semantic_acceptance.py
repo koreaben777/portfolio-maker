@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -24,18 +23,30 @@ from portfolio_maker.application.models import (
     ApplySemanticIndexRequest,
     BuildProfileRequest,
     ComposeProjectsV2Request,
+    FinalizeSemanticIndexRequest,
     IngestSourcesRequest,
+    NextSemanticWorkRequest,
     PrepareProjectReviewRequest,
     PrepareSemanticIndexRequest,
+    SemanticIndexStatusRequest,
+    ValidateSemanticWorkRequest,
 )
 from portfolio_maker.application.project_boundary import prepare_project_review_v2
 from portfolio_maker.application.project_composition import compose_projects_v2
+from portfolio_maker.application.project_review_v3 import prepare_project_review_v3
 from portfolio_maker.application.semantic_index import (
     apply_semantic_index,
     prepare_semantic_index,
 )
+from portfolio_maker.application.semantic_work import (
+    finalize_semantic_index,
+    next_semantic_work,
+    semantic_index_status,
+    validate_semantic_work,
+)
 from portfolio_maker.domain.models import GitHubActivity, Source, SourceStatus, SourceType
 from portfolio_maker.domain.semantic_models import boundary_fingerprint
+from portfolio_maker.infrastructure.managed_files import write_managed_text
 from portfolio_maker.infrastructure.sqlite_repository import SQLiteRepository
 from portfolio_maker.workspace import WorkspacePaths
 
@@ -60,6 +71,9 @@ class SemanticAcceptanceResult:
     restricted_activity_urls: tuple[str, ...]
     open_public_activity_urls: tuple[str, ...]
     restricted_local_evidence_count: int
+    semantic_topics: tuple[str, ...]
+    grounded_result_count: int
+    independent_child_signal_count: int
 
 
 @pytest.fixture
@@ -90,15 +104,9 @@ def semantic_runner(tmp_path: Path) -> Callable[[str, str], SemanticAcceptanceRe
                 )
             )
         ingest_sources(IngestSourcesRequest(workspace=workspace))
+        if public_activity is not None:
+            _insert_synthetic_public_activity_evidence(repository, public_activity)
 
-        prepared = prepare_semantic_index(
-            PrepareSemanticIndexRequest(workspace=workspace, root=source_root, chunk_size=1)
-        )
-        _write_deterministic_semantic_outputs(prepared.manifest_path, prepared.revision_id)
-        apply_semantic_index(ApplySemanticIndexRequest(workspace=workspace))
-
-        # The current v2 APIs create source evidence and read semantic-node evidence
-        # links, but do not yet expose a writer for that relationship.
         build_profile(
             BuildProfileRequest(
                 workspace=workspace,
@@ -106,10 +114,22 @@ def semantic_runner(tmp_path: Path) -> Callable[[str, str], SemanticAcceptanceRe
                 write_artifacts=False,
             )
         )
-        _link_file_nodes_to_source_evidence(repository, prepared.revision_id, source_root)
-        if public_activity is not None:
-            _insert_synthetic_public_activity_evidence(repository, public_activity)
+        prepared = prepare_semantic_index(
+            PrepareSemanticIndexRequest(workspace=workspace, root=source_root, chunk_size=1)
+        )
+        _complete_fixture_semantic_work(workspace, paths, manifest)
+        finalized = finalize_semantic_index(
+            FinalizeSemanticIndexRequest(workspace=workspace)
+        )
+        assert finalized.revision_id == prepared.revision_id
+        apply_semantic_index(ApplySemanticIndexRequest(workspace=workspace))
 
+        v3_review = prepare_project_review_v3(
+            PrepareProjectReviewRequest(workspace=workspace)
+        )
+        v3_nodes = _read_project_review_v3(paths, v3_review.chunk_count)
+        # Candidate composition remains a v2 compatibility surface. The semantic
+        # projection exercised above is the production v3 review surface.
         review = prepare_project_review_v2(PrepareProjectReviewRequest(workspace=workspace))
         review_payload = json.loads(review.input_path.read_text(encoding="utf-8"))
         candidate_payload = _safe_synthetic_codex_candidate_input(manifest, review_payload)
@@ -140,6 +160,25 @@ def semantic_runner(tmp_path: Path) -> Callable[[str, str], SemanticAcceptanceRe
             ),
         )
         _assert_locator_free_outputs(paths, source_root)
+        semantic_topics = tuple(
+            sorted(
+                {
+                    topic
+                    for node in v3_nodes
+                    for topic in node["topics"]
+                    if isinstance(topic, str)
+                }
+            )
+        )
+        grounded_result_count = sum(
+            bool(node["semantic_summary"])
+            and bool(node["semantic_facts"]["grounding_signal_ids"])
+            for node in v3_nodes
+        )
+        independent_child_signal_count = sum(
+            len(node["semantic_facts"]["independence_signals"])
+            for node in v3_nodes
+        )
 
         return SemanticAcceptanceResult(
             active_project_ids=tuple(
@@ -176,6 +215,9 @@ def semantic_runner(tmp_path: Path) -> Callable[[str, str], SemanticAcceptanceRe
             restricted_local_evidence_count=sum(
                 record.activity_id is None for record in restricted.records
             ),
+            semantic_topics=semantic_topics,
+            grounded_result_count=grounded_result_count,
+            independent_child_signal_count=independent_child_signal_count,
         )
 
     return run
@@ -189,6 +231,7 @@ def _read_fixture_manifest(fixtures_root: Path, name: str) -> dict[str, object]:
         or payload.get("fixture") != name
         or payload.get("artifact_scope") not in {"restricted", "open_public"}
         or not isinstance(payload.get("files"), dict)
+        or not isinstance(payload.get("semantic_meaning"), dict)
         or not isinstance(payload.get("synthetic_codex_candidate"), dict)
     ):
         raise AssertionError(f"invalid semantic fixture: {name}")
@@ -267,55 +310,156 @@ def _write_fixture_artifact_policy(paths: WorkspacePaths, artifact_scope: object
     paths.artifact_approval_path.write_text(json.dumps(policy), encoding="utf-8")
 
 
-def _write_deterministic_semantic_outputs(manifest_path: Path, revision_id: str) -> None:
-    input_dir = manifest_path.parent / "input"
-    output_dir = manifest_path.parent / "output"
-    output_dir.mkdir()
-    for input_path in sorted(input_dir.glob("chunk-*.json")):
-        input_text = input_path.read_text(encoding="utf-8")
-        input_payload = json.loads(input_text)
-        output = {
-            "version": 1,
-            "revision_id": revision_id,
-            "input_sha256": hashlib.sha256(input_text.encode("utf-8")).hexdigest(),
-            "nodes": [
-                {
-                    "node_id": node["node_id"],
-                    "semantic_summary": f"Synthetic summary for {node['display_name']}",
-                    "semantic_roles": node["roles"],
-                    "topics": ["synthetic-project"],
-                    "analysis_status": node["analysis_status"],
-                    "child_node_ids": node["child_node_ids"],
-                }
-                for node in input_payload["nodes"]
-            ],
-        }
-        output["output_sha256"] = hashlib.sha256(
-            _canonical_json(output).encode("utf-8")
-        ).hexdigest()
-        (output_dir / input_path.name).write_text(_canonical_json(output), encoding="utf-8")
-
-
-def _link_file_nodes_to_source_evidence(
-    repository: SQLiteRepository, revision_id: str, source_root: Path
+def _complete_fixture_semantic_work(
+    workspace: Path,
+    paths: WorkspacePaths,
+    manifest: dict[str, object],
 ) -> None:
-    records_by_uri = {
-        record.source_uri: record.evidence_id
-        for record in repository.list_evidence_selection_records()
-        if record.activity_id is None and record.source_uri is not None
-    }
-    nodes = repository.list_semantic_nodes(revision_id)
-    with sqlite3.connect(repository.db_path) as connection:
-        for node in nodes:
-            if node["node_kind"] != "file":
-                continue
-            relative_hierarchy = node["relative_hierarchy"]
-            assert isinstance(relative_hierarchy, str)
-            evidence_id = records_by_uri[(source_root / relative_hierarchy).resolve().as_uri()]
-            connection.execute(
-                "UPDATE semantic_nodes SET evidence_ids_json = ? WHERE revision_id = ? AND node_id = ?",
-                (json.dumps([evidence_id]), revision_id, node["node_id"]),
+    initial = semantic_index_status(SemanticIndexStatusRequest(workspace=workspace))
+    assert initial.work_unit_count > 0
+    assert initial.receipted_count == 0
+    assert initial.complete is False
+
+    prior_receipted = 0
+    while True:
+        current = next_semantic_work(NextSemanticWorkRequest(workspace=workspace))
+        if current.unit_id is None:
+            assert current.remaining_count == 0
+            break
+        assert current.input_path is not None
+        work_input = json.loads(current.input_path.read_text(encoding="utf-8"))
+        output = _fixture_semantic_output(manifest, work_input)
+        output_path = paths.semantic_work_output_dir / f"{current.unit_id}.json"
+        write_managed_text(output_path, _canonical_json(output))
+        validated = validate_semantic_work(
+            ValidateSemanticWorkRequest(
+                workspace=workspace,
+                unit_id=current.unit_id,
             )
+        )
+        assert validated.output_sha256 == hashlib.sha256(
+            output_path.read_bytes()
+        ).hexdigest()
+        status = semantic_index_status(
+            SemanticIndexStatusRequest(workspace=workspace)
+        )
+        assert status.receipted_count == prior_receipted + 1
+        prior_receipted = status.receipted_count
+
+    complete = semantic_index_status(SemanticIndexStatusRequest(workspace=workspace))
+    assert complete.receipted_count == complete.work_unit_count
+    assert complete.invalid_count == 0
+    assert complete.complete is True
+
+
+def _fixture_semantic_output(
+    manifest: dict[str, object],
+    work_input: dict[str, object],
+) -> dict[str, object]:
+    child_result_ids = [
+        result.get("node_id", result.get("aggregate_id"))
+        for child in work_input["child_results"]
+        for result in child["results"]
+    ]
+    if work_input["stage"] == "reduce":
+        profile = _fixture_meaning_profile(manifest, "aggregate")
+        results: list[dict[str, object]] = [
+            {
+                "result_kind": "aggregate",
+                "aggregate_id": f"aggregate:{work_input['unit_id']}",
+                **profile,
+                "grounding_signal_ids": child_result_ids,
+                "member_node_ids_sha256": hashlib.sha256(
+                    _canonical_json(child_result_ids).encode("utf-8")
+                ).hexdigest(),
+                "member_count": len(child_result_ids),
+            }
+        ]
+    else:
+        results = []
+        for target in work_input["targets"]:
+            hierarchy = target["relative_hierarchy"]
+            assert isinstance(hierarchy, str)
+            profile = _fixture_meaning_profile(manifest, hierarchy)
+            own_signal_ids = [signal["signal_id"] for signal in target["signals"]]
+            grounding_ids = own_signal_ids[:1] or child_result_ids[:1]
+            assert grounding_ids
+            results.append(
+                {
+                    "result_kind": "node",
+                    "node_id": target["node_id"],
+                    **profile,
+                    "grounding_signal_ids": grounding_ids,
+                    "semantic_disposition": "analyzed",
+                    "analysis_status": target["analysis_status"],
+                    "child_node_ids": target["child_node_ids"],
+                }
+            )
+    output: dict[str, object] = {
+        "version": 2,
+        "revision_id": work_input["revision_id"],
+        "unit_id": work_input["unit_id"],
+        "stage": work_input["stage"],
+        "input_sha256": work_input["input_sha256"],
+        "dependency_output_sha256s": [
+            dependency["output_sha256"]
+            for dependency in work_input["dependencies"]
+        ],
+        "analysis_method": "codex-semantic-v2",
+        "coverage": work_input["coverage"],
+        "results": results,
+    }
+    output["output_sha256"] = hashlib.sha256(
+        _canonical_json(output).encode("utf-8")
+    ).hexdigest()
+    return output
+
+
+def _fixture_meaning_profile(
+    manifest: dict[str, object],
+    hierarchy: str,
+) -> dict[str, object]:
+    raw_meaning = manifest["semantic_meaning"]
+    assert isinstance(raw_meaning, dict)
+    overrides = raw_meaning.get("by_hierarchy", {})
+    assert isinstance(overrides, dict)
+    raw_profile = overrides.get(hierarchy, raw_meaning.get("default"))
+    if hierarchy == "aggregate":
+        raw_profile = raw_meaning.get("aggregate")
+    assert isinstance(raw_profile, dict)
+    fields = {
+        "semantic_summary",
+        "semantic_roles",
+        "topics",
+        "purpose_signals",
+        "parent_context_signals",
+        "independence_signals",
+        "triviality_signals",
+    }
+    assert set(raw_profile) == fields
+    return {field: raw_profile[field] for field in fields}
+
+
+def _read_project_review_v3(
+    paths: WorkspacePaths,
+    chunk_count: int,
+) -> list[dict[str, object]]:
+    manifest = json.loads(
+        paths.project_review_v3_manifest_path.read_text(encoding="utf-8")
+    )
+    assert manifest["version"] == 3
+    assert manifest["protocol"] == "codex-semantic-v2"
+    assert manifest["chunk_count"] == chunk_count
+    nodes: list[dict[str, object]] = []
+    for index in range(1, chunk_count + 1):
+        chunk = json.loads(
+            (
+                paths.project_review_v3_input_dir / f"chunk-{index:04}.json"
+            ).read_text(encoding="utf-8")
+        )
+        nodes.extend(chunk["nodes"])
+    assert len(nodes) == manifest["projected_node_count"]
+    return nodes
 
 
 def _insert_synthetic_public_activity_evidence(
@@ -447,9 +591,14 @@ def _assert_locator_free_outputs(paths: WorkspacePaths, source_root: Path) -> No
     output_paths = [
         paths.semantic_index_manifest_path,
         paths.project_review_input_v2_path,
+        paths.project_review_v3_manifest_path,
         paths.project_candidates_path,
         *(paths.semantic_index_input_dir.glob("chunk-*.json")),
-        *((paths.semantic_index_dir / "output").glob("chunk-*.json")),
+        *(paths.semantic_work_input_dir.glob("unit-*.json")),
+        *(paths.semantic_work_output_dir.glob("unit-*.json")),
+        *(paths.semantic_work_receipts_dir.glob("unit-*.json")),
+        *(paths.semantic_final_dir.glob("chunk-*.json")),
+        *(paths.project_review_v3_input_dir.glob("chunk-*.json")),
     ]
     serialized = "\n".join(path.read_text(encoding="utf-8") for path in output_paths)
     assert str(source_root) not in serialized
@@ -493,6 +642,18 @@ def test_independent_contest_child_is_split(semantic_runner) -> None:
 
 def test_known_projects_do_not_regress_to_zero_candidates(semantic_runner) -> None:
     assert semantic_runner("coherent_parent").candidate_count > 0
+
+
+def test_known_project_fixtures_have_distinct_grounded_meaning(semantic_runner) -> None:
+    insurance = semantic_runner("coherent_parent")
+    contest = semantic_runner("independent_child")
+
+    assert insurance.semantic_topics
+    assert contest.semantic_topics
+    assert insurance.semantic_topics != contest.semantic_topics
+    assert insurance.grounded_result_count > 0
+    assert contest.grounded_result_count > 0
+    assert contest.independent_child_signal_count > 0
 
 
 def test_cross_directory_fixture_preserves_artifact_scope_boundary(semantic_runner) -> None:
