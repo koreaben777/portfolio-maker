@@ -174,6 +174,61 @@ class ApplySemanticIndexResult:
 
 
 @dataclass(frozen=True)
+class SemanticIndexStatusRequest:
+    workspace: Path
+
+
+@dataclass(frozen=True)
+class SemanticIndexStatusResult:
+    revision_id: str
+    node_count: int
+    work_unit_count: int
+    ready_count: int
+    receipted_count: int
+    invalid_count: int
+    complete: bool
+
+
+@dataclass(frozen=True)
+class NextSemanticWorkRequest:
+    workspace: Path
+
+
+@dataclass(frozen=True)
+class NextSemanticWorkResult:
+    revision_id: str
+    unit_id: str | None
+    input_path: Path | None
+    remaining_count: int
+
+
+@dataclass(frozen=True)
+class ValidateSemanticWorkRequest:
+    workspace: Path
+    unit_id: str
+
+
+@dataclass(frozen=True)
+class ValidateSemanticWorkResult:
+    unit_id: str
+    receipt_path: Path
+    output_sha256: str
+
+
+@dataclass(frozen=True)
+class FinalizeSemanticIndexRequest:
+    workspace: Path
+
+
+@dataclass(frozen=True)
+class FinalizeSemanticIndexResult:
+    revision_id: str
+    manifest_path: Path
+    chunk_count: int
+    node_count: int
+
+
+@dataclass(frozen=True)
 class HistoryPlanRequest:
     workspace: Path
 

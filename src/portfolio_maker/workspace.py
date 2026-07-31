@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -35,6 +36,11 @@ class WorkspacePaths:
     semantic_index_input_dir: Path
     semantic_index_manifest_path: Path
     semantic_index_report_path: Path
+    semantic_work_plan_path: Path
+    semantic_work_input_dir: Path
+    semantic_work_output_dir: Path
+    semantic_work_receipts_dir: Path
+    semantic_final_dir: Path
     master_profile_json_path: Path
     master_profile_md_path: Path
     portfolio_draft_path: Path
@@ -78,6 +84,11 @@ class WorkspacePaths:
             semantic_index_input_dir=reviews_dir / "semantic-index" / "input",
             semantic_index_manifest_path=reviews_dir / "semantic-index" / "input-manifest.json",
             semantic_index_report_path=reviews_dir / "semantic-index-report.md",
+            semantic_work_plan_path=reviews_dir / "semantic-index" / "work-plan.json",
+            semantic_work_input_dir=reviews_dir / "semantic-index" / "work-input",
+            semantic_work_output_dir=reviews_dir / "semantic-index" / "work-output",
+            semantic_work_receipts_dir=reviews_dir / "semantic-index" / "receipts",
+            semantic_final_dir=reviews_dir / "semantic-index" / "final",
             master_profile_json_path=artifacts_dir / "master-profile.json",
             master_profile_md_path=artifacts_dir / "master-profile.md",
             portfolio_draft_path=artifacts_dir / "portfolio-draft.md",
@@ -99,5 +110,34 @@ class WorkspacePaths:
             self.history_plans_dir,
             self.history_journal_dir,
             self.history_quarantine_dir,
+            self.semantic_work_input_dir,
+            self.semantic_work_output_dir,
+            self.semantic_work_receipts_dir,
+            self.semantic_final_dir,
         ):
             ensure_managed_directory(path)
+
+    def semantic_revision_raw_dir(self, revision_id: str) -> Path:
+        _validate_revision_id(revision_id)
+        return self.raw_dir / "semantic-index" / revision_id
+
+    def semantic_revision_structural_dir(self, revision_id: str) -> Path:
+        return self.semantic_revision_raw_dir(revision_id) / "structural"
+
+    def semantic_revision_locator_dir(self, revision_id: str) -> Path:
+        return self.semantic_revision_raw_dir(revision_id) / "locators"
+
+
+def _validate_revision_id(revision_id: str) -> None:
+    if (
+        not isinstance(revision_id, str)
+        or not revision_id
+        or revision_id in {".", ".."}
+        or "/" in revision_id
+        or "\\" in revision_id
+        or any(
+            unicodedata.category(character).startswith("C")
+            for character in revision_id
+        )
+    ):
+        raise ValueError("semantic revision identifier is unsafe")

@@ -57,10 +57,16 @@ def test_workspace_paths_create_expected_directories(workspace):
     assert paths.history_plans_dir.is_dir()
     assert paths.history_journal_dir.is_dir()
     assert paths.history_quarantine_dir.is_dir()
+    assert paths.semantic_work_input_dir.is_dir()
+    assert paths.semantic_work_output_dir.is_dir()
+    assert paths.semantic_work_receipts_dir.is_dir()
+    assert paths.semantic_final_dir.is_dir()
     assert not paths.db_path.exists()
     assert not paths.master_profile_json_path.exists()
     assert not paths.master_profile_md_path.exists()
     assert not paths.portfolio_draft_path.exists()
+    assert not paths.semantic_work_plan_path.exists()
+    assert not paths.semantic_revision_raw_dir("rev-1").exists()
 
 
 def test_sqlite_repository_initialize_creates_schema_tables(workspace):
