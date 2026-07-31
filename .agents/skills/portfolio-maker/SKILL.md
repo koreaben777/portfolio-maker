@@ -90,28 +90,65 @@ The artifact policy is required for per-artifact selection and is reloaded by
 (cd web/portfolio && npm ci)
 ```
 
-11. For the current 0.2.0 workflow, prepare and apply the semantic index from the same confirmed root
-used for discovery, then prepare the v2 safe review bundle from the repository root:
+11. When the plugin is available, prefer `$portfolio-maker` and its
+`$portfolio-semantic-index` child. The repository fallback uses the same
+`codex-semantic-v2` resumable sequence. Prepare from the same confirmed root
+used for discovery, then inspect safe status:
 
 ```bash
 portfolio-maker prepare-semantic-index --workspace . --root <confirmed-root>
-portfolio-maker apply-semantic-index --workspace .
-portfolio-maker prepare-project-review --workspace . --version v2
+portfolio-maker semantic-index-status --workspace . --format json
 ```
 
-Only `.portfolio-maker/reviews/project-review-input-v2.json` is supplied to Codex. Codex may write
-`project-candidates.json` and `project-candidates.md` using only that bundle. In v2, review the
-candidate file, materialize review decisions, and persist the user's state with `set-project-state`:
+Report `Work units` and `Managed input bytes`, then **WAIT FOR EXPLICIT USER
+APPROVAL** before requesting or reading semantic work. This approval is only
+for managed semantic analysis; it is not source, artifact, project, delivery,
+Sites, Git, publish, deploy, or release approval.
+
+After approval, process exactly one returned ready unit at a time:
+
+```bash
+portfolio-maker next-semantic-work --workspace .
+portfolio-maker validate-semantic-work --workspace . --unit-id <returned-unit-id>
+portfolio-maker semantic-index-status --workspace . --format json
+```
+
+Read only the returned managed input and write only its matching managed
+output. Use genuine semantic judgment grounded in managed signal IDs and
+child-output hashes. Do not read raw files. Do not use token extraction as
+final meaning. Validate every unit and its receipt, repeat status/resume until
+complete, and stop on missing or stale policy, invalid receipt or dependency,
+generic or ungrounded output, DB safety error, no-ready-but-incomplete or
+invalid state, or cancellation. Each work unit is at most 262,144 bytes and
+there is no global count cap.
+
+Finalize, apply, and prepare the chunked v3 review projection only in this
+order:
+
+```bash
+portfolio-maker finalize-semantic-index --workspace .
+portfolio-maker apply-semantic-index --workspace .
+portfolio-maker prepare-project-review --workspace . --version v3
+```
+
+Never edit SQLite or managed receipts/manifests directly, bypass validation,
+or expose managed payload content or private locators. The v3 managed
+manifest and chunks are the safe project-review input; do not fall back to the
+obsolete single v2 bundle.
+
+Codex may write `project-candidates.json` and `project-candidates.md` only from
+the safe review projection. Review the candidate file, materialize review
+decisions, and persist the user's state with `set-project-state`:
 
 ```bash
 portfolio-maker compose-projects --workspace . --mode review
 portfolio-maker set-project-state --workspace . --project-id ID --state included
 ```
 
-`approve --write-sample-project-approval` is a legacy v1 empty template only. It is not a v2
-approval step, and v2 does not use `project-approval.json` as its decision source.
+`approve --write-sample-project-approval` is a legacy v1 empty template only.
+It is not a current project-decision approval step.
 
-Candidate output is not database truth. Only active v2 decision states (`manually_approved`,
+Candidate output is not database truth. Only active decision states (`manually_approved`,
 `auto_included_high`, or `auto_included_medium`) are materialized; rejected, unassigned, stale,
 policy-excluded, or unknown evidence is not a project. Without an active project decision,
 generated project sections use an honest zero-project state while the evidence inventory remains

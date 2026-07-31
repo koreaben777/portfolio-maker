@@ -29,7 +29,12 @@ Always route these stages in this order:
    Codex-share confirmation. Skip it for text-only workflows; vision is not a
    prerequisite for semantic indexing or artifacts.
 3. `$portfolio-semantic-index` next. Invoke it only when governance has
-   produced current approved inputs for the semantic-index workflow.
+   produced current approved inputs for the semantic-index workflow. The
+   router may inspect and report only safe estimate and status fields,
+   including work unit count and managed input bytes. It must wait for explicit
+   user approval before semantic analysis starts. It delegates all semantic
+   work-unit content to `$portfolio-semantic-index` and must not read semantic
+   work-unit input or output content itself.
 4. `$portfolio-project-curation` next. Invoke it only with the current safe
    semantic review input, never with raw sources or arbitrary evidence.
 5. `$portfolio-project-review` next. Preserve the explicit review mode. Pass
@@ -58,6 +63,13 @@ Diagnosis is a gated status check, not permission to continue. A resume starts
 with the current governance state and must revalidate every later input before
 reuse. A complete request still ends after local artifact validation unless
 the user separately authorizes delivery.
+
+Semantic completion or application does not grant source approval, artifact
+inclusion, project approval, delivery, Sites, Git, publish, deploy, hosting,
+commit, push, tag, or release authority. These remain separate user and policy
+gates. Resume and diagnose requests revalidate current managed status, preserve
+valid receipts, and never infer semantic-work approval or restart completed
+units.
 
 ## Delivery Boundary
 

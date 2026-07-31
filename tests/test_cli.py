@@ -493,6 +493,66 @@ def test_cli_semantic_work_lifecycle_outputs_only_safe_identifiers_and_counts(
     assert "Traceback" not in combined
 
 
+def test_cli_parser_matches_resumable_semantic_skill_commands() -> None:
+    parser = cli.build_parser()
+    help_text = parser.format_help()
+
+    for command in (
+        "prepare-semantic-index",
+        "semantic-index-status",
+        "next-semantic-work",
+        "validate-semantic-work",
+        "finalize-semantic-index",
+        "apply-semantic-index",
+        "prepare-project-review",
+    ):
+        assert command in help_text
+
+    status = parser.parse_args(
+        [
+            "semantic-index-status",
+            "--workspace",
+            "synthetic-workspace",
+            "--format",
+            "json",
+        ]
+    )
+    assert status.workspace == Path("synthetic-workspace")
+    assert status.format == "json"
+
+    validation = parser.parse_args(
+        [
+            "validate-semantic-work",
+            "--workspace",
+            "synthetic-workspace",
+            "--unit-id",
+            "unit-000001",
+        ]
+    )
+    assert validation.unit_id == "unit-000001"
+
+    review = parser.parse_args(
+        [
+            "prepare-project-review",
+            "--workspace",
+            "synthetic-workspace",
+            "--version",
+            "v3",
+        ]
+    )
+    assert review.version == "v3"
+
+    with pytest.raises(SystemExit) as missing_unit:
+        parser.parse_args(
+            [
+                "validate-semantic-work",
+                "--workspace",
+                "synthetic-workspace",
+            ]
+        )
+    assert missing_unit.value.code == 2
+
+
 def test_cli_semantic_quality_failure_is_controlled_without_receipt_or_echo(
     workspace,
     tmp_path,

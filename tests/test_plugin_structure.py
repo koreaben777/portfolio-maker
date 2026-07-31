@@ -171,3 +171,127 @@ def test_repository_skill_is_a_legacy_compatible_router_shim() -> None:
     ):
         assert command in shim
     assert "legacy" in shim.lower()
+
+
+def test_semantic_skill_uses_resumable_codex_work_protocol() -> None:
+    skill = Path("skills/portfolio-semantic-index/SKILL.md").read_text(
+        encoding="utf-8"
+    )
+    commands = (
+        "portfolio-maker prepare-semantic-index --workspace . --root <approved-root>",
+        "portfolio-maker semantic-index-status --workspace . --format json",
+        "portfolio-maker next-semantic-work --workspace .",
+        (
+            "portfolio-maker validate-semantic-work --workspace . "
+            "--unit-id <returned-unit-id>"
+        ),
+        "portfolio-maker finalize-semantic-index --workspace .",
+        "portfolio-maker apply-semantic-index --workspace .",
+        "portfolio-maker prepare-project-review --workspace . --version v3",
+    )
+
+    normalized = " ".join(skill.split())
+    normalized_casefold = normalized.casefold()
+    positions = [normalized.index(command) for command in commands]
+    assert positions == sorted(positions)
+    approval_position = normalized.index("WAIT FOR EXPLICIT USER APPROVAL")
+    assert positions[1] < approval_position < positions[2]
+    for phrase in (
+        "codex-semantic-v2",
+        "Work units",
+        "Managed input bytes",
+        "262,144 bytes",
+        "no global count cap",
+        "exactly one returned ready unit at a time",
+        "read only the returned managed input",
+        "write only its matching managed output",
+        "managed signal IDs",
+        "child-output hashes",
+        "validate every unit and require its receipt",
+        "never edit SQLite or managed receipts/manifests directly",
+    ):
+        assert phrase.casefold() in normalized_casefold
+    for exact_phrase in (
+        "Do not read raw files",
+        "Do not use token extraction as final meaning",
+    ):
+        assert exact_phrase in skill
+    assert "input/chunk-####.json" not in skill
+    assert "output/chunk-####.json" not in skill
+
+
+def test_semantic_skill_stops_at_every_resumable_safety_gate() -> None:
+    skill = Path("skills/portfolio-semantic-index/SKILL.md").read_text(
+        encoding="utf-8"
+    )
+
+    for phrase in (
+        "missing or stale policy",
+        "invalid or missing receipt",
+        "dependency invalidation",
+        "generic or ungrounded output",
+        "DB safety error",
+        "no ready unit while status is incomplete or invalid",
+        "user cancellation",
+        "approval does not grant source-policy",
+        "artifact inclusion",
+        "delivery",
+        "publish",
+        "deploy",
+        "Git",
+        "release",
+    ):
+        assert phrase in skill
+
+
+def test_router_delegates_semantic_content_without_inheriting_authority() -> None:
+    skill = Path("skills/portfolio-maker/SKILL.md").read_text(encoding="utf-8")
+    normalized = " ".join(skill.split())
+    normalized_casefold = normalized.casefold()
+
+    assert "work unit count" in normalized_casefold
+    assert "managed input bytes" in normalized_casefold
+    assert "wait for explicit user approval" in normalized_casefold
+    assert "delegates all semantic work-unit content" in normalized_casefold
+    assert (
+        "must not read semantic work-unit input or output content"
+        in normalized_casefold
+    )
+    for authority in (
+        "source approval",
+        "artifact inclusion",
+        "project approval",
+        "delivery",
+        "Sites",
+        "Git",
+        "publish",
+        "deploy",
+        "release",
+    ):
+        assert authority.casefold() in normalized_casefold
+
+
+def test_repository_shim_routes_resumable_v2_and_chunked_v3() -> None:
+    shim = Path(".agents/skills/portfolio-maker/SKILL.md").read_text(
+        encoding="utf-8"
+    )
+    commands = (
+        "portfolio-maker prepare-semantic-index --workspace . --root <confirmed-root>",
+        "portfolio-maker semantic-index-status --workspace . --format json",
+        "portfolio-maker next-semantic-work --workspace .",
+        (
+            "portfolio-maker validate-semantic-work --workspace . "
+            "--unit-id <returned-unit-id>"
+        ),
+        "portfolio-maker finalize-semantic-index --workspace .",
+        "portfolio-maker apply-semantic-index --workspace .",
+        "portfolio-maker prepare-project-review --workspace . --version v3",
+    )
+
+    normalized = " ".join(shim.split())
+    positions = [normalized.index(command) for command in commands]
+    assert positions == sorted(positions)
+    approval_position = normalized.index("WAIT FOR EXPLICIT USER APPROVAL")
+    assert positions[1] < approval_position < positions[2]
+    assert "codex-semantic-v2" in shim
+    assert "--version v2" not in shim
