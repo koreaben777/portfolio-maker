@@ -560,6 +560,65 @@ def test_prepare_semantic_index_scans_only_the_requested_root(
     assert "not-in-scope.md" not in serialized
 
 
+def test_prepare_semantic_index_skips_unsupported_symlink_analysis(
+    workspace: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "approved-root"
+    root.mkdir()
+    (root / "README.md").write_text("insurance evidence search", encoding="utf-8")
+    (root / "broken-link").symlink_to(tmp_path / "missing-target")
+    approve_root(workspace, root)
+    original_analyze = semantic_index_module.analyze_file_input
+    analyzed: list[str] = []
+
+    def record_analysis(entry):
+        analyzed.append(entry.relative_hierarchy)
+        return original_analyze(entry)
+
+    monkeypatch.setattr(semantic_index_module, "analyze_file_input", record_analysis)
+
+    result = prepare_semantic_index(
+        PrepareSemanticIndexRequest(workspace=workspace, root=root)
+    )
+
+    nodes = SQLiteRepository(
+        WorkspacePaths.from_root(workspace).db_path
+    ).list_semantic_nodes(result.revision_id)
+    broken = next(
+        node for node in nodes if node["relative_hierarchy"] == "broken-link"
+    )
+    assert broken["analysis_status"] == "unsupported"
+    assert "README.md" in analyzed
+    assert "broken-link" not in analyzed
+
+
+def test_prepare_semantic_index_skips_evidence_for_file_missing_after_analysis(
+    workspace: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "approved-root"
+    root.mkdir()
+    (root / "README.md").write_text("insurance evidence search", encoding="utf-8")
+    approve_root(workspace, root)
+    original_canonicalize = semantic_index_module._canonical_file_uri
+
+    def disappear(path: Path) -> str:
+        if path.name == "README.md":
+            raise FileNotFoundError(path)
+        return original_canonicalize(path)
+
+    monkeypatch.setattr(semantic_index_module, "_canonical_file_uri", disappear)
+
+    result = prepare_semantic_index(
+        PrepareSemanticIndexRequest(workspace=workspace, root=root)
+    )
+
+    nodes = SQLiteRepository(
+        WorkspacePaths.from_root(workspace).db_path
+    ).list_semantic_nodes(result.revision_id)
+    readme = next(node for node in nodes if node["relative_hierarchy"] == "README.md")
+    assert readme["evidence_ids"] == []
+
+
 def test_prepare_semantic_index_replaces_only_prior_managed_chunks(
     workspace: Path, tmp_path: Path
 ) -> None:

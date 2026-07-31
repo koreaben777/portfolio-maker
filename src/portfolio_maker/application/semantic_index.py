@@ -560,7 +560,11 @@ def _prepare_nodes(
 
     prepared: list[_PreparedNode] = []
     for entry in structural_entries:
-        if entry.kind is SemanticNodeKind.FILE:
+        is_analyzable_file = (
+            entry.kind is SemanticNodeKind.FILE
+            and entry.status is not AnalysisStatus.UNSUPPORTED
+        )
+        if is_analyzable_file:
             analysis = analyze_file_input(entry)
             content_fingerprint = analysis.content_fingerprint
             semantic_roles = analysis.semantic_roles
@@ -571,6 +575,14 @@ def _prepare_nodes(
             semantic_roles = ()
             masked_excerpt = ""
             status = entry.status
+        evidence_ids: tuple[int, ...] = ()
+        if is_analyzable_file:
+            try:
+                evidence_ids = approved_evidence_by_source_uri.get(
+                    _canonical_file_uri(entry.absolute_path), ()
+                )
+            except (FileNotFoundError, OSError, RuntimeError):
+                pass
         node = SemanticNode(
             node_id=entry.node_id,
             source_id=entry.source_id,
@@ -582,11 +594,7 @@ def _prepare_nodes(
             semantic_summary="",
             semantic_roles=semantic_roles,
             topics=(),
-            evidence_ids=(
-                approved_evidence_by_source_uri.get(_canonical_file_uri(entry.absolute_path), ())
-                if entry.kind is SemanticNodeKind.FILE
-                else ()
-            ),
+            evidence_ids=evidence_ids,
             analysis_status=status,
             analyzer_version=ANALYZER_VERSION,
             updated_at="",
