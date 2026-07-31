@@ -87,6 +87,61 @@ def _receipt_path(prepared: PreparedWork, unit_id: str) -> Path:
     return prepared.paths.semantic_work_receipts_dir / f"{unit_id}.json"
 
 
+def _semantic_results(work_input: dict[str, object]) -> list[object]:
+    child_result_ids = [
+        result.get("node_id", result.get("aggregate_id"))
+        for child in work_input["child_results"]
+        for result in child["results"]
+    ]
+    if work_input["stage"] == "reduce":
+        return [
+            {
+                "result_kind": "aggregate",
+                "aggregate_id": f"aggregate:{work_input['unit_id']}",
+                "semantic_summary": (
+                    "직접 하위 결과를 결합해 상위 분석에 필요한 근거를 제공한다"
+                ),
+                "semantic_roles": ["evidence-aggregate"],
+                "topics": ["근거 집계"],
+                "purpose_signals": ["직접 하위 결과를 상위 분석에 전달한다"],
+                "parent_context_signals": [],
+                "independence_signals": [],
+                "triviality_signals": [],
+                "grounding_signal_ids": child_result_ids,
+                "member_node_ids_sha256": _sha256_text(
+                    _canonical_text(child_result_ids)
+                ),
+                "member_count": len(child_result_ids),
+            }
+        ]
+    results: list[object] = []
+    for target in work_input["targets"]:
+        own_signal_ids = [
+            signal["signal_id"] for signal in target["signals"]
+        ]
+        grounding_ids = own_signal_ids[:1] or child_result_ids[:1]
+        results.append(
+            {
+                "result_kind": "node",
+                "node_id": target["node_id"],
+                "semantic_summary": (
+                    "이 구성요소는 검증된 근거를 바탕으로 제품 기능을 제공한다"
+                ),
+                "semantic_roles": ["application-component"],
+                "topics": ["근거 기반 기능"],
+                "purpose_signals": ["검증된 근거를 제품 기능에 연결한다"],
+                "parent_context_signals": [],
+                "independence_signals": [],
+                "triviality_signals": [],
+                "grounding_signal_ids": grounding_ids,
+                "semantic_disposition": "analyzed",
+                "analysis_status": target["analysis_status"],
+                "child_node_ids": target["child_node_ids"],
+            }
+        )
+    return results
+
+
 def _write_valid_output(
     prepared: PreparedWork,
     input_path: Path,
@@ -107,7 +162,11 @@ def _write_valid_output(
         ],
         "analysis_method": "codex-semantic-v2",
         "coverage": work_input["coverage"],
-        "results": results or [],
+        "results": (
+            results
+            if results is not None
+            else _semantic_results(work_input)
+        ),
     }
     if overrides:
         payload.update(overrides)
@@ -399,6 +458,34 @@ def test_validation_rejects_wrong_output_binding_without_receipt(
     assert not _receipt_path(prepared_work, current.unit_id).exists()
 
 
+def test_validation_rejects_placeholder_semantics_without_receipt(
+    prepared_work: PreparedWork,
+) -> None:
+    current = next_semantic_work(
+        NextSemanticWorkRequest(workspace=prepared_work.workspace)
+    )
+    assert current.unit_id is not None
+    assert current.input_path is not None
+    work_input = json.loads(current.input_path.read_text(encoding="utf-8"))
+    results = _semantic_results(work_input)
+    results[0]["semantic_summary"] = "Indexed content."
+    _write_valid_output(
+        prepared_work,
+        current.input_path,
+        results=results,
+    )
+
+    with pytest.raises(SemanticWorkError, match="quality"):
+        validate_semantic_work(
+            ValidateSemanticWorkRequest(
+                workspace=prepared_work.workspace,
+                unit_id=current.unit_id,
+            )
+        )
+
+    assert not _receipt_path(prepared_work, current.unit_id).exists()
+
+
 def test_validation_is_idempotent_for_identical_input_output_and_dependencies(
     prepared_work: PreparedWork,
 ) -> None:
@@ -514,10 +601,17 @@ def test_validation_rechecks_output_before_publishing_receipt(
         if path == output_path:
             output_reads += 1
             if output_reads == 4:
+                work_input = json.loads(
+                    current.input_path.read_text(encoding="utf-8")
+                )
+                replacement_results = _semantic_results(work_input)
+                replacement_results[0]["semantic_summary"] = (
+                    "이 구성요소는 재검증 중 교체된 별도 제품 기능을 제공한다"
+                )
                 _write_valid_output(
                     prepared_work,
                     current.input_path,
-                    results=[{"synthetic": "changed during validation"}],
+                    results=replacement_results,
                 )
         return original_read(path)
 
@@ -597,10 +691,15 @@ def test_oversize_dependency_context_is_rejected_before_materialization(
         NextSemanticWorkRequest(workspace=prepared_work.workspace)
     )
     assert first.input_path is not None
+    work_input = json.loads(first.input_path.read_text(encoding="utf-8"))
+    oversized_results = _semantic_results(work_input)
+    oversized_results[0]["purpose_signals"] = [
+        "이 구성요소는 상위 근거 전달을 위해 " + "x" * 270_000
+    ]
     _write_valid_output(
         prepared_work,
         first.input_path,
-        results=[{"text": "x" * 270_000}],
+        results=oversized_results,
     )
     validate_semantic_work(
         ValidateSemanticWorkRequest(prepared_work.workspace, first.unit_id or "")

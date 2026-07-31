@@ -53,6 +53,64 @@ def approve_semantic_root(workspace, root) -> None:
     paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
 
 
+def cli_semantic_results(work_input: dict[str, object]) -> list[object]:
+    child_result_ids = [
+        result.get("node_id", result.get("aggregate_id"))
+        for child in work_input["child_results"]
+        for result in child["results"]
+    ]
+    if work_input["stage"] == "reduce":
+        serialized_ids = json.dumps(
+            child_result_ids,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return [
+            {
+                "result_kind": "aggregate",
+                "aggregate_id": f"aggregate:{work_input['unit_id']}",
+                "semantic_summary": (
+                    "직접 하위 결과를 결합해 상위 분석에 필요한 근거를 제공한다"
+                ),
+                "semantic_roles": ["evidence-aggregate"],
+                "topics": ["근거 집계"],
+                "purpose_signals": ["직접 하위 결과를 상위 분석에 전달한다"],
+                "parent_context_signals": [],
+                "independence_signals": [],
+                "triviality_signals": [],
+                "grounding_signal_ids": child_result_ids,
+                "member_node_ids_sha256": hashlib.sha256(
+                    serialized_ids.encode("utf-8")
+                ).hexdigest(),
+                "member_count": len(child_result_ids),
+            }
+        ]
+    return [
+        {
+            "result_kind": "node",
+            "node_id": target["node_id"],
+            "semantic_summary": (
+                "이 구성요소는 검증된 근거를 바탕으로 제품 기능을 제공한다"
+            ),
+            "semantic_roles": ["application-component"],
+            "topics": ["근거 기반 기능"],
+            "purpose_signals": ["검증된 근거를 제품 기능에 연결한다"],
+            "parent_context_signals": [],
+            "independence_signals": [],
+            "triviality_signals": [],
+            "grounding_signal_ids": (
+                [signal["signal_id"] for signal in target["signals"]][:1]
+                or child_result_ids[:1]
+            ),
+            "semantic_disposition": "analyzed",
+            "analysis_status": target["analysis_status"],
+            "child_node_ids": target["child_node_ids"],
+        }
+        for target in work_input["targets"]
+    ]
+
+
 def write_cli_semantic_output(paths: WorkspacePaths, input_path: Path) -> None:
     work_input = json.loads(input_path.read_text(encoding="utf-8"))
     payload = {
@@ -67,7 +125,7 @@ def write_cli_semantic_output(paths: WorkspacePaths, input_path: Path) -> None:
         ],
         "analysis_method": "codex-semantic-v2",
         "coverage": work_input["coverage"],
-        "results": [],
+        "results": cli_semantic_results(work_input),
     }
     payload["output_sha256"] = hashlib.sha256(
         json.dumps(
@@ -433,6 +491,75 @@ def test_cli_semantic_work_lifecycle_outputs_only_safe_identifiers_and_counts(
     ):
         assert forbidden not in combined
     assert "Traceback" not in combined
+
+
+def test_cli_semantic_quality_failure_is_controlled_without_receipt_or_echo(
+    workspace,
+    tmp_path,
+    capsys,
+):
+    root = tmp_path / "approved-root"
+    root.mkdir()
+    (root / "README.md").write_text("# Safe evidence", encoding="utf-8")
+    approve_semantic_root(workspace, root)
+    assert main(
+        [
+            "prepare-semantic-index",
+            "--workspace",
+            str(workspace),
+            "--root",
+            str(root),
+        ]
+    ) == 0
+    capsys.readouterr()
+    assert main(["next-semantic-work", "--workspace", str(workspace)]) == 0
+    capsys.readouterr()
+    paths = WorkspacePaths.from_root(workspace)
+    input_path = paths.semantic_work_input_dir / "unit-000001.json"
+    write_cli_semantic_output(paths, input_path)
+    output_path = paths.semantic_work_output_dir / "unit-000001.json"
+    output = json.loads(output_path.read_text(encoding="utf-8"))
+    rejected_summary = "Indexed content."
+    output["results"][0]["semantic_summary"] = rejected_summary
+    unsigned = dict(output)
+    unsigned.pop("output_sha256")
+    output["output_sha256"] = hashlib.sha256(
+        json.dumps(
+            unsigned,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    write_managed_text(
+        output_path,
+        json.dumps(
+            output,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+    )
+
+    assert main(
+        [
+            "validate-semantic-work",
+            "--workspace",
+            str(workspace),
+            "--unit-id",
+            "unit-000001",
+        ]
+    ) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "semantic work command failed safely\n"
+    assert rejected_summary not in captured.err
+    assert str(workspace) not in captured.err
+    assert "Traceback" not in captured.err
+    assert not (
+        paths.semantic_work_receipts_dir / "unit-000001.json"
+    ).exists()
 
 
 def test_cli_semantic_work_missing_output_is_controlled_without_locator(

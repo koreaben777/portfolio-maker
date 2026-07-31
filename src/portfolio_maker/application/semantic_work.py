@@ -15,6 +15,10 @@ from portfolio_maker.application.models import (
     ValidateSemanticWorkRequest,
     ValidateSemanticWorkResult,
 )
+from portfolio_maker.application.semantic_quality import (
+    SemanticQualityError,
+    validate_semantic_work_output,
+)
 from portfolio_maker.domain.history_models import utc_now
 from portfolio_maker.domain.semantic_work import (
     SemanticDisposition,
@@ -1021,6 +1025,12 @@ def _read_valid_output(
         != output_sha256
     ):
         raise SemanticWorkError("semantic work output is invalid")
+    try:
+        validate_semantic_work_output(input_payload, payload)
+    except SemanticQualityError as error:
+        raise SemanticWorkError(
+            "semantic work output fails quality validation"
+        ) from error
     return _OutputBinding(
         output_sha256=hashlib.sha256(content).hexdigest(),
         payload=payload,
