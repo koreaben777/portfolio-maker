@@ -15,9 +15,15 @@ from portfolio_maker.application.artifact_approval import write_sample_artifact_
 from portfolio_maker.application.history import HistoryError
 from portfolio_maker.application.models import (
     ApplyVisionAnalysisRequest,
+    NextSemanticWorkRequest,
     PrepareVisionAnalysisRequest,
+    ValidateSemanticWorkRequest,
 )
 import portfolio_maker.application.render_html as render_html_module
+from portfolio_maker.application.semantic_work import (
+    next_semantic_work,
+    validate_semantic_work,
+)
 from portfolio_maker.application.vision_analysis import (
     VisionAnalysisError,
     apply_vision_analysis,
@@ -29,6 +35,7 @@ from portfolio_maker.domain.history_models import CleanupExecutionState
 from portfolio_maker.domain.vision_models import VisionRequestStatus, VisionReviewStatus
 from portfolio_maker.domain.semantic_models import boundary_fingerprint
 from portfolio_maker.domain.models import Source, SourceStatus, SourceType
+from portfolio_maker.infrastructure.managed_files import write_managed_text
 from portfolio_maker.infrastructure.sqlite_repository import RepositoryError, SQLiteRepository
 from portfolio_maker.workspace import WorkspacePaths
 
@@ -44,6 +51,57 @@ def approve_semantic_root(workspace, root) -> None:
     approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
     approval["approved_source_uris"] = [root.resolve().as_uri()]
     paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+
+
+def write_cli_semantic_output(paths: WorkspacePaths, input_path: Path) -> None:
+    work_input = json.loads(input_path.read_text(encoding="utf-8"))
+    payload = {
+        "version": 2,
+        "revision_id": work_input["revision_id"],
+        "unit_id": work_input["unit_id"],
+        "stage": work_input["stage"],
+        "input_sha256": work_input["input_sha256"],
+        "dependency_output_sha256s": [
+            dependency["output_sha256"]
+            for dependency in work_input["dependencies"]
+        ],
+        "analysis_method": "codex-semantic-v2",
+        "coverage": work_input["coverage"],
+        "results": [],
+    }
+    payload["output_sha256"] = hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    write_managed_text(
+        paths.semantic_work_output_dir / f"{work_input['unit_id']}.json",
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+    )
+
+
+def complete_cli_semantic_work(workspace: Path) -> WorkspacePaths:
+    paths = WorkspacePaths.from_root(workspace)
+    while True:
+        current = next_semantic_work(NextSemanticWorkRequest(workspace=workspace))
+        if current.unit_id is None:
+            return paths
+        assert current.input_path is not None
+        write_cli_semantic_output(paths, current.input_path)
+        validate_semantic_work(
+            ValidateSemanticWorkRequest(
+                workspace=workspace,
+                unit_id=current.unit_id,
+            )
+        )
 
 
 def seed_v2_candidate(workspace, *, confidence="medium") -> tuple[WorkspacePaths, str]:
@@ -194,13 +252,20 @@ def test_cli_approve_write_sample(workspace):
 
 
 def test_cli_prepare_semantic_index_reports_chunks_without_locator_values(
-    workspace, tmp_path, capsys
+    workspace, tmp_path, capsys, monkeypatch
 ):
     root = tmp_path / "approved-root"
     root.mkdir()
     for index in range(501):
         (root / f"item-{index:03}.md").write_text("evidence", encoding="utf-8")
     approve_semantic_root(workspace, root)
+    monkeypatch.setattr(
+        SQLiteRepository,
+        "list_semantic_nodes",
+        lambda *_args, **_kwargs: pytest.fail(
+            "protocol-v2 preparation must not read staging graph nodes"
+        ),
+    )
 
     exit_code = main(
         [
@@ -223,14 +288,13 @@ def test_cli_prepare_semantic_index_reports_chunks_without_locator_values(
     assert str(root) not in captured.out
     assert report.exists()
     report_text = report.read_text(encoding="utf-8")
-    assert "Files: 501" in report_text
-    assert "Directories:" in report_text
-    assert "Complete:" in report_text
-    assert "Partial:" in report_text
-    assert "Unsupported:" in report_text
-    assert "Unreadable:" in report_text
-    assert "Failed:" in report_text
-    assert "Active revision: none" in report_text
+    assert "Nodes: 502" in report_text
+    assert "Work units: 510" in report_text
+    assert "Analysis targets: 502" in report_text
+    assert "Structural only: 0" in report_text
+    assert "Managed input bytes:" in report_text
+    assert str(workspace) not in report_text
+    assert str(root) not in report_text
 
 
 def test_cli_apply_semantic_index_is_controlled_when_output_missing(
@@ -257,7 +321,202 @@ def test_cli_apply_semantic_index_is_controlled_when_output_missing(
     assert exit_code == 1
     assert "semantic index output is missing" in captured.err
     assert "Traceback" not in captured.err
+
+
+def test_cli_semantic_work_rejects_unsafe_unit_identifier_without_echo(
+    workspace, capsys
+):
+    unsafe_unit = "file:///synthetic/private-unit"
+
+    assert main(
+        [
+            "validate-semantic-work",
+            "--workspace",
+            str(workspace),
+            "--unit-id",
+            unsafe_unit,
+        ]
+    ) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "semantic work command failed safely\n"
+    assert unsafe_unit not in captured.err
     assert str(workspace) not in captured.err
+    assert "Traceback" not in captured.err
+    assert str(workspace) not in captured.err
+
+
+def test_cli_semantic_work_lifecycle_outputs_only_safe_identifiers_and_counts(
+    workspace, tmp_path, capsys
+):
+    root = tmp_path / "approved-root"
+    root.mkdir()
+    (root / "README.md").write_text(
+        "OPENAI_API_KEY=sk-synthetic-placeholder\n"
+        f"SOURCE_PATH={root}/private.txt\n"
+        "# Safe evidence",
+        encoding="utf-8",
+    )
+    approve_semantic_root(workspace, root)
+    assert main(
+        [
+            "prepare-semantic-index",
+            "--workspace",
+            str(workspace),
+            "--root",
+            str(root),
+        ]
+    ) == 0
+    capsys.readouterr()
+
+    assert main(
+        [
+            "semantic-index-status",
+            "--workspace",
+            str(workspace),
+            "--format",
+            "json",
+        ]
+    ) == 0
+    status_output = capsys.readouterr()
+    status = json.loads(status_output.out)
+    assert status["work_unit_count"] == 2
+    assert status["ready_count"] == 1
+    assert status["receipted_count"] == 0
+    assert status["complete"] is False
+
+    assert main(["next-semantic-work", "--workspace", str(workspace)]) == 0
+    next_output = capsys.readouterr()
+    assert "Semantic work unit: unit-000001" in next_output.out
+    assert (
+        "Managed input: "
+        ".portfolio-maker/reviews/semantic-index/work-input/unit-000001.json"
+        in next_output.out
+    )
+    paths = WorkspacePaths.from_root(workspace)
+    input_path = paths.semantic_work_input_dir / "unit-000001.json"
+    write_cli_semantic_output(paths, input_path)
+
+    assert main(
+        [
+            "validate-semantic-work",
+            "--workspace",
+            str(workspace),
+            "--unit-id",
+            "unit-000001",
+        ]
+    ) == 0
+    validate_output = capsys.readouterr()
+    assert "Semantic work unit: unit-000001" in validate_output.out
+    assert (
+        "Receipt: "
+        ".portfolio-maker/reviews/semantic-index/receipts/unit-000001.json"
+        in validate_output.out
+    )
+    assert "Output SHA-256: " in validate_output.out
+
+    combined = (
+        status_output.out
+        + status_output.err
+        + next_output.out
+        + next_output.err
+        + validate_output.out
+        + validate_output.err
+    )
+    for forbidden in (
+        str(workspace),
+        str(root),
+        "sk-synthetic-placeholder",
+        "SOURCE_PATH=",
+        "# Safe evidence",
+    ):
+        assert forbidden not in combined
+    assert "Traceback" not in combined
+
+
+def test_cli_semantic_work_missing_output_is_controlled_without_locator(
+    workspace, tmp_path, capsys
+):
+    root = tmp_path / "approved-root"
+    root.mkdir()
+    (root / "README.md").write_text("# Safe evidence", encoding="utf-8")
+    approve_semantic_root(workspace, root)
+    assert main(
+        [
+            "prepare-semantic-index",
+            "--workspace",
+            str(workspace),
+            "--root",
+            str(root),
+        ]
+    ) == 0
+    capsys.readouterr()
+    assert main(["next-semantic-work", "--workspace", str(workspace)]) == 0
+    capsys.readouterr()
+
+    assert main(
+        [
+            "validate-semantic-work",
+            "--workspace",
+            str(workspace),
+            "--unit-id",
+            "unit-000001",
+        ]
+    ) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "semantic work command failed safely\n"
+    assert str(workspace) not in captured.err
+    assert str(root) not in captured.err
+    assert "Traceback" not in captured.err
+
+
+@pytest.mark.parametrize(
+    "directory_attribute",
+    (
+        "semantic_work_input_dir",
+        "semantic_work_output_dir",
+        "semantic_work_receipts_dir",
+    ),
+)
+def test_cli_semantic_work_rejects_undeclared_artifact_without_false_completion(
+    workspace,
+    tmp_path,
+    capsys,
+    directory_attribute,
+):
+    root = tmp_path / "approved-root"
+    root.mkdir()
+    (root / "README.md").write_text("# Safe evidence", encoding="utf-8")
+    approve_semantic_root(workspace, root)
+    assert main(
+        [
+            "prepare-semantic-index",
+            "--workspace",
+            str(workspace),
+            "--root",
+            str(root),
+        ]
+    ) == 0
+    capsys.readouterr()
+    paths = complete_cli_semantic_work(workspace)
+    canary = "unexpected-private-canary"
+    unexpected_path = getattr(paths, directory_attribute) / f"{canary}.json"
+    write_managed_text(unexpected_path, "{}")
+
+    assert main(["next-semantic-work", "--workspace", str(workspace)]) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "semantic work command failed safely\n"
+    assert "Semantic work complete." not in captured.out
+    assert "Remaining: 0" not in captured.out
+    assert str(workspace) not in captured.err
+    assert canary not in captured.err
+    assert "Traceback" not in captured.err
+    assert unexpected_path.read_text(encoding="utf-8") == "{}"
 
 
 def test_cli_prepare_semantic_index_invalid_root_is_controlled_without_locator(

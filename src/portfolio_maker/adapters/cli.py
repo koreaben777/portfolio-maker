@@ -4,6 +4,7 @@ import argparse
 import json
 import sys
 from collections.abc import Sequence
+from dataclasses import asdict
 from pathlib import Path
 
 from portfolio_maker.application.approval import ApprovalFormatError, ApprovalMissingError, write_sample_approval
@@ -26,6 +27,12 @@ from portfolio_maker.application.semantic_index import (
     SemanticIndexError,
     apply_semantic_index,
     prepare_semantic_index,
+)
+from portfolio_maker.application.semantic_work import (
+    SemanticWorkError,
+    next_semantic_work,
+    semantic_index_status,
+    validate_semantic_work,
 )
 from portfolio_maker.application.vision_analysis import (
     VisionAnalysisError,
@@ -59,9 +66,13 @@ from portfolio_maker.application.models import (
     PrepareProjectReviewRequest,
     ApplySemanticIndexRequest,
     ApplyVisionAnalysisRequest,
+    NextSemanticWorkRequest,
     PrepareSemanticIndexRequest,
+    PrepareSemanticIndexResult,
     PrepareVisionAnalysisRequest,
+    SemanticIndexStatusRequest,
     SetVisionAnalysisStateRequest,
+    ValidateSemanticWorkRequest,
 )
 from portfolio_maker.infrastructure.github_connector import GitHubDiscoveryError
 from portfolio_maker.infrastructure.local_discovery import DiscoveryRootError
@@ -146,6 +157,21 @@ def build_parser() -> argparse.ArgumentParser:
     apply_index = subparsers.add_parser("apply-semantic-index")
     apply_index.add_argument("--workspace", type=Path, default=Path("."))
 
+    semantic_status = subparsers.add_parser("semantic-index-status")
+    semantic_status.add_argument("--workspace", type=Path, default=Path("."))
+    semantic_status.add_argument(
+        "--format",
+        choices=("table", "json"),
+        default="table",
+    )
+
+    next_semantic = subparsers.add_parser("next-semantic-work")
+    next_semantic.add_argument("--workspace", type=Path, default=Path("."))
+
+    validate_semantic = subparsers.add_parser("validate-semantic-work")
+    validate_semantic.add_argument("--workspace", type=Path, default=Path("."))
+    validate_semantic.add_argument("--unit-id", required=True)
+
     prepare_vision = subparsers.add_parser("prepare-vision-analysis")
     prepare_vision.add_argument("--workspace", type=Path, default=Path("."))
     prepare_vision.add_argument("--source-id", type=int, required=True)
@@ -185,6 +211,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
     except VisionAnalysisError as error:
         print(_safe_vision_error_message(error), file=sys.stderr)
+        return 1
+    except SemanticWorkError:
+        print("semantic work command failed safely", file=sys.stderr)
         return 1
     except (
         ApprovalMissingError,
@@ -387,8 +416,9 @@ def _main(argv: Sequence[str] | None = None) -> int:
             result = prepare_semantic_index(
                 PrepareSemanticIndexRequest(workspace=args.workspace, root=args.root)
             )
-            _write_semantic_index_report(
-                WorkspacePaths.from_root(args.workspace), result.revision_id
+            _write_prepared_semantic_index_report(
+                WorkspacePaths.from_root(args.workspace),
+                result,
             )
         except ApprovalMissingError as error:
             raise SemanticIndexError("semantic index approval is missing") from error
@@ -398,19 +428,107 @@ def _main(argv: Sequence[str] | None = None) -> int:
             raise SemanticIndexError("semantic index preparation failed") from error
         print("Semantic index input prepared.")
         print(f"Chunks: {result.chunk_count}")
+        print(f"Work units: {result.work_unit_count}")
+        print(f"Managed input bytes: {result.managed_input_bytes}")
+        print(f"Analysis targets: {result.analysis_target_count}")
+        print(f"Structural only: {result.structural_only_count}")
         return 0
 
     if args.command == "apply-semantic-index":
         try:
+            status = semantic_index_status(
+                SemanticIndexStatusRequest(workspace=args.workspace)
+            )
+            if not status.complete:
+                raise SemanticIndexError("semantic index output is missing")
             result = apply_semantic_index(
                 ApplySemanticIndexRequest(workspace=args.workspace)
             )
-            _write_semantic_index_report(
+            _write_applied_semantic_index_report(
                 WorkspacePaths.from_root(args.workspace), result.revision_id
             )
         except OSError as error:
             raise SemanticIndexError("semantic index application failed") from error
         print("Semantic index applied.")
+        return 0
+
+    if args.command == "semantic-index-status":
+        result = semantic_index_status(
+            SemanticIndexStatusRequest(workspace=args.workspace)
+        )
+        revision_id = _safe_semantic_revision(result.revision_id)
+        if args.format == "json":
+            payload = asdict(result)
+            payload["revision_id"] = revision_id
+            print(
+                json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+        else:
+            print(f"Semantic revision: {revision_id}")
+            print(f"Nodes: {result.node_count}")
+            print(f"Work units: {result.work_unit_count}")
+            print(f"Ready: {result.ready_count}")
+            print(f"Receipted: {result.receipted_count}")
+            print(f"Invalid: {result.invalid_count}")
+            print(f"Complete: {'yes' if result.complete else 'no'}")
+        return 0
+
+    if args.command == "next-semantic-work":
+        result = next_semantic_work(
+            NextSemanticWorkRequest(workspace=args.workspace)
+        )
+        revision_id = _safe_semantic_revision(result.revision_id)
+        if result.unit_id is None:
+            print(f"Semantic revision: {revision_id}")
+            print("Semantic work complete.")
+            print("Remaining: 0")
+            return 0
+        unit_id = _safe_semantic_unit(result.unit_id)
+        if result.input_path is None:
+            raise SemanticWorkError("semantic work output is unsafe")
+        relative_path = _safe_semantic_managed_path(
+            args.workspace,
+            result.input_path,
+            "work-input",
+            unit_id,
+        )
+        print(f"Semantic revision: {revision_id}")
+        print(f"Semantic work unit: {unit_id}")
+        print(f"Managed input: {relative_path}")
+        print(f"Remaining: {result.remaining_count}")
+        return 0
+
+    if args.command == "validate-semantic-work":
+        result = validate_semantic_work(
+            ValidateSemanticWorkRequest(
+                workspace=args.workspace,
+                unit_id=args.unit_id,
+            )
+        )
+        unit_id = _safe_semantic_unit(result.unit_id)
+        if (
+            not isinstance(result.output_sha256, str)
+            or len(result.output_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in result.output_sha256
+            )
+        ):
+            raise SemanticWorkError("semantic work output is unsafe")
+        relative_path = _safe_semantic_managed_path(
+            args.workspace,
+            result.receipt_path,
+            "receipts",
+            unit_id,
+        )
+        print(f"Semantic work unit: {unit_id}")
+        print(f"Receipt: {relative_path}")
+        print(f"Output SHA-256: {result.output_sha256}")
         return 0
 
     if args.command == "prepare-vision-analysis":
@@ -518,7 +636,31 @@ def _main(argv: Sequence[str] | None = None) -> int:
     return 2
 
 
-def _write_semantic_index_report(paths: WorkspacePaths, revision_id: str) -> None:
+def _write_prepared_semantic_index_report(
+    paths: WorkspacePaths,
+    result: PrepareSemanticIndexResult,
+) -> None:
+    report = "\n".join(
+        (
+            "# Semantic Index Report",
+            "",
+            f"Nodes: {result.node_count}",
+            f"Chunks: {result.chunk_count}",
+            f"Work units: {result.work_unit_count}",
+            f"Analysis targets: {result.analysis_target_count}",
+            f"Structural only: {result.structural_only_count}",
+            f"Managed input bytes: {result.managed_input_bytes}",
+            f"Partial: {result.partial_count}",
+            "",
+        )
+    )
+    write_managed_text(paths.semantic_index_report_path, report)
+
+
+def _write_applied_semantic_index_report(
+    paths: WorkspacePaths,
+    revision_id: str,
+) -> None:
     repository = SQLiteRepository(paths.db_path)
     nodes = repository.list_semantic_nodes(revision_id)
     source_id = str(nodes[0]["source_id"])
@@ -543,6 +685,44 @@ def _write_semantic_index_report(paths: WorkspacePaths, revision_id: str) -> Non
         )
     )
     write_managed_text(paths.semantic_index_report_path, report)
+
+
+def _safe_semantic_revision(value: object) -> str:
+    if (
+        type(value) is not str
+        or len(value) != 32
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise SemanticWorkError("semantic work output is unsafe")
+    return value
+
+
+def _safe_semantic_unit(value: object) -> str:
+    if (
+        type(value) is not str
+        or not value.startswith("unit-")
+        or len(value) < 11
+        or not value[5:].isdigit()
+    ):
+        raise SemanticWorkError("semantic work output is unsafe")
+    return value
+
+
+def _safe_semantic_managed_path(
+    workspace: Path,
+    path: Path,
+    directory_name: str,
+    unit_id: str,
+) -> str:
+    expected = (
+        WorkspacePaths.from_root(workspace).reviews_dir
+        / "semantic-index"
+        / directory_name
+        / f"{unit_id}.json"
+    )
+    if path.resolve(strict=False) != expected.resolve(strict=False):
+        raise SemanticWorkError("semantic work output is unsafe")
+    return str(expected.relative_to(WorkspacePaths.from_root(workspace).workspace))
 
 
 def _history_apply_mode(args: argparse.Namespace) -> str:

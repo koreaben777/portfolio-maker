@@ -2,23 +2,158 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
 
+from portfolio_maker.application.models import (
+    NextSemanticWorkRequest,
+    NextSemanticWorkResult,
+    SemanticIndexStatusRequest,
+    SemanticIndexStatusResult,
+    ValidateSemanticWorkRequest,
+    ValidateSemanticWorkResult,
+)
+from portfolio_maker.domain.history_models import utc_now
 from portfolio_maker.domain.semantic_work import (
     SemanticDisposition,
     SemanticWorkPlan,
     SemanticWorkStage,
     SemanticWorkUnit,
 )
+from portfolio_maker.infrastructure.managed_files import (
+    read_managed_bytes,
+    write_managed_text,
+)
+from portfolio_maker.infrastructure.sqlite_repository import SQLiteRepository
+from portfolio_maker.workspace import WorkspacePaths
 
 
 MAX_WORK_UNIT_BYTES = 262_144
 REDUCE_FAN_IN = 64
 STRUCTURAL_CHUNK_SIZE = 1_000
 _VALID_DISPOSITIONS = {disposition.value for disposition in SemanticDisposition}
+_VALID_STAGES = {stage.value for stage in SemanticWorkStage}
+_SHA256 = re.compile(r"[0-9a-f]{64}")
+_UNIT_ID = re.compile(r"unit-[0-9]{6,}")
+_MANIFEST_KEYS = {
+    "version",
+    "protocol",
+    "revision_id",
+    "source_id",
+    "policy_hash",
+    "analyzer_version",
+    "capsule_chunk_sha256s",
+    "work_plan_sha256",
+    "node_count",
+    "work_unit_count",
+    "managed_input_bytes",
+    "analysis_target_count",
+    "structural_only_count",
+}
+_PLAN_KEYS = {
+    "version",
+    "revision_id",
+    "policy_hash",
+    "protocol",
+    "node_count",
+    "analysis_target_count",
+    "structural_owner_count",
+    "work_unit_count",
+    "max_work_unit_bytes",
+    "reduce_fan_in",
+    "node_assignment_sha256",
+    "units",
+}
+_UNIT_KEYS = {
+    "unit_id",
+    "stage",
+    "target_node_ids",
+    "dependency_unit_ids",
+    "template_sha256",
+    "template_byte_count",
+}
+_INPUT_KEYS = {
+    "version",
+    "revision_id",
+    "unit_id",
+    "stage",
+    "input_sha256",
+    "dependencies",
+    "coverage",
+    "targets",
+    "child_results",
+}
+_OUTPUT_KEYS = {
+    "version",
+    "revision_id",
+    "unit_id",
+    "stage",
+    "input_sha256",
+    "dependency_output_sha256s",
+    "analysis_method",
+    "coverage",
+    "results",
+    "output_sha256",
+}
+_RECEIPT_KEYS = {
+    "version",
+    "revision_id",
+    "unit_id",
+    "input_sha256",
+    "output_sha256",
+    "dependency_output_sha256s",
+    "validated_at",
+    "receipt_sha256",
+}
 
 
 class SemanticWorkError(ValueError):
     pass
+
+
+@dataclass(frozen=True)
+class _VerifiedUnit:
+    unit_id: str
+    stage: str
+    target_node_ids: tuple[str, ...]
+    dependency_unit_ids: tuple[str, ...]
+    template_sha256: str
+    template_byte_count: int
+
+
+@dataclass(frozen=True)
+class _VerifiedState:
+    paths: WorkspacePaths
+    revision_id: str
+    node_count: int
+    max_work_unit_bytes: int
+    capsules: dict[str, dict[str, object]]
+    units: tuple[_VerifiedUnit, ...]
+    unit_by_id: dict[str, _VerifiedUnit]
+
+
+@dataclass(frozen=True)
+class _OutputBinding:
+    output_sha256: str
+    payload: dict[str, object]
+    content: bytes
+
+
+@dataclass(frozen=True)
+class _ReceiptBinding:
+    input_sha256: str
+    output: _OutputBinding
+    dependency_output_sha256s: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _LifecycleEvaluation:
+    valid_receipts: dict[str, _ReceiptBinding]
+    ready_unit_ids: tuple[str, ...]
+    invalid_count: int
+    undeclared_artifact_count: int
 
 
 def build_semantic_work_plan(
@@ -255,6 +390,812 @@ def semantic_work_plan_payload(plan: SemanticWorkPlan) -> dict[str, object]:
 
 def structural_chunk_name(index: int) -> str:
     return f"chunk-{index // STRUCTURAL_CHUNK_SIZE + 1:04}.json"
+
+
+def semantic_index_status(
+    request: SemanticIndexStatusRequest,
+) -> SemanticIndexStatusResult:
+    paths = WorkspacePaths.from_root(request.workspace)
+    repository = SQLiteRepository(paths.db_path)
+    try:
+        with repository._repository_critical_section():
+            state = _load_verified_state(paths, repository)
+            evaluation = _evaluate_lifecycle(state)
+    except SemanticWorkError:
+        raise
+    except Exception as error:
+        raise SemanticWorkError("semantic work state is invalid") from error
+    return SemanticIndexStatusResult(
+        revision_id=state.revision_id,
+        node_count=state.node_count,
+        work_unit_count=len(state.units),
+        ready_count=len(evaluation.ready_unit_ids),
+        receipted_count=len(evaluation.valid_receipts),
+        invalid_count=evaluation.invalid_count,
+        complete=(
+            len(evaluation.valid_receipts) == len(state.units)
+            and evaluation.invalid_count == 0
+        ),
+    )
+
+
+def next_semantic_work(
+    request: NextSemanticWorkRequest,
+) -> NextSemanticWorkResult:
+    paths = WorkspacePaths.from_root(request.workspace)
+    repository = SQLiteRepository(paths.db_path)
+    try:
+        with repository._repository_critical_section():
+            state = _load_verified_state(paths, repository)
+            evaluation = _evaluate_lifecycle(state)
+            remaining_count = len(state.units) - len(evaluation.valid_receipts)
+            if evaluation.undeclared_artifact_count:
+                raise SemanticWorkError(
+                    "semantic work lifecycle contains invalid artifacts"
+                )
+            if not evaluation.ready_unit_ids:
+                if remaining_count == 0 and evaluation.invalid_count == 0:
+                    return NextSemanticWorkResult(
+                        revision_id=state.revision_id,
+                        unit_id=None,
+                        input_path=None,
+                        remaining_count=0,
+                    )
+                raise SemanticWorkError(
+                    "semantic work has no dependency-ready unit"
+                )
+            unit_id = evaluation.ready_unit_ids[0]
+            unit = state.unit_by_id[unit_id]
+            payload = _materialized_input(
+                state,
+                unit,
+                evaluation.valid_receipts,
+            )
+            content = _canonical_json_bytes(payload)
+            if len(content) > state.max_work_unit_bytes:
+                raise SemanticWorkError(
+                    "semantic work input exceeds byte budget"
+                )
+            input_path = _unit_path(
+                paths.semantic_work_input_dir,
+                unit_id,
+            )
+            write_managed_text(input_path, content.decode("utf-8"))
+    except SemanticWorkError:
+        raise
+    except Exception as error:
+        raise SemanticWorkError("semantic work materialization failed safely") from error
+    return NextSemanticWorkResult(
+        revision_id=state.revision_id,
+        unit_id=unit_id,
+        input_path=input_path,
+        remaining_count=remaining_count,
+    )
+
+
+def validate_semantic_work(
+    request: ValidateSemanticWorkRequest,
+) -> ValidateSemanticWorkResult:
+    if not _is_unit_id(request.unit_id):
+        raise SemanticWorkError("semantic work unit is invalid")
+    paths = WorkspacePaths.from_root(request.workspace)
+    repository = SQLiteRepository(paths.db_path)
+    try:
+        with repository._repository_critical_section():
+            state = _load_verified_state(paths, repository)
+            unit = state.unit_by_id.get(request.unit_id)
+            if unit is None:
+                raise SemanticWorkError("semantic work unit is invalid")
+            evaluation = _evaluate_lifecycle(state)
+            current_receipt = evaluation.valid_receipts.get(unit.unit_id)
+            receipt_path = _unit_path(
+                paths.semantic_work_receipts_dir,
+                unit.unit_id,
+            )
+            if current_receipt is not None:
+                return ValidateSemanticWorkResult(
+                    unit_id=unit.unit_id,
+                    receipt_path=receipt_path,
+                    output_sha256=current_receipt.output.output_sha256,
+                )
+            if any(
+                dependency_id not in evaluation.valid_receipts
+                for dependency_id in unit.dependency_unit_ids
+            ):
+                raise SemanticWorkError(
+                    "semantic work dependencies are not valid"
+                )
+
+            input_payload, input_content = _read_expected_input(
+                state,
+                unit,
+                evaluation.valid_receipts,
+            )
+            output = _read_valid_output(
+                state,
+                unit,
+                input_payload,
+                evaluation.valid_receipts,
+            )
+            receipt = _receipt_payload(
+                state,
+                unit,
+                input_payload,
+                output,
+                evaluation.valid_receipts,
+            )
+
+            current_state = _load_verified_state(paths, repository)
+            current_evaluation = _evaluate_lifecycle(current_state)
+            if current_state.revision_id != state.revision_id:
+                raise SemanticWorkError("semantic work state changed")
+            if any(
+                dependency_id not in current_evaluation.valid_receipts
+                for dependency_id in unit.dependency_unit_ids
+            ):
+                raise SemanticWorkError("semantic work state changed")
+            current_input, current_input_content = _read_expected_input(
+                current_state,
+                current_state.unit_by_id[unit.unit_id],
+                current_evaluation.valid_receipts,
+            )
+            current_output = _read_valid_output(
+                current_state,
+                current_state.unit_by_id[unit.unit_id],
+                current_input,
+                current_evaluation.valid_receipts,
+            )
+            if (
+                current_input_content != input_content
+                or current_output.content != output.content
+                or tuple(
+                    current_evaluation.valid_receipts[dependency_id]
+                    .output.output_sha256
+                    for dependency_id in unit.dependency_unit_ids
+                )
+                != tuple(receipt["dependency_output_sha256s"])
+            ):
+                raise SemanticWorkError("semantic work state changed")
+            write_managed_text(receipt_path, _canonical_json(receipt))
+    except SemanticWorkError:
+        raise
+    except Exception as error:
+        raise SemanticWorkError("semantic work output is unsafe or unavailable") from error
+    return ValidateSemanticWorkResult(
+        unit_id=unit.unit_id,
+        receipt_path=receipt_path,
+        output_sha256=output.output_sha256,
+    )
+
+
+def _load_verified_state(
+    paths: WorkspacePaths,
+    repository: SQLiteRepository,
+) -> _VerifiedState:
+    manifest_content = _read_required(paths.semantic_index_manifest_path)
+    manifest = _decode_object(manifest_content, "manifest")
+    if set(manifest) != _MANIFEST_KEYS:
+        raise SemanticWorkError("semantic work manifest is invalid")
+    if (
+        manifest.get("version") != 2
+        or manifest.get("protocol") != "codex-semantic-v2"
+        or not _is_nonempty_text(manifest.get("revision_id"))
+        or not _is_nonempty_text(manifest.get("source_id"))
+        or not _is_sha256(manifest.get("policy_hash"))
+        or manifest.get("analyzer_version") != "semantic-input-v2"
+        or not _is_sha256(manifest.get("work_plan_sha256"))
+        or not _is_nonnegative_int(manifest.get("node_count"))
+        or not _is_nonnegative_int(manifest.get("work_unit_count"))
+        or not _is_nonnegative_int(manifest.get("managed_input_bytes"))
+        or not _is_nonnegative_int(manifest.get("analysis_target_count"))
+        or not _is_nonnegative_int(manifest.get("structural_only_count"))
+    ):
+        raise SemanticWorkError("semantic work manifest is invalid")
+    chunk_sha256s = manifest.get("capsule_chunk_sha256s")
+    if (
+        type(chunk_sha256s) is not list
+        or not chunk_sha256s
+        or not all(_is_sha256(value) for value in chunk_sha256s)
+    ):
+        raise SemanticWorkError("semantic work manifest is invalid")
+
+    expected_chunk_paths = tuple(
+        paths.semantic_index_input_dir / f"chunk-{index:04}.json"
+        for index in range(1, len(chunk_sha256s) + 1)
+    )
+    existing_chunk_names = _directory_entry_names(paths.semantic_index_input_dir)
+    if existing_chunk_names != {path.name for path in expected_chunk_paths}:
+        raise SemanticWorkError("semantic work capsule input is invalid")
+
+    capsules: dict[str, dict[str, object]] = {}
+    chunk_contents: list[bytes] = []
+    for path, expected_hash in zip(
+        expected_chunk_paths,
+        chunk_sha256s,
+        strict=True,
+    ):
+        content = _read_required(path)
+        if hashlib.sha256(content).hexdigest() != expected_hash:
+            raise SemanticWorkError("semantic work capsule input is invalid")
+        chunk = _decode_object(content, "capsule input")
+        if (
+            set(chunk) != {"version", "revision_id", "capsules"}
+            or chunk.get("version") != 2
+            or chunk.get("revision_id") != manifest["revision_id"]
+            or type(chunk.get("capsules")) is not list
+        ):
+            raise SemanticWorkError("semantic work capsule input is invalid")
+        for capsule in chunk["capsules"]:
+            if type(capsule) is not dict:
+                raise SemanticWorkError("semantic work capsule input is invalid")
+            node_id = capsule.get("node_id")
+            if (
+                not _is_nonempty_text(node_id)
+                or node_id in capsules
+                or capsule.get("semantic_disposition") not in _VALID_DISPOSITIONS
+            ):
+                raise SemanticWorkError("semantic work capsule input is invalid")
+            capsules[node_id] = capsule
+        chunk_contents.append(content)
+
+    plan_content = _read_required(paths.semantic_work_plan_path)
+    if hashlib.sha256(plan_content).hexdigest() != manifest["work_plan_sha256"]:
+        raise SemanticWorkError("semantic work plan is invalid")
+    plan = _decode_object(plan_content, "work plan")
+    units = _validate_plan(plan, manifest, capsules)
+    if (
+        len(capsules) != manifest["node_count"]
+        or len(units) != manifest["work_unit_count"]
+        or len(plan_content) + sum(map(len, chunk_contents))
+        != manifest["managed_input_bytes"]
+    ):
+        raise SemanticWorkError("semantic work manifest counts are invalid")
+    _validate_staging_revision(repository, manifest)
+    return _VerifiedState(
+        paths=paths,
+        revision_id=str(manifest["revision_id"]),
+        node_count=int(manifest["node_count"]),
+        max_work_unit_bytes=int(plan["max_work_unit_bytes"]),
+        capsules=capsules,
+        units=units,
+        unit_by_id={unit.unit_id: unit for unit in units},
+    )
+
+
+def _validate_plan(
+    plan: dict[str, object],
+    manifest: dict[str, object],
+    capsules: dict[str, dict[str, object]],
+) -> tuple[_VerifiedUnit, ...]:
+    if (
+        set(plan) != _PLAN_KEYS
+        or plan.get("version") != 2
+        or plan.get("revision_id") != manifest["revision_id"]
+        or plan.get("policy_hash") != manifest["policy_hash"]
+        or plan.get("protocol") != "codex-semantic-v2"
+        or plan.get("node_count") != manifest["node_count"]
+        or plan.get("analysis_target_count")
+        != manifest["analysis_target_count"]
+        or plan.get("structural_owner_count")
+        != manifest["structural_only_count"]
+        or plan.get("work_unit_count") != manifest["work_unit_count"]
+        or plan.get("max_work_unit_bytes") != MAX_WORK_UNIT_BYTES
+        or plan.get("reduce_fan_in") != REDUCE_FAN_IN
+        or not _is_sha256(plan.get("node_assignment_sha256"))
+        or type(plan.get("units")) is not list
+    ):
+        raise SemanticWorkError("semantic work plan is invalid")
+    verified_units: list[_VerifiedUnit] = []
+    known_unit_ids: set[str] = set()
+    semantic_owners: dict[str, str] = {}
+    for index, raw_unit in enumerate(plan["units"], start=1):
+        if type(raw_unit) is not dict or set(raw_unit) != _UNIT_KEYS:
+            raise SemanticWorkError("semantic work plan is invalid")
+        unit_id = raw_unit.get("unit_id")
+        stage = raw_unit.get("stage")
+        target_node_ids = raw_unit.get("target_node_ids")
+        dependency_unit_ids = raw_unit.get("dependency_unit_ids")
+        if (
+            unit_id != f"unit-{index:06}"
+            or unit_id in known_unit_ids
+            or stage not in _VALID_STAGES
+            or type(target_node_ids) is not list
+            or type(dependency_unit_ids) is not list
+            or not all(_is_nonempty_text(value) for value in target_node_ids)
+            or not all(
+                _is_unit_id(value) and value in known_unit_ids
+                for value in dependency_unit_ids
+            )
+            or len(set(target_node_ids)) != len(target_node_ids)
+            or len(set(dependency_unit_ids)) != len(dependency_unit_ids)
+            or len(dependency_unit_ids) > REDUCE_FAN_IN
+            or not _is_sha256(raw_unit.get("template_sha256"))
+            or not _is_positive_int(raw_unit.get("template_byte_count"))
+        ):
+            raise SemanticWorkError("semantic work plan is invalid")
+        if stage == SemanticWorkStage.REDUCE.value:
+            if target_node_ids:
+                raise SemanticWorkError("semantic work plan is invalid")
+        elif len(target_node_ids) != 1:
+            raise SemanticWorkError("semantic work plan is invalid")
+        for node_id in target_node_ids:
+            capsule = capsules.get(node_id)
+            if (
+                capsule is None
+                or capsule.get("semantic_disposition")
+                != SemanticDisposition.ANALYSIS_REQUIRED.value
+                or node_id in semantic_owners
+                or not _stage_matches_capsule(stage, capsule)
+            ):
+                raise SemanticWorkError("semantic work plan is invalid")
+            semantic_owners[node_id] = unit_id
+        template = {
+            "version": 2,
+            "revision_id": manifest["revision_id"],
+            "unit_id": unit_id,
+            "stage": stage,
+            "target_node_ids": target_node_ids,
+            "dependency_unit_ids": dependency_unit_ids,
+            "capsules": [capsules[node_id] for node_id in target_node_ids],
+        }
+        template_bytes = _canonical_json_bytes(template)
+        if (
+            len(template_bytes) != raw_unit["template_byte_count"]
+            or len(template_bytes) > MAX_WORK_UNIT_BYTES
+            or hashlib.sha256(template_bytes).hexdigest()
+            != raw_unit["template_sha256"]
+        ):
+            raise SemanticWorkError("semantic work plan is invalid")
+        verified_units.append(
+            _VerifiedUnit(
+                unit_id=unit_id,
+                stage=str(stage),
+                target_node_ids=tuple(target_node_ids),
+                dependency_unit_ids=tuple(dependency_unit_ids),
+                template_sha256=str(raw_unit["template_sha256"]),
+                template_byte_count=int(raw_unit["template_byte_count"]),
+            )
+        )
+        known_unit_ids.add(unit_id)
+
+    semantic_nodes = {
+        node_id
+        for node_id, capsule in capsules.items()
+        if capsule.get("semantic_disposition")
+        == SemanticDisposition.ANALYSIS_REQUIRED.value
+    }
+    if semantic_nodes != set(semantic_owners):
+        raise SemanticWorkError("semantic work ownership is invalid")
+    ordered_capsules = sorted(
+        capsules.values(),
+        key=lambda capsule: (
+            str(capsule.get("relative_hierarchy", "")),
+            str(capsule.get("node_id", "")),
+        ),
+    )
+    assignments = [
+        (node_id, "semantic_work_unit", owner_id)
+        for node_id, owner_id in semantic_owners.items()
+    ]
+    for index, capsule in enumerate(ordered_capsules):
+        if (
+            capsule.get("semantic_disposition")
+            == SemanticDisposition.ANALYSIS_REQUIRED.value
+        ):
+            continue
+        assignments.append(
+            (
+                str(capsule["node_id"]),
+                "private_structural_chunk",
+                structural_chunk_name(index),
+            )
+        )
+    assignment_hash = hashlib.sha256(
+        _canonical_json_bytes(sorted(assignments))
+    ).hexdigest()
+    if (
+        assignment_hash != plan["node_assignment_sha256"]
+        or len(semantic_nodes) != plan["analysis_target_count"]
+        or len(capsules) - len(semantic_nodes)
+        != plan["structural_owner_count"]
+    ):
+        raise SemanticWorkError("semantic work ownership is invalid")
+    return tuple(verified_units)
+
+
+def _validate_staging_revision(
+    repository: SQLiteRepository,
+    manifest: dict[str, object],
+) -> None:
+    with repository._read_connection() as connection:
+        row = connection.execute(
+            """
+            SELECT source_id, policy_hash, analyzer_version, status
+            FROM semantic_index_revisions
+            WHERE id = ?
+            """,
+            (manifest["revision_id"],),
+        ).fetchone()
+    if (
+        row is None
+        or row["source_id"] != manifest["source_id"]
+        or row["policy_hash"] != manifest["policy_hash"]
+        or row["analyzer_version"] != manifest["analyzer_version"]
+        or row["status"] != "staging"
+    ):
+        raise SemanticWorkError("semantic work revision is not staging")
+
+
+def _evaluate_lifecycle(state: _VerifiedState) -> _LifecycleEvaluation:
+    input_names = _directory_entry_names(state.paths.semantic_work_input_dir)
+    output_names = _directory_entry_names(state.paths.semantic_work_output_dir)
+    receipt_names = _directory_entry_names(state.paths.semantic_work_receipts_dir)
+    expected_names = {f"{unit.unit_id}.json" for unit in state.units}
+    undeclared_artifact_count = sum(
+        len(names - expected_names)
+        for names in (input_names, output_names, receipt_names)
+    )
+    valid_receipts: dict[str, _ReceiptBinding] = {}
+    invalid_units: set[str] = set()
+    ready_unit_ids: list[str] = []
+    for unit in state.units:
+        filename = f"{unit.unit_id}.json"
+        dependencies_valid = all(
+            dependency_id in valid_receipts
+            for dependency_id in unit.dependency_unit_ids
+        )
+        if filename in receipt_names:
+            try:
+                if not dependencies_valid:
+                    raise SemanticWorkError("semantic work receipt is stale")
+                valid_receipts[unit.unit_id] = _read_valid_receipt(
+                    state,
+                    unit,
+                    valid_receipts,
+                )
+            except SemanticWorkError:
+                invalid_units.add(unit.unit_id)
+                if dependencies_valid:
+                    ready_unit_ids.append(unit.unit_id)
+        else:
+            if dependencies_valid:
+                ready_unit_ids.append(unit.unit_id)
+                try:
+                    if filename in input_names:
+                        input_payload, _ = _read_expected_input(
+                            state,
+                            unit,
+                            valid_receipts,
+                        )
+                    else:
+                        input_payload = None
+                    if filename in output_names:
+                        if input_payload is None:
+                            raise SemanticWorkError(
+                                "semantic work output is stale"
+                            )
+                        _read_valid_output(
+                            state,
+                            unit,
+                            input_payload,
+                            valid_receipts,
+                        )
+                except SemanticWorkError:
+                    invalid_units.add(unit.unit_id)
+            elif filename in input_names or filename in output_names:
+                invalid_units.add(unit.unit_id)
+    return _LifecycleEvaluation(
+        valid_receipts=valid_receipts,
+        ready_unit_ids=tuple(ready_unit_ids),
+        invalid_count=undeclared_artifact_count + len(invalid_units),
+        undeclared_artifact_count=undeclared_artifact_count,
+    )
+
+
+def _materialized_input(
+    state: _VerifiedState,
+    unit: _VerifiedUnit,
+    valid_receipts: dict[str, _ReceiptBinding],
+) -> dict[str, object]:
+    dependencies = [
+        {
+            "unit_id": dependency_id,
+            "output_sha256": valid_receipts[
+                dependency_id
+            ].output.output_sha256,
+        }
+        for dependency_id in unit.dependency_unit_ids
+    ]
+    targets = [state.capsules[node_id] for node_id in unit.target_node_ids]
+    child_results = [
+        {
+            "unit_id": dependency_id,
+            "output_sha256": valid_receipts[
+                dependency_id
+            ].output.output_sha256,
+            "coverage": valid_receipts[dependency_id].output.payload["coverage"],
+            "results": valid_receipts[dependency_id].output.payload["results"],
+        }
+        for dependency_id in unit.dependency_unit_ids
+    ]
+    coverage = (
+        targets[0]["coverage"]
+        if targets
+        else _dependency_coverage(child_results)
+    )
+    payload: dict[str, object] = {
+        "version": 2,
+        "revision_id": state.revision_id,
+        "unit_id": unit.unit_id,
+        "stage": unit.stage,
+        "dependencies": dependencies,
+        "coverage": coverage,
+        "targets": targets,
+        "child_results": child_results,
+    }
+    input_sha256 = hashlib.sha256(_canonical_json_bytes(payload)).hexdigest()
+    return {
+        **payload,
+        "input_sha256": input_sha256,
+    }
+
+
+def _dependency_coverage(
+    child_results: list[dict[str, object]],
+) -> dict[str, object]:
+    node_count = 0
+    digests: list[str] = []
+    for result in child_results:
+        coverage = result["coverage"]
+        if (
+            type(coverage) is not dict
+            or not _is_nonnegative_int(coverage.get("node_count"))
+            or not _is_sha256(coverage.get("node_ids_sha256"))
+        ):
+            raise SemanticWorkError("semantic work dependency output is invalid")
+        node_count += int(coverage["node_count"])
+        digests.append(str(coverage["node_ids_sha256"]))
+    return {
+        "node_count": node_count,
+        "node_ids_sha256": hashlib.sha256(
+            _canonical_json_bytes(digests)
+        ).hexdigest(),
+    }
+
+
+def _read_expected_input(
+    state: _VerifiedState,
+    unit: _VerifiedUnit,
+    valid_receipts: dict[str, _ReceiptBinding],
+) -> tuple[dict[str, object], bytes]:
+    expected = _materialized_input(state, unit, valid_receipts)
+    expected_content = _canonical_json_bytes(expected)
+    if len(expected_content) > state.max_work_unit_bytes:
+        raise SemanticWorkError("semantic work input exceeds byte budget")
+    content = _read_required(
+        _unit_path(state.paths.semantic_work_input_dir, unit.unit_id)
+    )
+    parsed = _decode_object(content, "work input")
+    if (
+        set(parsed) != _INPUT_KEYS
+        or parsed != expected
+        or content != expected_content
+    ):
+        raise SemanticWorkError("semantic work input is stale")
+    return parsed, content
+
+
+def _read_valid_output(
+    state: _VerifiedState,
+    unit: _VerifiedUnit,
+    input_payload: dict[str, object],
+    valid_receipts: dict[str, _ReceiptBinding],
+) -> _OutputBinding:
+    content = _read_required(
+        _unit_path(state.paths.semantic_work_output_dir, unit.unit_id),
+        output=True,
+    )
+    payload = _decode_object(content, "work output", output=True)
+    if set(payload) != _OUTPUT_KEYS:
+        raise SemanticWorkError("semantic work output is invalid")
+    output_sha256 = payload.get("output_sha256")
+    unsigned = dict(payload)
+    unsigned.pop("output_sha256", None)
+    expected_dependency_hashes = [
+        valid_receipts[dependency_id].output.output_sha256
+        for dependency_id in unit.dependency_unit_ids
+    ]
+    if (
+        payload.get("version") != 2
+        or payload.get("revision_id") != state.revision_id
+        or payload.get("unit_id") != unit.unit_id
+        or payload.get("stage") != unit.stage
+        or payload.get("input_sha256") != input_payload["input_sha256"]
+        or payload.get("dependency_output_sha256s")
+        != expected_dependency_hashes
+        or payload.get("analysis_method") != "codex-semantic-v2"
+        or payload.get("coverage") != input_payload["coverage"]
+        or type(payload.get("results")) is not list
+        or not _is_sha256(output_sha256)
+        or hashlib.sha256(_canonical_json_bytes(unsigned)).hexdigest()
+        != output_sha256
+    ):
+        raise SemanticWorkError("semantic work output is invalid")
+    return _OutputBinding(
+        output_sha256=hashlib.sha256(content).hexdigest(),
+        payload=payload,
+        content=content,
+    )
+
+
+def _read_valid_receipt(
+    state: _VerifiedState,
+    unit: _VerifiedUnit,
+    valid_receipts: dict[str, _ReceiptBinding],
+) -> _ReceiptBinding:
+    input_payload, _ = _read_expected_input(state, unit, valid_receipts)
+    output = _read_valid_output(
+        state,
+        unit,
+        input_payload,
+        valid_receipts,
+    )
+    path = _unit_path(state.paths.semantic_work_receipts_dir, unit.unit_id)
+    content = _read_required(path)
+    receipt = _decode_object(content, "receipt")
+    unsigned = dict(receipt)
+    receipt_sha256 = unsigned.pop("receipt_sha256", None)
+    dependency_hashes = tuple(
+        valid_receipts[dependency_id].output.output_sha256
+        for dependency_id in unit.dependency_unit_ids
+    )
+    if (
+        set(receipt) != _RECEIPT_KEYS
+        or receipt.get("version") != 2
+        or receipt.get("revision_id") != state.revision_id
+        or receipt.get("unit_id") != unit.unit_id
+        or receipt.get("input_sha256") != input_payload["input_sha256"]
+        or receipt.get("output_sha256") != output.output_sha256
+        or receipt.get("dependency_output_sha256s") != list(dependency_hashes)
+        or not _is_rfc3339(receipt.get("validated_at"))
+        or not _is_sha256(receipt_sha256)
+        or hashlib.sha256(_canonical_json_bytes(unsigned)).hexdigest()
+        != receipt_sha256
+        or content != _canonical_json_bytes(receipt)
+    ):
+        raise SemanticWorkError("semantic work receipt is invalid")
+    return _ReceiptBinding(
+        input_sha256=str(input_payload["input_sha256"]),
+        output=output,
+        dependency_output_sha256s=dependency_hashes,
+    )
+
+
+def _receipt_payload(
+    state: _VerifiedState,
+    unit: _VerifiedUnit,
+    input_payload: dict[str, object],
+    output: _OutputBinding,
+    valid_receipts: dict[str, _ReceiptBinding],
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "version": 2,
+        "revision_id": state.revision_id,
+        "unit_id": unit.unit_id,
+        "input_sha256": input_payload["input_sha256"],
+        "output_sha256": output.output_sha256,
+        "dependency_output_sha256s": [
+            valid_receipts[dependency_id].output.output_sha256
+            for dependency_id in unit.dependency_unit_ids
+        ],
+        "validated_at": utc_now(),
+    }
+    return {
+        **payload,
+        "receipt_sha256": hashlib.sha256(
+            _canonical_json_bytes(payload)
+        ).hexdigest(),
+    }
+
+
+def _read_required(path: Path, *, output: bool = False) -> bytes:
+    try:
+        return read_managed_bytes(path)
+    except (OSError, UnicodeError) as error:
+        label = "output" if output else "state"
+        raise SemanticWorkError(
+            f"semantic work {label} is unsafe or unavailable"
+        ) from error
+
+
+class _DuplicateKeyError(ValueError):
+    pass
+
+
+def _decode_object(
+    content: bytes,
+    label: str,
+    *,
+    output: bool = False,
+) -> dict[str, object]:
+    def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise _DuplicateKeyError
+            result[key] = value
+        return result
+
+    try:
+        parsed = json.loads(
+            content.decode("utf-8"),
+            object_pairs_hook=unique_object,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, _DuplicateKeyError) as error:
+        kind = "output" if output else label
+        raise SemanticWorkError(
+            f"semantic work {kind} is invalid"
+        ) from error
+    if type(parsed) is not dict:
+        kind = "output" if output else label
+        raise SemanticWorkError(f"semantic work {kind} is invalid")
+    return parsed
+
+
+def _unit_path(directory: Path, unit_id: str) -> Path:
+    if not _is_unit_id(unit_id):
+        raise SemanticWorkError("semantic work unit is invalid")
+    return directory / f"{unit_id}.json"
+
+
+def _directory_entry_names(directory: Path) -> set[str]:
+    try:
+        return {path.name for path in directory.iterdir()}
+    except OSError as error:
+        raise SemanticWorkError("semantic work managed directory is invalid") from error
+
+
+def _stage_matches_capsule(stage: object, capsule: dict[str, object]) -> bool:
+    kind = capsule.get("kind")
+    return (
+        (stage == SemanticWorkStage.LEAF.value and kind == "file")
+        or (stage == SemanticWorkStage.DIRECTORY.value and kind == "directory")
+        or (stage == SemanticWorkStage.ROOT.value and kind == "source")
+    )
+
+
+def _is_unit_id(value: object) -> bool:
+    return type(value) is str and _UNIT_ID.fullmatch(value) is not None
+
+
+def _is_sha256(value: object) -> bool:
+    return type(value) is str and _SHA256.fullmatch(value) is not None
+
+
+def _is_nonempty_text(value: object) -> bool:
+    return type(value) is str and bool(value)
+
+
+def _is_nonnegative_int(value: object) -> bool:
+    return type(value) is int and value >= 0
+
+
+def _is_positive_int(value: object) -> bool:
+    return type(value) is int and value > 0
+
+
+def _is_rfc3339(value: object) -> bool:
+    if type(value) is not str or not value:
+        return False
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None
+
+
+def _canonical_json(payload: object) -> str:
+    return _canonical_json_bytes(payload).decode("utf-8")
 
 
 def _canonical_json_bytes(payload: object) -> bytes:
