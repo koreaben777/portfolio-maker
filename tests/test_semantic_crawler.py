@@ -47,6 +47,90 @@ def _malformed_worker_main(connection, _enumerator):
     connection.send({"protocol": "wrong", "status": "ok", "entries": []})
 
 
+class _LifecycleConnection:
+    def __init__(self) -> None:
+        self.closed = False
+        self.sent: list[object] = []
+
+    def send(self, value: object) -> None:
+        self.sent.append(value)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _LifecycleProcess:
+    def __init__(
+        self,
+        *,
+        start_error: BaseException | None = None,
+        join_interruptions: tuple[int, ...] = (),
+        ignore_terminate: bool = False,
+    ) -> None:
+        self.start_error = start_error
+        self.join_interruptions = set(join_interruptions)
+        self.ignore_terminate = ignore_terminate
+        self.started = False
+        self.alive = False
+        self.closed = False
+        self.join_calls = 0
+        self.terminate_calls = 0
+        self.kill_calls = 0
+        self.kill_requested = False
+
+    @property
+    def pid(self) -> int | None:
+        return 4242 if self.started else None
+
+    @property
+    def sentinel(self) -> int:
+        return 73
+
+    def start(self) -> None:
+        if self.start_error is not None:
+            raise self.start_error
+        self.started = True
+        self.alive = True
+
+    def is_alive(self) -> bool:
+        return self.alive
+
+    def join(self, _timeout: float) -> None:
+        self.join_calls += 1
+        if self.join_calls in self.join_interruptions:
+            raise KeyboardInterrupt
+        if self.kill_requested or (
+            self.terminate_calls and not self.ignore_terminate
+        ):
+            self.alive = False
+
+    def terminate(self) -> None:
+        self.terminate_calls += 1
+
+    def kill(self) -> None:
+        self.kill_calls += 1
+        self.kill_requested = True
+
+    def close(self) -> None:
+        if self.alive:
+            raise AssertionError("cannot close a live process")
+        self.closed = True
+
+
+class _LifecycleContext:
+    def __init__(self, process: _LifecycleProcess) -> None:
+        self.process = process
+        self.parent = _LifecycleConnection()
+        self.child = _LifecycleConnection()
+
+    def Pipe(self, *, duplex: bool):
+        assert duplex is True
+        return self.parent, self.child
+
+    def Process(self, **_kwargs):
+        return self.process
+
+
 def approval_for(root: Path, *, excluded: tuple[Path, ...] = ()) -> SourceApproval:
     return SourceApproval(
         approved_source_uris=(root.resolve().as_uri(),),
@@ -211,6 +295,145 @@ def test_worker_reuses_successful_process_and_replaces_timed_out_process(
             responsive,
             timeout_seconds=0.2,
         ).timed_out
+
+
+def test_worker_start_oserror_is_controlled_and_closes_unstarted_resources() -> None:
+    start_error = OSError("synthetic private process start detail")
+    process = _LifecycleProcess(start_error=start_error)
+    context = _LifecycleContext(process)
+    worker = semantic_crawler_module._DirectoryEnumerationWorker(
+        process_context=context,
+    )
+
+    with pytest.raises(
+        semantic_crawler_module.StructuralCrawlWorkerError,
+        match="^semantic directory worker failed safely$",
+    ) as captured:
+        worker.__enter__()
+
+    assert captured.value.__cause__ is start_error
+    assert context.parent.closed is True
+    assert context.child.closed is True
+    assert process.closed is True
+    assert process.is_alive() is False
+    assert worker._process is None
+    assert worker._connection is None
+
+
+@pytest.mark.parametrize(
+    "control_error",
+    (KeyboardInterrupt(), SystemExit(73)),
+)
+def test_worker_start_control_error_is_reraised_after_resource_cleanup(
+    control_error: BaseException,
+) -> None:
+    process = _LifecycleProcess(start_error=control_error)
+    context = _LifecycleContext(process)
+    worker = semantic_crawler_module._DirectoryEnumerationWorker(
+        process_context=context,
+    )
+
+    with pytest.raises(type(control_error)) as captured:
+        worker.__enter__()
+
+    assert captured.value is control_error
+    assert context.parent.closed is True
+    assert context.child.closed is True
+    assert process.closed is True
+    assert process.is_alive() is False
+    assert worker._process is None
+    assert worker._connection is None
+
+
+def test_crawler_start_oserror_is_controlled_without_live_helper(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    process = _LifecycleProcess(start_error=OSError("private start detail"))
+    context = _LifecycleContext(process)
+
+    with pytest.raises(
+        semantic_crawler_module.StructuralCrawlWorkerError,
+        match="^semantic directory worker failed safely$",
+    ):
+        crawl_local_structure(
+            root,
+            approval_for(root),
+            _process_context=context,
+        )
+
+    assert process.closed is True
+    assert process.is_alive() is False
+    assert context.parent.closed is True
+    assert context.child.closed is True
+
+
+def test_worker_startup_wait_interruption_reaps_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = _LifecycleProcess()
+    context = _LifecycleContext(process)
+    worker = semantic_crawler_module._DirectoryEnumerationWorker(
+        process_context=context,
+    )
+    monkeypatch.setattr(
+        semantic_crawler_module,
+        "wait",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        worker.__enter__()
+
+    assert process.terminate_calls == 1
+    assert process.is_alive() is False
+    assert process.closed is True
+    assert context.parent.closed is True
+    assert context.child.closed is True
+    assert worker._process is None
+    assert worker._connection is None
+
+
+@pytest.mark.parametrize(
+    ("graceful", "join_interruptions", "ignore_terminate", "kill_calls"),
+    (
+        (True, (1,), False, 0),
+        (False, (1,), True, 1),
+        (False, (2,), True, 1),
+    ),
+    ids=(
+        "graceful-join-interruption",
+        "terminate-join-interruption",
+        "kill-join-interruption",
+    ),
+)
+def test_worker_join_interruption_finishes_cleanup_before_reraise(
+    graceful: bool,
+    join_interruptions: tuple[int, ...],
+    ignore_terminate: bool,
+    kill_calls: int,
+) -> None:
+    process = _LifecycleProcess(
+        join_interruptions=join_interruptions,
+        ignore_terminate=ignore_terminate,
+    )
+    process.start()
+    connection = _LifecycleConnection()
+    worker = semantic_crawler_module._DirectoryEnumerationWorker()
+    worker._process = process
+    worker._connection = connection
+
+    with pytest.raises(KeyboardInterrupt):
+        worker._stop(graceful=graceful)
+
+    assert process.terminate_calls == 1
+    assert process.kill_calls == kill_calls
+    assert process.is_alive() is False
+    assert process.closed is True
+    assert connection.closed is True
+    assert worker._process is None
+    assert worker._connection is None
 
 
 def test_worker_timeout_escalates_to_kill_and_reaps_process(

@@ -260,36 +260,56 @@ class _DirectoryEnumerationWorker:
             args=(child, self._enumerator),
             daemon=True,
         )
-        try:
-            process.start()
-        except BaseException:
-            parent.close()
-            child.close()
-            raise
-        child.close()
         self._connection = parent
         self._process = process
-        ready = wait([parent, process.sentinel], timeout=_WORKER_START_SECONDS)
-        if parent not in ready:
-            self._stop(graceful=False)
-            raise StructuralCrawlWorkerError(
-                "semantic directory worker failed safely"
-            )
         try:
+            process.start()
+            child.close()
+            ready = wait(
+                [parent, process.sentinel],
+                timeout=_WORKER_START_SECONDS,
+            )
+            if parent not in ready:
+                raise StructuralCrawlWorkerError(
+                    "semantic directory worker failed safely"
+                )
             response = parent.recv()
-        except (BrokenPipeError, EOFError, OSError) as error:
-            self._stop(graceful=False)
+            if response != {
+                "protocol": _DIRECTORY_WORKER_PROTOCOL,
+                "status": "ready",
+            }:
+                raise StructuralCrawlWorkerError(
+                    "semantic directory worker failed safely"
+                )
+        except BaseException as error:
+            try:
+                child.close()
+            except BaseException:
+                pass
+            cleanup_error: BaseException | None = None
+            try:
+                self._stop(graceful=False)
+            except BaseException as caught_cleanup_error:
+                cleanup_error = caught_cleanup_error
+            if self._process is not None or self._connection is not None:
+                raise StructuralCrawlWorkerError(
+                    "semantic directory worker could not be recovered"
+                ) from (cleanup_error or error)
+            if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                raise
+            if isinstance(cleanup_error, (KeyboardInterrupt, SystemExit)):
+                raise cleanup_error
+            if isinstance(error, StructuralCrawlWorkerError):
+                raise
+            if cleanup_error is not None:
+                if isinstance(cleanup_error, StructuralCrawlWorkerError):
+                    raise cleanup_error
+                raise StructuralCrawlWorkerError(
+                    "semantic directory worker could not be recovered"
+                ) from cleanup_error
             raise StructuralCrawlWorkerError(
                 "semantic directory worker failed safely"
             ) from error
-        if response != {
-            "protocol": _DIRECTORY_WORKER_PROTOCOL,
-            "status": "ready",
-        }:
-            self._stop(graceful=False)
-            raise StructuralCrawlWorkerError(
-                "semantic directory worker failed safely"
-            )
 
     def _replace(self) -> None:
         self._stop(graceful=False)
@@ -298,13 +318,36 @@ class _DirectoryEnumerationWorker:
     def _stop(self, *, graceful: bool) -> None:
         process = self._process
         connection = self._connection
-        self._process = None
-        self._connection = None
         if process is None:
             if connection is not None:
                 connection.close()
+                self._connection = None
             return
-        if graceful and process.is_alive() and connection is not None:
+
+        errors: list[BaseException] = []
+
+        def record(action: Callable[[], None]) -> bool:
+            try:
+                action()
+                return True
+            except BaseException as error:
+                errors.append(error)
+                return False
+
+        def is_alive() -> bool:
+            try:
+                return process.is_alive()
+            except BaseException as error:
+                errors.append(error)
+                return True
+
+        try:
+            started = process.pid is not None
+        except BaseException as error:
+            errors.append(error)
+            started = True
+
+        if started and graceful and is_alive() and connection is not None:
             try:
                 connection.send(
                     {
@@ -314,22 +357,36 @@ class _DirectoryEnumerationWorker:
                 )
             except (BrokenPipeError, EOFError, OSError):
                 pass
-            process.join(_WORKER_JOIN_SECONDS)
-        if process.is_alive():
-            process.terminate()
-            process.join(_WORKER_JOIN_SECONDS)
-        if process.is_alive():
-            process.kill()
-            process.join(_WORKER_JOIN_SECONDS)
-        if process.is_alive():
-            if connection is not None:
-                connection.close()
+            except BaseException as error:
+                errors.append(error)
+            record(lambda: process.join(_WORKER_JOIN_SECONDS))
+
+        if started and is_alive():
+            record(process.terminate)
+            record(lambda: process.join(_WORKER_JOIN_SECONDS))
+        if started and is_alive():
+            record(process.kill)
+            record(lambda: process.join(_WORKER_JOIN_SECONDS))
+        if started and is_alive():
+            record(lambda: process.join(_WORKER_JOIN_SECONDS))
+
+        worker_alive = started and is_alive()
+        connection_closed = connection is None or record(connection.close)
+        process_closed = not worker_alive and record(process.close)
+        if worker_alive or not connection_closed or not process_closed:
             raise StructuralCrawlWorkerError(
                 "semantic directory worker could not be recovered"
-            )
-        if connection is not None:
-            connection.close()
-        process.close()
+            ) from (errors[0] if errors else None)
+
+        self._process = None
+        self._connection = None
+        for error in errors:
+            if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                raise error
+        if errors:
+            raise StructuralCrawlWorkerError(
+                "semantic directory worker could not be recovered"
+            ) from errors[0]
 
     @classmethod
     def _consume_response(

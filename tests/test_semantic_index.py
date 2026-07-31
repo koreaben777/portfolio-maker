@@ -947,6 +947,74 @@ def test_prepare_worker_failure_is_controlled_without_semantic_publication(
     assert not paths.db_path.exists()
 
 
+def test_prepare_process_start_oserror_is_controlled_without_publication(
+    workspace: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Endpoint:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    class Process:
+        pid = None
+
+        def __init__(self, error: OSError) -> None:
+            self.error = error
+            self.closed = False
+
+        def start(self) -> None:
+            raise self.error
+
+        def close(self) -> None:
+            self.closed = True
+
+    class Context:
+        def __init__(self, process: Process) -> None:
+            self.process = process
+            self.parent = Endpoint()
+            self.child = Endpoint()
+
+        def Pipe(self, *, duplex: bool):
+            assert duplex is True
+            return self.parent, self.child
+
+        def Process(self, **_kwargs):
+            return self.process
+
+    root = tmp_path / "approved-root"
+    root.mkdir()
+    approve_root(workspace, root)
+    process = Process(
+        OSError(f"private startup detail at {root}"),
+    )
+    context = Context(process)
+    monkeypatch.setattr(
+        "portfolio_maker.infrastructure.semantic_crawler.get_context",
+        lambda _method: context,
+    )
+
+    with pytest.raises(SemanticIndexError) as captured:
+        prepare_semantic_index(
+            PrepareSemanticIndexRequest(workspace=workspace, root=root)
+        )
+
+    assert str(captured.value) == "semantic index crawl failed safely"
+    assert str(root) not in str(captured.value)
+    paths = WorkspacePaths.from_root(workspace)
+    assert not paths.semantic_index_manifest_path.exists()
+    assert not paths.semantic_work_plan_path.exists()
+    assert not paths.semantic_index_report_path.exists()
+    assert not (paths.raw_dir / "semantic-index").exists()
+    assert not paths.db_path.exists()
+    assert process.closed is True
+    assert context.parent.closed is True
+    assert context.child.closed is True
+
+
 def test_prepare_manifest_binds_crawl_watchdog_aggregates(
     workspace: Path,
     tmp_path: Path,
