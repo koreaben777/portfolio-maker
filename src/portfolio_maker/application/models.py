@@ -114,6 +114,7 @@ class PrepareProjectReviewRequest:
 class PrepareProjectReviewResult:
     input_path: Path
     evidence_count: int
+    chunk_count: int = 1
 
 
 @dataclass(frozen=True)

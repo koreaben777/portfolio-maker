@@ -52,6 +52,7 @@ from portfolio_maker.application.project_boundary import (
     ProjectBoundaryError,
     prepare_project_review_v2,
 )
+from portfolio_maker.application.project_review_v3 import prepare_project_review_v3
 from portfolio_maker.application.models import (
     BuildProfileRequest,
     DiscoverSourcesRequest,
@@ -136,7 +137,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     review = subparsers.add_parser("prepare-project-review")
     review.add_argument("--workspace", type=Path, default=Path("."))
-    review.add_argument("--version", choices=("v1", "v2"), default="v1")
+    review.add_argument("--version", choices=("v1", "v2", "v3"), default="v1")
 
     compose = subparsers.add_parser("compose-projects")
     compose.add_argument("--workspace", type=Path, default=Path("."))
@@ -353,7 +354,11 @@ def _main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     if args.command == "prepare-project-review":
-        if args.version == "v2":
+        if args.version == "v3":
+            result = prepare_project_review_v3(
+                PrepareProjectReviewRequest(workspace=args.workspace)
+            )
+        elif args.version == "v2":
             result = prepare_project_review_v2(
                 PrepareProjectReviewRequest(workspace=args.workspace)
             )
@@ -361,7 +366,11 @@ def _main(argv: Sequence[str] | None = None) -> int:
             result = prepare_project_review(
                 PrepareProjectReviewRequest(workspace=args.workspace)
             )
-        print(f"Project review input: {result.input_path}")
+        if args.version == "v3":
+            print("Project review version: v3")
+            print(f"Chunks: {result.chunk_count}")
+        else:
+            print(f"Project review input: {result.input_path}")
         print(f"Evidence: {result.evidence_count}")
         return 0
 

@@ -29,6 +29,9 @@ class WorkspacePaths:
     artifact_approval_path: Path
     project_review_input_path: Path
     project_review_input_v2_path: Path
+    project_review_v3_dir: Path
+    project_review_v3_input_dir: Path
+    project_review_v3_manifest_path: Path
     project_candidates_path: Path
     project_candidates_markdown_path: Path
     project_approval_path: Path
@@ -78,6 +81,11 @@ class WorkspacePaths:
             artifact_approval_path=reviews_dir / "artifact-approval.json",
             project_review_input_path=reviews_dir / "project-review-input.json",
             project_review_input_v2_path=reviews_dir / "project-review-input-v2.json",
+            project_review_v3_dir=reviews_dir / "project-review-v3",
+            project_review_v3_input_dir=reviews_dir / "project-review-v3" / "input",
+            project_review_v3_manifest_path=(
+                reviews_dir / "project-review-v3" / "manifest.json"
+            ),
             project_candidates_path=reviews_dir / "project-candidates.json",
             project_candidates_markdown_path=reviews_dir / "project-candidates.md",
             project_approval_path=reviews_dir / "project-approval.json",
@@ -114,6 +122,8 @@ class WorkspacePaths:
             self.history_plans_dir,
             self.history_journal_dir,
             self.history_quarantine_dir,
+            self.project_review_v3_dir,
+            self.project_review_v3_input_dir,
             self.semantic_work_input_dir,
             self.semantic_work_output_dir,
             self.semantic_work_receipts_dir,

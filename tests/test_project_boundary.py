@@ -13,6 +13,7 @@ from portfolio_maker.application.ingestion import ingest_sources
 from portfolio_maker.application.models import (
     ApplySemanticIndexRequest,
     ComposeProjectsRequest,
+    FinalizeSemanticIndexRequest,
     IngestSourcesRequest,
     PrepareProjectReviewRequest,
     PrepareSemanticIndexRequest,
@@ -34,10 +35,12 @@ from portfolio_maker.application.semantic_index import (
     apply_semantic_index,
     prepare_semantic_index,
 )
+from portfolio_maker.application.semantic_work import finalize_semantic_index
 from portfolio_maker.domain.models import Source, SourceStatus, SourceType
 from portfolio_maker.domain.semantic_models import boundary_fingerprint
 from portfolio_maker.infrastructure.sqlite_repository import SQLiteRepository
 from portfolio_maker.workspace import WorkspacePaths
+from test_semantic_finalization import PreparedFinalization, _complete_work
 
 
 @pytest.fixture
@@ -434,37 +437,13 @@ def _write_active_semantic_revision(workspace: Path, tmp_path: Path) -> Workspac
     prepared = prepare_semantic_index(
         PrepareSemanticIndexRequest(workspace=workspace, root=root, chunk_size=1)
     )
-    input_dir = prepared.manifest_path.parent / "input"
-    output_dir = prepared.manifest_path.parent / "output"
-    output_dir.mkdir()
-    for input_path in sorted(input_dir.glob("chunk-*.json")):
-        input_text = input_path.read_text(encoding="utf-8")
-        input_payload = json.loads(input_text)
-        output = {
-            "version": 1,
-            "revision_id": prepared.revision_id,
-            "input_sha256": hashlib.sha256(input_text.encode("utf-8")).hexdigest(),
-            "nodes": [
-                {
-                    "node_id": node["node_id"],
-                    "semantic_summary": f"Summary for {node['display_name']}",
-                    "semantic_roles": node["roles"],
-                    "topics": ["project-boundary"],
-                    "analysis_status": node["analysis_status"],
-                    "child_node_ids": node["child_node_ids"],
-                }
-                for node in input_payload["nodes"]
-            ],
-        }
-        output["output_sha256"] = hashlib.sha256(
-            json.dumps(output, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
-                "utf-8"
-            )
-        ).hexdigest()
-        (output_dir / input_path.name).write_text(
-            json.dumps(output, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
-            encoding="utf-8",
-        )
+    finalization = PreparedFinalization(
+        workspace=workspace,
+        paths=paths,
+        revision_id=prepared.revision_id,
+    )
+    _complete_work(finalization)
+    finalize_semantic_index(FinalizeSemanticIndexRequest(workspace=workspace))
     apply_semantic_index(ApplySemanticIndexRequest(workspace=workspace))
     return paths
 
