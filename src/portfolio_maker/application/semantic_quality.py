@@ -48,7 +48,29 @@ _NODE_KEYS = {
     "grounding_signal_ids",
     "semantic_disposition",
     "analysis_status",
-    "child_node_ids",
+}
+_TARGET_KEYS = {
+    "node_id",
+    "parent_node_id",
+    "kind",
+    "display_name",
+    "relative_hierarchy",
+    "content_fingerprint",
+    "analysis_status",
+    "semantic_disposition",
+    "roles",
+    "signals",
+    "skip_reason",
+    "evidence_ids",
+    "coverage",
+    "target_projection_contract",
+    "direct_child_topology",
+}
+_DIRECT_CHILD_TOPOLOGY_KEYS = {
+    "direct_child_count",
+    "direct_child_ids_sha256",
+    "sample_child_node_ids",
+    "sample_complete",
 }
 _AGGREGATE_KEYS = {
     "result_kind",
@@ -130,7 +152,6 @@ class ValidatedSemanticNodeResult:
     grounding_signal_ids: tuple[str, ...]
     semantic_disposition: str
     analysis_status: str
-    child_node_ids: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -317,15 +338,16 @@ def _validated_targets(
     for target in raw_targets:
         if (
             type(target) is not dict
+            or set(target) != _TARGET_KEYS
             or target.get("semantic_disposition") != "analysis_required"
             or target.get("kind") not in {"file", "directory", "source"}
             or not _is_identifier(target.get("node_id"))
             or type(target.get("signals")) is not list
-            or type(target.get("child_node_ids")) is not list
             or not _is_nonempty_text(target.get("analysis_status"))
             or target["node_id"] in seen
         ):
             raise SemanticQualityError("semantic target is invalid")
+        _validate_direct_child_topology(target)
         seen.add(str(target["node_id"]))
         targets.append(target)
     return tuple(targets)
@@ -384,7 +406,6 @@ def _validate_node_result(
         or raw.get("node_id") != target["node_id"]
         or raw.get("semantic_disposition") != "analyzed"
         or raw.get("analysis_status") != target["analysis_status"]
-        or raw.get("child_node_ids") != target["child_node_ids"]
     ):
         raise SemanticQualityError("semantic node result identity is invalid")
     kind = str(target["kind"])
@@ -412,11 +433,6 @@ def _validate_node_result(
         arrays["independence_signals"],
         arrays["triviality_signals"],
     )
-    child_node_ids = _validated_identifier_array(
-        raw.get("child_node_ids"),
-        maximum=None,
-        field="child node IDs",
-    )
     return ValidatedSemanticNodeResult(
         node_id=str(raw["node_id"]),
         semantic_summary=semantic_summary,
@@ -429,8 +445,39 @@ def _validate_node_result(
         grounding_signal_ids=grounding,
         semantic_disposition="analyzed",
         analysis_status=str(raw["analysis_status"]),
-        child_node_ids=child_node_ids,
     )
+
+
+def _validate_direct_child_topology(target: dict[str, object]) -> None:
+    topology = target.get("direct_child_topology")
+    if (
+        target.get("target_projection_contract")
+        != "direct-child-attestation-v1"
+        or type(topology) is not dict
+        or set(topology) != _DIRECT_CHILD_TOPOLOGY_KEYS
+        or type(topology.get("direct_child_count")) is not int
+        or int(topology["direct_child_count"]) < 0
+        or not _is_sha256(topology.get("direct_child_ids_sha256"))
+        or type(topology.get("sample_complete")) is not bool
+    ):
+        raise SemanticQualityError("semantic target topology is invalid")
+    sample = _validated_identifier_array(
+        topology.get("sample_child_node_ids"),
+        maximum=64,
+        field="target child sample IDs",
+    )
+    count = int(topology["direct_child_count"])
+    if (
+        len(sample) > count
+        or bool(topology["sample_complete"]) != (count <= len(sample))
+        or topology["sample_complete"]
+        and len(sample) != count
+        or topology["sample_complete"]
+        and topology["direct_child_ids_sha256"] != _sha256(list(sample))
+        or not topology["sample_complete"]
+        and len(sample) != 64
+    ):
+        raise SemanticQualityError("semantic target topology is invalid")
 
 
 def _validate_aggregate_result(

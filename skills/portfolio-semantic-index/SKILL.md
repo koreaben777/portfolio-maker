@@ -46,12 +46,24 @@ bounded to 262,144 bytes, with no global count cap.
    matching managed output and use the existing closed managed schema.
    **Do not read raw files** or inspect arbitrary source content.
 
+   A target whose `target_projection_contract` is
+   `direct-child-attestation-v1` exposes only bounded topology context:
+   exact direct-child count, the canonical sorted full-list digest, at most 64
+   sample IDs, and whether the sample is complete. Never treat an incomplete
+   sample as full topology. The projection is regenerated from private state;
+   do not trust or rewrite it.
+
 6. Produce genuine Codex semantic judgment grounded in managed signal IDs and
    child-output hashes. Analyze semantic summaries, roles, topics, facts,
    purpose, component relationships, and independence or triviality.
    **Do not use token extraction as final meaning** and do not infer meaning
    from filenames. Never synthesize generic, template, placeholder, or
    token-only output merely to satisfy validation.
+
+   Semantic node output contains semantic fields only. Do not echo topology
+   count, digest, sample IDs, completeness, `child_node_ids`, parent IDs, or
+   path structure. Finalization restores the exact full child list from
+   manifest-bound private structural state.
 
 7. Validate the exact returned unit and require its receipt:
 
@@ -99,6 +111,10 @@ locators, private URLs, credentials, or raw signal text.
 Also stop on aggregate directory timeout budget exhaustion. Do not retry or
 infer an exclusion; return to `$portfolio-source-governance` so it can request
 explicit user approval for any proposed common-ancestor exclusion.
+
+Stop if the staging work plan predates `direct-child-attestation-v1`. Recheck
+source approval and run a fresh `prepare-semantic-index`; do not silently resume
+the pre-change template or receipts.
 
 Never edit SQLite or managed receipts/manifests directly. Do not delete valid
 receipts, invent a second output schema, skip validation, force completion, or

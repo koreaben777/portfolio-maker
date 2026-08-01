@@ -177,6 +177,13 @@ command 하나마다 skill을 만들거나 같은 application logic을 여러 sk
   있지만 raw source, locator 또는 비선택 evidence를 다시 읽지 않는다.
 - semantic completion은 source/evidence, artifact, project, delivery, Sites/Git/push,
   deploy 또는 release approval로 승격되지 않는다.
+- direct-child fan-out은 [고 fan-out semantic target projection 계약](superpowers/specs/2026-08-02-portfolio-maker-high-fanout-semantic-target-projection-addendum.md)에
+  따라 full private topology와 bounded Codex context를 분리한다. 전체
+  `child_node_ids`는 manifest-bound capsule과 private structural state가 소유하고,
+  Codex target은 exact count, canonical full-list digest, 최대 64개 sample 및
+  completeness만 받는다. Semantic output은 topology를 소유하지 않으며 finalization은
+  private structural list를 복원한다. 이 계약 이전 staging work plan은 fresh
+  `prepare-semantic-index` 없이 resume하지 않는다.
 
 review mode에서는 user decision 전 candidate를 materialize하지 않는다. explicit automatic mode에서는 high와 medium을 포함하고, medium은 review recommended로 표시한다. low, conflict, stale, policy failure는 review/unassigned에 남긴다.
 

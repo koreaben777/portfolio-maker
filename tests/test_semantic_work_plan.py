@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+from types import SimpleNamespace
 
 import pytest
 
+import portfolio_maker.application.semantic_work as semantic_work_module
 from portfolio_maker.application.semantic_work import (
     STRUCTURAL_CHUNK_SIZE,
     SemanticWorkError,
@@ -162,6 +164,72 @@ def test_wide_tree_uses_bounded_reduce_units_and_exact_template_sizes() -> None:
     assert [unit.unit_id for unit in plan.units] == sorted(
         unit.unit_id for unit in plan.units
     )
+
+
+@pytest.mark.parametrize("child_count", (3_584, 10_000))
+def test_high_fanout_target_projection_keeps_real_work_template_bounded(
+    child_count: int,
+) -> None:
+    """Catches embedding every direct child id in one semantic target."""
+    root_id = f"sha256:{'f' * 64}"
+    children = tuple(
+        _capsule(
+            f"sha256:{index:064x}",
+            parent_node_id=root_id,
+            disposition="structural_only",
+            hierarchy=f"child-{index:05}",
+        )
+        for index in range(child_count)
+    )
+    root = _capsule(root_id, kind="source", hierarchy=".")
+    root["child_node_ids"] = [child["node_id"] for child in children]
+
+    plan = build_semantic_work_plan(
+        (root, *children),
+        revision_id="revision",
+        policy_hash="a" * 64,
+    )
+
+    assert plan.analysis_target_count == 1
+    assert plan.node_count == child_count + 1
+    assert len(plan.units) == 1
+    assert plan.units[0].stage is SemanticWorkStage.ROOT
+    assert plan.units[0].target_node_ids == (root_id,)
+    assert plan.units[0].template_byte_count <= 262_144
+    materialized = semantic_work_module._materialized_input(
+        SimpleNamespace(
+            revision_id="revision",
+            capsules={
+                str(capsule["node_id"]): capsule
+                for capsule in (root, *children)
+            },
+        ),
+        SimpleNamespace(
+            unit_id=plan.units[0].unit_id,
+            stage=plan.units[0].stage.value,
+            target_node_ids=plan.units[0].target_node_ids,
+            dependency_unit_ids=(),
+        ),
+        {},
+    )
+    topology = materialized["targets"][0]["direct_child_topology"]
+    assert materialized["targets"][0]["target_projection_contract"] == (
+        "direct-child-attestation-v1"
+    )
+    assert "child_node_ids" not in materialized["targets"][0]
+    assert topology["direct_child_count"] == child_count
+    assert topology["sample_child_node_ids"] == sorted(
+        child["node_id"] for child in children
+    )[:64]
+    assert topology["sample_complete"] is False
+    assert len(
+        json.dumps(
+            materialized,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ) <= 262_144
 
 
 def test_work_plan_accounts_for_structural_nodes_in_owner_digest() -> None:

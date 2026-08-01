@@ -18,6 +18,7 @@ from portfolio_maker.application.models import (
 )
 from portfolio_maker.application.semantic_index import prepare_semantic_index
 from portfolio_maker.application.semantic_work import (
+    MAX_WORK_UNIT_BYTES,
     SemanticWorkError,
     finalize_semantic_index,
     next_semantic_work,
@@ -192,7 +193,6 @@ def _semantic_results(work_input: dict[str, object]) -> list[object]:
                 "grounding_signal_ids": grounding_ids,
                 "semantic_disposition": "analyzed",
                 "analysis_status": target["analysis_status"],
-                "child_node_ids": target["child_node_ids"],
             }
         )
     return results
@@ -362,6 +362,78 @@ def test_finalize_compiles_exact_nodes_and_excludes_reduce_aggregates(
         assert forbidden not in serialized
 
 
+def test_high_fanout_finalization_restores_exact_private_child_topology(
+    tmp_path: Path,
+) -> None:
+    """Catches allowing a bounded LLM projection to replace full topology."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    root = tmp_path / "approved-root"
+    root.mkdir()
+    (root / "README.md").write_text(
+        "# Grounded project\n"
+        "The application validates approved evidence and publishes results.",
+        encoding="utf-8",
+    )
+    for index in range(3_584):
+        (root / f"empty-{index:05}.txt").write_text("", encoding="utf-8")
+    _approve_root(workspace, root)
+
+    prepared_result = prepare_semantic_index(
+        PrepareSemanticIndexRequest(
+            workspace=workspace,
+            root=root,
+            chunk_size=1_000,
+        )
+    )
+    prepared = PreparedFinalization(
+        workspace=workspace,
+        paths=WorkspacePaths.from_root(workspace),
+        revision_id=prepared_result.revision_id,
+    )
+    _complete_work(prepared)
+
+    structural_records = {
+        record["node_id"]: record
+        for path in sorted(
+            prepared.paths.semantic_revision_structural_dir(
+                prepared.revision_id
+            ).glob("chunk-*.json")
+        )
+        for record in json.loads(path.read_text(encoding="utf-8"))["nodes"]
+    }
+    source_record = next(
+        record
+        for record in structural_records.values()
+        if record["kind"] == "source"
+    )
+    source_input = next(
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in sorted(prepared.paths.semantic_work_input_dir.glob("unit-*.json"))
+        if json.loads(path.read_text(encoding="utf-8"))["stage"] == "root"
+    )
+    topology_projection = source_input["targets"][0]["direct_child_topology"]
+
+    assert len(source_record["child_node_ids"]) == 3_585
+    assert topology_projection["direct_child_count"] == 3_585
+    assert topology_projection["direct_child_ids_sha256"] == _sha256(
+        _canonical_bytes(sorted(source_record["child_node_ids"]))
+    )
+    assert topology_projection["sample_child_node_ids"] == sorted(
+        source_record["child_node_ids"]
+    )[:64]
+    assert len(topology_projection["sample_child_node_ids"]) == 64
+    assert topology_projection["sample_complete"] is False
+    assert len(_canonical_bytes(source_input)) <= MAX_WORK_UNIT_BYTES
+
+    finalize_semantic_index(FinalizeSemanticIndexRequest(workspace))
+    final_source = next(
+        node for node in _read_final_nodes(prepared) if node["kind"] == "source"
+    )
+
+    assert final_source["child_node_ids"] == source_record["child_node_ids"]
+
+
 @pytest.mark.parametrize("stale_kind", ("policy", "receipt", "revision"))
 def test_finalize_revalidates_policy_receipts_and_staging_revision(
     completed_finalization: PreparedFinalization,
@@ -474,7 +546,7 @@ def test_finalize_manifest_is_content_free_and_exactly_hash_bound(
 
 @pytest.mark.parametrize(
     "mutation",
-    ("noncanonical", "schema", "revision", "source"),
+    ("noncanonical", "schema", "revision", "source", "children"),
 )
 def test_finalize_rejects_private_structural_drift(
     completed_finalization: PreparedFinalization,
@@ -501,8 +573,14 @@ def test_finalize_rejects_private_structural_drift(
     elif mutation == "revision":
         payload["revision_id"] = "different-revision"
         write_managed_text(structural_path, _canonical_text(payload))
-    else:
+    elif mutation == "source":
         payload["nodes"][0]["source_id"] = "different-source"
+        write_managed_text(structural_path, _canonical_text(payload))
+    else:
+        record = next(
+            node for node in payload["nodes"] if node["child_node_ids"]
+        )
+        record["child_node_ids"] = []
         write_managed_text(structural_path, _canonical_text(payload))
 
     with pytest.raises(SemanticWorkError, match="structural"):

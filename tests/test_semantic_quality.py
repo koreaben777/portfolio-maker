@@ -28,7 +28,6 @@ NODE_RESULT_KEYS = {
     "grounding_signal_ids",
     "semantic_disposition",
     "analysis_status",
-    "child_node_ids",
 }
 AGGREGATE_RESULT_KEYS = {
     "result_kind",
@@ -74,6 +73,8 @@ def _capsule(
     analysis_status: str = "pending",
     child_node_ids: list[str] | None = None,
 ) -> dict[str, object]:
+    direct_children = sorted(child_node_ids or [])
+    sample = direct_children[:64]
     return {
         "node_id": node_id,
         "parent_node_id": "node-parent",
@@ -84,7 +85,6 @@ def _capsule(
         "analysis_status": analysis_status,
         "semantic_disposition": "analysis_required",
         "roles": ["component"],
-        "child_node_ids": child_node_ids or [],
         "signals": [
             {
                 "signal_id": signal_id,
@@ -95,6 +95,13 @@ def _capsule(
         "skip_reason": None,
         "evidence_ids": ["evidence-1"],
         "coverage": _coverage(node_id),
+        "target_projection_contract": "direct-child-attestation-v1",
+        "direct_child_topology": {
+            "direct_child_count": len(direct_children),
+            "direct_child_ids_sha256": _sha256(direct_children),
+            "sample_child_node_ids": sample,
+            "sample_complete": len(direct_children) <= len(sample),
+        },
     }
 
 
@@ -158,7 +165,6 @@ def valid_node_result(
         or [capsule["signals"][0]["signal_id"]],
         "semantic_disposition": "analyzed",
         "analysis_status": capsule["analysis_status"],
-        "child_node_ids": capsule["child_node_ids"],
     }
 
 
@@ -401,24 +407,43 @@ def test_semantic_quality_rejects_bounds_and_duplicates(
         "parent_context_signals",
         "independence_signals",
         "triviality_signals",
-        "child_node_ids",
     ),
 )
 def test_semantic_quality_rejects_duplicate_text_and_id_arrays(
     field: str,
 ) -> None:
-    target = (
-        _capsule(child_node_ids=["node-child", "node-child"])
-        if field == "child_node_ids"
-        else _capsule()
-    )
+    target = _capsule()
     work_input = valid_input_fixture(target=target)
     result = valid_node_result(target=target)
-    if field != "child_node_ids":
-        result[field] = ["duplicate-value", "duplicate-value"]
+    result[field] = ["duplicate-value", "duplicate-value"]
     output = valid_output_fixture(work_input, results=[result])
 
     with pytest.raises(SemanticQualityError):
+        validate_semantic_work_output(work_input, output)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("direct_child_count", 1),
+        ("direct_child_ids_sha256", "f" * 64),
+        ("sample_child_node_ids", ["node-child", "node-child"]),
+        ("sample_complete", False),
+    ),
+)
+def test_semantic_quality_rejects_tampered_complete_topology_projection(
+    field: str,
+    value: object,
+) -> None:
+    target = _capsule()
+    target["direct_child_topology"][field] = value
+    work_input = valid_input_fixture(target=target)
+    output = valid_output_fixture(
+        work_input,
+        results=[valid_node_result(target=target)],
+    )
+
+    with pytest.raises(SemanticQualityError, match="target"):
         validate_semantic_work_output(work_input, output)
 
 

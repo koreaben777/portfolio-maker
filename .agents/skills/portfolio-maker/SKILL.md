@@ -128,6 +128,18 @@ generic or ungrounded output, DB safety error, no-ready-but-incomplete or
 invalid state, or cancellation. Each work unit is at most 262,144 bytes and
 there is no global count cap.
 
+For a target with `target_projection_contract` equal to
+`direct-child-attestation-v1`, treat `direct_child_topology` as bounded context:
+the exact direct-child count, the canonical full-list digest, a sample of at
+most 64 IDs, and whether that sample is complete. Never treat an incomplete
+sample as the full topology. Do not copy count, digest, sample IDs, completeness,
+`child_node_ids`, parent IDs, or path structure into semantic node output. The
+validator restores topology from manifest-bound private structural state; Codex
+output contains semantic fields only. If the current staging work plan was
+prepared before this projection contract, stop and run a fresh
+`prepare-semantic-index` after rechecking source approval instead of silently
+resuming it.
+
 Finalize, apply, and prepare the chunked v3 review projection only in this
 order:
 

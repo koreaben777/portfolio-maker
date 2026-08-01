@@ -392,7 +392,6 @@ def _fixture_semantic_output(
                     "grounding_signal_ids": grounding_ids,
                     "semantic_disposition": "analyzed",
                     "analysis_status": target["analysis_status"],
-                    "child_node_ids": target["child_node_ids"],
                 }
             )
     output: dict[str, object] = {

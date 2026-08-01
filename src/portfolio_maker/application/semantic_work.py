@@ -54,6 +54,7 @@ from portfolio_maker.workspace import WorkspacePaths
 
 MAX_WORK_UNIT_BYTES = 262_144
 REDUCE_FAN_IN = 64
+SEMANTIC_CHILD_SAMPLE_LIMIT = 64
 STRUCTURAL_CHUNK_SIZE = 1_000
 _VALID_DISPOSITIONS = {disposition.value for disposition in SemanticDisposition}
 _VALID_STAGES = {stage.value for stage in SemanticWorkStage}
@@ -329,7 +330,10 @@ def build_semantic_work_plan(
             "stage": stage.value,
             "target_node_ids": list(target_node_ids),
             "dependency_unit_ids": list(dependency_unit_ids),
-            "capsules": [capsule_by_id[node_id] for node_id in target_node_ids],
+            "capsules": [
+                _semantic_target_projection(capsule_by_id[node_id])
+                for node_id in target_node_ids
+            ],
         }
         template_bytes = _canonical_json_bytes(template)
         if len(template_bytes) > max_work_unit_bytes:
@@ -419,6 +423,30 @@ def build_semantic_work_plan(
         ).hexdigest(),
         units=tuple(units),
     )
+
+
+def _semantic_target_projection(
+    capsule: Mapping[str, object],
+) -> dict[str, object]:
+    child_node_ids = sorted(str(value) for value in capsule["child_node_ids"])
+    sample = child_node_ids[:SEMANTIC_CHILD_SAMPLE_LIMIT]
+    projected = {
+        key: value
+        for key, value in capsule.items()
+        if key != "child_node_ids"
+    }
+    return {
+        **projected,
+        "target_projection_contract": "direct-child-attestation-v1",
+        "direct_child_topology": {
+            "direct_child_count": len(child_node_ids),
+            "direct_child_ids_sha256": hashlib.sha256(
+                _canonical_json_bytes(child_node_ids)
+            ).hexdigest(),
+            "sample_child_node_ids": sample,
+            "sample_complete": len(child_node_ids) <= len(sample),
+        },
+    }
 
 
 def _reduce_dependencies(
@@ -936,7 +964,6 @@ def _iter_final_nodes(
             }
             semantic_disposition = record["semantic_disposition"]
             analysis_status = record["analysis_status"]
-            child_node_ids = record["child_node_ids"]
         else:
             semantic_summary = result.semantic_summary
             semantic_roles = list(result.semantic_roles)
@@ -954,7 +981,7 @@ def _iter_final_nodes(
             }
             semantic_disposition = result.semantic_disposition
             analysis_status = result.analysis_status
-            child_node_ids = list(result.child_node_ids)
+        child_node_ids = record["child_node_ids"]
         yield {
             "result_kind": "node",
             "node_id": record["node_id"],
@@ -1655,7 +1682,10 @@ def _validate_unit_template(
         "stage": unit.stage,
         "target_node_ids": list(unit.target_node_ids),
         "dependency_unit_ids": list(unit.dependency_unit_ids),
-        "capsules": list(capsules),
+        "capsules": [
+            _semantic_target_projection(capsule)
+            for capsule in capsules
+        ],
     }
     template_bytes = _canonical_json_bytes(template)
     if (
@@ -1775,7 +1805,10 @@ def _materialized_input(
         }
         for dependency_id in unit.dependency_unit_ids
     ]
-    targets = [state.capsules[node_id] for node_id in unit.target_node_ids]
+    targets = [
+        _semantic_target_projection(state.capsules[node_id])
+        for node_id in unit.target_node_ids
+    ]
     child_results = [
         {
             "unit_id": dependency_id,

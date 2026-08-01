@@ -149,7 +149,6 @@ def _semantic_results(work_input: dict[str, object]) -> list[object]:
                 "grounding_signal_ids": grounding_ids,
                 "semantic_disposition": "analyzed",
                 "analysis_status": target["analysis_status"],
-                "child_node_ids": target["child_node_ids"],
             }
         )
     return results
@@ -361,6 +360,33 @@ def test_changed_dependency_output_invalidates_receipt_and_descendant_transitive
     assert status.receipted_count == 1
     assert status.invalid_count == 2
     assert resumed.unit_id == "unit-000001"
+
+
+def test_validation_rejects_rehashed_topology_projection_tamper(
+    prepared_work: PreparedWork,
+) -> None:
+    """Catches trusting persisted projection instead of full capsule state."""
+    current = next_semantic_work(
+        NextSemanticWorkRequest(workspace=prepared_work.workspace)
+    )
+    assert current.unit_id is not None
+    assert current.input_path is not None
+    work_input = json.loads(current.input_path.read_text(encoding="utf-8"))
+    topology = work_input["targets"][0]["direct_child_topology"]
+    topology["direct_child_ids_sha256"] = "f" * 64
+    unsigned = dict(work_input)
+    unsigned.pop("input_sha256")
+    work_input["input_sha256"] = _sha256_text(_canonical_text(unsigned))
+    write_managed_text(current.input_path, _canonical_text(work_input))
+    _write_valid_output(prepared_work, current.input_path)
+
+    with pytest.raises(SemanticWorkError, match="stale"):
+        validate_semantic_work(
+            ValidateSemanticWorkRequest(
+                workspace=prepared_work.workspace,
+                unit_id=current.unit_id,
+            )
+        )
 
 
 @pytest.mark.parametrize(

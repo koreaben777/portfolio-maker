@@ -105,7 +105,6 @@ def cli_semantic_results(work_input: dict[str, object]) -> list[object]:
             ),
             "semantic_disposition": "analyzed",
             "analysis_status": target["analysis_status"],
-            "child_node_ids": target["child_node_ids"],
         }
         for target in work_input["targets"]
     ]
