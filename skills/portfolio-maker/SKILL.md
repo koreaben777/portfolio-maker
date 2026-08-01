@@ -50,6 +50,11 @@ Do not infer approval from filenames, prior runs, authentication, a request for
 all-unassigned state is valid: do not invent a project, claim populated output,
 or silently promote review-required material.
 
+If semantic preparation stops at its aggregate directory timeout budget, do not
+read the private review from this router and do not retry preparation. Route
+back to `$portfolio-source-governance`, which may present a narrow
+common-ancestor exclusion proposal and must wait for explicit user approval.
+
 ## Modes And Commands
 
 Preserve the user's explicit target (`master profile`, `portfolio draft`, or

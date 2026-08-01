@@ -165,6 +165,10 @@ command 하나마다 skill을 만들거나 같은 application logic을 여러 sk
   따라 재사용 가능한 cancellable worker와 유한한 디렉터리별 deadline을 사용한다. 하위
   timeout은 unreadable node로 격리하고, root timeout이나 worker protocol 오류는 managed
   semantic output 없이 fail closed한다.
+- 반복된 하위 timeout의 누적 대기는 [timeout budget 계약](superpowers/specs/2026-07-31-portfolio-maker-semantic-crawl-timeout-budget-design-addendum.md)에
+  따라 유한하게 제한한다. 예산 소진은 local private review만 남기며, 그 review는 자동
+  제외나 재실행 권한이 아니다. common ancestor 제외는 사용자 명시 승인 뒤에만 정책에
+  반영하며 `Library`/`Containers`를 암묵적으로 제외하지 않는다.
 - 의미 실행은 dependency-ready unit 하나씩 수행하고 matching output을 production
   validator로 검증해 receipt를 받은 뒤 진행한다. 중단은 마지막 유효 receipt 다음부터
   재개하며, generic·token-only·ungrounded 결과는 활성 revision이 될 수 없다.

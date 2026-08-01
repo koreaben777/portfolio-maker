@@ -27,6 +27,12 @@ def _always_blocking_directory_enumerator(_path: Path):
     threading.Event().wait()
 
 
+def _multiple_blocking_directory_enumerator(path: Path):
+    if path.name.startswith("blocked"):
+        threading.Event().wait()
+    return semantic_crawler_module._materialize_directory(path)
+
+
 def _termination_resistant_directory_enumerator(_path: Path):
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
     threading.Event().wait()
@@ -129,6 +135,47 @@ class _LifecycleContext:
 
     def Process(self, **_kwargs):
         return self.process
+
+
+class _BudgetWorker:
+    instances: list["_BudgetWorker"] = []
+
+    def __init__(self, **_kwargs) -> None:
+        self.requests: list[tuple[str, float]] = []
+        self.replacement_count = 0
+        self.closed = False
+        type(self).instances.append(self)
+
+    def __enter__(self) -> "_BudgetWorker":
+        return self
+
+    def __exit__(self, *_args) -> None:
+        self.closed = True
+
+    def enumerate(
+        self,
+        directory: Path,
+        *,
+        timeout_seconds: float,
+        replace_after_timeout: bool = True,
+        monotonic_clock,
+    ):
+        del replace_after_timeout
+        self.requests.append((directory.name, timeout_seconds))
+        started_at = monotonic_clock()
+        elapsed = max(0.0, monotonic_clock() - started_at)
+        if directory.name.startswith("blocked"):
+            return semantic_crawler_module._DirectoryEnumeration(
+                entries=(),
+                timed_out=True,
+                timeout_wait_seconds=elapsed,
+            )
+        return semantic_crawler_module._DirectoryEnumeration(
+            entries=semantic_crawler_module._materialize_directory(directory),
+        )
+
+    def replace_after_timeout(self) -> None:
+        self.replacement_count += 1
 
 
 def approval_for(root: Path, *, excluded: tuple[Path, ...] = ()) -> SourceApproval:
@@ -295,6 +342,119 @@ def test_worker_reuses_successful_process_and_replaces_timed_out_process(
             responsive,
             timeout_seconds=0.2,
         ).timed_out
+
+
+def test_crawl_timeout_budget_exhausts_without_extra_worker_or_sibling(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "root"
+    for name in ("blocked-a", "blocked-b", "sibling"):
+        (root / name).mkdir(parents=True, exist_ok=True)
+    _BudgetWorker.instances.clear()
+    clock_values = iter((0.0, 0.0, 0.0, 0.04, 0.04, 0.05))
+    monkeypatch.setattr(
+        semantic_crawler_module,
+        "_DirectoryEnumerationWorker",
+        _BudgetWorker,
+    )
+
+    with pytest.raises(
+        semantic_crawler_module.StructuralCrawlTimeoutBudgetError,
+        match="^Structural crawl timeout budget exhausted$",
+    ) as captured:
+        crawl_local_structure(
+            root,
+            approval_for(root),
+            directory_timeout_seconds=0.04,
+            directory_timeout_budget_seconds=0.05,
+            _monotonic=lambda: next(clock_values),
+        )
+
+    worker = _BudgetWorker.instances[-1]
+    assert captured.value.timed_out_relative_hierarchies == (
+        "blocked-a",
+        "blocked-b",
+    )
+    assert captured.value.consumed_timeout_wait_seconds == pytest.approx(0.05)
+    assert [name for name, _timeout in worker.requests] == [
+        "root",
+        "blocked-a",
+        "blocked-b",
+    ]
+    assert [timeout for _name, timeout in worker.requests] == pytest.approx(
+        [0.04, 0.04, 0.01]
+    )
+    assert worker.replacement_count == 1
+    assert worker.closed is True
+
+
+def test_crawl_timeout_budget_counts_only_timed_out_waits(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "root"
+    for name in ("blocked", "sibling"):
+        (root / name).mkdir(parents=True, exist_ok=True)
+    _BudgetWorker.instances.clear()
+    clock_values = iter((0.0, 2.0, 2.0, 2.04, 2.04, 9.04))
+    monkeypatch.setattr(
+        semantic_crawler_module,
+        "_DirectoryEnumerationWorker",
+        _BudgetWorker,
+    )
+
+    crawl = crawl_local_structure(
+        root,
+        approval_for(root),
+        directory_timeout_seconds=0.04,
+        directory_timeout_budget_seconds=0.08,
+        _monotonic=lambda: next(clock_values),
+    )
+
+    assert crawl.timed_out_directory_count == 1
+    assert crawl.consumed_timeout_wait_seconds == pytest.approx(0.04)
+    assert _BudgetWorker.instances[-1].replacement_count == 1
+
+
+def test_crawl_timeout_budget_reaps_exhausted_worker_without_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "root"
+    for name in ("blocked-a", "blocked-b", "sibling"):
+        (root / name).mkdir(parents=True, exist_ok=True)
+    context = multiprocessing.get_context("fork")
+    before = {process.pid for process in multiprocessing.active_children()}
+    replacement_count = 0
+    original_replace = semantic_crawler_module._DirectoryEnumerationWorker.replace_after_timeout
+
+    def record_replace(worker):
+        nonlocal replacement_count
+        replacement_count += 1
+        return original_replace(worker)
+
+    monkeypatch.setattr(
+        semantic_crawler_module._DirectoryEnumerationWorker,
+        "replace_after_timeout",
+        record_replace,
+    )
+
+    with pytest.raises(
+        semantic_crawler_module.StructuralCrawlTimeoutBudgetError,
+        match="^Structural crawl timeout budget exhausted$",
+    ):
+        crawl_local_structure(
+            root,
+            approval_for(root),
+            directory_timeout_seconds=0.05,
+            directory_timeout_budget_seconds=0.10,
+            _process_context=context,
+            _enumerator=_multiple_blocking_directory_enumerator,
+        )
+
+    assert replacement_count == 1
+    assert {process.pid for process in multiprocessing.active_children()} == before
 
 
 def test_worker_start_oserror_is_controlled_and_closes_unstarted_resources() -> None:

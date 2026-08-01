@@ -84,8 +84,11 @@ from portfolio_maker.infrastructure.managed_files import write_managed_text
 from portfolio_maker.infrastructure.sqlite_repository import RepositoryError
 from portfolio_maker.infrastructure.sqlite_repository import SQLiteRepository
 from portfolio_maker.infrastructure.semantic_crawler import (
+    DEFAULT_DIRECTORY_TIMEOUT_BUDGET_SECONDS,
     DEFAULT_DIRECTORY_TIMEOUT_SECONDS,
+    MAX_DIRECTORY_TIMEOUT_BUDGET_SECONDS,
     MAX_DIRECTORY_TIMEOUT_SECONDS,
+    MIN_DIRECTORY_TIMEOUT_BUDGET_SECONDS,
 )
 from portfolio_maker.workspace import WorkspacePaths
 
@@ -165,6 +168,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--directory-timeout-seconds",
         type=_directory_timeout_argument,
         default=DEFAULT_DIRECTORY_TIMEOUT_SECONDS,
+    )
+    prepare_index.add_argument(
+        "--directory-timeout-budget-seconds",
+        type=_directory_timeout_budget_argument,
+        default=DEFAULT_DIRECTORY_TIMEOUT_BUDGET_SECONDS,
     )
 
     apply_index = subparsers.add_parser("apply-semantic-index")
@@ -442,6 +450,9 @@ def _main(argv: Sequence[str] | None = None) -> int:
                     workspace=args.workspace,
                     root=args.root,
                     directory_timeout_seconds=args.directory_timeout_seconds,
+                    directory_timeout_budget_seconds=(
+                        args.directory_timeout_budget_seconds
+                    ),
                 )
             )
             _write_prepared_semantic_index_report(
@@ -463,6 +474,10 @@ def _main(argv: Sequence[str] | None = None) -> int:
         print(
             "Directory timeout seconds: "
             f"{result.directory_timeout_seconds}"
+        )
+        print(
+            "Directory timeout budget seconds: "
+            f"{result.directory_timeout_budget_seconds}"
         )
         print(
             "Timed-out directories: "
@@ -702,6 +717,10 @@ def _write_prepared_semantic_index_report(
             f"Managed input bytes: {result.managed_input_bytes}",
             f"Partial: {result.partial_count}",
             f"Directory timeout seconds: {result.directory_timeout_seconds}",
+            (
+                "Directory timeout budget seconds: "
+                f"{result.directory_timeout_budget_seconds}"
+            ),
             f"Timed-out directories: {result.timed_out_directory_count}",
             f"Unreadable directories: {result.unreadable_directory_count}",
             "",
@@ -725,6 +744,26 @@ def _directory_timeout_argument(value: str) -> float:
         raise argparse.ArgumentTypeError(
             "directory timeout must be a finite positive number no greater "
             f"than {MAX_DIRECTORY_TIMEOUT_SECONDS:g}"
+        )
+    return timeout
+
+
+def _directory_timeout_budget_argument(value: str) -> float:
+    try:
+        timeout = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "directory timeout budget must be a finite number"
+        ) from error
+    if (
+        not math.isfinite(timeout)
+        or timeout < MIN_DIRECTORY_TIMEOUT_BUDGET_SECONDS
+        or timeout > MAX_DIRECTORY_TIMEOUT_BUDGET_SECONDS
+    ):
+        raise argparse.ArgumentTypeError(
+            "directory timeout budget must be no smaller than "
+            f"{MIN_DIRECTORY_TIMEOUT_BUDGET_SECONDS:g} and no greater than "
+            f"{MAX_DIRECTORY_TIMEOUT_BUDGET_SECONDS:g}"
         )
     return timeout
 

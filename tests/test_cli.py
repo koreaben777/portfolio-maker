@@ -334,6 +334,8 @@ def test_cli_prepare_semantic_index_reports_chunks_without_locator_values(
             str(root),
             "--directory-timeout-seconds",
             "12.5",
+            "--directory-timeout-budget-seconds",
+            "22.5",
         ]
     )
 
@@ -353,9 +355,11 @@ def test_cli_prepare_semantic_index_reports_chunks_without_locator_values(
     assert "Analysis targets: 502" in report_text
     assert "Structural only: 0" in report_text
     assert "Directory timeout seconds: 12.5" in captured.out
+    assert "Directory timeout budget seconds: 22.5" in captured.out
     assert "Timed-out directories: 0" in captured.out
     assert "Unreadable directories: 0" in captured.out
     assert "Directory timeout seconds: 12.5" in report_text
+    assert "Directory timeout budget seconds: 22.5" in report_text
     assert "Timed-out directories: 0" in report_text
     assert "Unreadable directories: 0" in report_text
     assert "Managed input bytes:" in report_text
@@ -391,6 +395,50 @@ def test_cli_rejects_invalid_directory_timeout_before_workspace_write(
 
     assert error.value.code == 2
     assert not (workspace / ".portfolio-maker").exists()
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["not-a-number", "nan", "inf", "0", "0.009", "3600.1"],
+)
+def test_cli_rejects_invalid_directory_timeout_budget_before_workspace_write(
+    tmp_path: Path,
+    value: str,
+) -> None:
+    workspace = tmp_path / "workspace"
+    root = tmp_path / "root"
+    workspace.mkdir()
+    root.mkdir()
+
+    with pytest.raises(SystemExit) as error:
+        main(
+            [
+                "prepare-semantic-index",
+                "--workspace",
+                str(workspace),
+                "--root",
+                str(root),
+                "--directory-timeout-budget-seconds",
+                value,
+            ]
+        )
+
+    assert error.value.code == 2
+    assert not (workspace / ".portfolio-maker").exists()
+
+
+def test_cli_exposes_default_directory_timeout_budget(capsys) -> None:
+    parser = cli.build_parser()
+    arguments = parser.parse_args(
+        ["prepare-semantic-index", "--root", "approved-root"]
+    )
+
+    assert arguments.directory_timeout_budget_seconds == 120.0
+    with pytest.raises(SystemExit) as error:
+        main(["prepare-semantic-index", "--help"])
+
+    assert error.value.code == 0
+    assert "--directory-timeout-budget-seconds" in capsys.readouterr().out
 
 
 def test_cli_apply_semantic_index_is_controlled_when_output_missing(

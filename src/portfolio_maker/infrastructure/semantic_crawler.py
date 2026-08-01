@@ -31,6 +31,24 @@ class StructuralCrawlRootTimeoutError(StructuralCrawlRootError):
     pass
 
 
+class StructuralCrawlTimeoutBudgetError(StructuralCrawlRootError):
+    def __init__(
+        self,
+        *,
+        source_id: str,
+        timed_out_relative_hierarchies: tuple[str, ...],
+        timed_out_directory_count: int,
+        unreadable_directory_count: int,
+        consumed_timeout_wait_seconds: float,
+    ) -> None:
+        super().__init__("Structural crawl timeout budget exhausted")
+        self.source_id = source_id
+        self.timed_out_relative_hierarchies = timed_out_relative_hierarchies
+        self.timed_out_directory_count = timed_out_directory_count
+        self.unreadable_directory_count = unreadable_directory_count
+        self.consumed_timeout_wait_seconds = consumed_timeout_wait_seconds
+
+
 class StructuralCrawlWorkerError(ValueError):
     pass
 
@@ -38,6 +56,9 @@ class StructuralCrawlWorkerError(ValueError):
 _DIRECTORY_WORKER_PROTOCOL = "portfolio-semantic-directory-v1"
 DEFAULT_DIRECTORY_TIMEOUT_SECONDS = 30.0
 MAX_DIRECTORY_TIMEOUT_SECONDS = 300.0
+DEFAULT_DIRECTORY_TIMEOUT_BUDGET_SECONDS = 120.0
+MIN_DIRECTORY_TIMEOUT_BUDGET_SECONDS = 0.01
+MAX_DIRECTORY_TIMEOUT_BUDGET_SECONDS = 3600.0
 _WORKER_START_SECONDS = 5.0
 _WORKER_JOIN_SECONDS = 1.0
 
@@ -56,6 +77,7 @@ class _DirectoryEnumeration:
     entries: tuple[_MaterializedDirectoryEntry, ...]
     unreadable: bool = False
     timed_out: bool = False
+    timeout_wait_seconds: float = 0.0
 
 
 def _materialize_directory(path: Path) -> tuple[_MaterializedDirectoryEntry, ...]:
@@ -191,7 +213,14 @@ class _DirectoryEnumerationWorker:
     def __exit__(self, *_exc_info: object) -> None:
         self.close()
 
-    def enumerate(self, path: Path, *, timeout_seconds: float) -> _DirectoryEnumeration:
+    def enumerate(
+        self,
+        path: Path,
+        *,
+        timeout_seconds: float,
+        replace_after_timeout: bool = True,
+        monotonic_clock: Callable[[], float] = monotonic,
+    ) -> _DirectoryEnumeration:
         if self._process is None or self._connection is None:
             raise StructuralCrawlWorkerError(
                 "semantic directory worker failed safely"
@@ -212,20 +241,35 @@ class _DirectoryEnumerationWorker:
                 "semantic directory worker failed safely"
             ) from error
 
-        deadline = monotonic() + timeout_seconds
+        started_at = monotonic_clock()
+        deadline = started_at + timeout_seconds
         entries: list[_MaterializedDirectoryEntry] = []
         while True:
-            remaining = deadline - monotonic()
+            remaining = deadline - monotonic_clock()
             if remaining <= 0:
-                self._replace()
-                return _DirectoryEnumeration(entries=(), timed_out=True)
+                timeout_wait_seconds = max(0.0, monotonic_clock() - started_at)
+                self._stop(graceful=False)
+                if replace_after_timeout:
+                    self.replace_after_timeout()
+                return _DirectoryEnumeration(
+                    entries=(),
+                    timed_out=True,
+                    timeout_wait_seconds=timeout_wait_seconds,
+                )
             ready = wait(
                 [self._connection, self._process.sentinel],
                 timeout=remaining,
             )
             if not ready:
-                self._replace()
-                return _DirectoryEnumeration(entries=(), timed_out=True)
+                timeout_wait_seconds = max(0.0, monotonic_clock() - started_at)
+                self._stop(graceful=False)
+                if replace_after_timeout:
+                    self.replace_after_timeout()
+                return _DirectoryEnumeration(
+                    entries=(),
+                    timed_out=True,
+                    timeout_wait_seconds=timeout_wait_seconds,
+                )
             if self._connection not in ready:
                 self._stop(graceful=False)
                 raise StructuralCrawlWorkerError(
@@ -313,6 +357,13 @@ class _DirectoryEnumerationWorker:
 
     def _replace(self) -> None:
         self._stop(graceful=False)
+        self._start()
+
+    def replace_after_timeout(self) -> None:
+        if self._process is not None or self._connection is not None:
+            raise StructuralCrawlWorkerError(
+                "semantic directory worker failed safely"
+            )
         self._start()
 
     def _stop(self, *, graceful: bool) -> None:
@@ -513,6 +564,7 @@ class StructuralCrawl:
     errors: tuple[StructuralCrawlError, ...]
     timed_out_directory_count: int = 0
     unreadable_directory_count: int = 0
+    consumed_timeout_wait_seconds: float = 0.0
 
 
 def crawl_local_structure(
@@ -521,10 +573,12 @@ def crawl_local_structure(
     prior_entries: tuple[StructuralEntry, ...] = (),
     *,
     directory_timeout_seconds: float = DEFAULT_DIRECTORY_TIMEOUT_SECONDS,
+    directory_timeout_budget_seconds: float = DEFAULT_DIRECTORY_TIMEOUT_BUDGET_SECONDS,
     _process_context: BaseContext | None = None,
     _enumerator: Callable[
         [Path], tuple[_MaterializedDirectoryEntry, ...]
     ] = _materialize_directory,
+    _monotonic: Callable[[], float] = monotonic,
 ) -> StructuralCrawl:
     root_path = _resolve_root(root)
     root_stat = _lstat(root_path)
@@ -549,6 +603,8 @@ def crawl_local_structure(
     errors: list[StructuralCrawlError] = []
     timed_out_directory_count = 0
     unreadable_directory_count = 0
+    consumed_timeout_wait_seconds = 0.0
+    timed_out_relative_hierarchies: list[str] = []
 
     def add_entry(
         path: Path,
@@ -624,11 +680,39 @@ def crawl_local_structure(
         timed_out_directory_count += int(timed_out)
 
     def walk(directory: Path, parent_node_id: str, relative_hierarchy: str) -> None:
+        nonlocal consumed_timeout_wait_seconds
+        remaining_budget = max(
+            0.0,
+            directory_timeout_budget_seconds - consumed_timeout_wait_seconds,
+        )
+        requested_timeout = min(directory_timeout_seconds, remaining_budget)
         enumeration = worker.enumerate(
             directory,
-            timeout_seconds=directory_timeout_seconds,
+            timeout_seconds=requested_timeout,
+            replace_after_timeout=False,
+            monotonic_clock=_monotonic,
         )
         if enumeration.timed_out:
+            consumed_timeout_wait_seconds = min(
+                directory_timeout_budget_seconds,
+                consumed_timeout_wait_seconds + enumeration.timeout_wait_seconds,
+            )
+            timed_out_relative_hierarchies.append(relative_hierarchy)
+            if consumed_timeout_wait_seconds >= directory_timeout_budget_seconds:
+                raise StructuralCrawlTimeoutBudgetError(
+                    source_id=source_id,
+                    timed_out_relative_hierarchies=tuple(
+                        timed_out_relative_hierarchies
+                    ),
+                    timed_out_directory_count=(
+                        timed_out_directory_count + 1
+                    ),
+                    unreadable_directory_count=(
+                        unreadable_directory_count + 1
+                    ),
+                    consumed_timeout_wait_seconds=consumed_timeout_wait_seconds,
+                )
+            worker.replace_after_timeout()
             if relative_hierarchy == ".":
                 raise StructuralCrawlRootTimeoutError(
                     "Structural crawl root timed out"
@@ -734,6 +818,7 @@ def crawl_local_structure(
         errors=tuple(errors),
         timed_out_directory_count=timed_out_directory_count,
         unreadable_directory_count=unreadable_directory_count,
+        consumed_timeout_wait_seconds=consumed_timeout_wait_seconds,
     )
 
 

@@ -96,6 +96,10 @@ no ready unit while status is incomplete or invalid, or user cancellation.
 Report only safe status and counts. Never expose managed payload content,
 locators, private URLs, credentials, or raw signal text.
 
+Also stop on aggregate directory timeout budget exhaustion. Do not retry or
+infer an exclusion; return to `$portfolio-source-governance` so it can request
+explicit user approval for any proposed common-ancestor exclusion.
+
 Never edit SQLite or managed receipts/manifests directly. Do not delete valid
 receipts, invent a second output schema, skip validation, force completion, or
 convert semantic completion into any later approval.

@@ -43,6 +43,7 @@ from portfolio_maker.domain.semantic_models import (
     SemanticNode,
     SemanticNodeDisposition,
     SemanticNodeKind,
+    stable_source_id,
 )
 from portfolio_maker.domain.models import SourceStatus, SourceType
 from portfolio_maker.infrastructure.extractors import extract_approved_text
@@ -50,6 +51,7 @@ from portfolio_maker.infrastructure.managed_files import (
     ensure_managed_directory,
     open_managed_directory,
     read_managed_bytes,
+    read_managed_relative_file,
     remove_managed_file,
     write_managed_text,
 )
@@ -68,9 +70,12 @@ from portfolio_maker.infrastructure.semantic_analyzers import (
 )
 from portfolio_maker.infrastructure.semantic_capsules import build_feature_capsules
 from portfolio_maker.infrastructure.semantic_crawler import (
+    MAX_DIRECTORY_TIMEOUT_BUDGET_SECONDS,
+    MIN_DIRECTORY_TIMEOUT_BUDGET_SECONDS,
     MAX_DIRECTORY_TIMEOUT_SECONDS,
     StructuralCrawlRootError,
     StructuralCrawlRootTimeoutError,
+    StructuralCrawlTimeoutBudgetError,
     StructuralCrawlWorkerError,
     StructuralEntry,
     crawl_local_structure,
@@ -191,6 +196,21 @@ _V2_INPUT_MANIFEST_KEYS = {
     "unreadable_directory_count",
     "manifest_sha256",
 }
+_TIMEOUT_REVIEW_KEYS = {
+    "version",
+    "status",
+    "policy_hash",
+    "root_source_id",
+    "directory_timeout_seconds",
+    "directory_timeout_budget_seconds",
+    "timed_out_directory_count",
+    "unreadable_directory_count",
+    "consumed_timeout_wait_seconds",
+    "timed_out_relative_hierarchies",
+    "reviewed_failure_sha256",
+    "review_sha256",
+}
+_MAX_TIMEOUT_REVIEW_BYTES = 262_144
 _WORK_PLAN_KEYS = {
     "version",
     "revision_id",
@@ -553,11 +573,25 @@ def _validated_directory_timeout(value: object) -> float:
     return float(value)
 
 
+def _validated_directory_timeout_budget(value: object) -> float:
+    if (
+        type(value) not in {int, float}
+        or not math.isfinite(value)
+        or value < MIN_DIRECTORY_TIMEOUT_BUDGET_SECONDS
+        or value > MAX_DIRECTORY_TIMEOUT_BUDGET_SECONDS
+    ):
+        raise SemanticIndexError("semantic index directory timeout budget is invalid")
+    return float(value)
+
+
 def prepare_semantic_index(
     request: PrepareSemanticIndexRequest,
 ) -> PrepareSemanticIndexResult:
     directory_timeout_seconds = _validated_directory_timeout(
         request.directory_timeout_seconds
+    )
+    directory_timeout_budget_seconds = _validated_directory_timeout_budget(
+        request.directory_timeout_budget_seconds
     )
     if not isinstance(request.chunk_size, int) or isinstance(request.chunk_size, bool) or request.chunk_size <= 0:
         raise SemanticIndexError("semantic index chunk size must be positive")
@@ -566,12 +600,39 @@ def prepare_semantic_index(
     paths.ensure()
     approval = load_approval(paths)
     _validate_approved_root(request.root, approval)
+    policy_hash = _policy_hash(approval)
     try:
         crawl = crawl_local_structure(
             request.root,
             approval,
             directory_timeout_seconds=directory_timeout_seconds,
+            directory_timeout_budget_seconds=directory_timeout_budget_seconds,
         )
+    except StructuralCrawlTimeoutBudgetError as error:
+        try:
+            _assert_timeout_review_root_is_current(paths, error.source_id)
+            _write_timeout_review(
+                paths,
+                status="approval_required",
+                policy_hash=policy_hash,
+                root_source_id=error.source_id,
+                directory_timeout_seconds=directory_timeout_seconds,
+                directory_timeout_budget_seconds=directory_timeout_budget_seconds,
+                timed_out_directory_count=error.timed_out_directory_count,
+                unreadable_directory_count=error.unreadable_directory_count,
+                consumed_timeout_wait_seconds=error.consumed_timeout_wait_seconds,
+                timed_out_relative_hierarchies=(
+                    error.timed_out_relative_hierarchies
+                ),
+                reviewed_failure_sha256=None,
+            )
+        except (OSError, SemanticIndexError) as review_error:
+            raise SemanticIndexError(
+                "semantic index crawl timeout review failed safely"
+            ) from review_error
+        raise SemanticIndexError(
+            "semantic index crawl timeout budget exhausted"
+        ) from error
     except StructuralCrawlRootTimeoutError as error:
         raise SemanticIndexError("semantic index root crawl timed out") from error
     except StructuralCrawlWorkerError as error:
@@ -581,9 +642,21 @@ def prepare_semantic_index(
     if not crawl.entries:
         raise SemanticIndexError("semantic index root contains no structural entries")
 
-    revision_id = uuid4().hex
     source_id = crawl.entries[0].source_id
-    policy_hash = _policy_hash(approval)
+    try:
+        timeout_review_update = _prepare_timeout_review_resolution(
+            paths,
+            policy_hash=policy_hash,
+            root_source_id=source_id,
+            directory_timeout_seconds=directory_timeout_seconds,
+            directory_timeout_budget_seconds=directory_timeout_budget_seconds,
+        )
+    except (OSError, SemanticIndexError) as error:
+        raise SemanticIndexError(
+            "semantic index crawl timeout review failed safely"
+        ) from error
+
+    revision_id = uuid4().hex
     repository = SQLiteRepository(paths.db_path)
     repository.initialize()
     approved_evidence_by_source_uri = _approved_local_evidence_by_source_uri(
@@ -660,6 +733,7 @@ def prepare_semantic_index(
             revision_id=revision_id,
             structural_texts=structural_texts,
             locator_texts=locator_texts,
+            timeout_review_update=timeout_review_update,
         )
     except Exception:
         repository.fail_semantic_revision(revision_id)
@@ -679,6 +753,7 @@ def prepare_semantic_index(
         analysis_target_count=plan.analysis_target_count,
         structural_only_count=plan.structural_owner_count,
         directory_timeout_seconds=directory_timeout_seconds,
+        directory_timeout_budget_seconds=directory_timeout_budget_seconds,
         timed_out_directory_count=crawl.timed_out_directory_count,
         unreadable_directory_count=crawl.unreadable_directory_count,
     )
@@ -2405,6 +2480,278 @@ def _current_policy_hash(paths: WorkspacePaths) -> str:
     return _policy_hash(approval)
 
 
+def read_semantic_crawl_timeout_review(
+    workspace: Path,
+    root: Path,
+) -> dict[str, object] | None:
+    paths = WorkspacePaths.from_root(workspace)
+    try:
+        approval = load_approval(paths)
+    except (ApprovalMissingError, ApprovalFormatError) as error:
+        raise SemanticIndexError("semantic index approval is unavailable") from error
+    _validate_approved_root(root, approval)
+    review = _read_timeout_review(paths)
+    if review is None:
+        return None
+    if (
+        review["policy_hash"] != _policy_hash(approval)
+        or review["root_source_id"] != _root_source_id(root)
+    ):
+        raise SemanticIndexError("semantic crawl timeout review is stale")
+    return review
+
+
+def _root_source_id(root: Path) -> str:
+    try:
+        metadata = root.lstat()
+    except OSError as error:
+        raise SemanticIndexError("semantic index root is invalid") from error
+    if stat.S_ISLNK(metadata.st_mode):
+        raise SemanticIndexError("semantic index root is invalid")
+    if type(metadata.st_dev) is int and type(metadata.st_ino) is int and metadata.st_ino > 0:
+        provider_key = f"{metadata.st_dev}:{metadata.st_ino}"
+    else:
+        provider_key = "."
+    return stable_source_id("local", provider_key)
+
+
+def _write_timeout_review(
+    paths: WorkspacePaths,
+    *,
+    status: str,
+    policy_hash: str,
+    root_source_id: str,
+    directory_timeout_seconds: float,
+    directory_timeout_budget_seconds: float,
+    timed_out_directory_count: int,
+    unreadable_directory_count: int,
+    consumed_timeout_wait_seconds: float,
+    timed_out_relative_hierarchies: tuple[str, ...],
+    reviewed_failure_sha256: str | None,
+) -> str:
+    content, review_sha256 = _timeout_review_text(
+        status=status,
+        policy_hash=policy_hash,
+        root_source_id=root_source_id,
+        directory_timeout_seconds=directory_timeout_seconds,
+        directory_timeout_budget_seconds=directory_timeout_budget_seconds,
+        timed_out_directory_count=timed_out_directory_count,
+        unreadable_directory_count=unreadable_directory_count,
+        consumed_timeout_wait_seconds=consumed_timeout_wait_seconds,
+        timed_out_relative_hierarchies=timed_out_relative_hierarchies,
+        reviewed_failure_sha256=reviewed_failure_sha256,
+    )
+    write_managed_text(paths.semantic_crawl_timeout_review_path, content)
+    persisted = _read_timeout_review(paths)
+    if persisted is None or persisted["review_sha256"] != review_sha256:
+        raise SemanticIndexError("semantic crawl timeout review is invalid")
+    return review_sha256
+
+
+def _timeout_review_text(
+    *,
+    status: str,
+    policy_hash: str,
+    root_source_id: str,
+    directory_timeout_seconds: float,
+    directory_timeout_budget_seconds: float,
+    timed_out_directory_count: int,
+    unreadable_directory_count: int,
+    consumed_timeout_wait_seconds: float,
+    timed_out_relative_hierarchies: tuple[str, ...],
+    reviewed_failure_sha256: str | None,
+) -> tuple[str, str]:
+    unsigned: dict[str, object] = {
+        "version": 1,
+        "status": status,
+        "policy_hash": policy_hash,
+        "root_source_id": root_source_id,
+        "directory_timeout_seconds": directory_timeout_seconds,
+        "directory_timeout_budget_seconds": directory_timeout_budget_seconds,
+        "timed_out_directory_count": timed_out_directory_count,
+        "unreadable_directory_count": unreadable_directory_count,
+        "consumed_timeout_wait_seconds": consumed_timeout_wait_seconds,
+        "timed_out_relative_hierarchies": list(
+            sorted(set(timed_out_relative_hierarchies))
+        ),
+        "reviewed_failure_sha256": reviewed_failure_sha256,
+    }
+    review_sha256 = hashlib.sha256(
+        _canonical_json(unsigned).encode("utf-8")
+    ).hexdigest()
+    review = {**unsigned, "review_sha256": review_sha256}
+    _validate_timeout_review(review)
+    return _canonical_json(review), review_sha256
+
+
+def _read_timeout_review(paths: WorkspacePaths) -> dict[str, object] | None:
+    snapshot = _read_timeout_review_snapshot(paths)
+    return None if snapshot is None else snapshot[0]
+
+
+def _read_timeout_review_snapshot(
+    paths: WorkspacePaths,
+) -> tuple[dict[str, object], str] | None:
+    try:
+        snapshot = read_managed_relative_file(
+            paths.root,
+            Path("reviews") / paths.semantic_crawl_timeout_review_path.name,
+        )
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise SemanticIndexError("semantic crawl timeout review is invalid") from error
+    if snapshot.size > _MAX_TIMEOUT_REVIEW_BYTES:
+        raise SemanticIndexError("semantic crawl timeout review is invalid")
+    review = _decode_canonical_object(
+        snapshot.content,
+        "semantic crawl timeout review",
+    )
+    _validate_timeout_review(review)
+    return review, snapshot.content.decode("utf-8")
+
+
+@dataclass(frozen=True)
+class _TimeoutReviewUpdate:
+    previous_text: str
+    resolved_text: str
+
+
+def _prepare_timeout_review_resolution(
+    paths: WorkspacePaths,
+    *,
+    policy_hash: str,
+    root_source_id: str,
+    directory_timeout_seconds: float,
+    directory_timeout_budget_seconds: float,
+) -> _TimeoutReviewUpdate | None:
+    prior_snapshot = _read_timeout_review_snapshot(paths)
+    if prior_snapshot is None:
+        return None
+    prior, previous_text = prior_snapshot
+    _assert_timeout_review_root_is_current(paths, root_source_id, prior=prior)
+    reviewed_failure_sha256: str | None = None
+    if prior["status"] == "approval_required":
+        reviewed_failure_sha256 = str(prior["review_sha256"])
+    elif prior["reviewed_failure_sha256"] is not None:
+        reviewed_failure_sha256 = str(prior["reviewed_failure_sha256"])
+    resolved_text, _review_sha256 = _timeout_review_text(
+        status="resolved",
+        policy_hash=policy_hash,
+        root_source_id=root_source_id,
+        directory_timeout_seconds=directory_timeout_seconds,
+        directory_timeout_budget_seconds=directory_timeout_budget_seconds,
+        timed_out_directory_count=0,
+        unreadable_directory_count=0,
+        consumed_timeout_wait_seconds=0.0,
+        timed_out_relative_hierarchies=(),
+        reviewed_failure_sha256=reviewed_failure_sha256,
+    )
+    return _TimeoutReviewUpdate(
+        previous_text=previous_text,
+        resolved_text=resolved_text,
+    )
+
+
+def _assert_timeout_review_root_is_current(
+    paths: WorkspacePaths,
+    root_source_id: str,
+    *,
+    prior: dict[str, object] | None = None,
+) -> None:
+    current = _read_timeout_review(paths) if prior is None else prior
+    if current is not None and current["root_source_id"] != root_source_id:
+        raise SemanticIndexError("semantic crawl timeout review is stale")
+
+
+def _validate_timeout_review(review: dict[str, object]) -> None:
+    unsigned = dict(review)
+    review_sha256 = unsigned.pop("review_sha256", None)
+    timed_out_relative_hierarchies = review.get(
+        "timed_out_relative_hierarchies"
+    )
+    reviewed_failure_sha256 = review.get("reviewed_failure_sha256")
+    status = review.get("status")
+    if (
+        set(review) != _TIMEOUT_REVIEW_KEYS
+        or type(review.get("version")) is not int
+        or review.get("version") != 1
+        or status not in {"approval_required", "resolved"}
+        or not _is_sha256(review.get("policy_hash"))
+        or not _is_source_id(review.get("root_source_id"))
+        or not _is_valid_directory_timeout(
+            review.get("directory_timeout_seconds")
+        )
+        or not _is_valid_directory_timeout_budget(
+            review.get("directory_timeout_budget_seconds")
+        )
+        or not _is_nonnegative_int(review.get("timed_out_directory_count"))
+        or not _is_nonnegative_int(review.get("unreadable_directory_count"))
+        or review["timed_out_directory_count"]
+        > review["unreadable_directory_count"]
+        or type(review.get("consumed_timeout_wait_seconds"))
+        not in {int, float}
+        or not math.isfinite(review["consumed_timeout_wait_seconds"])
+        or review["consumed_timeout_wait_seconds"] < 0
+        or review["consumed_timeout_wait_seconds"]
+        > review["directory_timeout_budget_seconds"]
+        or type(timed_out_relative_hierarchies) is not list
+        or timed_out_relative_hierarchies
+        != sorted(set(timed_out_relative_hierarchies))
+        or not all(
+            _is_valid_timeout_review_relative_hierarchy(value)
+            for value in timed_out_relative_hierarchies
+        )
+        or reviewed_failure_sha256 is not None
+        and not _is_sha256(reviewed_failure_sha256)
+        or not _is_sha256(review_sha256)
+        or hashlib.sha256(_canonical_json(unsigned).encode("utf-8")).hexdigest()
+        != review_sha256
+        or status == "approval_required"
+        and (
+            not timed_out_relative_hierarchies
+            or review["timed_out_directory_count"]
+            != len(timed_out_relative_hierarchies)
+            or review["consumed_timeout_wait_seconds"]
+            != review["directory_timeout_budget_seconds"]
+            or reviewed_failure_sha256 is not None
+        )
+        or status == "resolved"
+        and (
+            timed_out_relative_hierarchies
+            or review["timed_out_directory_count"] != 0
+            or review["unreadable_directory_count"] != 0
+            or review["consumed_timeout_wait_seconds"] != 0.0
+        )
+    ):
+        raise SemanticIndexError("semantic crawl timeout review is invalid")
+
+
+def _is_valid_directory_timeout_budget(value: object) -> bool:
+    return (
+        type(value) in {int, float}
+        and math.isfinite(value)
+        and MIN_DIRECTORY_TIMEOUT_BUDGET_SECONDS <= value
+        <= MAX_DIRECTORY_TIMEOUT_BUDGET_SECONDS
+    )
+
+
+def _is_valid_timeout_review_relative_hierarchy(value: object) -> bool:
+    if not isinstance(value, str) or not value or contains_unicode_control(value):
+        return False
+    if value == ".":
+        return True
+    return (
+        "\\" not in value
+        and not value.startswith("/")
+        and all(part not in {"", ".", ".."} for part in value.split("/"))
+    )
+
+
+def _is_source_id(value: object) -> bool:
+    return isinstance(value, str) and _FINGERPRINT.fullmatch(value) is not None
+
+
 def _redact_locators(value: str) -> str:
     value = _LOCATOR_VALUE.sub(r"\1[REDACTED]", value)
     value = _CREDENTIAL_VALUE.sub(r"\1[REDACTED]", value)
@@ -2428,6 +2775,7 @@ def _publish_semantic_input(
     revision_id: str,
     structural_texts: tuple[str, ...],
     locator_texts: tuple[str, ...],
+    timeout_review_update: _TimeoutReviewUpdate | None,
 ) -> None:
     with repository._repository_critical_section():
         ensure_managed_directory(paths.semantic_index_dir)
@@ -2437,6 +2785,13 @@ def _publish_semantic_input(
         ensure_managed_directory(structural_dir)
         ensure_managed_directory(locator_dir)
         previous = _read_published_semantic_input_unlocked(paths)
+        if timeout_review_update is not None:
+            current_review = _read_timeout_review_snapshot(paths)
+            if (
+                current_review is None
+                or current_review[1] != timeout_review_update.previous_text
+            ):
+                raise SemanticIndexError("semantic crawl timeout review is stale")
         current = {
             paths.semantic_index_input_dir / f"chunk-{index:04}.json": chunk_text
             for index, chunk_text in enumerate(chunk_texts, start=1)
@@ -2460,9 +2815,35 @@ def _publish_semantic_input(
             for path in previous.chunk_texts.keys() - current.keys():
                 remove_managed_file(path)
             write_managed_text(paths.semantic_work_plan_path, work_plan_text)
+            if timeout_review_update is not None:
+                write_managed_text(
+                    paths.semantic_crawl_timeout_review_path,
+                    timeout_review_update.resolved_text,
+                )
+                resolved_review = _read_timeout_review_snapshot(paths)
+                if (
+                    resolved_review is None
+                    or resolved_review[1]
+                    != timeout_review_update.resolved_text
+                ):
+                    raise SemanticIndexError(
+                        "semantic crawl timeout review is invalid"
+                    )
             write_managed_text(paths.semantic_index_manifest_path, manifest_text)
         except Exception:
-            _restore_published_semantic_input(paths, previous, current)
+            restore_error: Exception | None = None
+            try:
+                _restore_published_semantic_input(paths, previous, current)
+            except Exception as error:
+                restore_error = error
+            try:
+                _restore_timeout_review(paths, timeout_review_update)
+            except Exception as error:
+                restore_error = restore_error or error
+            if restore_error is not None:
+                raise SemanticIndexError(
+                    "semantic index publication failed safely"
+                ) from restore_error
             raise
 
 
@@ -2566,6 +2947,18 @@ def _restore_published_semantic_input(
         remove_managed_file(paths.semantic_index_manifest_path, missing_ok=True)
     else:
         write_managed_text(paths.semantic_index_manifest_path, previous.manifest_text)
+
+
+def _restore_timeout_review(
+    paths: WorkspacePaths,
+    update: _TimeoutReviewUpdate | None,
+) -> None:
+    if update is None:
+        return
+    write_managed_text(paths.semantic_crawl_timeout_review_path, update.previous_text)
+    restored = _read_timeout_review_snapshot(paths)
+    if restored is None or restored[1] != update.previous_text:
+        raise SemanticIndexError("semantic crawl timeout review is invalid")
 
 
 def _canonical_json(payload: dict[str, object]) -> str:

@@ -150,6 +150,7 @@ class PrepareSemanticIndexRequest:
     root: Path
     chunk_size: int = 100
     directory_timeout_seconds: float = 30.0
+    directory_timeout_budget_seconds: float = 120.0
 
 
 @dataclass(frozen=True)
@@ -164,6 +165,7 @@ class PrepareSemanticIndexResult:
     analysis_target_count: int
     structural_only_count: int
     directory_timeout_seconds: float = 30.0
+    directory_timeout_budget_seconds: float = 120.0
     timed_out_directory_count: int = 0
     unreadable_directory_count: int = 0
 

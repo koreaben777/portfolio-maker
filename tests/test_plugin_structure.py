@@ -295,3 +295,30 @@ def test_repository_shim_routes_resumable_v2_and_chunked_v3() -> None:
     assert positions[1] < approval_position < positions[2]
     assert "codex-semantic-v2" in shim
     assert "--version v2" not in shim
+
+
+def test_timeout_budget_review_requires_source_governance_approval_gate() -> None:
+    governance = Path("skills/portfolio-source-governance/SKILL.md").read_text(
+        encoding="utf-8"
+    )
+    router = Path("skills/portfolio-maker/SKILL.md").read_text(encoding="utf-8")
+    semantic = Path("skills/portfolio-semantic-index/SKILL.md").read_text(
+        encoding="utf-8"
+    )
+    shim = Path(".agents/skills/portfolio-maker/SKILL.md").read_text(
+        encoding="utf-8"
+    )
+
+    for phrase in (
+        "semantic-crawl-timeout-review.json",
+        "common ancestor",
+        "explicit user approval",
+        "source-approval.json",
+        "must not rerun",
+        "Library/Containers",
+    ):
+        assert phrase.casefold() in governance.casefold()
+    assert "timeout budget" in router.casefold()
+    assert "source-governance" in router.casefold()
+    assert "timeout budget" in semantic.casefold()
+    assert "timeout budget" in shim.casefold()

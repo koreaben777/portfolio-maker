@@ -100,6 +100,12 @@ portfolio-maker prepare-semantic-index --workspace . --root <confirmed-root>
 portfolio-maker semantic-index-status --workspace . --format json
 ```
 
+The directory timeout budget defaults to 120 seconds of timed-out directory
+wait and can be bounded with `--directory-timeout-budget-seconds`. On its
+controlled exhaustion, do not rerun or edit source approval automatically;
+return to `$portfolio-source-governance` and wait for explicit user approval of
+any narrow common-ancestor exclusion proposal.
+
 Report `Work units` and `Managed input bytes`, then **WAIT FOR EXPLICIT USER
 APPROVAL** before requesting or reading semantic work. This approval is only
 for managed semantic analysis; it is not source, artifact, project, delivery,

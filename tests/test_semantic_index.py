@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import multiprocessing
+import os
 import sqlite3
 import threading
 from pathlib import Path
@@ -1013,6 +1014,555 @@ def test_prepare_process_start_oserror_is_controlled_without_publication(
     assert process.closed is True
     assert context.parent.closed is True
     assert context.child.closed is True
+
+
+@pytest.mark.parametrize(
+    "value",
+    (True, 0, -1, 0.009, float("nan"), float("inf"), 3600.1),
+)
+def test_prepare_rejects_invalid_directory_timeout_budget_before_workspace_creation(
+    workspace: Path,
+    tmp_path: Path,
+    value: object,
+) -> None:
+    root = tmp_path / "approved-root"
+    root.mkdir()
+
+    with pytest.raises(
+        SemanticIndexError,
+        match="^semantic index directory timeout budget is invalid$",
+    ):
+        prepare_semantic_index(
+            PrepareSemanticIndexRequest(
+                workspace=workspace,
+                root=root,
+                directory_timeout_budget_seconds=value,
+            )
+        )
+
+    assert not WorkspacePaths.from_root(workspace).root.exists()
+
+
+def test_prepare_budget_exhaustion_publishes_only_private_timeout_review(
+    workspace: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "approved-root"
+    root.mkdir()
+    approve_root(workspace, root)
+
+    def exhaust_budget(*_args, **_kwargs):
+        raise semantic_index_module.StructuralCrawlTimeoutBudgetError(
+            source_id=semantic_index_module._root_source_id(root),
+            timed_out_relative_hierarchies=("blocked",),
+            timed_out_directory_count=1,
+            unreadable_directory_count=1,
+            consumed_timeout_wait_seconds=0.01,
+        )
+
+    monkeypatch.setattr(semantic_index_module, "crawl_local_structure", exhaust_budget)
+
+    with pytest.raises(
+        SemanticIndexError,
+        match="^semantic index crawl timeout budget exhausted$",
+    ):
+        prepare_semantic_index(
+            PrepareSemanticIndexRequest(
+                workspace=workspace,
+                root=root,
+                directory_timeout_budget_seconds=0.01,
+            )
+        )
+
+    paths = WorkspacePaths.from_root(workspace)
+    review_path = paths.reviews_dir / "semantic-crawl-timeout-review.json"
+    review = json.loads(review_path.read_text(encoding="utf-8"))
+    assert review["status"] == "approval_required"
+    assert review["timed_out_relative_hierarchies"] == ["blocked"]
+    assert not paths.semantic_index_manifest_path.exists()
+    assert not paths.semantic_work_plan_path.exists()
+    assert not paths.semantic_index_report_path.exists()
+    assert not paths.db_path.exists()
+
+
+def test_timeout_review_rejects_hash_symlink_and_stale_bindings(
+    workspace: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "approved-root"
+    root.mkdir()
+    approve_root(workspace, root)
+    source_id = semantic_index_module._root_source_id(root)
+
+    def exhaust_budget(*_args, **_kwargs):
+        raise semantic_index_module.StructuralCrawlTimeoutBudgetError(
+            source_id=source_id,
+            timed_out_relative_hierarchies=("blocked/private-marker",),
+            timed_out_directory_count=1,
+            unreadable_directory_count=1,
+            consumed_timeout_wait_seconds=0.01,
+        )
+
+    monkeypatch.setattr(semantic_index_module, "crawl_local_structure", exhaust_budget)
+    with pytest.raises(SemanticIndexError, match="timeout budget exhausted"):
+        prepare_semantic_index(
+            PrepareSemanticIndexRequest(
+                workspace=workspace,
+                root=root,
+                directory_timeout_budget_seconds=0.01,
+            )
+        )
+
+    paths = WorkspacePaths.from_root(workspace)
+    review_path = paths.semantic_crawl_timeout_review_path
+    review = semantic_index_module.read_semantic_crawl_timeout_review(workspace, root)
+    assert review is not None
+    assert review["timed_out_relative_hierarchies"] == ["blocked/private-marker"]
+
+    tampered = dict(review)
+    tampered["timed_out_directory_count"] = 2
+    review_path.write_text(
+        semantic_index_module._canonical_json(tampered),
+        encoding="utf-8",
+    )
+    with pytest.raises(SemanticIndexError, match="timeout review is invalid"):
+        semantic_index_module.read_semantic_crawl_timeout_review(workspace, root)
+
+    review_path.unlink()
+    semantic_index_module._write_timeout_review(
+        paths,
+        status="approval_required",
+        policy_hash="0" * 64,
+        root_source_id=source_id,
+        directory_timeout_seconds=30.0,
+        directory_timeout_budget_seconds=0.01,
+        timed_out_directory_count=1,
+        unreadable_directory_count=1,
+        consumed_timeout_wait_seconds=0.01,
+        timed_out_relative_hierarchies=("blocked",),
+        reviewed_failure_sha256=None,
+    )
+    with pytest.raises(SemanticIndexError, match="timeout review is stale"):
+        semantic_index_module.read_semantic_crawl_timeout_review(workspace, root)
+
+    other_root = tmp_path / "other-approved-root"
+    other_root.mkdir()
+    approval_payload = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    approval_payload["approved_source_uris"] = [other_root.resolve().as_uri()]
+    paths.approval_path.write_text(
+        json.dumps(approval_payload),
+        encoding="utf-8",
+    )
+    review_path.unlink()
+    semantic_index_module._write_timeout_review(
+        paths,
+        status="approval_required",
+        policy_hash=semantic_index_module._policy_hash(load_approval(paths)),
+        root_source_id=source_id,
+        directory_timeout_seconds=30.0,
+        directory_timeout_budget_seconds=0.01,
+        timed_out_directory_count=1,
+        unreadable_directory_count=1,
+        consumed_timeout_wait_seconds=0.01,
+        timed_out_relative_hierarchies=("blocked",),
+        reviewed_failure_sha256=None,
+    )
+    with pytest.raises(SemanticIndexError, match="timeout review is stale"):
+        semantic_index_module.read_semantic_crawl_timeout_review(workspace, other_root)
+
+    review_path.unlink()
+    semantic_index_module._write_timeout_review(
+        paths,
+        status="approval_required",
+        policy_hash=semantic_index_module._policy_hash(load_approval(paths)),
+        root_source_id=semantic_index_module._root_source_id(other_root),
+        directory_timeout_seconds=30.0,
+        directory_timeout_budget_seconds=0.01,
+        timed_out_directory_count=1,
+        unreadable_directory_count=1,
+        consumed_timeout_wait_seconds=0.01,
+        timed_out_relative_hierarchies=("blocked",),
+        reviewed_failure_sha256=None,
+    )
+    approval_payload["excluded_file_patterns"] = ["*.tmp"]
+    paths.approval_path.write_text(
+        json.dumps(approval_payload),
+        encoding="utf-8",
+    )
+    with pytest.raises(SemanticIndexError, match="timeout review is stale"):
+        semantic_index_module.read_semantic_crawl_timeout_review(workspace, other_root)
+
+    review_path.write_text(
+        '{"version":1,"version":1}',
+        encoding="utf-8",
+    )
+    with pytest.raises(SemanticIndexError, match="timeout review is invalid"):
+        semantic_index_module.read_semantic_crawl_timeout_review(
+            workspace,
+            other_root,
+        )
+
+    review_path.unlink()
+    target = tmp_path / "outside-review.json"
+    target.write_text("{}", encoding="utf-8")
+    review_path.symlink_to(target)
+    with pytest.raises(SemanticIndexError, match="timeout review is invalid"):
+        semantic_index_module.read_semantic_crawl_timeout_review(
+            workspace,
+            other_root,
+        )
+
+
+def test_timeout_failure_does_not_replace_other_root_review(
+    workspace: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_root = tmp_path / "first-approved-root"
+    second_root = tmp_path / "second-approved-root"
+    first_root.mkdir()
+    second_root.mkdir()
+    approve_root(workspace, first_root)
+    paths = WorkspacePaths.from_root(workspace)
+    paths.ensure()
+    semantic_index_module._write_timeout_review(
+        paths,
+        status="approval_required",
+        policy_hash=semantic_index_module._policy_hash(load_approval(paths)),
+        root_source_id=semantic_index_module._root_source_id(first_root),
+        directory_timeout_seconds=30.0,
+        directory_timeout_budget_seconds=0.01,
+        timed_out_directory_count=1,
+        unreadable_directory_count=1,
+        consumed_timeout_wait_seconds=0.01,
+        timed_out_relative_hierarchies=("first-private-marker",),
+        reviewed_failure_sha256=None,
+    )
+    before = paths.semantic_crawl_timeout_review_path.read_text(encoding="utf-8")
+    approval_payload = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    approval_payload["approved_source_uris"] = [second_root.resolve().as_uri()]
+    paths.approval_path.write_text(
+        json.dumps(approval_payload),
+        encoding="utf-8",
+    )
+
+    def exhaust_budget(*_args, **_kwargs):
+        raise semantic_index_module.StructuralCrawlTimeoutBudgetError(
+            source_id=semantic_index_module._root_source_id(second_root),
+            timed_out_relative_hierarchies=("second-private-marker",),
+            timed_out_directory_count=1,
+            unreadable_directory_count=1,
+            consumed_timeout_wait_seconds=0.01,
+        )
+
+    monkeypatch.setattr(semantic_index_module, "crawl_local_structure", exhaust_budget)
+    with pytest.raises(
+        SemanticIndexError,
+        match="^semantic index crawl timeout review failed safely$",
+    ):
+        prepare_semantic_index(
+            PrepareSemanticIndexRequest(
+                workspace=workspace,
+                root=second_root,
+                directory_timeout_budget_seconds=0.01,
+            )
+        )
+
+    assert paths.semantic_crawl_timeout_review_path.read_text(encoding="utf-8") == before
+    assert not paths.semantic_index_manifest_path.exists()
+
+
+def test_timeout_review_rejects_extra_malformed_and_hardlinked_files(
+    workspace: Path,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "approved-root"
+    root.mkdir()
+    approve_root(workspace, root)
+    paths = WorkspacePaths.from_root(workspace)
+    paths.ensure()
+
+    def write_valid_review() -> dict[str, object]:
+        semantic_index_module._write_timeout_review(
+            paths,
+            status="approval_required",
+            policy_hash=semantic_index_module._policy_hash(load_approval(paths)),
+            root_source_id=semantic_index_module._root_source_id(root),
+            directory_timeout_seconds=30.0,
+            directory_timeout_budget_seconds=0.01,
+            timed_out_directory_count=1,
+            unreadable_directory_count=1,
+            consumed_timeout_wait_seconds=0.01,
+            timed_out_relative_hierarchies=("blocked",),
+            reviewed_failure_sha256=None,
+        )
+        review = semantic_index_module.read_semantic_crawl_timeout_review(
+            workspace,
+            root,
+        )
+        assert review is not None
+        return review
+
+    review_path = paths.semantic_crawl_timeout_review_path
+    review_path.write_text("not-json", encoding="utf-8")
+    with pytest.raises(SemanticIndexError, match="timeout review is invalid"):
+        semantic_index_module.read_semantic_crawl_timeout_review(workspace, root)
+
+    review = write_valid_review()
+    unsigned = dict(review)
+    unsigned.pop("review_sha256")
+    unsigned["unexpected"] = "value"
+    extra_review = {
+        **unsigned,
+        "review_sha256": hashlib.sha256(
+            semantic_index_module._canonical_json(unsigned).encode("utf-8")
+        ).hexdigest(),
+    }
+    review_path.write_text(
+        semantic_index_module._canonical_json(extra_review),
+        encoding="utf-8",
+    )
+    with pytest.raises(SemanticIndexError, match="timeout review is invalid"):
+        semantic_index_module.read_semantic_crawl_timeout_review(workspace, root)
+
+    write_valid_review()
+    hardlink = tmp_path / "review-hardlink"
+    os.link(review_path, hardlink)
+    with pytest.raises(SemanticIndexError, match="timeout review is invalid"):
+        semantic_index_module.read_semantic_crawl_timeout_review(workspace, root)
+
+
+def test_successful_prepare_resolves_timeout_review_without_reusing_hierarchy(
+    workspace: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "approved-root"
+    root.mkdir()
+    (root / "README.md").write_text("evidence", encoding="utf-8")
+    approve_root(workspace, root)
+    source_id = semantic_index_module._root_source_id(root)
+    original_crawl = semantic_index_module.crawl_local_structure
+
+    def exhaust_budget(*_args, **_kwargs):
+        raise semantic_index_module.StructuralCrawlTimeoutBudgetError(
+            source_id=source_id,
+            timed_out_relative_hierarchies=("private-marker",),
+            timed_out_directory_count=1,
+            unreadable_directory_count=1,
+            consumed_timeout_wait_seconds=0.01,
+        )
+
+    monkeypatch.setattr(semantic_index_module, "crawl_local_structure", exhaust_budget)
+    with pytest.raises(SemanticIndexError, match="timeout budget exhausted"):
+        prepare_semantic_index(
+            PrepareSemanticIndexRequest(
+                workspace=workspace,
+                root=root,
+                directory_timeout_budget_seconds=0.01,
+            )
+        )
+
+    failure_review = semantic_index_module.read_semantic_crawl_timeout_review(
+        workspace,
+        root,
+    )
+    assert failure_review is not None
+    monkeypatch.setattr(semantic_index_module, "crawl_local_structure", original_crawl)
+
+    prepared = prepare_semantic_index(
+        PrepareSemanticIndexRequest(workspace=workspace, root=root)
+    )
+
+    resolved = semantic_index_module.read_semantic_crawl_timeout_review(workspace, root)
+    assert resolved is not None
+    assert resolved["status"] == "resolved"
+    assert resolved["timed_out_relative_hierarchies"] == []
+    assert resolved["reviewed_failure_sha256"] == failure_review["review_sha256"]
+    assert "private-marker" not in prepared.manifest_path.read_text(encoding="utf-8")
+
+
+def test_prepare_analysis_failure_preserves_timeout_review_bytes(
+    workspace: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "approved-root"
+    root.mkdir()
+    (root / "README.md").write_text("evidence", encoding="utf-8")
+    approve_root(workspace, root)
+    paths = WorkspacePaths.from_root(workspace)
+    paths.ensure()
+    semantic_index_module._write_timeout_review(
+        paths,
+        status="approval_required",
+        policy_hash=semantic_index_module._policy_hash(load_approval(paths)),
+        root_source_id=semantic_index_module._root_source_id(root),
+        directory_timeout_seconds=30.0,
+        directory_timeout_budget_seconds=0.01,
+        timed_out_directory_count=1,
+        unreadable_directory_count=1,
+        consumed_timeout_wait_seconds=0.01,
+        timed_out_relative_hierarchies=("private-marker",),
+        reviewed_failure_sha256=None,
+    )
+    before = paths.semantic_crawl_timeout_review_path.read_bytes()
+    monkeypatch.setattr(
+        semantic_index_module,
+        "_analyze_capsule_inputs",
+        lambda *_args: (_ for _ in ()).throw(
+            SemanticIndexError("synthetic analysis failure")
+        ),
+    )
+
+    with pytest.raises(SemanticIndexError, match="synthetic analysis failure"):
+        prepare_semantic_index(
+            PrepareSemanticIndexRequest(workspace=workspace, root=root)
+        )
+
+    assert paths.semantic_crawl_timeout_review_path.read_bytes() == before
+    assert not paths.semantic_index_manifest_path.exists()
+    assert not paths.semantic_work_plan_path.exists()
+    assert not paths.semantic_index_report_path.exists()
+
+
+def test_prepare_publish_failure_restores_timeout_review_bytes(
+    workspace: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "approved-root"
+    root.mkdir()
+    (root / "README.md").write_text("evidence", encoding="utf-8")
+    approve_root(workspace, root)
+    paths = WorkspacePaths.from_root(workspace)
+    paths.ensure()
+    semantic_index_module._write_timeout_review(
+        paths,
+        status="approval_required",
+        policy_hash=semantic_index_module._policy_hash(load_approval(paths)),
+        root_source_id=semantic_index_module._root_source_id(root),
+        directory_timeout_seconds=30.0,
+        directory_timeout_budget_seconds=0.01,
+        timed_out_directory_count=1,
+        unreadable_directory_count=1,
+        consumed_timeout_wait_seconds=0.01,
+        timed_out_relative_hierarchies=("private-marker",),
+        reviewed_failure_sha256=None,
+    )
+    before = paths.semantic_crawl_timeout_review_path.read_bytes()
+    original_write = semantic_index_module.write_managed_text
+    failed = False
+
+    def fail_manifest_once(path: Path, content: str, *, overwrite: bool = True) -> Path:
+        nonlocal failed
+        if path == paths.semantic_index_manifest_path and not failed:
+            failed = True
+            raise OSError("synthetic manifest publication failure")
+        return original_write(path, content, overwrite=overwrite)
+
+    monkeypatch.setattr(semantic_index_module, "write_managed_text", fail_manifest_once)
+    with pytest.raises(OSError, match="synthetic manifest publication failure"):
+        prepare_semantic_index(
+            PrepareSemanticIndexRequest(workspace=workspace, root=root)
+        )
+
+    assert paths.semantic_crawl_timeout_review_path.read_bytes() == before
+    assert not paths.semantic_index_manifest_path.exists()
+
+
+def test_prepare_publish_failure_without_prior_review_leaves_no_review(
+    workspace: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "approved-root"
+    root.mkdir()
+    (root / "README.md").write_text("evidence", encoding="utf-8")
+    approve_root(workspace, root)
+    paths = WorkspacePaths.from_root(workspace)
+    original_write = semantic_index_module.write_managed_text
+    failed = False
+
+    def fail_manifest_once(path: Path, content: str, *, overwrite: bool = True) -> Path:
+        nonlocal failed
+        if path == paths.semantic_index_manifest_path and not failed:
+            failed = True
+            raise OSError("synthetic manifest publication failure")
+        return original_write(path, content, overwrite=overwrite)
+
+    monkeypatch.setattr(semantic_index_module, "write_managed_text", fail_manifest_once)
+    with pytest.raises(OSError, match="synthetic manifest publication failure"):
+        prepare_semantic_index(
+            PrepareSemanticIndexRequest(workspace=workspace, root=root)
+        )
+
+    assert not paths.semantic_crawl_timeout_review_path.exists()
+    assert not paths.semantic_index_manifest_path.exists()
+
+
+def test_prepare_resolved_review_write_failure_has_no_semantic_publication(
+    workspace: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "approved-root"
+    root.mkdir()
+    (root / "README.md").write_text("evidence", encoding="utf-8")
+    approve_root(workspace, root)
+    paths = WorkspacePaths.from_root(workspace)
+    paths.ensure()
+    semantic_index_module._write_timeout_review(
+        paths,
+        status="approval_required",
+        policy_hash=semantic_index_module._policy_hash(load_approval(paths)),
+        root_source_id=semantic_index_module._root_source_id(root),
+        directory_timeout_seconds=30.0,
+        directory_timeout_budget_seconds=0.01,
+        timed_out_directory_count=1,
+        unreadable_directory_count=1,
+        consumed_timeout_wait_seconds=0.01,
+        timed_out_relative_hierarchies=("private-marker",),
+        reviewed_failure_sha256=None,
+    )
+    before = paths.semantic_crawl_timeout_review_path.read_bytes()
+    original_write = semantic_index_module.write_managed_text
+    failed = False
+
+    def fail_resolved_review_once(
+        path: Path,
+        content: str,
+        *,
+        overwrite: bool = True,
+    ) -> Path:
+        nonlocal failed
+        if (
+            path == paths.semantic_crawl_timeout_review_path
+            and '"status":"resolved"' in content
+            and not failed
+        ):
+            failed = True
+            raise OSError("synthetic resolved review failure")
+        return original_write(path, content, overwrite=overwrite)
+
+    monkeypatch.setattr(
+        semantic_index_module,
+        "write_managed_text",
+        fail_resolved_review_once,
+    )
+    with pytest.raises(OSError, match="synthetic resolved review failure"):
+        prepare_semantic_index(
+            PrepareSemanticIndexRequest(workspace=workspace, root=root)
+        )
+
+    assert paths.semantic_crawl_timeout_review_path.read_bytes() == before
+    assert not paths.semantic_index_manifest_path.exists()
+    repository = SQLiteRepository(paths.db_path)
+    assert repository.get_active_semantic_revision(
+        semantic_index_module._root_source_id(root)
+    ) is None
 
 
 def test_prepare_manifest_binds_crawl_watchdog_aggregates(

@@ -39,6 +39,7 @@ class WorkspacePaths:
     semantic_index_input_dir: Path
     semantic_index_manifest_path: Path
     semantic_index_report_path: Path
+    semantic_crawl_timeout_review_path: Path
     semantic_work_plan_path: Path
     semantic_work_input_dir: Path
     semantic_work_output_dir: Path
@@ -93,6 +94,9 @@ class WorkspacePaths:
             semantic_index_input_dir=reviews_dir / "semantic-index" / "input",
             semantic_index_manifest_path=reviews_dir / "semantic-index" / "input-manifest.json",
             semantic_index_report_path=reviews_dir / "semantic-index-report.md",
+            semantic_crawl_timeout_review_path=(
+                reviews_dir / "semantic-crawl-timeout-review.json"
+            ),
             semantic_work_plan_path=reviews_dir / "semantic-index" / "work-plan.json",
             semantic_work_input_dir=reviews_dir / "semantic-index" / "work-input",
             semantic_work_output_dir=reviews_dir / "semantic-index" / "work-output",

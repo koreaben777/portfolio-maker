@@ -60,6 +60,23 @@ After scope confirmation, use the existing approval and discovery flow from the 
 
    Review `.portfolio-maker/reviews/artifact-approval.json` and its per-artifact exclusions and delivery scope. Do not treat the sample policy as approval of every source.
 
+## Aggregate timeout review
+
+If `prepare-semantic-index` stops with the controlled aggregate timeout budget
+error, read only the local private
+`.portfolio-maker/reviews/semantic-crawl-timeout-review.json` through the
+approved governance boundary. Do not treat it as evidence, semantic input, or
+a public artifact. Group its stored relative hierarchies by the narrowest
+practical common ancestor and show the user each proposed exclusion, its
+coverage implication, the timeout count, and alternatives such as a smaller
+confirmed scan root.
+
+Wait for explicit user approval before editing `source-approval.json` or
+changing an exclusion. You must not rerun semantic preparation, infer approval,
+or add an implicit `Library/Containers` exclusion. After an approved policy
+change, treat the old review as stale and start a fresh preparation rather than
+reusing its entries.
+
 ## Authority boundaries
 
 - **Index authority:** confirmed root, exclusions, current source policy, and its policy hash authorize what `prepare-semantic-index` may analyze. Index inclusion is analysis input only.

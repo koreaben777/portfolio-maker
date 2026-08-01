@@ -220,7 +220,8 @@ Codex 의미 실행을 별도로 승인받아 한 work unit씩 재개 가능하�
 ```bash
 portfolio-maker ingest --workspace .
 portfolio-maker prepare-semantic-index --workspace . --root <confirmed-root> \
-  --directory-timeout-seconds 30
+  --directory-timeout-seconds 30 \
+  --directory-timeout-budget-seconds 120
 portfolio-maker semantic-index-status --workspace . --format json
 ```
 
@@ -229,8 +230,16 @@ portfolio-maker semantic-index-status --workspace . --format json
 후속 sibling을 계속 처리하며, scan root timeout은 semantic revision이나 managed input을
 게시하지 않고 controlled error로 종료합니다. prepare 출력에는 설정된 제한 시간과
 timeout/unreadable 합계만 표시되고 directory 이름이나 locator는 표시되지 않습니다.
-상세 계약은 [crawl watchdog 설계 보충](docs/superpowers/specs/2026-07-31-portfolio-maker-semantic-crawl-watchdog-design-addendum.md)과
-[TDD 계획](docs/superpowers/plans/2026-07-31-portfolio-maker-semantic-crawl-watchdog.md)을 따릅니다.
+반복된 하위 directory timeout의 누적 대기는 기본 120초(최대 3600초)로 제한합니다.
+예산이 소진되면 semantic output 대신 local private
+`.portfolio-maker/reviews/semantic-crawl-timeout-review.json`만 남습니다. 이 review를
+근거 또는 생성물로 사용하지 말고, Codex가 common ancestor 제외 후보와 범위 영향을
+보인 뒤 사용자가 명시적으로 승인할 때만 `source-approval.json`을 변경합니다. 승인 전
+자동 재실행·자동 제외·`Library` 또는 `Containers`의 암묵적 제외는 금지됩니다. 상세 계약은
+[crawl watchdog 설계 보충](docs/superpowers/specs/2026-07-31-portfolio-maker-semantic-crawl-watchdog-design-addendum.md),
+[TDD 계획](docs/superpowers/plans/2026-07-31-portfolio-maker-semantic-crawl-watchdog.md),
+[timeout budget 설계 보충](docs/superpowers/specs/2026-07-31-portfolio-maker-semantic-crawl-timeout-budget-design-addendum.md),
+[TDD 계획](docs/superpowers/plans/2026-07-31-portfolio-maker-semantic-crawl-timeout-budget.md)을 따릅니다.
 
 status의 `Work units`와 `Managed input bytes`는 안전한 실행 견적입니다. 이 견적을
 확인한 뒤에도 source 승인과 별도로 **Codex 의미 실행 승인**이 필요합니다. 승인 전에는
