@@ -2529,6 +2529,8 @@ def _write_timeout_review(
     timed_out_relative_hierarchies: tuple[str, ...],
     reviewed_failure_sha256: str | None,
 ) -> str:
+    prior_snapshot = _read_timeout_review_snapshot(paths)
+    previous_text = None if prior_snapshot is None else prior_snapshot[1]
     content, review_sha256 = _timeout_review_text(
         status=status,
         policy_hash=policy_hash,
@@ -2541,10 +2543,19 @@ def _write_timeout_review(
         timed_out_relative_hierarchies=timed_out_relative_hierarchies,
         reviewed_failure_sha256=reviewed_failure_sha256,
     )
-    write_managed_text(paths.semantic_crawl_timeout_review_path, content)
-    persisted = _read_timeout_review(paths)
-    if persisted is None or persisted["review_sha256"] != review_sha256:
-        raise SemanticIndexError("semantic crawl timeout review is invalid")
+    try:
+        write_managed_text(paths.semantic_crawl_timeout_review_path, content)
+        persisted = _read_timeout_review(paths)
+        if persisted is None or persisted["review_sha256"] != review_sha256:
+            raise SemanticIndexError("semantic crawl timeout review is invalid")
+    except Exception:
+        try:
+            _restore_timeout_review_snapshot(paths, previous_text)
+        except Exception as recovery_error:
+            raise SemanticIndexError(
+                "semantic crawl timeout review recovery failed"
+            ) from recovery_error
+        raise
     return review_sha256
 
 
@@ -2580,8 +2591,11 @@ def _timeout_review_text(
         _canonical_json(unsigned).encode("utf-8")
     ).hexdigest()
     review = {**unsigned, "review_sha256": review_sha256}
+    content = _canonical_json(review)
+    if len(content.encode("utf-8")) > _MAX_TIMEOUT_REVIEW_BYTES:
+        raise SemanticIndexError("semantic crawl timeout review is invalid")
     _validate_timeout_review(review)
-    return _canonical_json(review), review_sha256
+    return content, review_sha256
 
 
 def _read_timeout_review(paths: WorkspacePaths) -> dict[str, object] | None:
@@ -2955,9 +2969,21 @@ def _restore_timeout_review(
 ) -> None:
     if update is None:
         return
-    write_managed_text(paths.semantic_crawl_timeout_review_path, update.previous_text)
+    _restore_timeout_review_snapshot(paths, update.previous_text)
+
+
+def _restore_timeout_review_snapshot(
+    paths: WorkspacePaths,
+    previous_text: str | None,
+) -> None:
+    if previous_text is None:
+        remove_managed_file(paths.semantic_crawl_timeout_review_path, missing_ok=True)
+        if _read_timeout_review_snapshot(paths) is not None:
+            raise SemanticIndexError("semantic crawl timeout review is invalid")
+        return
+    write_managed_text(paths.semantic_crawl_timeout_review_path, previous_text)
     restored = _read_timeout_review_snapshot(paths)
-    if restored is None or restored[1] != update.previous_text:
+    if restored is None or restored[1] != previous_text:
         raise SemanticIndexError("semantic crawl timeout review is invalid")
 
 
