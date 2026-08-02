@@ -35,7 +35,7 @@
 |---|---|
 | `src/portfolio_maker/domain/semantic_frontier.py` | v3 protocol enum, budget, coverage, run/action/status dataclass |
 | `src/portfolio_maker/infrastructure/semantic_pack.py` | `pm-pack-v1` append/read/seal/root와 committed-prefix recovery |
-| `src/portfolio_maker/infrastructure/semantic_catalog.py` | revision별 immutable catalog write/query/seal/full streaming root |
+| `src/portfolio_maker/infrastructure/semantic_catalog.py` | revision catalog와 run-scoped deferred index의 write/query/seal/full streaming root |
 | `src/portfolio_maker/infrastructure/semantic_source_reader.py` | no-follow 단일 descriptor full hash와 bounded slice 수집 |
 | `src/portfolio_maker/application/semantic_frontier_v3.py` | seed, fairness lane, representative, expansion, audit sample selector |
 | `src/portfolio_maker/application/semantic_quality_v3.py` | v3 Codex output schema, grounding, action, dependency validation |
@@ -198,22 +198,65 @@ class SemanticFrontierPlan:
     validator_version: str
     purpose: str
     units: tuple[SemanticPlannedUnit, ...]
-    deferred: tuple[SemanticDeferredNode, ...]
+    deferred_count: int
+    deferred_root: str
+    deferred_cursor_root: str
 
 @dataclass(frozen=True)
 class SemanticDeepeningPlan:
     run_id: str
     revision_id: str
     project_id: str
+    authority_root: str
+    parent_run_id: str
+    parent_proposal_sha256: str
     parent_frontier_checkpoint_root: str
     project_boundary_sha256: str
+    source_policy_sha256: str
+    selector_version: str
+    catalog_root: str
+    private_context_scope: str
+    evidence_policy_sha256: str
     target_projection_contract: str
     input_schema_version: str
     output_schema_version: str
     validator_version: str
     purpose: str
     units: tuple[SemanticPlannedUnit, ...]
-    deferred: tuple[SemanticDeferredNode, ...]
+    deferred_count: int
+    deferred_root: str
+    deferred_cursor_root: str
+
+@dataclass(frozen=True)
+class SealedProposalAuthority:
+    revision_id: str
+    source_approval_sha256: str
+    source_policy_sha256: str
+    manifest_sha256: str
+    catalog_root: str
+    safe_source_label: str
+    private_context_scope: str
+    structural_node_count: int
+    baseline_coverage_counts: tuple[tuple[str, int], ...]
+    selector_version: str
+    lifecycle_genesis_root: str
+    target_projection_contract: str
+    input_schema_version: str
+    output_schema_version: str
+    validator_version: str
+    root: str
+
+@dataclass(frozen=True)
+class DeepeningAuthorityContext:
+    base: SealedProposalAuthority
+    parent_run_id: str
+    parent_proposal_sha256: str
+    parent_checkpoint_root: str
+    project_id: str
+    project_boundary_sha256: str
+    evidence_policy_sha256: str
+    purpose: str
+    root: str
 
 @dataclass(frozen=True)
 class PackRecordRef:
@@ -269,6 +312,7 @@ def test_v3_workspace_paths_are_revision_and_run_scoped(workspace: Path) -> None
     assert paths.semantic_v3_catalog_path("rev-1").name == "catalog.sqlite"
     assert paths.semantic_v3_pack_path("rev-1", "structural").name == "structural.pm-pack"
     assert paths.semantic_v3_result_pack_path("rev-1", "run-1").name == "results.pm-pack"
+    assert paths.semantic_v3_deepening_deferred_index_path("rev-1", "run-1").name == "deferred.sqlite"
     with pytest.raises(ValueError):
         paths.semantic_v3_run_dir("rev-1", "../escape")
 ```
@@ -308,12 +352,14 @@ class SemanticExecutionProposal:
     run_id: str
     revision_id: str
     approval_kind: str
+    source_approval_sha256: str
     manifest_sha256: str
     policy_sha256: str
     selector_version: str
     catalog_root: str
     safe_source_label: str
     private_context_scope: str
+    authority_root: str
     plan_sha256: str
     parent_checkpoint_root: str
     target_projection_contract: str
@@ -329,6 +375,8 @@ class SemanticExecutionProposal:
     budget: SemanticBudget
     project_id: str | None = None
     project_boundary_sha256: str | None = None
+    parent_proposal_sha256: str | None = None
+    evidence_policy_sha256: str | None = None
 
 @dataclass(frozen=True)
 class SemanticProposalEnvelope:
@@ -639,12 +687,27 @@ CREATE UNIQUE INDEX frontier_order_page ON frontier_order(
   fair_round, top_level_lane, project_like DESC, ambiguous DESC,
   independent_child DESC, evidence_linked DESC, uncertainty DESC, node_id
 );
+CREATE TABLE frontier_deferred (
+  node_id TEXT PRIMARY KEY REFERENCES nodes(node_id),
+  reason TEXT NOT NULL,
+  node_digest TEXT NOT NULL,
+  cursor_order INTEGER NOT NULL UNIQUE,
+  source_id TEXT NOT NULL,
+  coverage_stratum TEXT NOT NULL,
+  relevance_rank INTEGER NOT NULL
+);
+CREATE INDEX frontier_deferred_audit_order ON frontier_deferred(
+  relevance_rank, coverage_stratum, source_id, cursor_order, node_id
+);
 ```
 
 Use normalized child edges or the `(parent_node_id, node_id)` index as topology truth; never store a truncated child list as authority.
 Build `frontier_order.fair_round` once before seal using SQLite's file-backed sort/window operation
 (`temp_store=FILE`) partitioned by `top_level_lane`. Keyset pages over the unique index are the only
 frontier proposal iterator; Python never receives all lane members at once.
+`frontier_deferred` is the immutable file-backed authority for every eligible-but-unselected node.
+Its ordered canonical-row accumulator yields count/root/cursor-root without returning the population
+to Python; audit and full verify page it from the sealed catalog.
 
 - [ ] **Step 4: Implement catalog sealing and dual roots**
 
@@ -730,7 +793,7 @@ def test_only_one_workspace_run_can_be_operationally_running(workspace: Path) ->
 
 - [ ] **Step 2: Run the exact RED tests**
 
-Run: `python -m pytest -q tests/test_sqlite_repository.py::test_initialize_adds_v3_lifecycle_without_rewriting_legacy_rows tests/test_semantic_lifecycle_v3.py::test_only_one_workspace_run_can_own_execution_lock`
+Run: `python -m pytest -q tests/test_sqlite_repository.py::test_initialize_adds_v3_lifecycle_without_rewriting_legacy_rows tests/test_semantic_lifecycle_v3.py::test_only_one_workspace_run_can_own_execution_lock tests/test_semantic_lifecycle_v3.py::test_only_one_workspace_run_can_be_operationally_running`
 
 Expected: missing tables/methods.
 
@@ -761,6 +824,7 @@ CREATE TABLE IF NOT EXISTS semantic_v3_proposals (
   catalog_root TEXT NOT NULL,
   selector_version TEXT NOT NULL,
   private_context_scope TEXT NOT NULL,
+  authority_root TEXT NOT NULL,
   total_budget_json TEXT NOT NULL,
   phase_bindings_json TEXT NOT NULL,
   budget_binding_sha256 TEXT NOT NULL,
@@ -913,12 +977,13 @@ CREATE TABLE IF NOT EXISTS semantic_v3_approvals (
 );
 
 CREATE TABLE IF NOT EXISTS semantic_v3_deferred (
-  run_id TEXT NOT NULL,
-  node_id TEXT NOT NULL,
-  reason TEXT NOT NULL,
-  node_digest TEXT NOT NULL,
-  cursor_json TEXT NOT NULL,
-  PRIMARY KEY(run_id, node_id)
+  run_id TEXT NOT NULL REFERENCES semantic_v3_runs(run_id),
+  set_kind TEXT NOT NULL CHECK(set_kind IN ('initial_catalog','runtime_transition')),
+  deferred_count INTEGER NOT NULL,
+  deferred_root TEXT NOT NULL,
+  deferred_cursor_root TEXT NOT NULL,
+  current_cursor_json TEXT NOT NULL,
+  PRIMARY KEY(run_id, set_kind)
 );
 
 CREATE TABLE IF NOT EXISTS semantic_v3_expansion_cursors (
@@ -954,11 +1019,12 @@ lineage after their own contracts exist.
 ```python
 def bind_semantic_v3_revision(self, binding: SemanticRevisionBinding) -> None: ...
 def create_semantic_v3_proposal(self, envelope: SemanticProposalEnvelope, canonical_bytes: bytes, plan_bytes: bytes) -> None: ...
-def get_semantic_v3_proposal_by_digest(self, revision_id: str, proposal_sha256: str) -> SemanticProposalEnvelope: ...
-def get_semantic_v3_proposal_for_run(self, run_id: str) -> SemanticProposalEnvelope: ...
+def get_semantic_v3_proposal_by_digest(self, revision_id: str, proposal_sha256: str) -> tuple[SemanticProposalEnvelope, bytes, bytes]: ...
+def get_semantic_v3_proposal_for_run(self, run_id: str) -> tuple[SemanticProposalEnvelope, bytes, bytes]: ...
 def create_semantic_v3_run(self, envelope: SemanticProposalEnvelope) -> None: ...
 def approve_semantic_v3_run(self, run_id: str, proposal_sha256: str) -> None: ...
 def semantic_v3_status(self, run_id: str | None) -> SemanticStatusSnapshot: ...
+def claim_semantic_v3_running_slot(self, run_id: str) -> None: ...
 def acquire_semantic_v3_execution(self, run_id: str, unit_id: str, lease_nonce: str) -> None: ...
 def issue_semantic_v3_input(self, run_id: str, lease_nonce: str, input_sha256: str, byte_count: int) -> None: ...
 def commit_semantic_v3_receipt(self, receipt: SemanticReceiptCommit) -> None: ...
@@ -978,7 +1044,7 @@ new checkpoint after the last expansion receipt.
 
 - [ ] **Step 5: Run lifecycle atomicity and DB safety tests**
 
-Run: `python -m pytest -q tests/test_semantic_lifecycle_v3.py tests/test_sqlite_repository.py -k 'semantic_v3 or legacy_active_semantic or semantic_revision_activation or repository_'`
+Run: `python -m pytest -q tests/test_semantic_lifecycle_v3.py tests/test_sqlite_repository.py -k 'semantic_v3 or only_one_workspace_run or legacy_active_semantic or semantic_revision_activation or repository_'`
 
 Expected: PASS; existing database family/sidecar safety tests remain green.
 
@@ -1149,8 +1215,8 @@ git commit -m "feat: stream semantic local baseline"
 
 ```python
 def test_selector_is_deterministic_ancestor_closed_and_fair(catalog_fixture) -> None:
-    first = build_frontier_plan(catalog_fixture.reader(), revision_id="rev", policy_hash="p" * 64)
-    second = build_frontier_plan(catalog_fixture.reader(), revision_id="rev", policy_hash="p" * 64)
+    first = build_frontier_plan(catalog_fixture.fresh_planning_session(), revision_id="rev", policy_hash="p" * 64)
+    second = build_frontier_plan(catalog_fixture.fresh_planning_session(), revision_id="rev", policy_hash="p" * 64)
     assert first == second
     assert first.units[:3] == (
         unit_for("source-a/root"),
@@ -1163,12 +1229,15 @@ def test_selector_is_deterministic_ancestor_closed_and_fair(catalog_fixture) -> 
 def test_decoy_lane_cannot_starve_small_korean_project(catalog_fixture) -> None:
     catalog_fixture.add_decoy_subtree("source-a", count=100_000)
     catalog_fixture.add_project("source-b/공모전", roles=("documentation", "code", "test"))
-    plan = build_frontier_plan(catalog_fixture.reader(), "rev", "p" * 64)
+    plan = build_frontier_plan(catalog_fixture.fresh_planning_session(), "rev", "p" * 64)
     assert "source-b/공모전" in plan.orientation_target_ids
 
 def test_selector_keyset_pages_without_materializing_lane_members(million_feature_catalog, query_observer) -> None:
-    plan = build_frontier_plan(million_feature_catalog.reader(), "rev", "p" * 64)
+    plan = build_frontier_plan(million_feature_catalog.planning_session(), "rev", "p" * 64)
     assert plan.unit_count <= FRONTIER_BUDGET.max_units
+    assert not hasattr(plan, "deferred")
+    assert plan.deferred_count == million_feature_catalog.deferred_row_count()
+    assert plan.deferred_root == million_feature_catalog.deferred_logical_root()
     assert query_observer.max_python_rows <= 64
     assert query_observer.sequence_sort_calls == 0
 ```
@@ -1226,15 +1295,44 @@ def iter_fair_seeds(reader: SemanticCatalogReader) -> Iterator[FrontierSeed]:
         for seed in page:
             yield seed
         cursor = page[-1].order_key
+
+def build_frontier_plan(session: SemanticCatalogPlanningSession, revision_id: str, policy_hash: str) -> SemanticFrontierPlan:
+    units: list[SemanticPlannedUnit] = []
+    for page in session.iter_fair_seed_pages(limit=64):
+        for seed in page:
+            unit = maybe_build_bounded_unit(seed, session)
+            if unit is not None and within_phase_estimates(units, unit):
+                units.append(unit)
+            else:
+                session.append_deferred(deferred_record(seed))
+    deferred = session.seal_deferred_rows()
+    return SemanticFrontierPlan(
+        run_id=stable_run_id(revision_id, policy_hash),
+        revision_id=revision_id,
+        policy_sha256=policy_hash,
+        selector_version=FRONTIER_SELECTOR_VERSION,
+        target_projection_contract=TARGET_PROJECTION_CONTRACT,
+        input_schema_version=SEMANTIC_INPUT_SCHEMA_V3,
+        output_schema_version=SEMANTIC_OUTPUT_SCHEMA_V3,
+        validator_version=SEMANTIC_VALIDATOR_V3,
+        purpose="project_discovery",
+        units=tuple(units),
+        deferred_count=deferred.record_count,
+        deferred_root=deferred.logical_root,
+        deferred_cursor_root=deferred.cursor_root,
+    )
 ```
 
-`frontier_order_page()` uses the sealed Task 3 keyset index; the one-time fair-round build uses
-SQLite file-backed temporary storage before seal. Do not accept a Python `Sequence` of lane members,
+`frontier_order_page()` uses Task 3's indexed catalog during the pre-seal planning session; the
+one-time fair-round build uses SQLite file-backed temporary storage. After deferred rows and their
+roots are final, Task 7 seals the catalog. Do not accept a Python `Sequence` of lane members,
 call `sorted()` on all candidates, or retain more than one 64-row page. Build
 orientation/expansion/audit phase budgets exactly from Task 1. Batch small directory targets only
-while canonical input estimate stays ≤262,144 bytes and dependency count ≤64. Store each bounded
+while canonical input estimate stays ≤262,144 bytes and dependency count ≤64. `units` is bounded by
+the 512-unit approval cap; the unbounded deferred population is written row-by-row to the catalog
+sink and represented in the plan only by count/root/cursor-root. Store each bounded
 unit's canonical target-node IDs and dependency IDs/digests in `semantic_v3_units.target_ref_json`;
-all eligible-but-unselected records receive a reason, digest and cursor in the deferred plan.
+all eligible-but-unselected records receive a reason, digest and cursor in `frontier_deferred`.
 
 - [ ] **Step 6: Implement action transition and post-expansion audit freeze**
 
@@ -1297,7 +1395,16 @@ def test_prepare_defaults_to_v3_and_publishes_manifest_last(workspace: Path, app
     assert result.structural_node_count == result.local_baseline_terminal_count
     assert result.exchange_input_created is False
     assert repository(workspace).semantic_v3_binding(result.revision_id).manifest_sha256 == manifest["manifest_sha256"]
-    envelope = repository(workspace).get_semantic_v3_proposal_by_digest(result.revision_id, result.proposal_sha256)
+    envelope, _, _ = repository(workspace).get_semantic_v3_proposal_by_digest(result.revision_id, result.proposal_sha256)
+    authority = repository(workspace).sealed_proposal_authority(result.run_id)
+    assert envelope.proposal.manifest_sha256 == authority.manifest_sha256
+    assert envelope.proposal.catalog_root == authority.catalog_root
+    assert envelope.proposal.policy_sha256 == authority.source_policy_sha256
+    assert envelope.proposal.source_approval_sha256 == authority.source_approval_sha256
+    assert envelope.proposal.safe_source_label == authority.safe_source_label
+    assert envelope.proposal.private_context_scope == authority.private_context_scope
+    assert envelope.proposal.structural_node_count == authority.structural_node_count
+    assert envelope.proposal.baseline_coverage_counts == authority.baseline_coverage_counts
     assert tuple((item.phase, item.hard_budget) for item in envelope.proposal.phase_bindings) == FRONTIER_PHASE_HARD_BUDGETS
     assert all(item.estimated_units <= item.hard_budget.max_units for item in envelope.proposal.phase_bindings)
     assert all(item.estimated_input_bytes <= item.hard_budget.max_input_bytes for item in envelope.proposal.phase_bindings)
@@ -1313,10 +1420,11 @@ def test_prepare_failure_leaves_previous_active_and_staging_binding_unchanged(wo
 def test_prepare_persists_canonical_proposal_and_bounded_unit_targets_for_new_process(workspace, approved_root) -> None:
     prepared = prepare_semantic_index(PrepareSemanticIndexRequest(workspace, approved_root))
     repository = reopen_repository_in_new_process(workspace)
-    envelope, canonical = repository.get_semantic_v3_proposal_bytes_by_digest(
+    envelope, canonical, plan_bytes = repository.get_semantic_v3_proposal_bytes_by_digest(
         prepared.revision_id, prepared.proposal_sha256
     )
     assert hashlib.sha256(canonical).hexdigest() == envelope.proposal_sha256
+    assert hashlib.sha256(plan_bytes).hexdigest() == envelope.proposal.plan_sha256
     assert repository.semantic_v3_unit_count(envelope.proposal.run_id) <= FRONTIER_BUDGET.max_units
     assert all(repository.verify_unit_target_ref(row) for row in repository.iter_semantic_v3_units(envelope.proposal.run_id))
 ```
@@ -1368,20 +1476,35 @@ Maintain only directory depth state, one file payload, and one bounded DB batch.
 temporary = paths.semantic_revision_raw_dir(f".{revision_id}.tmp")
 sink.consume(iter_local_structure_events(request.root, approval))
 pack_seals = sink.seal_packs()
+frontier_plan = build_frontier_plan(
+    sink.catalog.planning_session(), revision_id, policy_hash
+)
 catalog_seal = sink.seal_catalog()
-frontier_plan = build_frontier_plan(SemanticCatalogReader(...), revision_id, policy_hash)
 frontier_plan_bytes = canonical_json_bytes(frontier_plan)
 frontier_plan_sha256 = sha256_hex(frontier_plan_bytes)
 manifest_bytes = build_canonical_v3_manifest_bytes(
     pack_seals, catalog_seal, frontier_plan_sha256, frontier_plan, resource_observation
 )
 manifest_sha256 = sha256_hex(manifest_bytes)
-proposal = build_execution_proposal(
+sealed_authority = build_sealed_proposal_authority(
+    approval=approval,
+    manifest_bytes=manifest_bytes,
+    catalog_seal=catalog_seal,
+    safe_source_label=safe_source_label(request.root),
+    private_context_scope=approved_private_context_scope(approval),
+    structural_node_count=sink.structural_node_count,
+    baseline_coverage_counts=sink.baseline_coverage_counts,
+    selector_version=frontier_plan.selector_version,
+    lifecycle_genesis_root=lifecycle_genesis_root(frontier_plan),
+    target_projection_contract=frontier_plan.target_projection_contract,
+    input_schema_version=frontier_plan.input_schema_version,
+    output_schema_version=frontier_plan.output_schema_version,
+    validator_version=frontier_plan.validator_version,
+)
+proposal = build_execution_proposal_from_frontier(
     frontier_plan,
+    authority=sealed_authority,
     plan_sha256=frontier_plan_sha256,
-    manifest_sha256=manifest_sha256,
-    catalog_root=catalog_seal.logical_root,
-    parent_checkpoint_root=lifecycle_genesis_root(frontier_plan),
     phase_bindings=build_frontier_phase_bindings(
         frontier_plan, hard_budgets=FRONTIER_PHASE_HARD_BUDGETS
     ),
@@ -1396,16 +1519,26 @@ repository.bind_semantic_v3_revision_genesis_proposal_and_units(
     proposal_envelope=proposal_envelope,
     frontier_plan_bytes=frontier_plan_bytes,
     units=frontier_plan.units,
-    deferred=frontier_plan.deferred,
+    deferred_binding=(
+        frontier_plan.deferred_count,
+        frontier_plan.deferred_root,
+        frontier_plan.deferred_cursor_root,
+    ),
 )
 ```
 
 The manifest binds the frontier plan digest/estimates but not the later proposal digest, avoiding a
 manifest/proposal hash cycle. The proposal binds the already sealed manifest hash and catalog root.
+`build_sealed_proposal_authority()` parses and rehashes the manifest, current source approval/policy,
+catalog seal, safe source label/privacy scope and exact structural/baseline aggregates; its `root`
+binds every field. The proposal builder accepts this authority object rather than reconstructing
+dynamic values from caller arguments, and verifies all plan projection/schema/selector fields match.
 The last method is one DB transaction and verifies that canonical plan/proposal bytes, proposal and
 manifest frontier-plan digests,
 unit target/dependency roots and lifecycle genesis agree before inserting the revision binding,
-canonical proposal row, run, bounded units, dependencies, aggregates and deferred cursors. An
+canonical proposal row, run, bounded units, dependencies, aggregates and the catalog deferred
+count/root/cursor binding. It uses `INSERT ... SELECT`/root verification against the sealed
+file-backed catalog and never passes deferred rows through Python. An
 unbound published directory is crash residue, not current staging. Failure review is bounded/private
 and does not copy locator or payload.
 The newly bound run state is `awaiting_approval`; only exact approval changes it to approved
@@ -1519,12 +1652,15 @@ Expected: missing approval use case and v3 aggregate result fields.
 def approve_semantic_execution(request: ApproveSemanticExecutionRequest) -> ApproveSemanticExecutionResult:
     paths = WorkspacePaths.from_root(request.workspace)
     repository = initialized_repository(paths)
-    envelope, canonical_bytes = repository.get_semantic_v3_proposal_bytes_by_digest(
+    envelope, canonical_bytes, plan_bytes = repository.get_semantic_v3_proposal_bytes_by_digest(
         request.revision_id, request.proposal_sha256
     )
     if sha256_hex(canonical_bytes) != envelope.proposal_sha256:
         raise SemanticWorkError("semantic proposal authority is corrupt")
+    if sha256_hex(plan_bytes) != envelope.proposal.plan_sha256:
+        raise SemanticWorkError("semantic plan authority is corrupt")
     validate_current_proposal_binding(paths, envelope, request.proposal_sha256)
+    validate_sealed_or_deepening_authority_root(repository, envelope.proposal)
     validate_exact_phase_bindings(envelope.proposal.phase_bindings, envelope.proposal.budget)
     repository.approve_semantic_v3_run(envelope.proposal.run_id, envelope.proposal_sha256)
     return ApproveSemanticExecutionResult(envelope.proposal.run_id, SemanticRunState.PREPARED)
@@ -1685,7 +1821,7 @@ def test_phase_budget_exhaustion_cannot_borrow_from_other_phase(approved_run, ax
 
 - [ ] **Step 3: Confirm bounded-next tests are RED**
 
-Run: `python -m pytest -q tests/test_semantic_lifecycle_v3.py tests/test_cli.py -k 'concurrent_next or active_lease or next_reads or tail_rewrite'`
+Run: `python -m pytest -q tests/test_semantic_lifecycle_v3.py tests/test_cli.py -k 'concurrent_next or active_lease or next_reads or tail_rewrite or phase_budget'`
 
 Expected: current full-state v2 behavior or missing v3 next.
 
@@ -1759,7 +1895,7 @@ If omitted, select only when exactly one runnable v3 run exists; otherwise fail 
 
 - [ ] **Step 7: Run next/exchange/concurrency and v2 compatibility tests**
 
-Run: `python -m pytest -q tests/test_semantic_lifecycle_v3.py tests/test_cli.py tests/test_semantic_work_lifecycle.py -k 'next or lease or exchange or ready_order'`
+Run: `python -m pytest -q tests/test_semantic_lifecycle_v3.py tests/test_cli.py tests/test_semantic_work_lifecycle.py -k 'next or lease or exchange or ready_order or phase_budget or running_slot'`
 
 Expected: PASS with no full catalog/plan load in v3.
 
@@ -2266,6 +2402,7 @@ def verify_semantic_v3_full(context: SemanticV3Context) -> FullVerification:
         units=context.repository.iter_semantic_v3_units(context.run_id, fetch_size=256),
         dependencies=context.repository.iter_semantic_v3_dependencies(context.run_id, fetch_size=256),
         deferred=context.repository.iter_semantic_v3_deferred(context.run_id, fetch_size=256),
+        catalog_deferred=catalog.iter_frontier_deferred(fetch_size=256),
         audit_members=context.repository.iter_semantic_v3_audit_members(context.run_id, fetch_size=256),
         receipts=context.repository.iter_receipts(context.run_id, fetch_size=256),
         result_pack_path=context.result_pack_path,
@@ -2488,10 +2625,13 @@ git commit -m "feat: migrate semantic staging explicitly"
 - Modify: `src/portfolio_maker/application/project_decisions.py`
 - Modify: `src/portfolio_maker/application/project_review_v3.py`
 - Modify: `src/portfolio_maker/infrastructure/sqlite_repository.py`
+- Modify: `src/portfolio_maker/infrastructure/semantic_catalog.py`
+- Modify: `src/portfolio_maker/workspace.py`
 - Modify: `src/portfolio_maker/adapters/cli.py`
 - Create: `tests/test_semantic_deepening_v3.py`
 - Modify: `tests/test_project_review_v3.py`
 - Modify: `tests/test_project_decisions.py`
+- Modify: `tests/test_semantic_catalog_v3.py`
 - Modify: `tests/test_cli.py`
 
 **Interfaces:**
@@ -2510,9 +2650,17 @@ def test_prepare_deepening_accepts_only_current_opaque_project_id(active_v3_proj
     assert result.budget == DEEPENING_BUDGET
     assert result.project_boundary_sha256 == active_v3_projects.boundary_sha256
     plan, plan_bytes = active_v3_projects.repository.deepening_plan_bytes(result.run_id)
-    envelope, proposal_bytes = active_v3_projects.repository.get_semantic_v3_proposal_bytes_for_run(result.run_id)
+    envelope, proposal_bytes, stored_plan_bytes = active_v3_projects.repository.get_semantic_v3_proposal_bytes_for_run(result.run_id)
+    assert stored_plan_bytes == plan_bytes
+    authority = active_v3_projects.repository.deepening_authority_context(result.run_id)
     assert sha256_hex(plan_bytes) == envelope.proposal.plan_sha256
+    assert plan.authority_root == envelope.proposal.authority_root == authority.root
+    assert plan.parent_proposal_sha256 == envelope.proposal.parent_proposal_sha256 == authority.parent_proposal_sha256
     assert envelope.proposal.parent_checkpoint_root == active_v3_projects.frontier_checkpoint_root
+    assert plan.source_policy_sha256 == envelope.proposal.policy_sha256 == authority.base.source_policy_sha256
+    assert plan.catalog_root == envelope.proposal.catalog_root == authority.base.catalog_root
+    assert plan.private_context_scope == envelope.proposal.private_context_scope == authority.base.private_context_scope
+    assert plan.evidence_policy_sha256 == envelope.proposal.evidence_policy_sha256 == authority.evidence_policy_sha256
     assert envelope.proposal.target_projection_contract == plan.target_projection_contract
     assert envelope.proposal.phase_bindings == (
         SemanticPhaseBinding(FrontierPhase.DEEPENING, DEEPENING_BUDGET, result.estimated_units, result.estimated_input_bytes, result.estimated_wall_seconds),
@@ -2571,7 +2719,7 @@ def test_deepening_overlay_cannot_upgrade_review_required_medium_candidate(deepe
 
 - [ ] **Step 4: Confirm deepening/project tests are RED**
 
-Run: `python -m pytest -q tests/test_semantic_deepening_v3.py tests/test_project_review_v3.py tests/test_project_decisions.py tests/test_cli.py -k 'deepening or overlay or authority'`
+Run: `python -m pytest -q tests/test_semantic_deepening_v3.py tests/test_project_review_v3.py tests/test_project_decisions.py tests/test_semantic_catalog_v3.py tests/test_cli.py -k 'deepening or deferred_index or overlay or authority'`
 
 Expected: missing deepening planner/schema/CLI and inactive-overlay authority.
 
@@ -2582,8 +2730,11 @@ CREATE TABLE IF NOT EXISTS semantic_v3_deepening_runs (
   run_id TEXT PRIMARY KEY REFERENCES semantic_v3_runs(run_id),
   project_id TEXT NOT NULL,
   parent_revision_id TEXT NOT NULL,
+  authority_root TEXT NOT NULL,
+  parent_proposal_sha256 TEXT NOT NULL,
   parent_frontier_checkpoint_root TEXT NOT NULL,
   project_boundary_sha256 TEXT NOT NULL,
+  evidence_policy_sha256 TEXT NOT NULL,
   deepening_plan_sha256 TEXT NOT NULL,
   unit_queue_root TEXT NOT NULL,
   proposal_sha256 TEXT NOT NULL,
@@ -2597,24 +2748,29 @@ CREATE INDEX IF NOT EXISTS semantic_v3_deepening_project
 ```
 
 ```python
-deepening_plan = ProjectDeepeningPlanner(catalog, active_projects).prepare(
+authority = load_verified_deepening_authority_context(
+    workspace=request.workspace,
+    project_id=request.project_id,
+)
+deferred_writer = SemanticDeferredIndexWriter(
+    paths.semantic_v3_deepening_deferred_temp_path(authority.base.revision_id, authority.project_id)
+)
+deepening_draft = ProjectDeepeningPlanner(catalog, active_projects).prepare(
+    authority=authority,
     project_id=request.project_id,
     budget=DEEPENING_BUDGET,
     max_dependencies=MAX_DEPENDENCIES,
     max_page_size=64,
+    deferred_sink=deferred_writer,
 )
+deferred_seal = deferred_writer.seal()
+deepening_plan = finalize_deepening_plan(deepening_draft, deferred_seal)
 plan_bytes = canonical_json_bytes(deepening_plan)
 plan_sha256 = sha256_hex(plan_bytes)
 proposal = build_deepening_execution_proposal(
     deepening_plan=deepening_plan,
+    authority=authority,
     plan_sha256=plan_sha256,
-    parent_checkpoint_root=deepening_plan.parent_frontier_checkpoint_root,
-    project_boundary_sha256=deepening_plan.project_boundary_sha256,
-    target_projection_contract=deepening_plan.target_projection_contract,
-    input_schema_version=deepening_plan.input_schema_version,
-    output_schema_version=deepening_plan.output_schema_version,
-    validator_version=deepening_plan.validator_version,
-    purpose=deepening_plan.purpose,
     phase_bindings=(SemanticPhaseBinding(
         FrontierPhase.DEEPENING,
         DEEPENING_BUDGET,
@@ -2631,6 +2787,11 @@ repository.create_semantic_v3_deepening_proposal_run_and_units(
     deepening_plan=deepening_plan,
     deepening_plan_bytes=plan_bytes,
     units=deepening_plan.units,
+    deferred_binding=(
+        deepening_plan.deferred_count,
+        deepening_plan.deferred_root,
+        deepening_plan.deferred_cursor_root,
+    ),
 )
 ```
 
@@ -2641,6 +2802,16 @@ do not copy approval from the frontier run. The one repository call is a transac
 both canonical bodies, requires proposal `plan_sha256` and parent/projection/schema/validator/purpose
 bindings to match the deepening plan, derives `unit_queue_root` from `deepening_plan.units`, and then
 stores proposal, plan, run, units, dependencies and aggregate together.
+`load_verified_deepening_authority_context()` follows the active opaque project provenance to its
+exact parent run/proposal digest (never revision alone), rehashes that canonical parent envelope,
+full-verified checkpoint, sealed manifest/catalog, current source/evidence policy, privacy scope and
+project boundary, and returns one root-bound context. Planner and proposal builder both accept that
+same object and reject any plan field mismatch before publication.
+The planner pages the sealed source catalog 64 rows at a time, retains at most 256 selected units,
+and streams all unselected project-scope nodes to a run-scoped temporary `deferred.sqlite`. It seals
+that index before proposal construction and publishes it with the run only after the repository
+transaction verifies its count/root/cursor-root. No deepening deferred row tuple enters the plan or
+Python heap.
 
 - [ ] **Step 6: Implement inactive overlay and cancel/replay**
 
@@ -2661,14 +2832,14 @@ state only. It does not accept a path/URL and does not approve or start executio
 
 - [ ] **Step 8: Run deepening, decisions, review, lifecycle, and CLI tests**
 
-Run: `python -m pytest -q tests/test_semantic_deepening_v3.py tests/test_project_review_v3.py tests/test_project_decisions.py tests/test_semantic_lifecycle_v3.py tests/test_cli.py -k 'deepening or overlay or project or semantic_v3'`
+Run: `python -m pytest -q tests/test_semantic_deepening_v3.py tests/test_project_review_v3.py tests/test_project_decisions.py tests/test_semantic_catalog_v3.py tests/test_semantic_lifecycle_v3.py tests/test_cli.py -k 'deepening or deferred_index or overlay or project or semantic_v3'`
 
 Expected: PASS; no deepening action changes project/evidence/artifact/delivery authority.
 
 - [ ] **Step 9: Commit Task 14 only**
 
 ```bash
-git add src/portfolio_maker/application/semantic_deepening_v3.py src/portfolio_maker/application/models.py src/portfolio_maker/application/project_boundary.py src/portfolio_maker/application/project_decisions.py src/portfolio_maker/application/project_review_v3.py src/portfolio_maker/infrastructure/sqlite_repository.py src/portfolio_maker/adapters/cli.py tests/test_semantic_deepening_v3.py tests/test_project_review_v3.py tests/test_project_decisions.py tests/test_cli.py
+git add src/portfolio_maker/application/semantic_deepening_v3.py src/portfolio_maker/application/models.py src/portfolio_maker/application/project_boundary.py src/portfolio_maker/application/project_decisions.py src/portfolio_maker/application/project_review_v3.py src/portfolio_maker/infrastructure/sqlite_repository.py src/portfolio_maker/infrastructure/semantic_catalog.py src/portfolio_maker/workspace.py src/portfolio_maker/adapters/cli.py tests/test_semantic_deepening_v3.py tests/test_project_review_v3.py tests/test_project_decisions.py tests/test_semantic_catalog_v3.py tests/test_cli.py
 git commit -m "feat: deepen selected semantic projects"
 ```
 
