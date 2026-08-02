@@ -30,8 +30,10 @@ _AUTHORITATIVE_TABLES = (
     ("content_identities", ("node_id",)),
     ("evidence_links", ("node_id", "evidence_id", "relation")),
     ("frontier_features", ("node_id",)),
+    ("frontier_selector_authorities", ("selector_version",)),
+    ("frontier_selector_results", ("selector_version", "node_id")),
     ("frontier_order", ("node_id",)),
-    ("frontier_deferred", ("node_id",)),
+    ("frontier_deferred", ("selector_version", "node_id")),
 )
 _EXPECTED_TABLES = {name for name, _ in _AUTHORITATIVE_TABLES}
 _EXPECTED_INDEXES = {
@@ -40,6 +42,7 @@ _EXPECTED_INDEXES = {
     "children_traversal_order",
     "local_baselines_coverage",
     "frontier_ready_order",
+    "frontier_selector_results_node_order",
     "frontier_order_page",
     "frontier_deferred_audit_order",
 }
@@ -51,6 +54,8 @@ _EXPECTED_COLUMNS = {
     "content_identities": ("node_id", "metadata_identity_json", "sample_identity_sha256", "full_content_sha256"),
     "evidence_links": ("node_id", "evidence_id", "relation"),
     "frontier_features": ("node_id", "feature_version", "project_like", "ambiguous", "independent_child", "evidence_linked", "uncertainty", "top_level_lane", "feature_digest"),
+    "frontier_selector_authorities": ("selector_version", "selector_digest"),
+    "frontier_selector_results": ("selector_version", "node_id", "selected", "reason", "node_digest", "cursor_json", "cursor_order", "source_id", "coverage_stratum", "relevance_rank", "selector_feature_digest"),
     "frontier_order": ("node_id", "fair_round", "top_level_lane", "project_like", "ambiguous", "independent_child", "evidence_linked", "uncertainty"),
     "frontier_deferred": ("node_id", "reason", "node_digest", "cursor_json", "cursor_order", "source_id", "coverage_stratum", "relevance_rank", "selector_version", "selector_feature_digest"),
 }
@@ -60,8 +65,9 @@ _EXPECTED_INDEX_LAYOUT = {
     "children_traversal_order": (("parent_node_id", 0), ("traversal_order", 0)),
     "local_baselines_coverage": (("coverage", 0), ("node_id", 0)),
     "frontier_ready_order": (("top_level_lane", 0), ("project_like", 1), ("ambiguous", 1), ("node_id", 0)),
+    "frontier_selector_results_node_order": (("node_id", 0), ("selector_version", 0)),
     "frontier_order_page": (("fair_round", 0), ("top_level_lane", 0), ("project_like", 1), ("ambiguous", 1), ("independent_child", 1), ("evidence_linked", 1), ("uncertainty", 1), ("node_id", 0)),
-    "frontier_deferred_audit_order": (("relevance_rank", 0), ("coverage_stratum", 0), ("source_id", 0), ("cursor_order", 0), ("node_id", 0)),
+    "frontier_deferred_audit_order": (("selector_version", 0), ("relevance_rank", 0), ("coverage_stratum", 0), ("source_id", 0), ("cursor_order", 0), ("node_id", 0)),
 }
 _EXPECTED_UNIQUE_INDEXES = {"children_traversal_order", "frontier_order_page"}
 
@@ -141,6 +147,27 @@ class FrontierFeatureRecord:
 
 @dataclass(frozen=True)
 class FrontierDeferredRecord:
+    node_id: str
+    reason: str
+    node_digest: str
+    cursor_json: str
+    cursor_order: int
+    source_id: str
+    coverage_stratum: str
+    relevance_rank: int
+    selector_version: str
+    selector_feature_digest: str
+
+
+@dataclass(frozen=True)
+class FrontierSelectorAuthority:
+    selector_version: str
+    selector_digest: str
+
+
+@dataclass(frozen=True)
+class FrontierSelectorResult:
+    selected: bool
     node_id: str
     reason: str
     node_digest: str
@@ -393,13 +420,69 @@ class SemanticCatalogWriter:
         except sqlite3.IntegrityError as error:
             raise CatalogError("catalog frontier feature is invalid") from error
 
+    def add_frontier_selector_authority(
+        self, authority: FrontierSelectorAuthority
+    ) -> None:
+        connection = self._require_writable()
+        _require_text(authority.selector_version, "selector version")
+        _validate_digest(authority.selector_digest, "selector authority digest")
+        try:
+            connection.execute(
+                """
+                INSERT INTO frontier_selector_authorities(selector_version, selector_digest)
+                VALUES (?, ?)
+                """,
+                (authority.selector_version, authority.selector_digest),
+            )
+        except sqlite3.IntegrityError as error:
+            raise CatalogError("catalog selector authority is invalid") from error
+
+    def add_frontier_selector_result(self, result: FrontierSelectorResult) -> None:
+        connection = self._require_writable()
+        _validate_selector_row(result)
+        try:
+            connection.execute(
+                """
+                INSERT INTO frontier_selector_results(
+                    selector_version, node_id, selected, reason, node_digest, cursor_json,
+                    cursor_order, source_id, coverage_stratum, relevance_rank,
+                    selector_feature_digest
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    result.selector_version,
+                    result.node_id,
+                    int(result.selected),
+                    result.reason,
+                    result.node_digest,
+                    result.cursor_json,
+                    result.cursor_order,
+                    result.source_id,
+                    result.coverage_stratum,
+                    result.relevance_rank,
+                    result.selector_feature_digest,
+                ),
+            )
+        except sqlite3.IntegrityError as error:
+            raise CatalogError("catalog selector result is invalid") from error
+
     def add_frontier_deferred(self, record: FrontierDeferredRecord) -> None:
         connection = self._require_writable()
-        _validate_digest(record.node_digest, "frontier deferred node digest")
-        _validate_digest(record.selector_feature_digest, "frontier deferred feature digest")
-        if record.cursor_order < 0 or record.relevance_rank < 0:
-            raise CatalogError("frontier deferred ordering is invalid")
-        _canonical_json_from_text(record.cursor_json)
+        _validate_selector_row(
+            FrontierSelectorResult(
+                False,
+                record.node_id,
+                record.reason,
+                record.node_digest,
+                record.cursor_json,
+                record.cursor_order,
+                record.source_id,
+                record.coverage_stratum,
+                record.relevance_rank,
+                record.selector_version,
+                record.selector_feature_digest,
+            )
+        )
         try:
             connection.execute(
                 """
@@ -539,24 +622,95 @@ class SemanticCatalogWriter:
 
     @staticmethod
     def _validate_before_seal(connection: sqlite3.Connection) -> None:
+        feature_count = connection.execute("SELECT COUNT(*) FROM frontier_features").fetchone()[0]
+        authority_count = connection.execute(
+            "SELECT COUNT(*) FROM frontier_selector_authorities"
+        ).fetchone()[0]
+        if feature_count and not authority_count:
+            raise CatalogError("frontier selector authority is missing")
         invalid = connection.execute(
             """
-            SELECT deferred.node_id
-            FROM frontier_deferred AS deferred
-            LEFT JOIN nodes AS node ON node.node_id = deferred.node_id
-            LEFT JOIN local_baselines AS baseline ON baseline.node_id = deferred.node_id
-            LEFT JOIN frontier_features AS feature ON feature.node_id = deferred.node_id
-            WHERE node.node_id IS NULL
-               OR node.source_id != deferred.source_id
+            SELECT feature.node_id
+            FROM frontier_selector_authorities AS authority
+            CROSS JOIN frontier_features AS feature
+            LEFT JOIN frontier_selector_results AS result
+              ON result.selector_version = authority.selector_version
+             AND result.node_id = feature.node_id
+            LEFT JOIN nodes AS node ON node.node_id = feature.node_id
+            LEFT JOIN local_baselines AS baseline ON baseline.node_id = feature.node_id
+            WHERE result.node_id IS NULL
+               OR node.source_id != result.source_id
                OR baseline.node_id IS NULL
-               OR baseline.coverage != deferred.coverage_stratum
-               OR feature.node_id IS NULL
-               OR feature.feature_digest != deferred.selector_feature_digest
+               OR baseline.coverage != result.coverage_stratum
+               OR feature.feature_digest != result.selector_feature_digest
             LIMIT 1
             """
         ).fetchone()
         if invalid is not None:
-            raise CatalogError("frontier deferred feature digest or selector fields are invalid")
+            raise CatalogError("frontier selector result is incomplete or invalid")
+        invalid = connection.execute(
+            """
+            SELECT result.node_id
+            FROM frontier_selector_results AS result
+            LEFT JOIN frontier_selector_authorities AS authority
+              ON authority.selector_version = result.selector_version
+            LEFT JOIN frontier_features AS feature ON feature.node_id = result.node_id
+            LEFT JOIN nodes AS node ON node.node_id = result.node_id
+            LEFT JOIN local_baselines AS baseline ON baseline.node_id = result.node_id
+            WHERE authority.selector_version IS NULL
+               OR feature.node_id IS NULL
+               OR node.source_id != result.source_id
+               OR baseline.node_id IS NULL
+               OR baseline.coverage != result.coverage_stratum
+               OR feature.feature_digest != result.selector_feature_digest
+            LIMIT 1
+            """
+        ).fetchone()
+        if invalid is not None:
+            raise CatalogError("frontier selector result is incomplete or invalid")
+        invalid = connection.execute(
+            """
+            SELECT result.node_id
+            FROM frontier_selector_results AS result
+            LEFT JOIN frontier_deferred AS deferred
+              ON deferred.selector_version = result.selector_version
+             AND deferred.node_id = result.node_id
+             AND deferred.reason = result.reason
+             AND deferred.node_digest = result.node_digest
+             AND deferred.cursor_json = result.cursor_json
+             AND deferred.cursor_order = result.cursor_order
+             AND deferred.source_id = result.source_id
+             AND deferred.coverage_stratum = result.coverage_stratum
+             AND deferred.relevance_rank = result.relevance_rank
+             AND deferred.selector_feature_digest = result.selector_feature_digest
+            WHERE result.selected = 0 AND deferred.node_id IS NULL
+            LIMIT 1
+            """
+        ).fetchone()
+        if invalid is not None:
+            raise CatalogError("frontier selector deferred set is incomplete")
+        invalid = connection.execute(
+            """
+            SELECT deferred.node_id
+            FROM frontier_deferred AS deferred
+            LEFT JOIN frontier_selector_results AS result
+              ON result.selector_version = deferred.selector_version
+             AND result.node_id = deferred.node_id
+            WHERE result.node_id IS NULL
+               OR result.selected != 0
+               OR deferred.reason != result.reason
+               OR deferred.node_digest != result.node_digest
+               OR deferred.cursor_json != result.cursor_json
+               OR deferred.cursor_order != result.cursor_order
+               OR deferred.source_id != result.source_id
+               OR deferred.coverage_stratum != result.coverage_stratum
+               OR deferred.relevance_rank != result.relevance_rank
+               OR deferred.selector_feature_digest != result.selector_feature_digest
+            LIMIT 1
+            """
+        ).fetchone()
+        if invalid is not None:
+            raise CatalogError("frontier selector deferred row is invalid")
 
 
 class SemanticCatalogReader:
@@ -758,45 +912,86 @@ class SemanticCatalogReader:
     def iter_frontier_deferred_for_audit(
         self, *, selector_version: str, fetch_size: int
     ) -> Iterator[SemanticDeferredAuditRow]:
-        _page_limit(fetch_size)
-        cursor = self.connection.execute(
-            """
-            SELECT node_id, reason, node_digest, cursor_json, cursor_order, source_id,
-                   coverage_stratum, relevance_rank, selector_version, selector_feature_digest
-            FROM frontier_deferred
-            WHERE selector_version = ?
-            ORDER BY relevance_rank, coverage_stratum, source_id, cursor_order, node_id
-            """,
-            (selector_version,),
-        )
+        cursor: tuple[str, int, str, str, int, str] | None = None
         while True:
-            rows = cursor.fetchmany(fetch_size)
-            if not rows:
+            page = self.frontier_deferred_page(selector_version, cursor, fetch_size)
+            if not page:
                 return
-            for row in rows:
-                yield SemanticDeferredAuditRow(*tuple(row))
+            for row in page:
+                yield row
+            cursor = self.frontier_deferred_cursor(page[-1])
+
+    def frontier_deferred_page(
+        self,
+        selector_version: str,
+        cursor: tuple[str, int, str, str, int, str] | None,
+        limit: int,
+    ) -> list[SemanticDeferredAuditRow]:
+        _page_limit(limit)
+        if cursor is None:
+            rows = self.connection.execute(
+                _DEFERRED_PAGE_SELECT + " WHERE selector_version = ?" + _DEFERRED_PAGE_ORDER + " LIMIT ?",
+                (selector_version, limit),
+            ).fetchall()
+        else:
+            (
+                cursor_selector_version,
+                relevance_rank,
+                coverage_stratum,
+                source_id,
+                cursor_order,
+                node_id,
+            ) = cursor
+            if cursor_selector_version != selector_version:
+                raise CatalogError("catalog deferred cursor selector does not match")
+            rows = self.connection.execute(
+                _DEFERRED_PAGE_SELECT
+                + " WHERE selector_version = ? AND "
+                + "(relevance_rank, coverage_stratum, source_id, cursor_order, node_id) > (?, ?, ?, ?, ?)"
+                + _DEFERRED_PAGE_ORDER
+                + " LIMIT ?",
+                (
+                    selector_version,
+                    relevance_rank,
+                    coverage_stratum,
+                    source_id,
+                    cursor_order,
+                    node_id,
+                    limit,
+                ),
+            ).fetchall()
+        return [SemanticDeferredAuditRow(*tuple(row)) for row in rows]
+
+    @staticmethod
+    def frontier_deferred_cursor(
+        row: SemanticDeferredAuditRow,
+    ) -> tuple[str, int, str, str, int, str]:
+        return (
+            row.selector_version,
+            row.relevance_rank,
+            row.coverage_stratum,
+            row.source_id,
+            row.cursor_order,
+            row.node_id,
+        )
 
     def deferred_summary(self, *, selector_version: str) -> DeferredSummary:
         root = bytes(32)
         cursor_root = bytes(32)
         count = 0
-        cursor = self.connection.execute(
-            """
-            SELECT node_id, reason, node_digest, cursor_json, cursor_order, source_id,
-                   coverage_stratum, relevance_rank, selector_version, selector_feature_digest
-            FROM frontier_deferred
-            WHERE selector_version = ?
-            ORDER BY relevance_rank, coverage_stratum, source_id, cursor_order, node_id
-            """,
-            (selector_version,),
-        )
-        for row in cursor:
-            row_json = canonical_json_text(dict(row)).encode("utf-8")
-            root = hashlib.sha256(_ROOT_DOMAIN + b"deferred\0" + root + row_json).digest()
-            cursor_root = hashlib.sha256(
-                _ROOT_DOMAIN + b"deferred-cursor\0" + cursor_root + row["cursor_json"].encode("utf-8")
-            ).digest()
-            count += 1
+        cursor: tuple[str, int, str, str, int, str] | None = None
+        while True:
+            page = self.frontier_deferred_page(selector_version, cursor, 64)
+            if not page:
+                break
+            for row in page:
+                row_json = canonical_json_text(row.__dict__).encode("utf-8")
+                root = hashlib.sha256(_ROOT_DOMAIN + b"deferred\0" + root + row_json).digest()
+                cursor_root = hashlib.sha256(
+                    _ROOT_DOMAIN + b"deferred-cursor\0" + cursor_root + row.cursor_json.encode("utf-8")
+                ).digest()
+                count += 1
+            cursor = self.frontier_deferred_cursor(page[-1])
         return DeferredSummary(count, root.hex(), cursor_root.hex())
 
 
@@ -853,6 +1048,21 @@ def _validate_reference(reference: PackRecordRef) -> None:
     _validate_digest(reference.sha256, "catalog payload sha256")
 
 
+def _validate_selector_row(row: FrontierSelectorResult) -> None:
+    _require_text(row.node_id, "selector node id")
+    _require_text(row.reason, "selector reason")
+    _require_text(row.source_id, "selector source id")
+    _require_text(row.coverage_stratum, "selector coverage stratum")
+    _require_text(row.selector_version, "selector version")
+    _validate_digest(row.node_digest, "selector node digest")
+    _validate_digest(row.selector_feature_digest, "selector feature digest")
+    if not isinstance(row.selected, bool):
+        raise CatalogError("selector selected flag is invalid")
+    if row.cursor_order < 0 or row.relevance_rank < 0:
+        raise CatalogError("selector ordering is invalid")
+    _canonical_json_from_text(row.cursor_json)
+
+
 def _validate_digest(value: str | None, name: str) -> None:
     if value is None:
         return
@@ -881,14 +1091,42 @@ def _logical_root(connection: sqlite3.Connection) -> str:
     for table, primary_key in _AUTHORITATIVE_TABLES:
         columns = [row[1] for row in connection.execute(f"PRAGMA table_info({table})")]
         order_by = ", ".join(primary_key)
-        cursor = connection.execute(f"SELECT * FROM {table} ORDER BY {order_by}")
         table_name = table.encode("utf-8")
         root = hashlib.sha256(_ROOT_DOMAIN + b"table\0" + root + table_name).digest()
-        for row in cursor:
+        for row in _authoritative_rows(connection, table, order_by):
             value = {column: row[index] for index, column in enumerate(columns)}
             encoded = canonical_json_text(value).encode("utf-8")
             root = hashlib.sha256(_ROOT_DOMAIN + b"row\0" + root + encoded).digest()
     return root.hex()
+
+
+def _authoritative_rows(
+    connection: sqlite3.Connection, table: str, order_by: str
+) -> Iterator[sqlite3.Row | tuple[object, ...]]:
+    if table != "frontier_deferred":
+        yield from connection.execute(f"SELECT * FROM {table} ORDER BY {order_by}")
+        return
+    cursor: tuple[str, str] | None = None
+    while True:
+        if cursor is None:
+            rows = connection.execute(
+                "SELECT * FROM frontier_deferred ORDER BY selector_version, node_id LIMIT 64"
+            ).fetchall()
+        else:
+            rows = connection.execute(
+                """
+                SELECT * FROM frontier_deferred
+                WHERE (selector_version, node_id) > (?, ?)
+                ORDER BY selector_version, node_id
+                LIMIT 64
+                """,
+                cursor,
+            ).fetchall()
+        if not rows:
+            return
+        yield from rows
+        final = rows[-1]
+        cursor = (final[8], final[0])
 
 
 def _verify_schema(connection: sqlite3.Connection) -> None:
@@ -994,6 +1232,16 @@ _FRONTIER_PAGE_ORDER = """
              independent_child DESC, evidence_linked DESC, uncertainty DESC, node_id
 """
 
+_DEFERRED_PAGE_SELECT = """
+    SELECT node_id, reason, node_digest, cursor_json, cursor_order, source_id,
+           coverage_stratum, relevance_rank, selector_version, selector_feature_digest
+    FROM frontier_deferred
+"""
+
+_DEFERRED_PAGE_ORDER = """
+    ORDER BY selector_version, relevance_rank, coverage_stratum, source_id, cursor_order, node_id
+"""
+
 
 _SCHEMA = """
 CREATE TABLE nodes (
@@ -1061,6 +1309,26 @@ CREATE TABLE frontier_features (
   feature_digest TEXT NOT NULL
 );
 CREATE INDEX frontier_ready_order ON frontier_features(top_level_lane, project_like DESC, ambiguous DESC, node_id);
+CREATE TABLE frontier_selector_authorities (
+  selector_version TEXT PRIMARY KEY,
+  selector_digest TEXT NOT NULL
+);
+CREATE TABLE frontier_selector_results (
+  selector_version TEXT NOT NULL,
+  node_id TEXT NOT NULL REFERENCES nodes(node_id),
+  selected INTEGER NOT NULL,
+  reason TEXT NOT NULL,
+  node_digest TEXT NOT NULL,
+  cursor_json TEXT NOT NULL,
+  cursor_order INTEGER NOT NULL,
+  source_id TEXT NOT NULL,
+  coverage_stratum TEXT NOT NULL,
+  relevance_rank INTEGER NOT NULL,
+  selector_feature_digest TEXT NOT NULL,
+  PRIMARY KEY(selector_version, node_id),
+  UNIQUE(selector_version, cursor_order)
+);
+CREATE INDEX frontier_selector_results_node_order ON frontier_selector_results(node_id, selector_version);
 CREATE TABLE frontier_order (
   node_id TEXT PRIMARY KEY REFERENCES frontier_features(node_id),
   fair_round INTEGER NOT NULL,
@@ -1076,18 +1344,20 @@ CREATE UNIQUE INDEX frontier_order_page ON frontier_order(
   independent_child DESC, evidence_linked DESC, uncertainty DESC, node_id
 );
 CREATE TABLE frontier_deferred (
-  node_id TEXT PRIMARY KEY REFERENCES nodes(node_id),
+  node_id TEXT NOT NULL REFERENCES nodes(node_id),
   reason TEXT NOT NULL,
   node_digest TEXT NOT NULL,
   cursor_json TEXT NOT NULL,
-  cursor_order INTEGER NOT NULL UNIQUE,
+  cursor_order INTEGER NOT NULL,
   source_id TEXT NOT NULL,
   coverage_stratum TEXT NOT NULL,
   relevance_rank INTEGER NOT NULL,
   selector_version TEXT NOT NULL,
-  selector_feature_digest TEXT NOT NULL
+  selector_feature_digest TEXT NOT NULL,
+  PRIMARY KEY(selector_version, node_id),
+  UNIQUE(selector_version, cursor_order)
 );
 CREATE INDEX frontier_deferred_audit_order ON frontier_deferred(
-  relevance_rank, coverage_stratum, source_id, cursor_order, node_id
+  selector_version, relevance_rank, coverage_stratum, source_id, cursor_order, node_id
 );
 """
