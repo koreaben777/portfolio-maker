@@ -5,6 +5,11 @@ from pathlib import Path
 from typing import Literal
 
 from portfolio_maker.domain.history_models import CleanupExecutionState
+from portfolio_maker.domain.semantic_frontier import (
+    SEMANTIC_PROTOCOL_V2,
+    SEMANTIC_PROTOCOL_V3,
+    SemanticPhaseBinding,
+)
 
 
 ArtifactKind = Literal[
@@ -148,6 +153,7 @@ class ComposeProjectsV2Result:
 class PrepareSemanticIndexRequest:
     workspace: Path
     root: Path
+    protocol: str = SEMANTIC_PROTOCOL_V3
     chunk_size: int = 100
     directory_timeout_seconds: float = 30.0
     directory_timeout_budget_seconds: float = 120.0
@@ -168,6 +174,12 @@ class PrepareSemanticIndexResult:
     directory_timeout_budget_seconds: float = 120.0
     timed_out_directory_count: int = 0
     unreadable_directory_count: int = 0
+    protocol: str = SEMANTIC_PROTOCOL_V2
+    run_id: str | None = None
+    proposal_sha256: str | None = None
+    structural_node_count: int = 0
+    baseline_coverage_counts: tuple[tuple[str, int], ...] = ()
+    phase_bindings: tuple[SemanticPhaseBinding, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -198,6 +210,7 @@ class SemanticIndexStatusResult:
     receipted_count: int
     invalid_count: int
     complete: bool
+    protocol: str = SEMANTIC_PROTOCOL_V2
 
 
 @dataclass(frozen=True)
@@ -211,6 +224,7 @@ class NextSemanticWorkResult:
     unit_id: str | None
     input_path: Path | None
     remaining_count: int
+    protocol: str = SEMANTIC_PROTOCOL_V2
 
 
 @dataclass(frozen=True)
@@ -224,6 +238,7 @@ class ValidateSemanticWorkResult:
     unit_id: str
     receipt_path: Path
     output_sha256: str
+    protocol: str = SEMANTIC_PROTOCOL_V2
 
 
 @dataclass(frozen=True)
@@ -237,6 +252,7 @@ class FinalizeSemanticIndexResult:
     manifest_path: Path
     chunk_count: int
     node_count: int
+    protocol: str = SEMANTIC_PROTOCOL_V2
 
 
 @dataclass(frozen=True)

@@ -145,6 +145,50 @@ class WorkspacePaths:
     def semantic_revision_locator_dir(self, revision_id: str) -> Path:
         return self.semantic_revision_raw_dir(revision_id) / "locators"
 
+    def semantic_v3_manifest_path(self, revision_id: str) -> Path:
+        return self.semantic_revision_raw_dir(revision_id) / "manifest.v3.json"
+
+    def semantic_v3_catalog_path(self, revision_id: str) -> Path:
+        return self.semantic_revision_raw_dir(revision_id) / "catalog.sqlite"
+
+    def semantic_v3_pack_path(self, revision_id: str, pack_name: str) -> Path:
+        _validate_revision_id(pack_name)
+        return self.semantic_revision_raw_dir(revision_id) / "packs" / f"{pack_name}.pm-pack"
+
+    def semantic_v3_prepare_pack_path(self, revision_id: str, run_id: str) -> Path:
+        return self.semantic_v3_run_dir(revision_id, run_id) / "prepare.pm-pack"
+
+    def semantic_v3_run_dir(self, revision_id: str, run_id: str) -> Path:
+        _validate_revision_id(revision_id)
+        _validate_revision_id(run_id)
+        return self.semantic_revision_raw_dir(revision_id) / "runs" / run_id
+
+    def semantic_v3_result_pack_path(self, revision_id: str, run_id: str) -> Path:
+        return self.semantic_v3_run_dir(revision_id, run_id) / "results.pm-pack"
+
+    def semantic_v3_exchange_input_path(self, revision_id: str, run_id: str) -> Path:
+        return self.semantic_v3_run_dir(revision_id, run_id) / "exchange-input.pm-pack"
+
+    def semantic_v3_exchange_output_path(self, revision_id: str, run_id: str) -> Path:
+        return self.semantic_v3_run_dir(revision_id, run_id) / "exchange-output.pm-pack"
+
+    def semantic_v3_deepening_deferred_index_path(
+        self, revision_id: str, run_id: str
+    ) -> Path:
+        return self.semantic_v3_run_dir(revision_id, run_id) / "deepening" / "deferred.sqlite"
+
+    def semantic_v3_deepening_deferred_temp_path(
+        self, revision_id: str, run_id: str
+    ) -> Path:
+        return self.semantic_v3_deepening_deferred_index_path(
+            revision_id, run_id
+        ).with_name("deferred.sqlite.preparing")
+
+    def semantic_v3_private_failure_review_path(
+        self, revision_id: str, run_id: str
+    ) -> Path:
+        return self.semantic_v3_run_dir(revision_id, run_id) / "failure-review.private.json"
+
 
 def _validate_revision_id(revision_id: str) -> None:
     if (

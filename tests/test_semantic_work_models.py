@@ -14,6 +14,7 @@ from portfolio_maker.application.models import (
     ValidateSemanticWorkRequest,
     ValidateSemanticWorkResult,
 )
+from portfolio_maker.domain.semantic_frontier import SEMANTIC_PROTOCOL_V3
 from portfolio_maker.domain.semantic_work import (
     SemanticDisposition,
     SemanticWorkPlan,
@@ -123,22 +124,23 @@ def test_semantic_application_contracts_have_exact_fields_and_are_frozen(
                 "receipted_count",
                 "invalid_count",
                 "complete",
+                "protocol",
             ),
         ),
         (next_request, ("workspace",)),
         (
             next_result,
-            ("revision_id", "unit_id", "input_path", "remaining_count"),
+            ("revision_id", "unit_id", "input_path", "remaining_count", "protocol"),
         ),
         (validate_request, ("workspace", "unit_id")),
         (
             validate_result,
-            ("unit_id", "receipt_path", "output_sha256"),
+            ("unit_id", "receipt_path", "output_sha256", "protocol"),
         ),
         (finalize_request, ("workspace",)),
         (
             finalize_result,
-            ("revision_id", "manifest_path", "chunk_count", "node_count"),
+            ("revision_id", "manifest_path", "chunk_count", "node_count", "protocol"),
         ),
         (
             prepare_result,
@@ -156,6 +158,12 @@ def test_semantic_application_contracts_have_exact_fields_and_are_frozen(
                 "directory_timeout_budget_seconds",
                 "timed_out_directory_count",
                 "unreadable_directory_count",
+                "protocol",
+                "run_id",
+                "proposal_sha256",
+                "structural_node_count",
+                "baseline_coverage_counts",
+                "phase_bindings",
             ),
         ),
     )
@@ -177,6 +185,14 @@ def test_semantic_application_contracts_have_exact_fields_and_are_frozen(
     assert validate_result.unit_id == "unit-000001"
     assert validate_result.receipt_path == workspace / "receipt.json"
     assert finalize_result.manifest_path == workspace / "manifest.json"
+
+
+def test_v3_prepare_request_defaults_to_the_v3_protocol(tmp_path: Path) -> None:
+    from portfolio_maker.application.models import PrepareSemanticIndexRequest
+
+    request = PrepareSemanticIndexRequest(tmp_path / "workspace", tmp_path / "root")
+
+    assert request.protocol == SEMANTIC_PROTOCOL_V3
 
 
 def test_workspace_paths_include_semantic_protocol_v2_surfaces(tmp_path: Path) -> None:

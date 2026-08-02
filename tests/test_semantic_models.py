@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import FrozenInstanceError, fields
+from dataclasses import FrozenInstanceError, fields, replace
 
 import pytest
 
@@ -15,6 +15,22 @@ from portfolio_maker.domain.semantic_models import (
     stable_node_id,
     stable_source_id,
 )
+from portfolio_maker.domain.semantic_frontier import (
+    AUDIT_BUDGET,
+    DEEPENING_BUDGET,
+    EXPANSION_BUDGET,
+    FRONTIER_BUDGET,
+    FRONTIER_PHASE_HARD_BUDGETS,
+    ORIENTATION_BUDGET,
+    FrontierPhase,
+    SemanticBudget,
+    SemanticCompletion,
+    SemanticExecutionProposal,
+    SemanticLeaseState,
+    SemanticPhaseBinding,
+    SemanticRunState,
+)
+from portfolio_maker.workspace import WorkspacePaths
 
 
 def test_semantic_ids_are_stable_and_do_not_contain_locator() -> None:
@@ -95,3 +111,101 @@ def test_semantic_value_types_are_frozen_and_locator_free() -> None:
     assert revision.status is RevisionStatus.STAGING
     with pytest.raises(FrozenInstanceError):
         node.display_name = "changed"  # type: ignore[misc]
+
+
+def test_v3_default_budgets_and_completion_states_are_exact(tmp_path: Path) -> None:
+    assert FRONTIER_BUDGET == SemanticBudget(512, 128 * 1024**2, 7_200)
+    assert DEEPENING_BUDGET == SemanticBudget(256, 64 * 1024**2, 3_600)
+    assert FRONTIER_PHASE_HARD_BUDGETS == (
+        (FrontierPhase.ORIENTATION, ORIENTATION_BUDGET),
+        (FrontierPhase.EXPANSION, EXPANSION_BUDGET),
+        (FrontierPhase.AUDIT, AUDIT_BUDGET),
+    )
+    completion = SemanticCompletion(
+        structural_complete=True,
+        local_baseline_complete=True,
+        planned_receipts_complete=True,
+        frontier_converged=False,
+        paused_budget=True,
+        project_discovery_ready=False,
+        deepening_complete=False,
+    )
+
+    assert completion.paused_budget is True
+    assert completion.project_discovery_ready is False
+
+
+def test_run_and_lease_states_are_disjoint() -> None:
+    assert not ({state.value for state in SemanticRunState} & {state.value for state in SemanticLeaseState})
+
+
+def test_frontier_converged_and_paused_budget_cannot_both_be_true() -> None:
+    with pytest.raises(ValueError, match="converged.*paused_budget"):
+        SemanticCompletion(
+            structural_complete=True,
+            local_baseline_complete=True,
+            planned_receipts_complete=True,
+            frontier_converged=True,
+            paused_budget=True,
+            project_discovery_ready=False,
+            deepening_complete=False,
+        )
+
+
+def test_v3_workspace_paths_are_revision_and_run_scoped(tmp_path: Path) -> None:
+    paths = WorkspacePaths.from_root(tmp_path / "workspace")
+
+    assert paths.semantic_v3_catalog_path("rev-1").name == "catalog.sqlite"
+    assert paths.semantic_v3_pack_path("rev-1", "structural").name == "structural.pm-pack"
+    assert paths.semantic_v3_result_pack_path("rev-1", "run-1").name == "results.pm-pack"
+    assert paths.semantic_v3_deepening_deferred_index_path("rev-1", "run-1").name == "deferred.sqlite"
+    temp = paths.semantic_v3_deepening_deferred_temp_path("rev-1", "run-1")
+
+    assert temp.parent == paths.semantic_v3_deepening_deferred_index_path("rev-1", "run-1").parent
+    assert temp.name == "deferred.sqlite.preparing"
+    with pytest.raises(ValueError):
+        paths.semantic_v3_run_dir("rev-1", "../escape")
+
+
+def test_frontier_proposal_rejects_reassigned_phase_budget() -> None:
+    proposal = SemanticExecutionProposal(
+        run_id="run-1",
+        revision_id="rev-1",
+        approval_kind="frontier",
+        source_approval_sha256="a" * 64,
+        manifest_sha256="b" * 64,
+        policy_sha256="c" * 64,
+        selector_version="selector-v1",
+        catalog_root="sha256:catalog",
+        safe_source_label="approved-source",
+        private_context_scope="private",
+        authority_root="sha256:authority",
+        plan_sha256="d" * 64,
+        parent_checkpoint_root="sha256:checkpoint",
+        target_projection_contract="projection-v1",
+        input_schema_version="input-v1",
+        output_schema_version="output-v1",
+        validator_version="validator-v1",
+        purpose="frontier",
+        structural_node_count=9,
+        baseline_coverage_counts=(("file", 9),),
+        phase_bindings=tuple(
+            SemanticPhaseBinding(phase, budget, budget)
+            for phase, budget in FRONTIER_PHASE_HARD_BUDGETS
+        ),
+        audit_selector_rule="unresolved",
+        deferred_semantics="defer",
+        budget=FRONTIER_BUDGET,
+    )
+    with pytest.raises(ValueError, match="phase bindings"):
+        replace(
+            proposal,
+            phase_bindings=(
+                SemanticPhaseBinding(
+                    FrontierPhase.ORIENTATION,
+                    ORIENTATION_BUDGET,
+                    EXPANSION_BUDGET,
+                ),
+                *proposal.phase_bindings[1:],
+            ),
+        )
