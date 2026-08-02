@@ -201,9 +201,11 @@ v3 staging은 다음 논리 객체를 가진다. 실제 파일명은 구현 계�
     content.pm-pack
     structural.pm-pack
     locators.pm-pack
-  exchange/
-    input.json
-    output.json
+  runs/<run-id>/
+    results.pm-pack
+    exchange/
+      input.json
+      output.json
   private-reviews/
 
 .portfolio-maker/portfolio.db
@@ -215,11 +217,15 @@ v3 staging은 다음 논리 객체를 가진다. 실제 파일명은 구현 계�
   파일 사본이 아니며, 이후 선택되는 representative 원문을 pack에 append하지 않는다.
 - `structural.pm-pack`은 full child list와 topology payload를 보존한다.
 - `locators.pm-pack`은 raw local locator/private source locator를 분리해 보존한다.
-- 기존 workspace `portfolio.db`의 additive lifecycle table만 실행 중 mutable하다.
-  queue, lease, receipt, aggregate, checkpoint, pause state와 current staging binding을
-  같은 SQLite transaction으로 관리한다.
-- `exchange`는 매 unit마다 원자 교체되는 단일 bounded slot이다. unit별 파일을
-  누적 생성하지 않는다.
+- 기존 workspace `portfolio.db`의 additive lifecycle table은 유일한 mutable
+  **transactional authority**다. queue, lease, receipt, aggregate, checkpoint, pause
+  state와 current staging binding을 같은 SQLite transaction으로 관리한다.
+- `results.pm-pack`은 한 run의 validated semantic output canonical bytes를 append-only로
+  보존하는 durable authority다. prepare pack과 달리 run finalize 때 seal한다.
+- 각 run의 `exchange`는 매 unit마다 원자 교체되는 단일 bounded slot이다. unit별
+  exchange 파일을 누적 생성하지 않는다.
+- 준비·pause된 run은 여러 개 보존할 수 있지만 workspace execution mutex와 DB unique
+  invariant로 `running` 또는 active lease를 가진 run은 정확히 하나만 허용한다.
 
 ### 5.2 `pm-pack-v1`
 
@@ -241,6 +247,15 @@ catalog은 WAL을 본 파일로 checkpoint하고 WAL/SHM이 남지 않은 상태
 check, `VACUUM`, fsync를 거쳐 seal한다. `catalog_file_sha256`은 seal된 SQLite 파일
 전체 bytes의 SHA-256이고, `catalog_logical_root`는 primary-key 순서의 권위 row를
 canonical encode해 계산한 streaming root다. manifest는 둘 다 bind한다.
+
+runtime `results.pm-pack`은 같은 record framing을 사용하되 receipt commit 전까지
+append-only open 상태다. validate는 canonical output record를 append하고 fsync한 뒤,
+DB transaction에서 offset, length, record digest, committed pack length와 누적 result
+root를 receipt/checkpoint에 기록한다. crash가 append 후 DB commit 전에 발생하면 마지막
+committed pack length 밖의 tail은 권위가 아니다. recovery는 committed prefix root를
+검증하고 그 tail을 무시하거나 잘라낸 뒤 재개한다. DB commit 뒤 exchange cleanup 전에
+crash하면 existing receipt/result reference를 idempotently 재생한다. in-place record
+rewrite는 언제나 금지한다.
 
 ### 5.3 immutable catalog
 
@@ -270,9 +285,9 @@ payload를 이 DB에 복제하지 않고, 한 실행의 bounded frontier unit과
 | `revision_binding` | exact manifest hash, catalog root, policy hash, lifecycle schema |
 | `frontier_units` | unit ID, phase, dependency, priority, terminal/deferred state |
 | `leases` | 현재 unit, input hash, owner nonce, 발급·만료 상태 |
-| `receipts` | validated output hash, action, validator version, committed sequence |
+| `receipts` | validated output hash, result-pack offset/length/hash, action, validator version, committed sequence |
 | `aggregates` | 상태·phase별 count, bytes, elapsed, coverage와 next-ready count |
-| `checkpoints` | receipt sequence, queue root, aggregate root, resume cursor |
+| `checkpoints` | receipt sequence, result-pack root/length, queue root, aggregate root, resume cursor |
 | `approvals` | 실행 종류, plan/estimate/budget binding과 명시 승인 기록 |
 | `deepening_runs` | project별 별도 revision, authority, budget, cancel/resume 상태 |
 
@@ -301,6 +316,7 @@ manifest는 canonical JSON으로 다음을 결합한다.
 - frontier algorithm ID, deterministic parameters, traversal order
 - proposed phase별 unit/byte/time estimate와 기본 budget
 - exchange limit와 per-unit limit
+- run result-pack format, output limit와 initial empty root
 - lifecycle schema version와 initial checkpoint root
 - v2 migration이면 `derived_from`과 migration report digest
 - manifest self-hash
@@ -386,7 +402,11 @@ artifact로 자동 승격하지 않는다.
 
 metadata, prefix digest, sampled digest를 cache key의 full-content 부분으로 쓰지 않는다.
 프런티어 또는 deepening에 실제로 선택되어 Codex 근거나 candidate activation에 영향을
-주는 regular file은 원본을 streaming 재검증해 full content SHA-256을 얻는다.
+주는 regular file은 원본을 streaming 재검증해 full content SHA-256을 얻는다. application은
+symlink-follow를 금지한 동일한 open file descriptor에서 pre-`fstat`, full hash와 bounded
+slice 수집, post-`fstat`을 한 pass로 수행한다. device, inode, size, mtime-ns 또는 읽은
+bytes가 중간에 바뀌면 input을 publish하지 않고 stale로 중단한다. hash 뒤 locator를
+다시 열어 slice를 읽지 않는다.
 
 원본이 prepare 이후 바뀌었거나 source policy가 달라졌으면 해당 unit과 downstream
 candidate를 stale 처리하고 재승인 가능한 새 plan을 요구한다. unreadable/unsupported
@@ -595,13 +615,17 @@ paused인 시간과 사용자 승인 대기 시간은 제외한다. process rest
 `next-semantic-work`는 다음 절차만 수행한다.
 
 1. manifest binding과 approval receipt를 bounded query로 확인
-2. pause/budget/active lease 확인
-3. ready index에서 한 unit 선택
+2. DB transaction에서 pause/budget/active lease를 확인하고 workspace execution mutex,
+   run ID, unit ID, lease nonce를 `materializing` 상태로 먼저 예약
+3. existing lease면 같은 nonce의 input을 idempotently 재생하고, 아니면 ready index에서
+   예약된 한 unit만 처리
 4. 필요한 catalog row와 pack slice만 읽기
-5. selected regular file의 full content identity/current policy 재검증
-6. locator를 application 내부에서만 사용해 필요한 bounded slice를 다시 읽고 mask한 뒤
-   262,144 bytes 이하 canonical input을 temporary file에 작성
-7. input fsync/atomic replace와 lease commit
+5. locator를 application 내부에서만 사용해 selected regular file을 no-follow로 한 번
+   열고, 같은 descriptor의 한 streaming pass에서 full content identity와 필요한 bounded
+   slice를 함께 얻어 current policy 및 pre/post identity를 재검증
+6. 검증된 slice를 mask한 뒤 262,144 bytes 이하 canonical input을 temporary file에 작성
+7. input fsync/atomic replace 뒤 exact input hash를 같은 nonce에 bind하며 lease를 `issued`로
+   전환
 
 같은 active lease에는 byte-identical input을 반환한다. lease 없이 output을 받지 않는다.
 on-demand representative input은 immutable pack에 원본 사본으로 남기지 않는다. receipt
@@ -613,9 +637,10 @@ digest가 같은 원본에서 결정론적으로 다시 materialize한다. diges
 
 `validate-semantic-work`는 exact unit/lease/input hash, output schema, allowed action,
 grounding, byte/time budget, dependency, policy와 content identity를 확인한다. 성공 시
-output receipt와 후속 queue/aggregate/checkpoint를 한 transaction에 commit하고 exchange
-output을 비운다. 동일 output 재전송은 같은 receipt를 반환하는 idempotent success이며,
-다른 output은 conflict로 거부한다.
+canonical output bytes를 run result pack에 append/fsync하고, 그 exact record reference와
+output receipt, 후속 queue/aggregate/checkpoint를 한 DB transaction에 commit한 뒤에만
+exchange output을 비운다. 동일 output 재전송은 같은 receipt와 result reference를 반환하는
+idempotent success이며, 다른 output은 conflict로 거부한다.
 
 ### 10.3 pause와 recovery
 
@@ -623,7 +648,8 @@ output을 비운다. 동일 output 재전송은 같은 receipt를 반환하는 i
   멈추고 durable checkpoint를 게시한다.
 - process crash 전 commit되지 않은 output은 receipt가 아니며 다시 실행한다.
 - exchange write는 temporary + fsync + atomic replace를 사용한다.
-- checkpoint는 receipt sequence, queue root, aggregate root, resume cursor를 bind한다.
+- checkpoint는 receipt sequence, result-pack root/length, queue root, aggregate root,
+  resume cursor를 bind한다.
 - resume는 마지막 검증 checkpoint와 active/expired lease를 복구하고 다음 미완료 unit부터
   시작한다.
 - 한 unit을 두 번 commit하거나 budget counter를 두 번 차감하지 않는다.
@@ -660,6 +686,7 @@ finalize는 mutable counter만 신뢰하지 않고 다음을 streaming O(N), bou
 
 - manifest self-hash와 pack/catalog roots
 - 모든 receipt sequence, input/output hash와 dependency
+- 모든 committed result record의 offset/length/hash와 checkpoint result root
 - selector convergence 또는 deepening completion 조건
 - deferred/partial material counter-signal
 - source policy/current content binding
@@ -667,8 +694,10 @@ finalize는 mutable counter만 신뢰하지 않고 다음을 streaming O(N), bou
 
 검증된 semantic node를 새 immutable final pack/catalog에 stream write한다. Codex output에
 topology가 없으므로 full child list는 structural pack에서 복원한다. publication 전 byte
-size/root preflight와 이전 상태 snapshot을 만들고, post-write failure 시 이전 bytes/absence를
-복원해 확인한다.
+size/root preflight를 수행하고 receipt가 가리키는 result-pack canonical bytes만 streaming
+읽는다. 이전 상태 snapshot은 다중 GB generation 복사가 아니라 기존의 작은 DB
+binding/pointer와 manifest bytes/absence만 의미한다. post-write failure 시 이 작은 이전
+binding과 manifest bytes/absence를 복원해 확인한다.
 
 ### 11.3 apply
 
@@ -765,6 +794,13 @@ path나 source URL을 target으로 받지 않는다. 취소·재시도·resume�
 receipt를 삭제하지 않고 byte-idempotent해야 한다. deepening 결과만으로 project,
 evidence, artifact 또는 delivery state가 달라지는 것을 금지한다.
 
+동시 `next` 두 개가 서로 다른 run을 요청하면 workspace execution mutex를 먼저 획득한
+정확히 한 run만 lease를 얻는다. 다른 호출은 bounded `run_busy` 응답을 받고 exchange를
+쓰지 않는다. mutex/lease reservation은 어떤 pack/source read나 exchange write보다 먼저
+commit한다. `materializing` 중 crash하면 같은 nonce만 결정론적으로 input을 복원할 수 있고,
+다른 run은 slot을 건드릴 수 없다. 같은 run·같은 lease의 재호출만 byte-identical
+idempotent replay다.
+
 ### 14.2 application port
 
 구현은 다음 책임을 분리한다.
@@ -838,16 +874,24 @@ keyword 또는 파일 수만으로는 통과하지 않는다.
 
 ### 16.1 300-sample false-negative audit
 
-프런티어 종료 뒤 비선택/deferred 영역에서 정확히 세 층을 만든다.
+300-sample 감사는 별도 deepening이나 무승인 작업이 아니라 같은 `frontier` approval에
+결합된 audit phase다. sample-set digest, private-context 범위, 최대 64 units/16 MiB/15분이
+frontier proposal과 approval receipt에 미리 포함된다. 300개 node는 bounded unit으로
+batch되며 이 예산을 넘기면 `paused_budget`로 멈추고 `project_discovery_ready`가 될 수
+없다. 더 진행하려면 변경된 proposal digest에 대한 새 frontier 승인을 받아야 한다.
+
+프런티어 expansion 종료 뒤 비선택/deferred 영역에서 정확히 세 층을 만든다.
 
 1. relevance-weighted 100: 남은 node 중 local project-likeness/counter-signal이 높은 순
 2. coverage-stratified 100: source, depth, size, role, coverage/error 상태를 층화해 선택
 3. deterministic-random 100: revision ID와 policy hash를 seed로 stable hash 선택
 
 중복 node는 다음 stable 후보로 대체해 총 300개를 유지한다. 독립 reviewer가 parent/child
-맥락과 local baseline을 검토하며, 프런티어가 놓친 high/medium project가 1건이라도 있으면
-release gate 실패다. low/ambiguous 발견은 severity와 selector 개선 입력으로 기록하되
-자동으로 source를 재탐색하거나 budget을 늘리지 않는다.
+맥락과 validated private audit projection을 검토한다. 이 사람/Review Team 검토는 새로운
+raw source read나 Codex context 노출을 만들지 않고 이미 승인·검증된 audit output만
+평가한다. 프런티어가 놓친 high/medium project가 1건이라도 있으면 release gate 실패다.
+low/ambiguous 발견은 severity와 selector 개선 입력으로 기록하되 자동으로 source를
+재탐색하거나 budget을 늘리지 않는다.
 
 ## 17. 테스트 전략
 
@@ -862,6 +906,9 @@ release gate 실패다. low/ambiguous 발견은 severity와 selector 개선 입�
 - phase별 unit/byte/time budget과 no-auto-increase
 - state truth table과 false completion 방지
 - lease idempotency, duplicate/conflicting output, pause/recovery
+- result-pack append/fsync/receipt 각 경계 crash, orphan tail, exchange cleanup 후 복원
+- 두 run의 concurrent next에서 단일 workspace lease와 slot 격리
+- full hash 직후 tail rewrite/동일 inode 변경의 TOCTOU 거부
 - v2/v3 protocol dispatch와 migration binding
 - deepening authority, split/merge/exclude invalidation
 
@@ -887,6 +934,7 @@ release gate 실패다. low/ambiguous 발견은 severity와 selector 개선 입�
 - Codex가 nonexistent child/evidence 또는 full topology를 출력하면 거부
 - unreadable subtree를 non-project로 자동 판정하지 않음
 - deterministic audit sample을 임의로 교체하면 digest mismatch 실패
+- exchange 삭제·process restart 뒤 result pack에서 byte-identical finalize
 
 같은 사용자가 manifest, pack, catalog, ledger와 검증 코드를 모두 일관되게 다시 쓰는 공격은
 현재 threat model 밖이다. SHA-256과 checkpoint chain은 accidental corruption, partial write,
@@ -910,6 +958,8 @@ stale/mismatched component를 탐지하지만 외부 공격자에 대한 서명 
 10. deepening이 project authority, cancel, idempotent resume를 bind하지 않음
 11. 완료 상태를 합쳐 partial/deferred/unreadable을 숨김
 12. fresh pilot에서 필수 3개 project recall/boundary/audit gate 실패
+13. validated semantic output canonical bytes와 receipt 사이 durable result reference가 없음
+14. multi-run exchange 충돌 또는 hash와 input slice 사이 TOCTOU가 가능
 
 release candidate는 다음 증거를 모두 요구한다.
 
