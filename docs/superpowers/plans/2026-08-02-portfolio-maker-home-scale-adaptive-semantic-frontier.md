@@ -200,6 +200,12 @@ class SemanticDeferredAuditRow:
     selector_feature_digest: str
 
 @dataclass(frozen=True)
+class SemanticRuntimeDeferredRow:
+    audit: SemanticDeferredAuditRow
+    source_transition_unit_id: str
+    created_sequence: int
+
+@dataclass(frozen=True)
 class SemanticFrontierPlan:
     run_id: str
     revision_id: str
@@ -1091,7 +1097,8 @@ def claim_semantic_v3_running_slot(self, run_id: str) -> None: ...
 def acquire_semantic_v3_execution(self, run_id: str, unit_id: str, lease_nonce: str) -> None: ...
 def issue_semantic_v3_input(self, run_id: str, lease_nonce: str, input_sha256: str, byte_count: int) -> None: ...
 def commit_semantic_v3_receipt(self, receipt: SemanticReceiptCommit) -> None: ...
-def iter_semantic_v3_runtime_deferred(self, run_id: str, fetch_size: int = 256) -> Iterator[SemanticDeferredAuditRow]: ...
+def iter_semantic_v3_runtime_deferred(self, run_id: str, fetch_size: int = 256) -> Iterator[SemanticRuntimeDeferredRow]: ...
+def iter_semantic_v3_runtime_deferred_audit(self, run_id: str, fetch_size: int = 256) -> Iterator[SemanticDeferredAuditRow]: ...
 def checkpoint_semantic_v3_run(self, checkpoint: SemanticCheckpoint) -> None: ...
 def commit_semantic_v3_audit_freeze(self, freeze: SemanticAuditFreeze) -> None: ...
 def pause_semantic_v3_run(self, run_id: str, reason: str) -> None: ...
@@ -1105,7 +1112,11 @@ root/checkpoint, insert every bounded runtime `defer_on_demand` row, recompute t
 `runtime_transition` count/root/cursor binding, and release the singleton lock in one transaction.
 Each runtime canonical row stores the exact cursor JSON plus its validated numeric order, source,
 coverage stratum, relevance rank, selector version and sealed-catalog feature digest; the transaction
-rejects a cursor/order or selector/feature mismatch.
+rejects a cursor/order or selector/feature mismatch. `SemanticRuntimeDeferredRow` additionally
+preserves the source transition unit and receipt sequence. The `runtime_transition` ledger root
+hashes the audit row and both lineage fields; its cursor root hashes only ordered audit cursors.
+`iter_semantic_v3_runtime_deferred_audit()` is a streaming projection used by the audit selector,
+while full verification always consumes the complete runtime row.
 The runtime table is bounded by approved work: at most 64 transitioned node IDs per unit and at most
 512 frontier units (32,768 rows), or the separately approved 256-unit deepening budget. Duplicate exact receipt is
 success before any pack append; different replay is conflict. `commit_semantic_v3_audit_freeze()`
@@ -1115,7 +1126,9 @@ merge of selector-enriched sealed-catalog `frontier_deferred` rows and repositor
 `semantic_v3_runtime_deferred` rows,
 ordered by `(set_kind_rank, cursor_order, node_id)` with `initial_catalog` before
 `runtime_transition`; its domain-separated canonical row includes every field of
-`SemanticDeferredAuditRow`, and the checkpoint stores the exact combined population digest.
+`SemanticDeferredAuditRow`, and the checkpoint stores the exact combined population digest. Receipt
+lineage is intentionally outside this audit-population projection but remains hash-bound by the
+runtime ledger root and is independently receipt-joined during full verification.
 
 - [ ] **Step 5: Run lifecycle atomicity and DB safety tests**
 
@@ -2152,9 +2165,10 @@ def test_runtime_deferred_transition_is_atomic_restartable_and_row_exact(expansi
     rows = list(expansion_run.repository.iter_semantic_v3_runtime_deferred(expansion_run.run_id))
     assert [
         (
-            row.node_id, row.reason, row.node_digest, row.cursor_json, row.cursor_order,
-            row.source_id, row.coverage_stratum, row.relevance_rank,
-            row.selector_version, row.selector_feature_digest,
+            row.audit.node_id, row.audit.reason, row.audit.node_digest,
+            row.audit.cursor_json, row.audit.cursor_order, row.audit.source_id,
+            row.audit.coverage_stratum, row.audit.relevance_rank,
+            row.audit.selector_version, row.audit.selector_feature_digest,
         )
         for row in rows
     ] == [
@@ -2165,10 +2179,16 @@ def test_runtime_deferred_transition_is_atomic_restartable_and_row_exact(expansi
         )
         for row in transition.deferred
     ]
+    assert [
+        (row.source_transition_unit_id, row.created_sequence) for row in rows
+    ] == [
+        (transition.source_unit_id, transition.receipt_sequence)
+        for _ in transition.deferred
+    ]
     assert expansion_run.repository.deferred_binding(expansion_run.run_id, "runtime_transition") == (
         len(transition.deferred),
-        digest_runtime_deferred(rows),
-        digest_runtime_deferred_cursors(rows),
+        digest_runtime_deferred_ledger(rows),
+        digest_runtime_deferred_cursors(row.audit for row in rows),
     )
 
 @pytest.mark.parametrize("failure_point", ("before_receipt_insert", "after_runtime_deferred_insert", "before_commit"))
@@ -2189,7 +2209,9 @@ def test_audit_freeze_can_select_runtime_deferred_member_and_binds_combined_popu
             selector_version=expansion_run.selector_version,
             fetch_size=64,
         ),
-        expansion_run.repository.iter_semantic_v3_runtime_deferred(expansion_run.run_id, fetch_size=64),
+        expansion_run.repository.iter_semantic_v3_runtime_deferred_audit(
+            expansion_run.run_id, fetch_size=64
+        ),
     )
 ```
 
@@ -2251,7 +2273,9 @@ try:
                 selector_version=authority.selector_version,
                 fetch_size=64,
             ),
-            runtime_deferred=repository.iter_semantic_v3_runtime_deferred(run_id, fetch_size=64),
+            runtime_deferred=repository.iter_semantic_v3_runtime_deferred_audit(
+                run_id, fetch_size=64
+            ),
             pending_runtime_deferred=transition.deferred,
             checkpoint=repository.expansion_checkpoint(
                 run_id, expected_root=authority.checkpoint_root
@@ -2580,6 +2604,7 @@ def test_full_verify_streams_initial_and_runtime_deferred_and_binds_combined_roo
     (
         "node_digest", "cursor_json", "cursor_order", "source_id", "coverage_stratum",
         "relevance_rank", "selector_version", "selector_feature_digest",
+        "source_transition_unit_id", "created_sequence",
     ),
 )
 def test_runtime_deferred_row_field_tamper_fails_full_verify(v3_run, field) -> None:
@@ -2643,6 +2668,9 @@ initial root, repository runtime root and canonical combined deferred population
 its aggregate/checkpoint binding. A runtime row whose reason, node digest, exact cursor JSON/order,
 source, coverage stratum, relevance rank, selector version/feature digest, source unit or creation
 sequence does not follow its receipt transition and sealed-catalog feature row fails verification.
+The verifier recomputes the runtime ledger root from `SemanticRuntimeDeferredRow` including
+`source_transition_unit_id` and `created_sequence`, joins those two values to the exact receipt's
+unit/sequence, and only then projects `.audit` into the combined deferred population root.
 
 - [ ] **Step 6: Implement result-driven finalization and recoverable publication**
 
