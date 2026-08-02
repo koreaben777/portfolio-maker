@@ -72,7 +72,9 @@ def _proposal(run_id: str, revision_id: str = "revision-1") -> SemanticProposalE
     return SemanticProposalEnvelope(proposal, semantic_proposal_sha256(proposal))
 
 
-def _initialized_run(repository: SQLiteRepository, run_id: str) -> SemanticProposalEnvelope:
+def _stored_proposal(
+    repository: SQLiteRepository, run_id: str, *, project_deepening: bool = False,
+) -> SemanticProposalEnvelope:
     binding = SemanticRevisionBinding(
         revision_id="revision-1",
         manifest_sha256=_digest("manifest"),
@@ -96,13 +98,38 @@ def _initialized_run(repository: SQLiteRepository, run_id: str) -> SemanticPropo
     plan = {"run_id": run_id, "units": ["unit-1"]}
     plan_bytes = semantic_canonical_json_bytes(plan)
     proposal = envelope.proposal
+    project_authority = (
+        {
+            "approval_kind": "project_deepening",
+            "purpose": "project-deepening",
+            "phase_bindings": (
+                SemanticPhaseBinding(FrontierPhase.DEEPENING, DEEPENING_BUDGET, 1, 1, 1),
+            ),
+            "budget": DEEPENING_BUDGET,
+            "project_id": "project-1",
+            "project_boundary_sha256": _digest("project-boundary"),
+            "parent_proposal_sha256": _digest("parent-proposal"),
+            "evidence_policy_sha256": _digest("evidence-policy"),
+        }
+        if project_deepening
+        else {}
+    )
     proposal = SemanticExecutionProposal(
-        **{**proposal.__dict__, "plan_sha256": sha256(plan_bytes).hexdigest()}
+        **{
+            **proposal.__dict__,
+            "plan_sha256": sha256(plan_bytes).hexdigest(),
+            **project_authority,
+        }
     )
     envelope = SemanticProposalEnvelope(proposal, semantic_proposal_sha256(proposal))
     repository.create_semantic_v3_proposal(
         envelope, semantic_canonical_json_bytes(proposal), plan_bytes
     )
+    return envelope
+
+
+def _initialized_run(repository: SQLiteRepository, run_id: str) -> SemanticProposalEnvelope:
+    envelope = _stored_proposal(repository, run_id)
     repository.create_semantic_v3_run(envelope)
     repository.add_semantic_v3_units(
         run_id,
@@ -697,3 +724,218 @@ def test_queue_rejects_aligned_source_authority_drift_without_mutation(workspace
         assert connection.execute(
             "SELECT COUNT(*) FROM semantic_v3_units WHERE run_id = 'run-a'"
         ).fetchone()[0] == before
+
+
+@pytest.mark.parametrize(
+    ("binding_column", "drift_label"),
+    (
+        ("source_approval_sha256", "run-create-source-approval-drift"),
+        ("manifest_sha256", "run-create-manifest-drift"),
+        ("source_policy_sha256", "run-create-policy-drift"),
+        ("catalog_logical_root", "run-create-catalog-drift"),
+    ),
+)
+def test_run_creation_rejects_revision_authority_drift_without_durable_rows(
+    workspace: Path, binding_column: str, drift_label: str,
+) -> None:
+    repository = SQLiteRepository(WorkspacePaths.from_root(workspace).db_path)
+    repository.initialize()
+    envelope = _stored_proposal(repository, "run-a")
+    with repository._connection() as connection:
+        connection.execute(
+            f"UPDATE semantic_v3_revision_bindings SET {binding_column} = ? WHERE revision_id = 'revision-1'",
+            (_digest(drift_label),),
+        )
+
+    with pytest.raises(RepositoryError, match="semantic run proposal authority"):
+        repository.create_semantic_v3_run(envelope)
+
+    with repository._read_connection() as connection:
+        counts = tuple(
+            connection.execute(
+                """SELECT
+                       (SELECT COUNT(*) FROM semantic_v3_runs WHERE run_id = 'run-a'),
+                       (SELECT COUNT(*) FROM semantic_v3_aggregates WHERE run_id = 'run-a'),
+                       (SELECT COUNT(*) FROM semantic_v3_deferred WHERE run_id = 'run-a')"""
+            ).fetchone()
+        )
+        proposal_state = connection.execute(
+            "SELECT state FROM semantic_v3_proposals WHERE run_id = 'run-a'"
+        ).fetchone()[0]
+    assert counts == (0, 0, 0)
+    assert proposal_state == "proposed"
+
+
+def test_run_creation_rejects_aligned_proposal_projection_drift_without_durable_rows(
+    workspace: Path,
+) -> None:
+    repository = SQLiteRepository(WorkspacePaths.from_root(workspace).db_path)
+    repository.initialize()
+    envelope = _stored_proposal(repository, "run-a")
+    aligned_drift = _digest("aligned-run-create-policy-drift")
+    with repository._connection() as connection:
+        connection.execute(
+            "UPDATE semantic_v3_proposals SET source_policy_sha256 = ? WHERE run_id = 'run-a'",
+            (aligned_drift,),
+        )
+        connection.execute(
+            "UPDATE semantic_v3_revision_bindings SET source_policy_sha256 = ? WHERE revision_id = 'revision-1'",
+            (aligned_drift,),
+        )
+
+    with pytest.raises(RepositoryError, match="semantic run proposal authority"):
+        repository.create_semantic_v3_run(envelope)
+
+    with repository._read_connection() as connection:
+        assert tuple(
+            connection.execute(
+                """SELECT
+                       (SELECT COUNT(*) FROM semantic_v3_runs WHERE run_id = 'run-a'),
+                       (SELECT COUNT(*) FROM semantic_v3_aggregates WHERE run_id = 'run-a'),
+                       (SELECT COUNT(*) FROM semantic_v3_deferred WHERE run_id = 'run-a')"""
+            ).fetchone()
+        ) == (0, 0, 0)
+
+
+@pytest.mark.parametrize(
+    ("proposal_column", "drift_value"),
+    (
+        ("project_id", "project-drift"),
+        ("project_boundary_sha256", _digest("project-boundary-drift")),
+        ("parent_proposal_sha256", _digest("parent-proposal-drift")),
+        ("evidence_policy_sha256", _digest("evidence-policy-drift")),
+    ),
+)
+def test_run_creation_rejects_deepening_projection_drift_without_durable_rows(
+    workspace: Path, proposal_column: str, drift_value: str,
+) -> None:
+    repository = SQLiteRepository(WorkspacePaths.from_root(workspace).db_path)
+    repository.initialize()
+    envelope = _stored_proposal(repository, "deepening-run", project_deepening=True)
+    with repository._connection() as connection:
+        connection.execute(
+            f"UPDATE semantic_v3_proposals SET {proposal_column} = ? WHERE run_id = 'deepening-run'",
+            (drift_value,),
+        )
+
+    with pytest.raises(RepositoryError, match="semantic run proposal authority"):
+        repository.create_semantic_v3_run(envelope)
+
+    with repository._read_connection() as connection:
+        assert tuple(
+            connection.execute(
+                """SELECT
+                       (SELECT COUNT(*) FROM semantic_v3_runs WHERE run_id = 'deepening-run'),
+                       (SELECT COUNT(*) FROM semantic_v3_aggregates WHERE run_id = 'deepening-run'),
+                       (SELECT COUNT(*) FROM semantic_v3_deferred WHERE run_id = 'deepening-run')"""
+            ).fetchone()
+        ) == (0, 0, 0)
+
+
+@pytest.mark.parametrize(
+    ("binding_column", "drift_label"),
+    (
+        ("source_approval_sha256", "approval-source-approval-drift"),
+        ("manifest_sha256", "approval-manifest-drift"),
+        ("source_policy_sha256", "approval-policy-drift"),
+        ("catalog_logical_root", "approval-catalog-drift"),
+    ),
+)
+def test_approval_rejects_revision_authority_drift_without_state_change(
+    workspace: Path, binding_column: str, drift_label: str,
+) -> None:
+    repository = SQLiteRepository(WorkspacePaths.from_root(workspace).db_path)
+    repository.initialize()
+    envelope = _stored_proposal(repository, "run-a")
+    repository.create_semantic_v3_run(envelope)
+    with repository._connection() as connection:
+        connection.execute(
+            f"UPDATE semantic_v3_revision_bindings SET {binding_column} = ? WHERE revision_id = 'revision-1'",
+            (_digest(drift_label),),
+        )
+
+    with pytest.raises(RepositoryError, match="authority"):
+        repository.approve_semantic_v3_run("run-a", envelope.proposal_sha256)
+
+    with repository._read_connection() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM semantic_v3_approvals WHERE run_id = 'run-a'"
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT state FROM semantic_v3_proposals WHERE run_id = 'run-a'"
+        ).fetchone()[0] == "proposed"
+        assert connection.execute(
+            "SELECT state FROM semantic_v3_runs WHERE run_id = 'run-a'"
+        ).fetchone()[0] == SemanticRunState.PREPARED.value
+
+
+def test_approval_rejects_aligned_proposal_projection_drift_without_state_change(
+    workspace: Path,
+) -> None:
+    repository = SQLiteRepository(WorkspacePaths.from_root(workspace).db_path)
+    repository.initialize()
+    envelope = _stored_proposal(repository, "run-a")
+    repository.create_semantic_v3_run(envelope)
+    aligned_drift = _digest("aligned-approval-policy-drift")
+    with repository._connection() as connection:
+        connection.execute(
+            "UPDATE semantic_v3_proposals SET source_policy_sha256 = ? WHERE run_id = 'run-a'",
+            (aligned_drift,),
+        )
+        connection.execute(
+            "UPDATE semantic_v3_revision_bindings SET source_policy_sha256 = ? WHERE revision_id = 'revision-1'",
+            (aligned_drift,),
+        )
+
+    with pytest.raises(RepositoryError, match="authority"):
+        repository.approve_semantic_v3_run("run-a", envelope.proposal_sha256)
+
+    with repository._read_connection() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM semantic_v3_approvals WHERE run_id = 'run-a'"
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT state FROM semantic_v3_proposals WHERE run_id = 'run-a'"
+        ).fetchone()[0] == "proposed"
+        assert connection.execute(
+            "SELECT state FROM semantic_v3_runs WHERE run_id = 'run-a'"
+        ).fetchone()[0] == SemanticRunState.PREPARED.value
+
+
+@pytest.mark.parametrize(
+    ("table", "column", "drift_value"),
+    (
+        ("semantic_v3_runs", "project_id", "approval-project-id-drift"),
+        (
+            "semantic_v3_proposals",
+            "project_boundary_sha256",
+            _digest("approval-project-boundary-drift"),
+        ),
+    ),
+)
+def test_approval_rejects_deepening_projection_drift_without_state_change(
+    workspace: Path, table: str, column: str, drift_value: str,
+) -> None:
+    repository = SQLiteRepository(WorkspacePaths.from_root(workspace).db_path)
+    repository.initialize()
+    envelope = _stored_proposal(repository, "deepening-run", project_deepening=True)
+    repository.create_semantic_v3_run(envelope)
+    with repository._connection() as connection:
+        connection.execute(
+            f"UPDATE {table} SET {column} = ? WHERE run_id = 'deepening-run'",
+            (drift_value,),
+        )
+
+    with pytest.raises(RepositoryError, match="authority"):
+        repository.approve_semantic_v3_run("deepening-run", envelope.proposal_sha256)
+
+    with repository._read_connection() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM semantic_v3_approvals WHERE run_id = 'deepening-run'"
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT state FROM semantic_v3_proposals WHERE run_id = 'deepening-run'"
+        ).fetchone()[0] == "proposed"
+        assert connection.execute(
+            "SELECT state FROM semantic_v3_runs WHERE run_id = 'deepening-run'"
+        ).fetchone()[0] == SemanticRunState.PREPARED.value

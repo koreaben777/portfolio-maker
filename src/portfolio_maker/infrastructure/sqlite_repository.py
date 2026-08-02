@@ -1616,6 +1616,41 @@ class SQLiteRepository:
             raise RepositoryError("semantic proposal authority is invalid")
         return proposal
 
+    @staticmethod
+    def _v3_validate_run_projection(
+        run: sqlite3.Row, proposal: SemanticExecutionProposal, error_message: str,
+    ) -> None:
+        expected = {
+            "run_id": proposal.run_id,
+            "revision_id": proposal.revision_id,
+            "approval_kind": proposal.approval_kind,
+            "project_id": proposal.project_id,
+            "proposal_sha256": semantic_proposal_sha256(proposal),
+        }
+        if any(run[field] != value for field, value in expected.items()):
+            raise RepositoryError(error_message)
+
+    @staticmethod
+    def _v3_validate_revision_authority(
+        conn: sqlite3.Connection,
+        proposal: SemanticExecutionProposal,
+        error_message: str,
+    ) -> sqlite3.Row:
+        binding = conn.execute(
+            """SELECT manifest_sha256, source_policy_sha256, source_approval_sha256,
+                      catalog_logical_root
+               FROM semantic_v3_revision_bindings WHERE revision_id = ?""",
+            (proposal.revision_id,),
+        ).fetchone()
+        if binding is None or (
+            binding["manifest_sha256"] != proposal.manifest_sha256
+            or binding["source_policy_sha256"] != proposal.policy_sha256
+            or binding["source_approval_sha256"] != proposal.source_approval_sha256
+            or binding["catalog_logical_root"] != proposal.catalog_root
+        ):
+            raise RepositoryError(error_message)
+        return binding
+
     def _v3_authority(
         self, conn: sqlite3.Connection, run_id: str
     ) -> tuple[sqlite3.Row, sqlite3.Row, SemanticBudget, dict[str, SemanticBudget]]:
@@ -1670,6 +1705,12 @@ class SQLiteRepository:
         if row is None:
             raise RepositoryError("semantic receipt authority is invalid")
         proposal = self._v3_validate_canonical_proposal_row(row)
+        self._v3_validate_run_projection(
+            row, proposal, "semantic receipt authority is invalid",
+        )
+        self._v3_validate_revision_authority(
+            conn, proposal, "semantic receipt authority is invalid",
+        )
         exact_pairs = (
             ("proposal_sha256", "approval_proposal_sha256"),
             ("proposal_project_id", "approval_project_id"),
@@ -1792,19 +1833,9 @@ class SQLiteRepository:
                 self._v3_digest(value, field)
         budget, phases, budget_binding = self._v3_budget_binding(proposal)
         with self._connection() as conn:
-            binding = conn.execute(
-                """SELECT manifest_sha256, source_policy_sha256, source_approval_sha256,
-                          catalog_logical_root
-                   FROM semantic_v3_revision_bindings WHERE revision_id = ?""",
-                (proposal.revision_id,),
-            ).fetchone()
-            if binding is None or (
-                binding["manifest_sha256"] != proposal.manifest_sha256
-                or binding["source_policy_sha256"] != proposal.policy_sha256
-                or binding["source_approval_sha256"] != proposal.source_approval_sha256
-                or binding["catalog_logical_root"] != proposal.catalog_root
-            ):
-                raise RepositoryError("semantic proposal revision authority is invalid")
+            self._v3_validate_revision_authority(
+                conn, proposal, "semantic proposal revision authority is invalid",
+            )
             conn.execute(
                 """
                 INSERT INTO semantic_v3_proposals(
@@ -1872,16 +1903,28 @@ class SQLiteRepository:
         return self._semantic_v3_proposal_from_row(row)
 
     def create_semantic_v3_run(self, envelope: SemanticProposalEnvelope) -> None:
-        proposal = envelope.proposal
-        phase = proposal.phase_bindings[0].phase.value
-        budget, phases, budget_binding = self._v3_budget_binding(proposal)
+        requested_proposal = envelope.proposal
         with self._connection() as conn:
             row = conn.execute(
-                """SELECT proposal_sha256, state, budget_binding_sha256 FROM semantic_v3_proposals
-                   WHERE run_id = ?""", (proposal.run_id,)
+                "SELECT * FROM semantic_v3_proposals WHERE run_id = ?",
+                (requested_proposal.run_id,),
             ).fetchone()
-            if row is None or row["proposal_sha256"] != envelope.proposal_sha256 or row["state"] != "proposed" or row["budget_binding_sha256"] != budget_binding:
+            if row is None:
                 raise RepositoryError("semantic run proposal authority is invalid")
+            try:
+                proposal = self._v3_validate_canonical_proposal_row(row)
+            except RepositoryError as error:
+                raise RepositoryError("semantic run proposal authority is invalid") from error
+            if (
+                proposal != requested_proposal
+                or row["proposal_sha256"] != envelope.proposal_sha256
+                or row["state"] != "proposed"
+            ):
+                raise RepositoryError("semantic run proposal authority is invalid")
+            self._v3_validate_revision_authority(
+                conn, proposal, "semantic run proposal authority is invalid",
+            )
+            phase = proposal.phase_bindings[0].phase.value
             conn.execute(
                 """INSERT INTO semantic_v3_runs(
                     run_id, revision_id, approval_kind, project_id, state, phase, proposal_sha256,
@@ -1917,24 +1960,12 @@ class SQLiteRepository:
         if run is None or proposal_row is None:
             raise RepositoryError("semantic proposal authority is invalid")
         proposal = self._v3_validate_canonical_proposal_row(proposal_row)
-        binding = conn.execute(
-            """SELECT manifest_sha256, source_policy_sha256, source_approval_sha256,
-                      catalog_logical_root
-               FROM semantic_v3_revision_bindings WHERE revision_id = ?""",
-            (run["revision_id"],),
-        ).fetchone()
-        if (
-            run["revision_id"] != proposal.revision_id
-            or run["approval_kind"] != proposal.approval_kind
-            or run["project_id"] != proposal.project_id
-            or run["proposal_sha256"] != semantic_proposal_sha256(proposal)
-            or binding is None
-            or binding["manifest_sha256"] != proposal.manifest_sha256
-            or binding["source_policy_sha256"] != proposal.policy_sha256
-            or binding["source_approval_sha256"] != proposal.source_approval_sha256
-            or binding["catalog_logical_root"] != proposal.catalog_root
-        ):
-            raise RepositoryError("semantic proposal authority is invalid")
+        self._v3_validate_run_projection(
+            run, proposal, "semantic proposal authority is invalid",
+        )
+        self._v3_validate_revision_authority(
+            conn, proposal, "semantic proposal authority is invalid",
+        )
         approval = conn.execute(
             "SELECT * FROM semantic_v3_approvals WHERE run_id = ?", (run_id,)
         ).fetchone()
@@ -2041,18 +2072,23 @@ class SQLiteRepository:
                 "SELECT * FROM semantic_v3_proposals WHERE run_id = ?", (run_id,)
             ).fetchone()
             run = conn.execute("SELECT * FROM semantic_v3_runs WHERE run_id = ?", (run_id,)).fetchone()
-            if row is None or run is None or row["proposal_sha256"] != proposal_sha256 or run["proposal_sha256"] != proposal_sha256:
+            if row is None or run is None or row["proposal_sha256"] != proposal_sha256:
                 raise RepositoryError("semantic approval authority is invalid")
-            proposal = self._v3_validate_canonical_proposal_row(row)
-            if (
-                proposal.run_id != run_id
-                or proposal.revision_id != run["revision_id"]
-                or proposal.approval_kind != run["approval_kind"]
-                or proposal.project_id != run["project_id"]
-            ):
+            try:
+                proposal = self._v3_validate_canonical_proposal_row(row)
+            except RepositoryError as error:
+                raise RepositoryError("semantic approval authority is invalid") from error
+            self._v3_validate_run_projection(
+                run, proposal, "semantic approval authority is invalid",
+            )
+            self._v3_validate_revision_authority(
+                conn, proposal, "semantic approval authority is invalid",
+            )
+            if proposal.run_id != run_id or row["state"] != "proposed":
                 raise RepositoryError("semantic approval authority is invalid")
             if run["state"] != SemanticRunState.PREPARED.value:
                 raise RepositoryError("semantic run is not prepared")
+            budget, phases, budget_binding = self._v3_budget_binding(proposal)
             conn.execute(
                 """INSERT INTO semantic_v3_approvals(
                     run_id, approval_kind, proposal_sha256, manifest_sha256, source_policy_sha256,
@@ -2061,15 +2097,23 @@ class SQLiteRepository:
                     evidence_policy_sha256, total_budget_json, phase_bindings_json,
                     budget_binding_sha256, project_id, user_confirmed, approved_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (run_id, row["approval_kind"], proposal_sha256, row["manifest_sha256"],
-                 row["source_policy_sha256"], row["source_approval_sha256"], row["catalog_root"],
-                 row["selector_version"], row["private_context_scope"], row["parent_checkpoint_root"],
-                 row["project_boundary_sha256"], row["parent_proposal_sha256"],
-                 row["evidence_policy_sha256"], row["total_budget_json"],
-                 row["phase_bindings_json"], row["budget_binding_sha256"], run["project_id"],
-                 1, self._v3_now()),
+                (
+                    run_id, proposal.approval_kind, proposal_sha256,
+                    proposal.manifest_sha256, proposal.policy_sha256,
+                    proposal.source_approval_sha256, proposal.catalog_root,
+                    proposal.selector_version, proposal.private_context_scope,
+                    proposal.parent_checkpoint_root, proposal.project_boundary_sha256,
+                    proposal.parent_proposal_sha256, proposal.evidence_policy_sha256,
+                    budget, phases, budget_binding, proposal.project_id, 1, self._v3_now(),
+                ),
             )
-            conn.execute("UPDATE semantic_v3_proposals SET state = 'approved' WHERE run_id = ?", (run_id,))
+            result = conn.execute(
+                """UPDATE semantic_v3_proposals SET state = 'approved'
+                   WHERE run_id = ? AND state = 'proposed'""",
+                (run_id,),
+            )
+            if result.rowcount != 1:
+                raise RepositoryError("semantic approval authority is invalid")
 
     def run_state(self, run_id: str) -> SemanticRunState:
         with self._read_connection() as conn:
