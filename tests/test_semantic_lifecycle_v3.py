@@ -1,0 +1,267 @@
+from __future__ import annotations
+
+from hashlib import sha256
+from pathlib import Path
+
+import pytest
+
+from portfolio_maker.domain.semantic_frontier import (
+    FRONTIER_BUDGET,
+    FRONTIER_PHASE_HARD_BUDGETS,
+    FrontierAction,
+    FrontierPhase,
+    PackRecordRef,
+    SemanticDeferredAuditRow,
+    SemanticExecutionProposal,
+    SemanticPhaseBinding,
+    SemanticPlannedUnit,
+    SemanticProposalEnvelope,
+    SemanticReceiptCommit,
+    SemanticRevisionBinding,
+    SemanticRunState,
+    SemanticRuntimeDeferredRow,
+    SemanticCheckpoint,
+    SemanticAuditFreeze,
+    semantic_canonical_json_bytes,
+    semantic_proposal_sha256,
+)
+from portfolio_maker.infrastructure.sqlite_repository import RepositoryError, SQLiteRepository
+from portfolio_maker.workspace import WorkspacePaths
+
+
+def _digest(label: str) -> str:
+    return sha256(label.encode("utf-8")).hexdigest()
+
+
+def _proposal(run_id: str, revision_id: str = "revision-1") -> SemanticProposalEnvelope:
+    proposal = SemanticExecutionProposal(
+        run_id=run_id,
+        revision_id=revision_id,
+        approval_kind="frontier",
+        source_approval_sha256=_digest("approval"),
+        manifest_sha256=_digest("manifest"),
+        policy_sha256=_digest("policy"),
+        selector_version="selector-v1",
+        catalog_root=_digest("catalog"),
+        safe_source_label="approved-source",
+        private_context_scope="private",
+        authority_root=_digest("authority"),
+        plan_sha256=_digest("plan"),
+        parent_checkpoint_root=_digest("checkpoint"),
+        target_projection_contract="projection-v1",
+        input_schema_version="input-v1",
+        output_schema_version="output-v1",
+        validator_version="validator-v1",
+        purpose="frontier",
+        structural_node_count=1,
+        baseline_coverage_counts=(("complete", 1),),
+        phase_bindings=tuple(
+            SemanticPhaseBinding(
+                phase, budget, budget.max_units, budget.max_input_bytes,
+                budget.max_wall_seconds,
+            )
+            for phase, budget in FRONTIER_PHASE_HARD_BUDGETS
+        ),
+        audit_selector_rule="selector-v1",
+        deferred_semantics="defer",
+        budget=FRONTIER_BUDGET,
+    )
+    return SemanticProposalEnvelope(proposal, semantic_proposal_sha256(proposal))
+
+
+def _initialized_run(repository: SQLiteRepository, run_id: str) -> SemanticProposalEnvelope:
+    binding = SemanticRevisionBinding(
+        revision_id="revision-1",
+        manifest_sha256=_digest("manifest"),
+        source_policy_sha256=_digest("policy"),
+        catalog_file_sha256=_digest("catalog-file"),
+        catalog_logical_root=_digest("catalog"),
+        lifecycle_schema_version="v3",
+        lifecycle_genesis_root=_digest("genesis"),
+        current_checkpoint_root=_digest("checkpoint"),
+    )
+    try:
+        repository.create_semantic_revision("revision-1", "source-1", _digest("policy"), "v3")
+    except RepositoryError:
+        pass
+    try:
+        repository.bind_semantic_v3_revision(binding)
+    except RepositoryError:
+        pass
+    envelope = _proposal(run_id)
+    plan = {"run_id": run_id, "units": ["unit-1"]}
+    plan_bytes = semantic_canonical_json_bytes(plan)
+    proposal = envelope.proposal
+    proposal = SemanticExecutionProposal(
+        **{**proposal.__dict__, "plan_sha256": sha256(plan_bytes).hexdigest()}
+    )
+    envelope = SemanticProposalEnvelope(proposal, semantic_proposal_sha256(proposal))
+    repository.create_semantic_v3_proposal(
+        envelope, semantic_canonical_json_bytes(proposal), plan_bytes
+    )
+    repository.create_semantic_v3_run(envelope)
+    repository.add_semantic_v3_units(
+        run_id,
+        (
+            SemanticPlannedUnit(
+                "unit-1", FrontierPhase.ORIENTATION, ("node-1",), (), 1, 0, "source-1"
+            ),
+        ),
+    )
+    repository.approve_semantic_v3_run(run_id, envelope.proposal_sha256)
+    return envelope
+
+
+def initialized_repository(workspace: Path) -> SQLiteRepository:
+    repository = SQLiteRepository(WorkspacePaths.from_root(workspace).db_path)
+    repository.initialize()
+    _initialized_run(repository, "run-a")
+    repository.claim_semantic_v3_running_slot("run-a")
+    return repository
+
+
+def test_only_one_workspace_run_can_own_execution_lock(workspace: Path) -> None:
+    repository = initialized_repository(workspace)
+
+    repository.acquire_semantic_v3_execution("run-a", "unit-1", "nonce-a")
+
+    with pytest.raises(RepositoryError, match="semantic execution is busy"):
+        repository.acquire_semantic_v3_execution("run-a", "unit-1", "nonce-b")
+
+
+def test_only_one_workspace_run_can_be_operationally_running(workspace: Path) -> None:
+    repository = SQLiteRepository(WorkspacePaths.from_root(workspace).db_path)
+    repository.initialize()
+    _initialized_run(repository, "run-a")
+    _initialized_run(repository, "run-b")
+
+    repository.claim_semantic_v3_running_slot("run-a")
+
+    with pytest.raises(RepositoryError, match="semantic execution is busy"):
+        repository.claim_semantic_v3_running_slot("run-b")
+    assert repository.run_state("run-b") is SemanticRunState.PREPARED
+
+
+def test_proposal_requires_exact_canonical_bytes_and_plan_binding(workspace: Path) -> None:
+    repository = SQLiteRepository(WorkspacePaths.from_root(workspace).db_path)
+    repository.initialize()
+    repository.create_semantic_revision("revision-1", "source-1", _digest("policy"), "v3")
+    repository.bind_semantic_v3_revision(
+        SemanticRevisionBinding(
+            "revision-1", _digest("manifest"), _digest("policy"), _digest("catalog-file"),
+            _digest("catalog"), "v3", _digest("genesis"), _digest("checkpoint"),
+        )
+    )
+    envelope = _proposal("run-a")
+    with pytest.raises(RepositoryError, match="canonical"):
+        repository.create_semantic_v3_proposal(envelope, b'{"z":1,"a":2}', b"{}")
+
+
+def test_receipt_replay_and_invalid_commit_leave_lock_and_state_unchanged(
+    workspace: Path,
+) -> None:
+    repository = initialized_repository(workspace)
+    repository.acquire_semantic_v3_execution("run-a", "unit-1", "nonce-a")
+    repository.issue_semantic_v3_input("run-a", "nonce-a", _digest("input"), 3)
+    receipt = SemanticReceiptCommit(
+        run_id="run-a", unit_id="unit-1", lease_nonce="nonce-a", input_sha256=_digest("input"),
+        output_sha256=_digest("output"), result=PackRecordRef(0, 7, _digest("result")),
+        action=FrontierAction.DEFER_ON_DEMAND, validator_version="validator-v1",
+        receipt_sha256=_digest("receipt"), active_seconds=1.5,
+    )
+
+    with pytest.raises(RepositoryError, match="result pack"):
+        repository.commit_semantic_v3_receipt(
+            SemanticReceiptCommit(**{**receipt.__dict__, "result_pack_root": "wrong"})
+        )
+    assert repository.execution_lock() == ("run-a", "unit-1", "nonce-a", "issued")
+    assert repository.receipt_count("run-a") == 0
+
+    committed = SemanticReceiptCommit(
+        **{
+            **receipt.__dict__,
+            "result_pack_length": 7,
+            "result_pack_root": _digest("result-pack"),
+        }
+    )
+    repository.commit_semantic_v3_receipt(committed)
+    repository.commit_semantic_v3_receipt(committed)
+    with pytest.raises(RepositoryError, match="receipt replay conflicts"):
+        repository.commit_semantic_v3_receipt(
+            SemanticReceiptCommit(**{**committed.__dict__, "output_sha256": _digest("other")})
+        )
+    assert repository.receipt_count("run-a") == 1
+
+
+def test_runtime_deferred_is_bounded_and_streamed_with_exact_lineage(workspace: Path) -> None:
+    repository = initialized_repository(workspace)
+    repository.acquire_semantic_v3_execution("run-a", "unit-1", "nonce-a")
+    repository.issue_semantic_v3_input("run-a", "nonce-a", _digest("input"), 3)
+    audit = SemanticDeferredAuditRow(
+        "node-1", "budget", _digest("node"), '{"offset":1}', 1, "source-1", "complete", 0,
+        "selector-v1", _digest("feature"),
+    )
+    receipt = SemanticReceiptCommit(
+        "run-a", "unit-1", "nonce-a", _digest("input"), _digest("output"),
+        PackRecordRef(0, 7, _digest("result")), FrontierAction.DEFER_ON_DEMAND,
+        "validator-v1", _digest("receipt"), 1.0, 7, _digest("result-pack"),
+        (SemanticRuntimeDeferredRow(audit, "unit-1", 1),),
+    )
+    repository.commit_semantic_v3_receipt(receipt)
+
+    assert list(repository.iter_semantic_v3_runtime_deferred("run-a", fetch_size=1)) == [
+        SemanticRuntimeDeferredRow(audit, "unit-1", 1)
+    ]
+    assert list(repository.iter_semantic_v3_runtime_deferred_audit("run-a", fetch_size=1)) == [audit]
+
+
+def test_first_checkpoint_rejects_a_root_not_chained_from_revision_genesis(workspace: Path) -> None:
+    repository = initialized_repository(workspace)
+    with repository._read_connection() as connection:
+        aggregate_root = connection.execute(
+            "SELECT aggregate_root FROM semantic_v3_aggregates WHERE run_id = 'run-a'"
+        ).fetchone()["aggregate_root"]
+
+    with pytest.raises(RepositoryError, match="checkpoint authority"):
+        repository.checkpoint_semantic_v3_run(
+            SemanticCheckpoint(
+                "run-a", 1, 0, 0, "0" * 64, _digest("queue"), aggregate_root,
+                "{}", "selector-v1", _digest("not-genesis"), _digest("checkpoint-1"),
+            )
+        )
+
+
+def test_audit_freeze_rejects_a_runtime_population_different_from_receipts(
+    workspace: Path,
+) -> None:
+    repository = initialized_repository(workspace)
+    repository.acquire_semantic_v3_execution("run-a", "unit-1", "nonce-a")
+    repository.issue_semantic_v3_input("run-a", "nonce-a", _digest("input"), 3)
+    audit = SemanticDeferredAuditRow(
+        "node-1", "budget", _digest("node"), '{"offset":1}', 1, "source-1", "complete", 0,
+        "selector-v1", _digest("feature"),
+    )
+    repository.commit_semantic_v3_receipt(
+        SemanticReceiptCommit(
+            "run-a", "unit-1", "nonce-a", _digest("input"), _digest("output"),
+            PackRecordRef(0, 7, _digest("result")), FrontierAction.DEFER_ON_DEMAND,
+            "validator-v1", _digest("receipt"), 1.0, 7, _digest("result-pack"),
+            (SemanticRuntimeDeferredRow(audit, "unit-1", 1),),
+        )
+    )
+    with repository._read_connection() as connection:
+        aggregate_root = connection.execute(
+            "SELECT aggregate_root FROM semantic_v3_aggregates WHERE run_id = 'run-a'"
+        ).fetchone()["aggregate_root"]
+
+    with pytest.raises(RepositoryError, match="audit population authority"):
+        repository.commit_semantic_v3_audit_freeze(
+            SemanticAuditFreeze(
+                "run-a", (), (), (),
+                SemanticCheckpoint(
+                    "run-a", 1, 1, 7, _digest("result-pack"), _digest("queue"),
+                    aggregate_root, "{}", "selector-v1", _digest("genesis"),
+                    _digest("audit-checkpoint"),
+                ),
+            )
+        )

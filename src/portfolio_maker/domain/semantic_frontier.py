@@ -351,14 +351,121 @@ class SemanticStatusSnapshot:
     completion: SemanticCompletion
 
 
+@dataclass(frozen=True)
+class SemanticRevisionBinding:
+    """Private v3 ledger binding for one staging semantic revision."""
+
+    revision_id: str
+    manifest_sha256: str
+    source_policy_sha256: str
+    catalog_file_sha256: str
+    catalog_logical_root: str
+    lifecycle_schema_version: str
+    lifecycle_genesis_root: str
+    current_checkpoint_root: str
+
+
+@dataclass(frozen=True)
+class SemanticReceiptCommit:
+    """The already-validated, pack-appended result committed by the ledger."""
+
+    run_id: str
+    unit_id: str
+    lease_nonce: str
+    input_sha256: str
+    output_sha256: str
+    result: PackRecordRef
+    action: FrontierAction
+    validator_version: str
+    receipt_sha256: str
+    active_seconds: float
+    result_pack_length: int = 0
+    result_pack_root: str = ""
+    runtime_deferred: tuple[SemanticRuntimeDeferredRow, ...] = ()
+
+
+@dataclass(frozen=True)
+class SemanticCheckpoint:
+    run_id: str
+    sequence: int
+    receipt_sequence: int
+    result_pack_length: int
+    result_pack_root: str
+    queue_root: str
+    aggregate_root: str
+    resume_cursor_json: str
+    selector_version: str
+    previous_checkpoint_root: str
+    checkpoint_root: str
+    audit_ordered_set_sha256: str | None = None
+    audit_population_sha256: str | None = None
+
+
+@dataclass(frozen=True)
+class SemanticAuditMember:
+    ordinal: int
+    stratum: str
+    node_id: str
+    node_digest: str
+    audit_unit_id: str
+
+
+@dataclass(frozen=True)
+class SemanticAuditFreeze:
+    """A caller-streamed audit population and its deterministically selected members."""
+
+    run_id: str
+    initial_deferred: tuple[SemanticDeferredAuditRow, ...]
+    runtime_deferred: tuple[SemanticRuntimeDeferredRow, ...]
+    members: tuple[SemanticAuditMember, ...]
+    checkpoint: SemanticCheckpoint
+
+
+def semantic_canonical_json_bytes(value: object) -> bytes:
+    """Canonical bytes shared by proposal storage and cross-process approval."""
+
+    try:
+        return json.dumps(
+            _canonical_value(value),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as error:
+        raise ValueError("semantic value cannot be canonically encoded") from error
+
+
+def semantic_execution_proposal_from_payload(
+    payload: object,
+) -> SemanticExecutionProposal:
+    """Rebuild the frozen authority only after its stored bytes are canonical."""
+
+    if not isinstance(payload, dict):
+        raise ValueError("semantic proposal payload is invalid")
+    values = dict(payload)
+    try:
+        values["phase_bindings"] = tuple(
+            SemanticPhaseBinding(
+                FrontierPhase(item["phase"]),
+                SemanticBudget(**item["hard_budget"]),
+                item["estimated_units"],
+                item["estimated_input_bytes"],
+                item["estimated_wall_seconds"],
+            )
+            for item in values["phase_bindings"]
+        )
+        values["budget"] = SemanticBudget(**values["budget"])
+        values["baseline_coverage_counts"] = tuple(
+            tuple(item) for item in values["baseline_coverage_counts"]
+        )
+        return SemanticExecutionProposal(**values)
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("semantic proposal payload is invalid") from error
+
+
 def semantic_proposal_sha256(proposal: SemanticExecutionProposal) -> str:
-    canonical_json = json.dumps(
-        _canonical_value(proposal),
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    )
-    return hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
+    return hashlib.sha256(semantic_canonical_json_bytes(proposal)).hexdigest()
 
 
 def _canonical_value(value: Any) -> Any:
@@ -371,4 +478,8 @@ def _canonical_value(value: Any) -> Any:
         }
     if isinstance(value, tuple):
         return [_canonical_value(item) for item in value]
+    if isinstance(value, list):
+        return [_canonical_value(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _canonical_value(item) for key, item in value.items()}
     return value

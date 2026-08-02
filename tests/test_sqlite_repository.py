@@ -118,6 +118,35 @@ def test_schema_adds_protocol_and_import_receipts(workspace: Path) -> None:
     assert "semantic_import_receipts" in repository.table_names()
 
 
+def test_initialize_adds_v3_lifecycle_without_rewriting_legacy_rows(
+    workspace: Path,
+) -> None:
+    repository = SQLiteRepository(WorkspacePaths.from_root(workspace).db_path)
+
+    repository.initialize()
+    repository.create_semantic_revision("legacy-v2", "source", "policy", "v2")
+    repository.initialize()
+
+    assert repository.get_active_semantic_revision("source") is None
+    assert {
+        "semantic_v3_revision_bindings",
+        "semantic_v3_runs",
+        "semantic_v3_units",
+        "semantic_v3_proposals",
+        "semantic_v3_dependencies",
+        "semantic_v3_leases",
+        "semantic_v3_receipts",
+        "semantic_v3_aggregates",
+        "semantic_v3_checkpoints",
+        "semantic_v3_approvals",
+        "semantic_v3_deferred",
+        "semantic_v3_runtime_deferred",
+        "semantic_v3_expansion_cursors",
+        "semantic_v3_audit_members",
+        "semantic_v3_execution_lock",
+    }.issubset(repository.table_names())
+
+
 def test_legacy_active_semantic_revision_gains_lossless_defaults_without_rewrite(
     workspace: Path,
 ) -> None:
