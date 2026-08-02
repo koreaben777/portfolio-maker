@@ -17,18 +17,37 @@ from portfolio_maker.domain.semantic_models import (
 )
 from portfolio_maker.domain.semantic_frontier import (
     AUDIT_BUDGET,
+    CHECKPOINT_UNITS,
     DEEPENING_BUDGET,
     EXPANSION_BUDGET,
     FRONTIER_BUDGET,
     FRONTIER_PHASE_HARD_BUDGETS,
+    MAX_DEPENDENCIES,
+    MAX_UNIT_BYTES,
     ORIENTATION_BUDGET,
+    BaselineCoverage,
+    DeepeningAuthorityContext,
+    DeepeningOverlayState,
+    FrontierAction,
     FrontierPhase,
+    PackRecordRef,
     SemanticBudget,
     SemanticCompletion,
+    SemanticDeepeningPlan,
+    SemanticDeferredAuditRow,
+    SemanticDeferredNode,
     SemanticExecutionProposal,
+    SemanticFrontierPlan,
     SemanticLeaseState,
     SemanticPhaseBinding,
+    SemanticPlannedUnit,
+    SemanticProposalEnvelope,
+    SemanticRunAuthority,
     SemanticRunState,
+    SemanticRuntimeDeferredRow,
+    SemanticUnitState,
+    SealedProposalAuthority,
+    semantic_proposal_sha256,
 )
 from portfolio_maker.workspace import WorkspacePaths
 
@@ -168,7 +187,130 @@ def test_v3_workspace_paths_are_revision_and_run_scoped(tmp_path: Path) -> None:
 
 
 def test_frontier_proposal_rejects_reassigned_phase_budget() -> None:
-    proposal = SemanticExecutionProposal(
+    proposal = _frontier_proposal()
+    with pytest.raises(ValueError, match="phase bindings"):
+        replace(
+            proposal,
+            phase_bindings=(
+                SemanticPhaseBinding(
+                    FrontierPhase.ORIENTATION,
+                    ORIENTATION_BUDGET,
+                    EXPANSION_BUDGET.max_units,
+                    EXPANSION_BUDGET.max_input_bytes,
+                    EXPANSION_BUDGET.max_wall_seconds,
+                ),
+                *proposal.phase_bindings[1:],
+            ),
+        )
+
+
+def test_shared_interface_contract_exposes_the_fixed_v3_types() -> None:
+    assert MAX_UNIT_BYTES == 262_144
+    assert MAX_DEPENDENCIES == 64
+    assert CHECKPOINT_UNITS == 16
+    assert tuple(BaselineCoverage) == (
+        BaselineCoverage.COMPLETE,
+        BaselineCoverage.SAMPLED,
+        BaselineCoverage.UNSUPPORTED,
+        BaselineCoverage.UNREADABLE,
+        BaselineCoverage.FAILED,
+    )
+    assert tuple(FrontierAction) == (
+        FrontierAction.ACCEPT_BOUNDARY,
+        FrontierAction.EXPAND_CHILDREN,
+        FrontierAction.STOP_NON_PROJECT,
+        FrontierAction.DEFER_ON_DEMAND,
+    )
+    assert SemanticRunState.AWAITING_APPROVAL == "awaiting_approval"
+    assert SemanticRunState.PAUSED_USER == "paused_user"
+    assert SemanticLeaseState.MATERIALIZING == "materializing"
+    assert SemanticLeaseState.ISSUED == "issued"
+    assert SemanticUnitState.VALIDATED == "validated"
+    assert DeepeningOverlayState.INACTIVE_REVIEW_REQUIRED == "inactive_review_required"
+
+    budget = SemanticBudget(1, 2, 3)
+    binding = SemanticPhaseBinding(FrontierPhase.ORIENTATION, budget, 1, 2, 3)
+    unit = SemanticPlannedUnit(
+        "unit-1", FrontierPhase.ORIENTATION, ("node-1",), (), 2, 1, "default"
+    )
+    deferred = SemanticDeferredNode("node-1", "budget", "digest", "{}")
+    audit = SemanticDeferredAuditRow(
+        "node-1", "budget", "digest", "{}", 1, "source-1", "sampled", 2,
+        "selector-v1", "feature-digest",
+    )
+    runtime_deferred = SemanticRuntimeDeferredRow(audit, "unit-1", 1)
+    plan = SemanticFrontierPlan(
+        "run-1", "rev-1", "policy", "selector-v1", "projection-v1", "input-v1",
+        "output-v1", "validator-v1", "frontier", (unit,), 1, "deferred-root",
+        "cursor-root",
+    )
+    sealed = SealedProposalAuthority(
+        "rev-1", "approval", "policy", "manifest", "catalog", "source", "private",
+        1, ((BaselineCoverage.COMPLETE.value, 1),), "selector-v1", "genesis",
+        "projection-v1", "input-v1", "output-v1", "validator-v1", "sealed-root",
+    )
+    deepening = SemanticDeepeningPlan(
+        "run-2", "rev-1", "project-1", "authority", "run-1", "proposal",
+        "checkpoint", "boundary", "policy", "selector-v1", "catalog", "private",
+        "evidence", "projection-v1", "input-v1", "output-v1", "validator-v1",
+        "deepening", (unit,), 1, "deferred-root", "cursor-root",
+    )
+    context = DeepeningAuthorityContext(
+        sealed, "run-1", "proposal", "checkpoint", "project-1", "boundary",
+        "evidence", "deepening", "context-root",
+    )
+    record = PackRecordRef(0, 1, "digest")
+
+    assert budget.max_units == 1
+    assert budget.max_input_bytes == 2
+    assert budget.max_wall_seconds == 3
+    assert binding.estimated_input_bytes == 2
+    assert plan.units == (unit,)
+    assert deferred.cursor_json == "{}"
+    assert runtime_deferred.audit is audit
+    assert deepening.project_id == "project-1"
+    assert context.base is sealed
+    assert record.length == 1
+
+
+def test_proposal_authority_uses_approval_kind_and_envelope_digest() -> None:
+    frontier = _frontier_proposal()
+
+    with pytest.raises(ValueError, match="frontier"):
+        replace(
+            frontier,
+            project_id="project-1",
+            project_boundary_sha256="boundary",
+            parent_proposal_sha256="parent",
+            evidence_policy_sha256="evidence",
+            phase_bindings=(
+                SemanticPhaseBinding(
+                    FrontierPhase.DEEPENING, DEEPENING_BUDGET, 256, 64 * 1024**2, 3_600
+                ),
+            ),
+            budget=DEEPENING_BUDGET,
+        )
+    with pytest.raises(ValueError, match="deepening"):
+        replace(
+            frontier,
+            approval_kind="deepening",
+            phase_bindings=(
+                SemanticPhaseBinding(
+                    FrontierPhase.DEEPENING, DEEPENING_BUDGET, 256, 64 * 1024**2, 3_600
+                ),
+            ),
+            budget=DEEPENING_BUDGET,
+        )
+    with pytest.raises(ValueError, match="proposal_sha256"):
+        SemanticProposalEnvelope(frontier, "0" * 64)
+
+    assert SemanticProposalEnvelope(
+        frontier, semantic_proposal_sha256(frontier)
+    ).proposal is frontier
+
+
+def _frontier_proposal() -> SemanticExecutionProposal:
+    return SemanticExecutionProposal(
         run_id="run-1",
         revision_id="rev-1",
         approval_kind="frontier",
@@ -190,22 +332,13 @@ def test_frontier_proposal_rejects_reassigned_phase_budget() -> None:
         structural_node_count=9,
         baseline_coverage_counts=(("file", 9),),
         phase_bindings=tuple(
-            SemanticPhaseBinding(phase, budget, budget)
+            SemanticPhaseBinding(
+                phase, budget, budget.max_units, budget.max_input_bytes,
+                budget.max_wall_seconds,
+            )
             for phase, budget in FRONTIER_PHASE_HARD_BUDGETS
         ),
         audit_selector_rule="unresolved",
         deferred_semantics="defer",
         budget=FRONTIER_BUDGET,
     )
-    with pytest.raises(ValueError, match="phase bindings"):
-        replace(
-            proposal,
-            phase_bindings=(
-                SemanticPhaseBinding(
-                    FrontierPhase.ORIENTATION,
-                    ORIENTATION_BUDGET,
-                    EXPANSION_BUDGET,
-                ),
-                *proposal.phase_bindings[1:],
-            ),
-        )
