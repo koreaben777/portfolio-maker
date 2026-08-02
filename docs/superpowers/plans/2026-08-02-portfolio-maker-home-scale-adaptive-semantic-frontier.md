@@ -187,6 +187,19 @@ class SemanticDeferredNode:
     cursor_json: str
 
 @dataclass(frozen=True)
+class SemanticDeferredAuditRow:
+    node_id: str
+    reason: str
+    node_digest: str
+    cursor_json: str
+    cursor_order: int
+    source_id: str
+    coverage_stratum: str
+    relevance_rank: int
+    selector_version: str
+    selector_feature_digest: str
+
+@dataclass(frozen=True)
 class SemanticFrontierPlan:
     run_id: str
     revision_id: str
@@ -583,7 +596,7 @@ git commit -m "feat: add semantic payload packs"
 
 **Interfaces:**
 - Consumes: prepare `PackRecordRef`s and v3 domain coverage/actions.
-- Produces: `SemanticCatalogWriter`, `SemanticCatalogReader`, `CatalogSeal`, indexed structural/local/frontier query API.
+- Produces: `SemanticCatalogWriter`, `SemanticCatalogReader`, `CatalogSeal`, indexed structural/local/frontier query API and selector-enriched deferred audit rows.
 
 - [ ] **Step 1: Write RED catalog round-trip and seal tests**
 
@@ -600,6 +613,20 @@ def test_catalog_keeps_every_node_and_queries_children_without_full_load(tmp_pat
     assert reader.node_count() == 10_001
     assert [row.node_id for row in reader.children_page("root", None, 64)][:2] == ["n-00000", "n-00001"]
     assert len(reader.children_page("root", "n-00063", 64)) == 64
+
+def test_catalog_frontier_deferred_audit_row_round_trips_exact_selector_fields(
+    catalog_with_frontier_deferred,
+) -> None:
+    rows = list(catalog_with_frontier_deferred.reader.iter_frontier_deferred_for_audit(
+        selector_version=catalog_with_frontier_deferred.selector_version,
+        fetch_size=64,
+    ))
+    assert rows == [catalog_with_frontier_deferred.expected_audit_row]
+    assert rows[0].cursor_json == canonical_json_text({"lane": "source-1", "offset": 64})
+    assert rows[0].source_id == "source-1"
+    assert rows[0].coverage_stratum == "complete"
+    assert rows[0].relevance_rank == 0
+    assert rows[0].selector_feature_digest == catalog_with_frontier_deferred.feature_digest
 ```
 
 - [ ] **Step 2: Run the new catalog tests and confirm RED**
@@ -694,10 +721,13 @@ CREATE TABLE frontier_deferred (
   node_id TEXT PRIMARY KEY REFERENCES nodes(node_id),
   reason TEXT NOT NULL,
   node_digest TEXT NOT NULL,
+  cursor_json TEXT NOT NULL,
   cursor_order INTEGER NOT NULL UNIQUE,
   source_id TEXT NOT NULL,
   coverage_stratum TEXT NOT NULL,
-  relevance_rank INTEGER NOT NULL
+  relevance_rank INTEGER NOT NULL,
+  selector_version TEXT NOT NULL,
+  selector_feature_digest TEXT NOT NULL
 );
 CREATE INDEX frontier_deferred_audit_order ON frontier_deferred(
   relevance_rank, coverage_stratum, source_id, cursor_order, node_id
@@ -710,7 +740,10 @@ Build `frontier_order.fair_round` once before seal using SQLite's file-backed so
 frontier proposal iterator; Python never receives all lane members at once.
 `frontier_deferred` is the immutable file-backed authority for every eligible-but-unselected node.
 Its ordered canonical-row accumulator yields count/root/cursor-root without returning the population
-to Python; audit and full verify page it from the sealed catalog.
+to Python; audit and full verify page it from the sealed catalog. Its row is the same
+`SemanticDeferredAuditRow` contract later used by runtime transitions: exact canonical cursor JSON
+and order, source/coverage/relevance fields, selector version and the corresponding
+`frontier_features.feature_digest` are stored and cross-checked before catalog seal.
 
 - [ ] **Step 4: Implement catalog sealing and dual roots**
 
@@ -995,7 +1028,13 @@ CREATE TABLE IF NOT EXISTS semantic_v3_runtime_deferred (
   node_id TEXT NOT NULL,
   reason TEXT NOT NULL,
   node_digest TEXT NOT NULL,
+  cursor_json TEXT NOT NULL,
   cursor_order INTEGER NOT NULL,
+  source_id TEXT NOT NULL,
+  coverage_stratum TEXT NOT NULL,
+  relevance_rank INTEGER NOT NULL,
+  selector_version TEXT NOT NULL,
+  selector_feature_digest TEXT NOT NULL,
   source_transition_unit_id TEXT NOT NULL,
   created_sequence INTEGER NOT NULL,
   PRIMARY KEY(run_id, node_id),
@@ -1005,6 +1044,10 @@ CREATE TABLE IF NOT EXISTS semantic_v3_runtime_deferred (
 );
 CREATE INDEX IF NOT EXISTS semantic_v3_runtime_deferred_sequence
   ON semantic_v3_runtime_deferred(run_id, created_sequence, cursor_order, node_id);
+CREATE INDEX IF NOT EXISTS semantic_v3_runtime_deferred_audit_order
+  ON semantic_v3_runtime_deferred(
+    run_id, relevance_rank, coverage_stratum, source_id, cursor_order, node_id
+  );
 
 CREATE TABLE IF NOT EXISTS semantic_v3_expansion_cursors (
   run_id TEXT NOT NULL,
@@ -1048,7 +1091,7 @@ def claim_semantic_v3_running_slot(self, run_id: str) -> None: ...
 def acquire_semantic_v3_execution(self, run_id: str, unit_id: str, lease_nonce: str) -> None: ...
 def issue_semantic_v3_input(self, run_id: str, lease_nonce: str, input_sha256: str, byte_count: int) -> None: ...
 def commit_semantic_v3_receipt(self, receipt: SemanticReceiptCommit) -> None: ...
-def iter_semantic_v3_runtime_deferred(self, run_id: str, fetch_size: int = 256) -> Iterator[SemanticDeferredNode]: ...
+def iter_semantic_v3_runtime_deferred(self, run_id: str, fetch_size: int = 256) -> Iterator[SemanticDeferredAuditRow]: ...
 def checkpoint_semantic_v3_run(self, checkpoint: SemanticCheckpoint) -> None: ...
 def commit_semantic_v3_audit_freeze(self, freeze: SemanticAuditFreeze) -> None: ...
 def pause_semantic_v3_run(self, run_id: str, reason: str) -> None: ...
@@ -1060,14 +1103,19 @@ the cross-process approval authority. `commit_semantic_v3_receipt()` must valida
 exact lock/nonce/input/current authority, insert the receipt, update unit/dependents/aggregate/result
 root/checkpoint, insert every bounded runtime `defer_on_demand` row, recompute the
 `runtime_transition` count/root/cursor binding, and release the singleton lock in one transaction.
+Each runtime canonical row stores the exact cursor JSON plus its validated numeric order, source,
+coverage stratum, relevance rank, selector version and sealed-catalog feature digest; the transaction
+rejects a cursor/order or selector/feature mismatch.
 The runtime table is bounded by approved work: at most 64 transitioned node IDs per unit and at most
 512 frontier units (32,768 rows), or the separately approved 256-unit deepening budget. Duplicate exact receipt is
 success before any pack append; different replay is conflict. `commit_semantic_v3_audit_freeze()`
 atomically inserts the ordered membership, its audit units, population/ordered-set digests and the
 new checkpoint after the last expansion receipt. Its population authority is the streaming canonical
-merge of sealed-catalog `frontier_deferred` rows and repository `semantic_v3_runtime_deferred` rows,
+merge of selector-enriched sealed-catalog `frontier_deferred` rows and repository
+`semantic_v3_runtime_deferred` rows,
 ordered by `(set_kind_rank, cursor_order, node_id)` with `initial_catalog` before
-`runtime_transition`; the checkpoint stores the exact combined population digest.
+`runtime_transition`; its domain-separated canonical row includes every field of
+`SemanticDeferredAuditRow`, and the checkpoint stores the exact combined population digest.
 
 - [ ] **Step 5: Run lifecycle atomicity and DB safety tests**
 
@@ -1309,6 +1357,20 @@ REPRESENTATIVE_ROLE_ORDER = (
     "project-description", "entrypoint", "package-manifest",
     "test", "deployment", "documentation", "data", "generated-output",
 )
+
+def deferred_audit_row(seed: FrontierSeed, cursor: FrontierCursor) -> SemanticDeferredAuditRow:
+    return SemanticDeferredAuditRow(
+        node_id=seed.node_id,
+        reason=seed.deferred_reason,
+        node_digest=seed.node_digest,
+        cursor_json=canonical_json_text(cursor.as_canonical_dict()),
+        cursor_order=cursor.order,
+        source_id=seed.source_id,
+        coverage_stratum=seed.coverage_stratum,
+        relevance_rank=seed.relevance_rank,
+        selector_version=FRONTIER_SELECTOR_VERSION,
+        selector_feature_digest=seed.feature_digest,
+    )
 ```
 
 A node is eligible when multiple complementary role/purpose signals, ambiguity, independent-child, approved-evidence, uncertainty, or explicit on-demand authority is present. One filename/README/manifest or file count alone must never set `project_like`.
@@ -1331,7 +1393,9 @@ def build_frontier_plan(session: SemanticCatalogPlanningSession, revision_id: st
             if unit is not None and within_phase_estimates(units, unit):
                 units.append(unit)
             else:
-                session.append_deferred(deferred_record(seed))
+                session.append_deferred(
+                    deferred_audit_row(seed, session.allocate_deferred_cursor(seed))
+                )
     deferred = session.seal_deferred_rows()
     return SemanticFrontierPlan(
         run_id=stable_run_id(revision_id, policy_hash),
@@ -1359,27 +1423,54 @@ while canonical input estimate stays ≤262,144 bytes and dependency count ≤64
 the 512-unit approval cap; the unbounded deferred population is written row-by-row to the catalog
 sink and represented in the plan only by count/root/cursor-root. Store each bounded
 unit's canonical target-node IDs and dependency IDs/digests in `semantic_v3_units.target_ref_json`;
-all eligible-but-unselected records receive a reason, digest and cursor in `frontier_deferred`.
+all eligible-but-unselected records receive the complete `SemanticDeferredAuditRow` in
+`frontier_deferred`; cursor JSON is canonical and its numeric order, selector version and feature
+digest are validated before the catalog can seal.
 
 - [ ] **Step 6: Implement action transition and post-expansion audit freeze**
 
 ```python
-def freeze_audit_sample(reader: SemanticCatalogReader, expansion: ExpansionCheckpoint) -> AuditSample:
-    population = reader.deferred_population(expansion.population_cursor)
-    relevance = take_unique(population.by_relevance(), 100)
-    coverage = take_unique(population.by_coverage_strata(), 100, exclude=relevance)
-    random = take_unique(population.by_stable_hash(expansion.revision_id, expansion.policy_hash), 100, exclude=(*relevance, *coverage))
+def freeze_audit_sample(
+    *,
+    catalog_deferred: Iterator[SemanticDeferredAuditRow],
+    runtime_deferred: Iterator[SemanticDeferredAuditRow],
+    pending_runtime_deferred: Sequence[SemanticDeferredAuditRow],
+    checkpoint: ExpansionCheckpoint,
+) -> AuditSample:
+    selector = BoundedAuditSelector(per_stratum_reserve=300)
+    population = DeferredPopulationAccumulator(domain="semantic-v3-deferred-population")
+    for set_kind, row in stream_canonical_deferred_merge(
+        catalog_deferred,
+        runtime_deferred,
+        pending_runtime_deferred,
+    ):
+        validate_deferred_audit_row(row, checkpoint.selector_version)
+        population.update(set_kind, row)
+        selector.consider(
+            row,
+            random_key=sha256_hex(
+                f"{checkpoint.revision_id}\0{checkpoint.policy_sha256}\0{row.node_id}".encode()
+            ),
+        )
+    relevance, coverage, random = selector.finalize_unique(100, 100, 100)
     ordered = tuple((*relevance, *coverage, *random))
     members = tuple(
         AuditMember(index, stratum_for(index), node.node_id, node.node_digest)
         for index, node in enumerate(ordered)
     )
-    return AuditSample(members, digest_audit_members(members), population.digest, FRONTIER_SELECTOR_VERSION)
+    return AuditSample(
+        members,
+        digest_audit_members(members),
+        population.digest,
+        checkpoint.selector_version,
+    )
 ```
 
 `freeze_audit_sample()` returns data only; Task 10 is the sole authority that may atomically store
 its ordered membership, create membership-bound audit units and publish the audit checkpoint.
-`transition_frontier()` accepts only the four actions, validates requested child IDs against catalog
+The selector retains at most 300 candidates for each of the three strata and therefore never holds
+the population. `stream_canonical_deferred_merge()` rejects duplicate node IDs, noncanonical cursors
+and selector/feature mismatch. `transition_frontier()` accepts only the four actions, validates requested child IDs against catalog
 pages, and never turns budget exhaustion into `stop_non_project` or convergence.
 
 - [ ] **Step 7: Run frontier, quality, high-fanout, and audit tests**
@@ -2059,8 +2150,19 @@ def test_runtime_deferred_transition_is_atomic_restartable_and_row_exact(expansi
     )
     expansion_run.restart_process()
     rows = list(expansion_run.repository.iter_semantic_v3_runtime_deferred(expansion_run.run_id))
-    assert [(row.node_id, row.reason, row.node_digest, row.cursor_json) for row in rows] == [
-        (row.node_id, row.reason, row.node_digest, row.cursor_json)
+    assert [
+        (
+            row.node_id, row.reason, row.node_digest, row.cursor_json, row.cursor_order,
+            row.source_id, row.coverage_stratum, row.relevance_rank,
+            row.selector_version, row.selector_feature_digest,
+        )
+        for row in rows
+    ] == [
+        (
+            row.node_id, row.reason, row.node_digest, row.cursor_json, row.cursor_order,
+            row.source_id, row.coverage_stratum, row.relevance_rank,
+            row.selector_version, row.selector_feature_digest,
+        )
         for row in transition.deferred
     ]
     assert expansion_run.repository.deferred_binding(expansion_run.run_id, "runtime_transition") == (
@@ -2083,7 +2185,10 @@ def test_audit_freeze_can_select_runtime_deferred_member_and_binds_combined_popu
     freeze = expansion_run.repository.audit_freeze(expansion_run.run_id)
     assert runtime.node_id in {member.node_id for member in freeze.members}
     assert freeze.population_sha256 == digest_combined_deferred_population(
-        expansion_run.catalog.iter_frontier_deferred(fetch_size=64),
+        expansion_run.catalog.iter_frontier_deferred_for_audit(
+            selector_version=expansion_run.selector_version,
+            fetch_size=64,
+        ),
         expansion_run.repository.iter_semantic_v3_runtime_deferred(expansion_run.run_id, fetch_size=64),
     )
 ```
@@ -2130,11 +2235,22 @@ canonical output after process restart.
 
 ```python
 try:
-    transition = transition_frontier(catalog, unit, validated)
+    raw_transition = transition_frontier(catalog, unit, validated)
+    transition = replace(
+        raw_transition,
+        deferred=catalog.enrich_runtime_deferred_for_audit(
+            raw_transition.deferred,
+            selector_version=authority.selector_version,
+            max_rows=64,
+        ),
+    )
     audit_freeze = None
     if transition.ends_expansion:
         audit_freeze = freeze_audit_sample(
-            catalog_deferred=catalog.iter_frontier_deferred(fetch_size=64),
+            catalog_deferred=catalog.iter_frontier_deferred_for_audit(
+                selector_version=authority.selector_version,
+                fetch_size=64,
+            ),
             runtime_deferred=repository.iter_semantic_v3_runtime_deferred(run_id, fetch_size=64),
             pending_runtime_deferred=transition.deferred,
             checkpoint=repository.expansion_checkpoint(
@@ -2164,7 +2280,10 @@ exchange.clear_output_if_matches(lease.nonce, validated.output_sha256)
 return validation_result(committed)
 ```
 
-`transition.deferred` is at most 64 canonical rows. The receipt transaction inserts them into
+The transition first yields at most 64 `SemanticDeferredNode` values. One bounded sealed-catalog
+lookup enriches them into `SemanticDeferredAuditRow` values and verifies each node/source/coverage/
+feature digest against the approved selector before result receipt commit. No later audit depends on
+an unrecorded lookup. The receipt transaction inserts those exact rows into
 `semantic_v3_runtime_deferred`, rejects any node/cursor conflict, and updates the
 `runtime_transition` aggregate binding and checkpoint from those exact rows; receipt failure rolls
 all of those writes back together. When `audit_freeze` is present, the same DB transaction first
@@ -2456,9 +2575,18 @@ def test_full_verify_streams_initial_and_runtime_deferred_and_binds_combined_roo
         v3_run.repository.current_checkpoint(v3_run.run_id).audit_population_sha256
     )
 
-def test_runtime_deferred_row_tamper_fails_full_verify(v3_run) -> None:
+@pytest.mark.parametrize(
+    "field",
+    (
+        "node_digest", "cursor_json", "cursor_order", "source_id", "coverage_stratum",
+        "relevance_rank", "selector_version", "selector_feature_digest",
+    ),
+)
+def test_runtime_deferred_row_field_tamper_fails_full_verify(v3_run, field) -> None:
     runtime = v3_run.add_runtime_deferred_counter_signal(relevance_rank=0)
-    v3_run.repository.mutate_runtime_deferred_digest_for_test(v3_run.run_id, runtime.node_id)
+    v3_run.repository.mutate_runtime_deferred_field_for_test(
+        v3_run.run_id, runtime.node_id, field
+    )
     with pytest.raises(SemanticWorkError, match="runtime deferred"):
         verify_semantic_v3_full(v3_run.context())
 ```
@@ -2487,7 +2615,10 @@ def verify_semantic_v3_full(context: SemanticV3Context) -> FullVerification:
         units=context.repository.iter_semantic_v3_units(context.run_id, fetch_size=256),
         dependencies=context.repository.iter_semantic_v3_dependencies(context.run_id, fetch_size=256),
         deferred=context.repository.iter_semantic_v3_deferred(context.run_id, fetch_size=256),
-        catalog_deferred=catalog.iter_frontier_deferred(fetch_size=256),
+        catalog_deferred=catalog.iter_frontier_deferred_for_audit(
+            selector_version=authority.selector_version,
+            fetch_size=256,
+        ),
         runtime_deferred=context.repository.iter_semantic_v3_runtime_deferred(
             context.run_id, fetch_size=256
         ),
@@ -2509,8 +2640,9 @@ approval/policy/content binding. Cross-verify every ordered structural edge and 
 between the structural pack and catalog. Read in bounded batches; never materialize the catalog,
 pack, unit, dependency, audit member or receipt set. Independently recompute the sealed catalog
 initial root, repository runtime root and canonical combined deferred population root; each must match
-its aggregate/checkpoint binding. A runtime row whose reason, node digest, cursor order, source unit,
-or creation sequence does not follow its receipt transition fails verification.
+its aggregate/checkpoint binding. A runtime row whose reason, node digest, exact cursor JSON/order,
+source, coverage stratum, relevance rank, selector version/feature digest, source unit or creation
+sequence does not follow its receipt transition and sealed-catalog feature row fails verification.
 
 - [ ] **Step 6: Implement result-driven finalization and recoverable publication**
 
@@ -2896,13 +3028,20 @@ CREATE TABLE deferred_nodes (
   node_id TEXT PRIMARY KEY,
   reason TEXT NOT NULL,
   node_digest TEXT NOT NULL,
-  cursor_order INTEGER NOT NULL UNIQUE
+  cursor_json TEXT NOT NULL,
+  cursor_order INTEGER NOT NULL UNIQUE,
+  source_id TEXT NOT NULL,
+  coverage_stratum TEXT NOT NULL,
+  relevance_rank INTEGER NOT NULL,
+  selector_version TEXT NOT NULL,
+  selector_feature_digest TEXT NOT NULL
 );
 CREATE INDEX deferred_nodes_cursor
   ON deferred_nodes(cursor_order, node_id);
 ```
 
-`SemanticDeferredIndexWriter` inserts canonical rows in bounded pages, checkpoints and fsyncs the
+`SemanticDeferredIndexWriter` inserts `SemanticDeferredAuditRow` canonical rows in bounded pages,
+cross-checks their selector feature fields against the sealed source catalog, checkpoints and fsyncs the
 temporary file, rejects WAL/SHM sidecars, and derives `logical_root`, `deferred_count` and
 `cursor_root` by streaming `(cursor_order, node_id)` rows. `seal()` runs integrity check, compacts,
 fsyncs, closes the writer, hashes the final bytes and reopens the file read-only before returning the
@@ -3058,7 +3197,10 @@ def verify_deepening_deferred_authority(
 deepening_deferred = verify_deepening_deferred_authority(context, authority)
 catalog_deferred = (
     None if deepening_deferred is not None
-    else catalog.iter_frontier_deferred(fetch_size=256)
+    else catalog.iter_frontier_deferred_for_audit(
+        selector_version=authority.selector_version,
+        fetch_size=256,
+    )
 )
 lifecycle = verify_lifecycle_streaming(
     proposal=context.repository.get_semantic_v3_proposal_bytes_for_run(context.run_id),
