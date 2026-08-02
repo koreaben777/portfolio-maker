@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError, fields, replace
+from enum import StrEnum
 
 import pytest
 
@@ -208,19 +209,6 @@ def test_shared_interface_contract_exposes_the_fixed_v3_types() -> None:
     assert MAX_UNIT_BYTES == 262_144
     assert MAX_DEPENDENCIES == 64
     assert CHECKPOINT_UNITS == 16
-    assert tuple(BaselineCoverage) == (
-        BaselineCoverage.COMPLETE,
-        BaselineCoverage.SAMPLED,
-        BaselineCoverage.UNSUPPORTED,
-        BaselineCoverage.UNREADABLE,
-        BaselineCoverage.FAILED,
-    )
-    assert tuple(FrontierAction) == (
-        FrontierAction.ACCEPT_BOUNDARY,
-        FrontierAction.EXPAND_CHILDREN,
-        FrontierAction.STOP_NON_PROJECT,
-        FrontierAction.DEFER_ON_DEMAND,
-    )
     assert SemanticRunState.AWAITING_APPROVAL == "awaiting_approval"
     assert SemanticRunState.PAUSED_USER == "paused_user"
     assert SemanticLeaseState.MATERIALIZING == "materializing"
@@ -310,26 +298,34 @@ def test_proposal_authority_uses_approval_kind_and_envelope_digest() -> None:
 
 
 def test_fixed_v3_enum_wire_sets_and_project_deepening_literal() -> None:
-    assert tuple((member.name, member.value) for member in BaselineCoverage) == (
+    assert tuple(
+        (name, member.value) for name, member in BaselineCoverage.__members__.items()
+    ) == (
         ("COMPLETE", "complete"),
         ("SAMPLED", "sampled"),
         ("UNSUPPORTED", "unsupported"),
         ("UNREADABLE", "unreadable"),
         ("FAILED", "failed"),
     )
-    assert tuple((member.name, member.value) for member in FrontierPhase) == (
+    assert tuple(
+        (name, member.value) for name, member in FrontierPhase.__members__.items()
+    ) == (
         ("ORIENTATION", "orientation"),
         ("EXPANSION", "expansion"),
         ("AUDIT", "audit"),
         ("DEEPENING", "deepening"),
     )
-    assert tuple((member.name, member.value) for member in FrontierAction) == (
+    assert tuple(
+        (name, member.value) for name, member in FrontierAction.__members__.items()
+    ) == (
         ("ACCEPT_BOUNDARY", "accept_boundary"),
         ("EXPAND_CHILDREN", "expand_children"),
         ("STOP_NON_PROJECT", "stop_non_project"),
         ("DEFER_ON_DEMAND", "defer_on_demand"),
     )
-    assert tuple((member.name, member.value) for member in SemanticRunState) == (
+    assert tuple(
+        (name, member.value) for name, member in SemanticRunState.__members__.items()
+    ) == (
         ("PREPARED", "prepared"),
         ("AWAITING_APPROVAL", "awaiting_approval"),
         ("RUNNING", "running"),
@@ -341,19 +337,26 @@ def test_fixed_v3_enum_wire_sets_and_project_deepening_literal() -> None:
         ("FINALIZED", "finalized"),
         ("FAILED", "failed"),
     )
-    assert tuple((member.name, member.value) for member in SemanticLeaseState) == (
+    assert tuple(
+        (name, member.value) for name, member in SemanticLeaseState.__members__.items()
+    ) == (
         ("MATERIALIZING", "materializing"),
         ("ISSUED", "issued"),
         ("EXPIRED", "expired"),
     )
-    assert tuple((member.name, member.value) for member in SemanticUnitState) == (
+    assert tuple(
+        (name, member.value) for name, member in SemanticUnitState.__members__.items()
+    ) == (
         ("READY", "ready"),
         ("LEASED", "leased"),
         ("VALIDATED", "validated"),
         ("DEFERRED", "deferred"),
         ("ERROR", "error"),
     )
-    assert tuple((member.name, member.value) for member in DeepeningOverlayState) == (
+    assert tuple(
+        (name, member.value)
+        for name, member in DeepeningOverlayState.__members__.items()
+    ) == (
         ("PROPOSED", "proposed"),
         ("INACTIVE_REVIEW_REQUIRED", "inactive_review_required"),
         ("CANCELLED", "cancelled"),
@@ -365,6 +368,22 @@ def test_fixed_v3_enum_wire_sets_and_project_deepening_literal() -> None:
     assert proposal.approval_kind == "project_deepening"
     with pytest.raises(ValueError, match="approval_kind"):
         replace(proposal, approval_kind="deepening")
+
+
+def test_enum_iteration_misses_an_added_alias() -> None:
+    class AliasProbe(StrEnum):
+        CANONICAL = "canonical"
+        ALIAS = "canonical"
+
+    assert tuple((member.name, member.value) for member in AliasProbe) == (
+        ("CANONICAL", "canonical"),
+    )
+    assert tuple(
+        (name, member.value) for name, member in AliasProbe.__members__.items()
+    ) == (
+        ("CANONICAL", "canonical"),
+        ("ALIAS", "canonical"),
+    )
 
 
 def _project_deepening_proposal() -> SemanticExecutionProposal:
