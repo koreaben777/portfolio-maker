@@ -162,6 +162,60 @@ class SemanticBudget:
     checkpoint_units: int = CHECKPOINT_UNITS
 
 @dataclass(frozen=True)
+class SemanticPhaseBinding:
+    phase: FrontierPhase
+    hard_budget: SemanticBudget
+    estimated_units: int
+    estimated_input_bytes: int
+    estimated_wall_seconds: int
+
+@dataclass(frozen=True)
+class SemanticPlannedUnit:
+    unit_id: str
+    phase: FrontierPhase
+    target_node_ids: tuple[str, ...]
+    dependency_unit_ids: tuple[str, ...]
+    estimated_input_bytes: int
+    priority: int
+    fairness_lane: str
+
+@dataclass(frozen=True)
+class SemanticDeferredNode:
+    node_id: str
+    reason: str
+    node_digest: str
+    cursor_json: str
+
+@dataclass(frozen=True)
+class SemanticFrontierPlan:
+    run_id: str
+    revision_id: str
+    policy_sha256: str
+    selector_version: str
+    target_projection_contract: str
+    input_schema_version: str
+    output_schema_version: str
+    validator_version: str
+    purpose: str
+    units: tuple[SemanticPlannedUnit, ...]
+    deferred: tuple[SemanticDeferredNode, ...]
+
+@dataclass(frozen=True)
+class SemanticDeepeningPlan:
+    run_id: str
+    revision_id: str
+    project_id: str
+    parent_frontier_checkpoint_root: str
+    project_boundary_sha256: str
+    target_projection_contract: str
+    input_schema_version: str
+    output_schema_version: str
+    validator_version: str
+    purpose: str
+    units: tuple[SemanticPlannedUnit, ...]
+    deferred: tuple[SemanticDeferredNode, ...]
+
+@dataclass(frozen=True)
 class PackRecordRef:
     offset: int
     length: int
@@ -193,6 +247,11 @@ class PackRecordRef:
 def test_v3_default_budgets_and_completion_states_are_exact(workspace: Path) -> None:
     assert FRONTIER_BUDGET == SemanticBudget(512, 128 * 1024**2, 7_200)
     assert DEEPENING_BUDGET == SemanticBudget(256, 64 * 1024**2, 3_600)
+    assert FRONTIER_PHASE_HARD_BUDGETS == (
+        (FrontierPhase.ORIENTATION, ORIENTATION_BUDGET),
+        (FrontierPhase.EXPANSION, EXPANSION_BUDGET),
+        (FrontierPhase.AUDIT, AUDIT_BUDGET),
+    )
     completion = SemanticCompletion(
         structural_complete=True,
         local_baseline_complete=True,
@@ -228,6 +287,11 @@ ORIENTATION_BUDGET = SemanticBudget(64, 16 * 1024**2, 15 * 60)
 EXPANSION_BUDGET = SemanticBudget(384, 96 * 1024**2, 90 * 60)
 AUDIT_BUDGET = SemanticBudget(64, 16 * 1024**2, 15 * 60)
 DEEPENING_BUDGET = SemanticBudget(256, 64 * 1024**2, 3_600)
+FRONTIER_PHASE_HARD_BUDGETS = (
+    (FrontierPhase.ORIENTATION, ORIENTATION_BUDGET),
+    (FrontierPhase.EXPANSION, EXPANSION_BUDGET),
+    (FrontierPhase.AUDIT, AUDIT_BUDGET),
+)
 
 @dataclass(frozen=True)
 class SemanticCompletion:
@@ -250,9 +314,16 @@ class SemanticExecutionProposal:
     catalog_root: str
     safe_source_label: str
     private_context_scope: str
+    plan_sha256: str
+    parent_checkpoint_root: str
+    target_projection_contract: str
+    input_schema_version: str
+    output_schema_version: str
+    validator_version: str
+    purpose: str
     structural_node_count: int
     baseline_coverage_counts: tuple[tuple[str, int], ...]
-    phase_estimates: tuple[tuple[FrontierPhase, int, int, int], ...]
+    phase_bindings: tuple[SemanticPhaseBinding, ...]
     audit_selector_rule: str
     deferred_semantics: str
     budget: SemanticBudget
@@ -293,7 +364,7 @@ class PrepareSemanticIndexRequest:
 `PrepareSemanticIndexResult`, `SemanticIndexStatusResult`, `NextSemanticWorkResult`,
 `ValidateSemanticWorkResult`, and `FinalizeSemanticIndexResult` gain an explicit `protocol`
 field while retaining legacy-compatible defaults at v2 dispatch boundaries. The v3 prepare result
-also returns the safe `run_id`, `proposal_sha256`, structural/baseline aggregates and phase estimates
+also returns the safe `run_id`, `proposal_sha256`, structural/baseline aggregates and phase bindings
 needed to display the durable proposal without selecting it by revision alone.
 
 `proposal_sha256` is the SHA-256 of canonical JSON bytes of `SemanticExecutionProposal` only; the
@@ -302,6 +373,10 @@ proposal digest covers every proposal field above. For the frontier proposal, au
 selector rule/version, sealed catalog root, private-context scope and audit phase budget; the exact
 ordered 300-node sample/population digests are frozen only after expansion and committed to the
 checkpoint as specified in Task 6.
+Each `SemanticPhaseBinding` contains both the dynamic estimate and immutable hard budget. Frontier
+proposal phase order and hard budgets must equal `FRONTIER_PHASE_HARD_BUDGETS`; a deepening proposal
+contains exactly one `DEEPENING` binding with `DEEPENING_BUDGET`. Unused units/bytes/time in one phase
+cannot be reassigned to another phase without a new proposal digest and explicit approval.
 
 - [ ] **Step 3a: Add the completion/run/lease truth-table tests**
 
@@ -644,6 +719,13 @@ def test_only_one_workspace_run_can_own_execution_lock(workspace: Path) -> None:
     repository.acquire_semantic_v3_execution("run-a", "unit-a", "nonce-a")
     with pytest.raises(RepositoryError, match="semantic execution is busy"):
         repository.acquire_semantic_v3_execution("run-b", "unit-b", "nonce-b")
+
+def test_only_one_workspace_run_can_be_operationally_running(workspace: Path) -> None:
+    repository = initialized_repository_with_two_approved_prepared_runs(workspace)
+    repository.claim_semantic_v3_running_slot("run-a")
+    with pytest.raises(RepositoryError, match="semantic execution is busy"):
+        repository.claim_semantic_v3_running_slot("run-b")
+    assert repository.run_state("run-b") is SemanticRunState.PREPARED
 ```
 
 - [ ] **Step 2: Run the exact RED tests**
@@ -672,12 +754,16 @@ CREATE TABLE IF NOT EXISTS semantic_v3_proposals (
   approval_kind TEXT NOT NULL CHECK(approval_kind IN ('frontier','project_deepening')),
   proposal_canonical_json BLOB NOT NULL,
   proposal_sha256 TEXT NOT NULL UNIQUE,
+  plan_canonical_json BLOB NOT NULL,
+  plan_sha256 TEXT NOT NULL,
   manifest_sha256 TEXT NOT NULL,
   source_policy_sha256 TEXT NOT NULL,
   catalog_root TEXT NOT NULL,
   selector_version TEXT NOT NULL,
   private_context_scope TEXT NOT NULL,
-  budget_json TEXT NOT NULL,
+  total_budget_json TEXT NOT NULL,
+  phase_bindings_json TEXT NOT NULL,
+  budget_binding_sha256 TEXT NOT NULL,
   state TEXT NOT NULL CHECK(state IN ('proposed','approved','stale')),
   created_at TEXT NOT NULL,
   UNIQUE(run_id, proposal_sha256)
@@ -701,6 +787,8 @@ CREATE TABLE IF NOT EXISTS semantic_v3_runs (
   FOREIGN KEY(run_id, proposal_sha256)
     REFERENCES semantic_v3_proposals(run_id, proposal_sha256)
 );
+CREATE UNIQUE INDEX IF NOT EXISTS semantic_v3_one_running_run
+  ON semantic_v3_runs(state) WHERE state = 'running';
 CREATE TABLE IF NOT EXISTS semantic_v3_execution_lock (
   singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
   run_id TEXT NOT NULL REFERENCES semantic_v3_runs(run_id),
@@ -814,7 +902,9 @@ CREATE TABLE IF NOT EXISTS semantic_v3_approvals (
   catalog_root TEXT NOT NULL,
   selector_version TEXT NOT NULL,
   private_context_scope TEXT NOT NULL,
-  budget_json TEXT NOT NULL,
+  total_budget_json TEXT NOT NULL,
+  phase_bindings_json TEXT NOT NULL,
+  budget_binding_sha256 TEXT NOT NULL,
   project_id TEXT,
   user_confirmed INTEGER NOT NULL CHECK(user_confirmed = 1),
   approved_at TEXT NOT NULL,
@@ -863,7 +953,7 @@ lineage after their own contracts exist.
 
 ```python
 def bind_semantic_v3_revision(self, binding: SemanticRevisionBinding) -> None: ...
-def create_semantic_v3_proposal(self, envelope: SemanticProposalEnvelope, canonical_bytes: bytes) -> None: ...
+def create_semantic_v3_proposal(self, envelope: SemanticProposalEnvelope, canonical_bytes: bytes, plan_bytes: bytes) -> None: ...
 def get_semantic_v3_proposal_by_digest(self, revision_id: str, proposal_sha256: str) -> SemanticProposalEnvelope: ...
 def get_semantic_v3_proposal_for_run(self, run_id: str) -> SemanticProposalEnvelope: ...
 def create_semantic_v3_run(self, envelope: SemanticProposalEnvelope) -> None: ...
@@ -877,8 +967,9 @@ def commit_semantic_v3_audit_freeze(self, freeze: SemanticAuditFreeze) -> None: 
 def pause_semantic_v3_run(self, run_id: str, reason: str) -> None: ...
 ```
 
-`create_semantic_v3_proposal()` rejects noncanonical bytes or a digest mismatch and preserves those
-exact bytes as the cross-process approval authority. `commit_semantic_v3_receipt()` must validate the
+`create_semantic_v3_proposal()` rejects noncanonical proposal/plan bytes or digest mismatch, requires
+`envelope.proposal.plan_sha256` to match the canonical plan bytes, and preserves both exact bodies as
+the cross-process approval authority. `commit_semantic_v3_receipt()` must validate the
 exact lock/nonce/input/current authority, insert the receipt, update unit/dependents/aggregate/result
 root/checkpoint, and release the singleton lock in one transaction. Duplicate exact receipt is
 success before any pack append; different replay is conflict. `commit_semantic_v3_audit_freeze()`
@@ -1206,6 +1297,11 @@ def test_prepare_defaults_to_v3_and_publishes_manifest_last(workspace: Path, app
     assert result.structural_node_count == result.local_baseline_terminal_count
     assert result.exchange_input_created is False
     assert repository(workspace).semantic_v3_binding(result.revision_id).manifest_sha256 == manifest["manifest_sha256"]
+    envelope = repository(workspace).get_semantic_v3_proposal_by_digest(result.revision_id, result.proposal_sha256)
+    assert tuple((item.phase, item.hard_budget) for item in envelope.proposal.phase_bindings) == FRONTIER_PHASE_HARD_BUDGETS
+    assert all(item.estimated_units <= item.hard_budget.max_units for item in envelope.proposal.phase_bindings)
+    assert all(item.estimated_input_bytes <= item.hard_budget.max_input_bytes for item in envelope.proposal.phase_bindings)
+    assert all(item.estimated_wall_seconds <= item.hard_budget.max_wall_seconds for item in envelope.proposal.phase_bindings)
 
 def test_prepare_failure_leaves_previous_active_and_staging_binding_unchanged(workspace, approved_root, monkeypatch) -> None:
     before = snapshot_semantic_bindings(workspace)
@@ -1274,14 +1370,21 @@ sink.consume(iter_local_structure_events(request.root, approval))
 pack_seals = sink.seal_packs()
 catalog_seal = sink.seal_catalog()
 frontier_plan = build_frontier_plan(SemanticCatalogReader(...), revision_id, policy_hash)
+frontier_plan_bytes = canonical_json_bytes(frontier_plan)
+frontier_plan_sha256 = sha256_hex(frontier_plan_bytes)
 manifest_bytes = build_canonical_v3_manifest_bytes(
-    pack_seals, catalog_seal, frontier_plan, resource_observation
+    pack_seals, catalog_seal, frontier_plan_sha256, frontier_plan, resource_observation
 )
 manifest_sha256 = sha256_hex(manifest_bytes)
 proposal = build_execution_proposal(
     frontier_plan,
+    plan_sha256=frontier_plan_sha256,
     manifest_sha256=manifest_sha256,
     catalog_root=catalog_seal.logical_root,
+    parent_checkpoint_root=lifecycle_genesis_root(frontier_plan),
+    phase_bindings=build_frontier_phase_bindings(
+        frontier_plan, hard_budgets=FRONTIER_PHASE_HARD_BUDGETS
+    ),
 )
 proposal_bytes = canonical_json_bytes(proposal)
 proposal_envelope = SemanticProposalEnvelope(proposal, sha256_hex(proposal_bytes))
@@ -1291,6 +1394,7 @@ repository.bind_semantic_v3_revision_genesis_proposal_and_units(
     binding=binding_from_manifest_bytes(manifest_bytes, proposal_envelope),
     proposal_bytes=proposal_bytes,
     proposal_envelope=proposal_envelope,
+    frontier_plan_bytes=frontier_plan_bytes,
     units=frontier_plan.units,
     deferred=frontier_plan.deferred,
 )
@@ -1298,11 +1402,14 @@ repository.bind_semantic_v3_revision_genesis_proposal_and_units(
 
 The manifest binds the frontier plan digest/estimates but not the later proposal digest, avoiding a
 manifest/proposal hash cycle. The proposal binds the already sealed manifest hash and catalog root.
-The last method is one DB transaction and verifies that proposal bytes, manifest frontier-plan digest,
+The last method is one DB transaction and verifies that canonical plan/proposal bytes, proposal and
+manifest frontier-plan digests,
 unit target/dependency roots and lifecycle genesis agree before inserting the revision binding,
 canonical proposal row, run, bounded units, dependencies, aggregates and deferred cursors. An
 unbound published directory is crash residue, not current staging. Failure review is bounded/private
 and does not copy locator or payload.
+The newly bound run state is `awaiting_approval`; only exact approval changes it to approved
+`prepared`, and only Task 9 `next` may claim `running`.
 
 - [ ] **Step 6: Convert public prepare/apply functions to protocol dispatchers**
 
@@ -1362,10 +1469,19 @@ def test_approval_binds_exact_proposal_catalog_policy_selector_scope_and_budget(
         revision_id=proposal.revision_id,
         proposal_sha256=envelope.proposal_sha256,
     ))
-    assert result.run_state is SemanticRunState.RUNNING
-    for changed in ("proposal", "catalog", "policy", "selector", "scope", "budget"):
+    assert result.run_state is SemanticRunState.PREPARED
+    for changed in (
+        "proposal", "catalog", "policy", "selector", "scope", "total_budget",
+        "orientation_budget", "expansion_budget", "audit_budget",
+    ):
         with pytest.raises(SemanticWorkError, match="stale"):
             prepared_v3.approve_with_drift(changed)
+
+def test_two_exact_approvals_remain_prepared_until_one_next_claims_running_slot(prepared_two_runs) -> None:
+    first = approve_semantic_execution(prepared_two_runs.approval_request(0))
+    second = approve_semantic_execution(prepared_two_runs.approval_request(1))
+    assert first.run_state is second.run_state is SemanticRunState.PREPARED
+    assert prepared_two_runs.repository.running_run_count() == 0
 
 def test_separate_process_approval_rehashes_durable_canonical_proposal(prepared_v3) -> None:
     completed = run_cli_in_new_process(
@@ -1409,15 +1525,21 @@ def approve_semantic_execution(request: ApproveSemanticExecutionRequest) -> Appr
     if sha256_hex(canonical_bytes) != envelope.proposal_sha256:
         raise SemanticWorkError("semantic proposal authority is corrupt")
     validate_current_proposal_binding(paths, envelope, request.proposal_sha256)
+    validate_exact_phase_bindings(envelope.proposal.phase_bindings, envelope.proposal.budget)
     repository.approve_semantic_v3_run(envelope.proposal.run_id, envelope.proposal_sha256)
-    return ApproveSemanticExecutionResult(envelope.proposal.run_id, SemanticRunState.RUNNING)
+    return ApproveSemanticExecutionResult(envelope.proposal.run_id, SemanticRunState.PREPARED)
 ```
 
 Do not reconstruct proposal authority from a digest or caller values and do not accept caller-supplied
 budget overrides. A CLI invocation is only valid after the skill has shown the exact durable proposal
-and the user has confirmed it. Multiple approved runs may have operational `running` state; this
-means eligible for work, not possession of the workspace exchange. Task 9's singleton mutex permits
-only one `materializing`/`issued` lease across them.
+and the user has confirmed it. Approval changes `awaiting_approval` to approved `prepared`; it never
+claims execution. Multiple approved/prepared runs may coexist. Task 9's first `next` transaction
+claims the partial-unique `running` row and singleton mutex together; another run stays `prepared`
+and receives `run_busy` until the running run is paused/finalized/failed.
+`validate_exact_phase_bindings()` requires orientation/expansion/audit hard budgets to equal Task 1's
+three constants and sum exactly to `FRONTIER_BUDGET`; deepening requires exactly one deepening binding.
+The approval receipt stores canonical total budget, all phase bindings and their digest. No runtime
+method accepts a phase transfer/reallocation parameter.
 
 - [ ] **Step 5: Implement aggregate-only status and explicit completion fields**
 
@@ -1500,6 +1622,8 @@ def test_two_concurrent_next_calls_issue_exactly_one_workspace_lease(approved_tw
     assert len(issued) == 1
     assert len(busy) == 1
     assert busy[0].safe_code == "run_busy"
+    assert approved_two_runs.repository.running_run_count() == 1
+    assert approved_two_runs.repository.run_state(busy[0].run_id) is SemanticRunState.PREPARED
 
 def test_same_active_lease_replays_byte_identical_input(approved_run) -> None:
     first = next_semantic_work_v3(NextSemanticWorkRequest(approved_run.workspace, approved_run.run_id))
@@ -1549,6 +1673,14 @@ def test_batched_unit_uses_ledger_target_refs_not_unit_id_as_catalog_node(approv
     result = next_semantic_work_v3(approved_batched_run.request())
     assert result.unit_id != approved_batched_run.target_node_ids[0]
     assert tuple(result.target_node_ids) == approved_batched_run.target_node_ids
+
+@pytest.mark.parametrize("axis", ("units", "input_bytes", "active_seconds"))
+def test_phase_budget_exhaustion_cannot_borrow_from_other_phase(approved_run, axis) -> None:
+    approved_run.exhaust_phase_budget(FrontierPhase.ORIENTATION, axis)
+    approved_run.leave_spare_budget(FrontierPhase.EXPANSION)
+    with pytest.raises(SemanticWorkPaused, match="paused_budget"):
+        next_semantic_work_v3(approved_run.request())
+    assert approved_run.status().phase_usage[FrontierPhase.EXPANSION].used_units == 0
 ```
 
 - [ ] **Step 3: Confirm bounded-next tests are RED**
@@ -1578,7 +1710,8 @@ def next_semantic_work_v3(request: NextSemanticWorkRequest) -> NextSemanticWorkR
     authority = repository.load_bounded_semantic_v3_authority(request.run_id)
     validate_current_run_authority(request.workspace, authority)
     lease = repository.reserve_next_semantic_v3_unit(
-        request.run_id, new_nonce(), expected_authority_root=authority.root
+        request.run_id, new_nonce(), expected_authority_root=authority.root,
+        claim_single_running_slot=True,
     )
     if lease.replay_binding is not None:
         return replay_existing_input(lease.replay_binding)
@@ -1606,7 +1739,11 @@ def next_semantic_work_v3(request: NextSemanticWorkRequest) -> NextSemanticWorkR
 `validate_current_run_authority()` rehashes the current source approval/policy, durable canonical
 proposal, approval receipt, manifest and sealed catalog binding and checks the latest checkpoint/run
 budget. It runs before mutex/lease/source/pack/exchange access and again after source materialization;
-the reserve/issue transactions compare the same authority root. Check unit/input/monotonic active-time budgets before reserving. Persist accumulated active seconds
+the reserve transaction atomically changes this approved `prepared` run to `running`, enforces the
+partial unique running index, and takes the singleton execution lock before materialization. A
+different running run returns `run_busy` without changing the requested run or exchange. The
+reserve/issue transactions compare the same authority root. Check unit/input/phase-specific/
+monotonic active-time budgets before reserving. Persist accumulated active seconds
 and the current process monotonic interval boundary in the ledger so restart resumes from the stored
 accumulator; explicit paused/approval-wait time is excluded. If any budget is exhausted, atomically
 set `paused_budget`, preserve deferred cursor, and return no unit. Validate also rejects a lease whose
@@ -1830,7 +1967,9 @@ only membership-bound audit units, records ordered/population digests and select
 checkpoint, and advances the binding's current checkpoint root. `next` rejects any audit target not
 found under the same run/unit in `semantic_v3_audit_members`. Resume/full verify streams those rows;
 it never recomputes or substitutes the set. No source/Codex output may alter budgets, selector
-version, completion, approval or policy binding.
+version, completion, approval or policy binding. The receipt charges units/input/active seconds to
+its exact phase binding; a phase cannot consume another phase's unused allowance and exhaustion
+sets `paused_budget` with that phase/cursor intact.
 
 - [ ] **Step 6: Implement durable pause/resume and CLI commands**
 
@@ -1846,7 +1985,9 @@ resume.add_argument("--run-id", required=True)
 Pause stops new lease issuance after the current atomic unit and publishes a durable checkpoint within
 10 seconds even when the receipt sequence is not a multiple of 16. Resume validates the result-pack
 committed prefix, recovers `materializing`/expired leases, then revalidates
-proposal/policy/catalog/approval/budget/checkpoint and returns to the exact cursor. Controlled failure
+proposal/policy/catalog/approval/budget/checkpoint and changes `paused_user` to approved `prepared`;
+the following `next` must claim the one running slot again. Pause/finalize/failure releases the
+running slot and mutex in its state transaction. Resume returns to the exact cursor. Controlled failure
 writes only the ≤64-KiB private safe review fields tested above; an absolute locator is a separate
 private reference only when indispensable and is never copied into default review text/public output.
 
@@ -2368,6 +2509,15 @@ def test_prepare_deepening_accepts_only_current_opaque_project_id(active_v3_proj
     assert result.approval_kind == "project_deepening"
     assert result.budget == DEEPENING_BUDGET
     assert result.project_boundary_sha256 == active_v3_projects.boundary_sha256
+    plan, plan_bytes = active_v3_projects.repository.deepening_plan_bytes(result.run_id)
+    envelope, proposal_bytes = active_v3_projects.repository.get_semantic_v3_proposal_bytes_for_run(result.run_id)
+    assert sha256_hex(plan_bytes) == envelope.proposal.plan_sha256
+    assert envelope.proposal.parent_checkpoint_root == active_v3_projects.frontier_checkpoint_root
+    assert envelope.proposal.target_projection_contract == plan.target_projection_contract
+    assert envelope.proposal.phase_bindings == (
+        SemanticPhaseBinding(FrontierPhase.DEEPENING, DEEPENING_BUDGET, result.estimated_units, result.estimated_input_bytes, result.estimated_wall_seconds),
+    )
+    assert not hasattr(envelope.proposal, "units")
     for locator in ("../project", "/Users/example/project", "https://github.com/private/repo"):
         with pytest.raises(SemanticDeepeningError):
             prepare_semantic_deepening(PrepareSemanticDeepeningRequest(active_v3_projects.workspace, locator))
@@ -2376,6 +2526,12 @@ def test_deepening_requires_separate_exact_approval(active_v3_projects) -> None:
     proposal = prepare_semantic_deepening(active_v3_projects.request())
     with pytest.raises(SemanticWorkError, match="approval"):
         next_semantic_work(NextSemanticWorkRequest(active_v3_projects.workspace, proposal.run_id))
+
+def test_deepening_phase_budget_drift_requires_new_proposal(active_v3_projects) -> None:
+    proposal = prepare_semantic_deepening(active_v3_projects.request())
+    active_v3_projects.mutate_deepening_hard_budget(proposal.run_id, max_units=257)
+    with pytest.raises(SemanticWorkError, match="stale"):
+        approve_semantic_execution(active_v3_projects.approval_request(proposal))
 ```
 
 - [ ] **Step 2: Write RED non-authority, invalidation, and idempotency tests**
@@ -2428,6 +2584,8 @@ CREATE TABLE IF NOT EXISTS semantic_v3_deepening_runs (
   parent_revision_id TEXT NOT NULL,
   parent_frontier_checkpoint_root TEXT NOT NULL,
   project_boundary_sha256 TEXT NOT NULL,
+  deepening_plan_sha256 TEXT NOT NULL,
+  unit_queue_root TEXT NOT NULL,
   proposal_sha256 TEXT NOT NULL,
   overlay_state TEXT NOT NULL CHECK(overlay_state IN ('proposed','inactive_review_required','cancelled','invalidated')),
   invalidated_reason TEXT,
@@ -2439,25 +2597,50 @@ CREATE INDEX IF NOT EXISTS semantic_v3_deepening_project
 ```
 
 ```python
-proposal = ProjectDeepeningPlanner(catalog, active_projects).prepare(
+deepening_plan = ProjectDeepeningPlanner(catalog, active_projects).prepare(
     project_id=request.project_id,
     budget=DEEPENING_BUDGET,
     max_dependencies=MAX_DEPENDENCIES,
     max_page_size=64,
+)
+plan_bytes = canonical_json_bytes(deepening_plan)
+plan_sha256 = sha256_hex(plan_bytes)
+proposal = build_deepening_execution_proposal(
+    deepening_plan=deepening_plan,
+    plan_sha256=plan_sha256,
+    parent_checkpoint_root=deepening_plan.parent_frontier_checkpoint_root,
+    project_boundary_sha256=deepening_plan.project_boundary_sha256,
+    target_projection_contract=deepening_plan.target_projection_contract,
+    input_schema_version=deepening_plan.input_schema_version,
+    output_schema_version=deepening_plan.output_schema_version,
+    validator_version=deepening_plan.validator_version,
+    purpose=deepening_plan.purpose,
+    phase_bindings=(SemanticPhaseBinding(
+        FrontierPhase.DEEPENING,
+        DEEPENING_BUDGET,
+        len(deepening_plan.units),
+        sum(unit.estimated_input_bytes for unit in deepening_plan.units),
+        estimate_deepening_wall_seconds(deepening_plan),
+    ),),
 )
 proposal_bytes = canonical_json_bytes(proposal)
 envelope = SemanticProposalEnvelope(proposal, sha256_hex(proposal_bytes))
 repository.create_semantic_v3_deepening_proposal_run_and_units(
     envelope=envelope,
     canonical_bytes=proposal_bytes,
-    units=proposal.units,
+    deepening_plan=deepening_plan,
+    deepening_plan_bytes=plan_bytes,
+    units=deepening_plan.units,
 )
 ```
 
 Bind project ID, parent revision/checkpoint, boundary digest, selector/projection/schema versions,
 policy/masking scope and the exact 256-unit/64-MiB/3,600-second budget. This is a new durable
 `semantic_v3_proposals` row addressed by revision plus digest; do not select it by revision alone and
-do not copy approval from the frontier run.
+do not copy approval from the frontier run. The one repository call is a transaction that rehashes
+both canonical bodies, requires proposal `plan_sha256` and parent/projection/schema/validator/purpose
+bindings to match the deepening plan, derives `unit_queue_root` from `deepening_plan.units`, and then
+stores proposal, plan, run, units, dependencies and aggregate together.
 
 - [ ] **Step 6: Implement inactive overlay and cancel/replay**
 
@@ -2767,6 +2950,7 @@ Cover at minimum:
 - expired/wrong-unit lease replay and conflicting duplicate output;
 - exact duplicate validate replay leaving result-pack length/root unchanged;
 - forced completion after unit/byte/time exhaustion;
+- phase hard-budget drift and attempted orientation/expansion/audit/deepening budget reallocation;
 - nonexistent child/evidence/full-topology Codex output;
 - unreadable subtree misclassification attempt;
 - audit node replacement and selector/catalog/policy/privacy/budget drift;
@@ -2776,9 +2960,12 @@ Cover at minimum:
 - current source approval/policy/manifest/catalog/proposal/approval/checkpoint drift before next,
   before exchange publication, before result append and inside receipt/full-verify gates;
 - two concurrent runs competing for the singleton workspace exchange;
+- two simultaneous exact approvals staying prepared, then one atomic `next` winning the unique running slot;
 - result recovery after exchange deletion/restart;
 - v2 active preservation, migration interruption and pre-attestation migration rejection;
 - deepening split/merge/exclude/policy/boundary invalidation;
+- deepening canonical plan/proposal hash mismatch, parent checkpoint/projection/schema drift and
+  attempted use of proposal body as the unit plan;
 - private locator/URL/token/excluded content non-disclosure in status, failure review and artifacts.
 
 - [ ] **Step 6: Run the semantic scale suite and save measurements**
