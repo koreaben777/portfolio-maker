@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from hashlib import sha256
+import json
 from pathlib import Path
 
 import pytest
@@ -76,6 +77,7 @@ def _initialized_run(repository: SQLiteRepository, run_id: str) -> SemanticPropo
         revision_id="revision-1",
         manifest_sha256=_digest("manifest"),
         source_policy_sha256=_digest("policy"),
+        source_approval_sha256=_digest("approval"),
         catalog_file_sha256=_digest("catalog-file"),
         catalog_logical_root=_digest("catalog"),
         lifecycle_schema_version="v3",
@@ -151,7 +153,7 @@ def test_proposal_requires_exact_canonical_bytes_and_plan_binding(workspace: Pat
     repository.bind_semantic_v3_revision(
         SemanticRevisionBinding(
             "revision-1", _digest("manifest"), _digest("policy"), _digest("catalog-file"),
-            _digest("catalog"), "v3", _digest("genesis"), _digest("checkpoint"),
+            _digest("catalog"), "v3", _digest("genesis"), _digest("checkpoint"), _digest("approval"),
         )
     )
     envelope = _proposal("run-a")
@@ -520,8 +522,12 @@ def test_semantic_v3_authority_schema_durably_records_source_and_project_authori
         approval_columns = {
             row["name"] for row in connection.execute("PRAGMA table_info(semantic_v3_approvals)")
         }
+        revision_binding_columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(semantic_v3_revision_bindings)")
+        }
     assert expected <= proposal_columns
     assert expected <= approval_columns
+    assert "source_approval_sha256" in revision_binding_columns
 
 
 def test_claim_rejects_durable_source_approval_drift(workspace: Path) -> None:
@@ -539,12 +545,12 @@ def test_claim_rejects_durable_source_approval_drift(workspace: Path) -> None:
     assert repository.run_state("run-a") is SemanticRunState.PREPARED
 
 
-def test_claim_rejects_durable_project_authority_drift(workspace: Path) -> None:
+def test_queue_rejects_aligned_project_id_authority_drift_without_mutation(workspace: Path) -> None:
     repository = SQLiteRepository(WorkspacePaths.from_root(workspace).db_path)
     repository.initialize()
     binding = SemanticRevisionBinding(
         "revision-1", _digest("manifest"), _digest("policy"), _digest("catalog-file"),
-        _digest("catalog"), "v3", _digest("genesis"), _digest("checkpoint"),
+        _digest("catalog"), "v3", _digest("genesis"), _digest("checkpoint"), _digest("approval"),
     )
     repository.create_semantic_revision("revision-1", "source-1", _digest("policy"), "v3")
     repository.bind_semantic_v3_revision(binding)
@@ -579,10 +585,115 @@ def test_claim_rejects_durable_project_authority_drift(workspace: Path) -> None:
     repository.approve_semantic_v3_run("deepening-run", envelope.proposal_sha256)
     with repository._connection() as connection:
         connection.execute(
-            "UPDATE semantic_v3_approvals SET project_boundary_sha256 = ? WHERE run_id = 'deepening-run'",
-            (_digest("drifted-boundary"),),
+            "UPDATE semantic_v3_runs SET project_id = 'project-drift' WHERE run_id = 'deepening-run'",
+        )
+        connection.execute(
+            "UPDATE semantic_v3_approvals SET project_id = 'project-drift' WHERE run_id = 'deepening-run'",
+        )
+    with repository._read_connection() as connection:
+        before = connection.execute(
+            "SELECT COUNT(*) AS unit_count, (SELECT aggregate_root FROM semantic_v3_aggregates WHERE run_id = 'deepening-run') AS aggregate_root FROM semantic_v3_units WHERE run_id = 'deepening-run'"
+        ).fetchone()
+
+    with pytest.raises(RepositoryError, match="proposal authority"):
+        repository.add_semantic_v3_units(
+            "deepening-run",
+            (SemanticPlannedUnit("new-unit", FrontierPhase.DEEPENING, ("node-new",), (), 1, 0, "source-1"),),
+        )
+    with repository._read_connection() as connection:
+        after = connection.execute(
+            "SELECT COUNT(*) AS unit_count, (SELECT aggregate_root FROM semantic_v3_aggregates WHERE run_id = 'deepening-run') AS aggregate_root FROM semantic_v3_units WHERE run_id = 'deepening-run'"
+        ).fetchone()
+    assert tuple(after) == tuple(before)
+
+
+def test_claim_rejects_revision_source_approval_drift(workspace: Path) -> None:
+    repository = SQLiteRepository(WorkspacePaths.from_root(workspace).db_path)
+    repository.initialize()
+    _initialized_run(repository, "run-a")
+    with repository._connection() as connection:
+        connection.execute(
+            "UPDATE semantic_v3_revision_bindings SET source_approval_sha256 = ? WHERE revision_id = 'revision-1'",
+            (_digest("drifted-revision-source-approval"),),
         )
 
     with pytest.raises(RepositoryError, match="receipt authority"):
-        repository.claim_semantic_v3_running_slot("deepening-run")
-    assert repository.run_state("deepening-run") is SemanticRunState.PREPARED
+        repository.claim_semantic_v3_running_slot("run-a")
+    assert repository.run_state("run-a") is SemanticRunState.PREPARED
+
+
+def test_queue_uses_canonical_budget_after_projection_is_relaxed(workspace: Path) -> None:
+    repository = SQLiteRepository(WorkspacePaths.from_root(workspace).db_path)
+    repository.initialize()
+    _initialized_run(repository, "run-a")
+    with repository._connection() as connection:
+        proposal = connection.execute(
+            "SELECT total_budget_json, phase_bindings_json FROM semantic_v3_proposals WHERE run_id = 'run-a'"
+        ).fetchone()
+        total = json.loads(proposal["total_budget_json"])
+        phases = json.loads(proposal["phase_bindings_json"])
+        total["max_unit_input_bytes"] = FRONTIER_BUDGET.max_unit_input_bytes + 1
+        for phase in phases:
+            if phase["phase"] == FrontierPhase.ORIENTATION.value:
+                phase["hard_budget"]["max_unit_input_bytes"] = (
+                    FRONTIER_BUDGET.max_unit_input_bytes + 1
+                )
+        connection.execute(
+            """UPDATE semantic_v3_proposals
+               SET total_budget_json = ?, phase_bindings_json = ? WHERE run_id = 'run-a'""",
+            (
+                semantic_canonical_json_bytes(total).decode("utf-8"),
+                semantic_canonical_json_bytes(phases).decode("utf-8"),
+            ),
+        )
+    with repository._read_connection() as connection:
+        before = connection.execute(
+            "SELECT COUNT(*) AS unit_count, (SELECT aggregate_root FROM semantic_v3_aggregates WHERE run_id = 'run-a') AS aggregate_root FROM semantic_v3_units WHERE run_id = 'run-a'"
+        ).fetchone()
+
+    with pytest.raises(RepositoryError, match="proposal authority"):
+        repository.add_semantic_v3_units(
+            "run-a",
+            (SemanticPlannedUnit(
+                "oversized", FrontierPhase.ORIENTATION, ("node-oversized",), (),
+                FRONTIER_BUDGET.max_unit_input_bytes + 1, 0, "source-1",
+            ),),
+        )
+
+    with repository._read_connection() as connection:
+        after = connection.execute(
+            "SELECT COUNT(*) AS unit_count, (SELECT aggregate_root FROM semantic_v3_aggregates WHERE run_id = 'run-a') AS aggregate_root FROM semantic_v3_units WHERE run_id = 'run-a'"
+        ).fetchone()
+    assert tuple(after) == tuple(before)
+
+
+def test_queue_rejects_aligned_source_authority_drift_without_mutation(workspace: Path) -> None:
+    repository = SQLiteRepository(WorkspacePaths.from_root(workspace).db_path)
+    repository.initialize()
+    _initialized_run(repository, "run-a")
+    with repository._connection() as connection:
+        drifted = _digest("aligned-source-approval-drift")
+        connection.execute(
+            "UPDATE semantic_v3_proposals SET source_approval_sha256 = ? WHERE run_id = 'run-a'",
+            (drifted,),
+        )
+        connection.execute(
+            "UPDATE semantic_v3_approvals SET source_approval_sha256 = ? WHERE run_id = 'run-a'",
+            (drifted,),
+        )
+    with repository._read_connection() as connection:
+        before = connection.execute(
+            "SELECT COUNT(*) FROM semantic_v3_units WHERE run_id = 'run-a'"
+        ).fetchone()[0]
+
+    with pytest.raises(RepositoryError, match="proposal authority"):
+        repository.add_semantic_v3_units(
+            "run-a",
+            (SemanticPlannedUnit("new-unit", FrontierPhase.ORIENTATION, ("node-new",), (), 1, 0, "source-1"),),
+        )
+
+    assert repository.receipt_count("run-a") == 0
+    with repository._read_connection() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM semantic_v3_units WHERE run_id = 'run-a'"
+        ).fetchone()[0] == before

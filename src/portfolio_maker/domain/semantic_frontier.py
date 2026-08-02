@@ -363,6 +363,7 @@ class SemanticRevisionBinding:
     lifecycle_schema_version: str
     lifecycle_genesis_root: str
     current_checkpoint_root: str
+    source_approval_sha256: str
 
 
 @dataclass(frozen=True)

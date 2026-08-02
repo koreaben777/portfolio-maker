@@ -331,8 +331,8 @@ CREATE TABLE IF NOT EXISTS history_cleanup_journal_entries (
 
 
 SEMANTIC_V3_SCHEMA = """
-CREATE TABLE IF NOT EXISTS semantic_v3_revision_bindings (revision_id TEXT PRIMARY KEY REFERENCES semantic_index_revisions(id), manifest_sha256 TEXT NOT NULL, source_policy_sha256 TEXT NOT NULL, catalog_file_sha256 TEXT NOT NULL, catalog_logical_root TEXT NOT NULL, lifecycle_schema_version TEXT NOT NULL, lifecycle_genesis_root TEXT NOT NULL, current_checkpoint_root TEXT NOT NULL, protocol TEXT NOT NULL CHECK(protocol = 'codex-semantic-v3'));
-CREATE TABLE IF NOT EXISTS semantic_v3_proposals (run_id TEXT PRIMARY KEY, revision_id TEXT NOT NULL REFERENCES semantic_v3_revision_bindings(revision_id), approval_kind TEXT NOT NULL CHECK(approval_kind IN ('frontier','project_deepening')), proposal_canonical_json BLOB NOT NULL, proposal_sha256 TEXT NOT NULL UNIQUE, plan_canonical_json BLOB NOT NULL, plan_sha256 TEXT NOT NULL, manifest_sha256 TEXT NOT NULL, source_policy_sha256 TEXT NOT NULL, source_approval_sha256 TEXT, catalog_root TEXT NOT NULL, selector_version TEXT NOT NULL, private_context_scope TEXT NOT NULL, authority_root TEXT NOT NULL, parent_checkpoint_root TEXT, project_boundary_sha256 TEXT, parent_proposal_sha256 TEXT, evidence_policy_sha256 TEXT, total_budget_json TEXT NOT NULL, phase_bindings_json TEXT NOT NULL, budget_binding_sha256 TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('proposed','approved','stale')), created_at TEXT NOT NULL, UNIQUE(run_id, proposal_sha256));
+CREATE TABLE IF NOT EXISTS semantic_v3_revision_bindings (revision_id TEXT PRIMARY KEY REFERENCES semantic_index_revisions(id), manifest_sha256 TEXT NOT NULL, source_policy_sha256 TEXT NOT NULL, source_approval_sha256 TEXT, catalog_file_sha256 TEXT NOT NULL, catalog_logical_root TEXT NOT NULL, lifecycle_schema_version TEXT NOT NULL, lifecycle_genesis_root TEXT NOT NULL, current_checkpoint_root TEXT NOT NULL, protocol TEXT NOT NULL CHECK(protocol = 'codex-semantic-v3'));
+CREATE TABLE IF NOT EXISTS semantic_v3_proposals (run_id TEXT PRIMARY KEY, revision_id TEXT NOT NULL REFERENCES semantic_v3_revision_bindings(revision_id), approval_kind TEXT NOT NULL CHECK(approval_kind IN ('frontier','project_deepening')), project_id TEXT, proposal_canonical_json BLOB NOT NULL, proposal_sha256 TEXT NOT NULL UNIQUE, plan_canonical_json BLOB NOT NULL, plan_sha256 TEXT NOT NULL, manifest_sha256 TEXT NOT NULL, source_policy_sha256 TEXT NOT NULL, source_approval_sha256 TEXT, catalog_root TEXT NOT NULL, selector_version TEXT NOT NULL, private_context_scope TEXT NOT NULL, authority_root TEXT NOT NULL, parent_checkpoint_root TEXT, project_boundary_sha256 TEXT, parent_proposal_sha256 TEXT, evidence_policy_sha256 TEXT, total_budget_json TEXT NOT NULL, phase_bindings_json TEXT NOT NULL, budget_binding_sha256 TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('proposed','approved','stale')), created_at TEXT NOT NULL, UNIQUE(run_id, proposal_sha256));
 CREATE TABLE IF NOT EXISTS semantic_v3_runs (run_id TEXT PRIMARY KEY, revision_id TEXT NOT NULL REFERENCES semantic_v3_revision_bindings(revision_id), approval_kind TEXT NOT NULL CHECK(approval_kind IN ('frontier','project_deepening')), project_id TEXT, state TEXT NOT NULL CHECK(state IN ('prepared','awaiting_approval','running','paused_user','paused_budget','blocked','converged','finalizing','finalized','failed')), phase TEXT NOT NULL CHECK(phase IN ('orientation','expansion','audit','deepening')), proposal_sha256 TEXT NOT NULL, used_units INTEGER NOT NULL DEFAULT 0, used_input_bytes INTEGER NOT NULL DEFAULT 0, used_active_seconds REAL NOT NULL DEFAULT 0, result_pack_length INTEGER NOT NULL DEFAULT 0, result_pack_root TEXT NOT NULL, FOREIGN KEY(run_id, proposal_sha256) REFERENCES semantic_v3_proposals(run_id, proposal_sha256));
 CREATE UNIQUE INDEX IF NOT EXISTS semantic_v3_one_running_run ON semantic_v3_runs(state) WHERE state = 'running';
 CREATE TABLE IF NOT EXISTS semantic_v3_execution_lock (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), run_id TEXT NOT NULL REFERENCES semantic_v3_runs(run_id), unit_id TEXT NOT NULL, lease_nonce TEXT NOT NULL, lease_state TEXT NOT NULL CHECK(lease_state IN ('materializing','issued')));
@@ -1259,6 +1259,12 @@ class SQLiteRepository:
             for name, definition in additions:
                 if name not in columns:
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+        proposal_columns = cls._table_columns(conn, "semantic_v3_proposals")
+        if "project_id" not in proposal_columns:
+            conn.execute("ALTER TABLE semantic_v3_proposals ADD COLUMN project_id TEXT")
+        binding_columns = cls._table_columns(conn, "semantic_v3_revision_bindings")
+        if "source_approval_sha256" not in binding_columns:
+            conn.execute("ALTER TABLE semantic_v3_revision_bindings ADD COLUMN source_approval_sha256 TEXT")
 
     @classmethod
     def _ensure_legacy_normalized_columns(cls, conn: sqlite3.Connection) -> None:
@@ -1584,6 +1590,7 @@ class SQLiteRepository:
             "run_id": proposal.run_id,
             "revision_id": proposal.revision_id,
             "approval_kind": proposal.approval_kind,
+            "project_id": proposal.project_id,
             "proposal_sha256": semantic_proposal_sha256(proposal),
             "plan_sha256": proposal.plan_sha256,
             "manifest_sha256": proposal.manifest_sha256,
@@ -1617,6 +1624,7 @@ class SQLiteRepository:
                       proposal.run_id AS proposal_run_id,
                       proposal.revision_id AS proposal_revision_id,
                       proposal.approval_kind AS proposal_approval_kind,
+                      proposal.project_id AS proposal_project_id,
                       proposal.proposal_canonical_json, proposal.plan_canonical_json,
                       proposal.plan_sha256 AS proposal_plan_sha256,
                       proposal.proposal_sha256 AS proposal_proposal_sha256,
@@ -1651,6 +1659,7 @@ class SQLiteRepository:
                       approval.project_id AS approval_project_id,
                       binding.manifest_sha256 AS binding_manifest_sha256,
                       binding.source_policy_sha256 AS binding_source_policy_sha256,
+                      binding.source_approval_sha256 AS binding_source_approval_sha256,
                       binding.catalog_logical_root AS binding_catalog_root
                FROM semantic_v3_runs AS run
                JOIN semantic_v3_proposals AS proposal ON proposal.run_id = run.run_id
@@ -1660,9 +1669,10 @@ class SQLiteRepository:
         ).fetchone()
         if row is None:
             raise RepositoryError("semantic receipt authority is invalid")
-        self._v3_validate_canonical_proposal_row(row)
+        proposal = self._v3_validate_canonical_proposal_row(row)
         exact_pairs = (
             ("proposal_sha256", "approval_proposal_sha256"),
+            ("proposal_project_id", "approval_project_id"),
             ("run_approval_kind", "proposal_approval_kind"),
             ("run_approval_kind", "approval_kind"),
             ("proposal_manifest_sha256", "approval_manifest_sha256"),
@@ -1681,23 +1691,24 @@ class SQLiteRepository:
         )
         if (
             any(row[left] != row[right] for left, right in exact_pairs)
-            or row["project_id"] != row["approval_project_id"]
+            or proposal.project_id != row["project_id"]
+            or proposal.project_id != row["approval_project_id"]
             or row["proposal_manifest_sha256"] != row["binding_manifest_sha256"]
             or row["proposal_source_policy_sha256"] != row["binding_source_policy_sha256"]
+            or row["proposal_source_approval_sha256"] != row["binding_source_approval_sha256"]
             or row["proposal_catalog_root"] != row["binding_catalog_root"]
         ):
             raise RepositoryError("semantic receipt authority is invalid")
         try:
-            budget = SemanticBudget(**json.loads(row["proposal_total_budget_json"]))
             phase_budgets = {
-                item["phase"]: SemanticBudget(**item["hard_budget"])
-                for item in json.loads(row["proposal_phase_bindings_json"])
+                binding.phase.value: binding.hard_budget
+                for binding in proposal.phase_bindings
             }
-        except (TypeError, KeyError, ValueError, json.JSONDecodeError) as error:
+        except (TypeError, ValueError) as error:
             raise RepositoryError("semantic budget authority is invalid") from error
         if not phase_budgets:
             raise RepositoryError("semantic budget authority is invalid")
-        return row, row, budget, phase_budgets
+        return row, row, proposal.budget, phase_budgets
 
     @staticmethod
     def _v3_pause_budget(conn: sqlite3.Connection, run_id: str) -> None:
@@ -1714,6 +1725,7 @@ class SQLiteRepository:
         for value, field in (
             (binding.manifest_sha256, "manifest digest"),
             (binding.source_policy_sha256, "source policy digest"),
+            (binding.source_approval_sha256, "source approval digest"),
             (binding.catalog_file_sha256, "catalog file digest"),
             (binding.catalog_logical_root, "catalog root"),
             (binding.lifecycle_genesis_root, "genesis root"),
@@ -1731,14 +1743,16 @@ class SQLiteRepository:
             conn.execute(
                 """
                 INSERT INTO semantic_v3_revision_bindings(
-                    revision_id, manifest_sha256, source_policy_sha256, catalog_file_sha256,
+                    revision_id, manifest_sha256, source_policy_sha256, source_approval_sha256,
+                    catalog_file_sha256,
                     catalog_logical_root, lifecycle_schema_version, lifecycle_genesis_root,
                     current_checkpoint_root, protocol
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'codex-semantic-v3')
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'codex-semantic-v3')
                 """,
                 (
                     binding.revision_id, binding.manifest_sha256, binding.source_policy_sha256,
-                    binding.catalog_file_sha256, binding.catalog_logical_root,
+                    binding.source_approval_sha256, binding.catalog_file_sha256,
+                    binding.catalog_logical_root,
                     binding.lifecycle_schema_version, binding.lifecycle_genesis_root,
                     binding.current_checkpoint_root,
                 ),
@@ -1779,29 +1793,32 @@ class SQLiteRepository:
         budget, phases, budget_binding = self._v3_budget_binding(proposal)
         with self._connection() as conn:
             binding = conn.execute(
-                """SELECT manifest_sha256, source_policy_sha256, catalog_logical_root
+                """SELECT manifest_sha256, source_policy_sha256, source_approval_sha256,
+                          catalog_logical_root
                    FROM semantic_v3_revision_bindings WHERE revision_id = ?""",
                 (proposal.revision_id,),
             ).fetchone()
             if binding is None or (
                 binding["manifest_sha256"] != proposal.manifest_sha256
                 or binding["source_policy_sha256"] != proposal.policy_sha256
+                or binding["source_approval_sha256"] != proposal.source_approval_sha256
                 or binding["catalog_logical_root"] != proposal.catalog_root
             ):
                 raise RepositoryError("semantic proposal revision authority is invalid")
             conn.execute(
                 """
                 INSERT INTO semantic_v3_proposals(
-                    run_id, revision_id, approval_kind, proposal_canonical_json, proposal_sha256,
+                    run_id, revision_id, approval_kind, project_id, proposal_canonical_json, proposal_sha256,
                     plan_canonical_json, plan_sha256, manifest_sha256, source_policy_sha256,
                     source_approval_sha256, catalog_root, selector_version, private_context_scope,
                     authority_root, parent_checkpoint_root, project_boundary_sha256,
                     parent_proposal_sha256, evidence_policy_sha256,
                     total_budget_json, phase_bindings_json, budget_binding_sha256, state, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?)
                 """,
                 (
-                    proposal.run_id, proposal.revision_id, proposal.approval_kind, canonical_bytes,
+                    proposal.run_id, proposal.revision_id, proposal.approval_kind, proposal.project_id,
+                    canonical_bytes,
                     envelope.proposal_sha256, plan_bytes, plan_sha, proposal.manifest_sha256,
                     proposal.policy_sha256, proposal.source_approval_sha256, proposal.catalog_root,
                     proposal.selector_version, proposal.private_context_scope, proposal.authority_root,
@@ -1888,6 +1905,65 @@ class SQLiteRepository:
                 (proposal.run_id, 0, "0" * 64, "0" * 64),
             )
 
+    def _v3_queue_authority(
+        self, conn: sqlite3.Connection, run_id: str,
+    ) -> tuple[sqlite3.Row, SemanticExecutionProposal, dict[str, SemanticBudget]]:
+        run = conn.execute(
+            "SELECT * FROM semantic_v3_runs WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        proposal_row = conn.execute(
+            "SELECT * FROM semantic_v3_proposals WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        if run is None or proposal_row is None:
+            raise RepositoryError("semantic proposal authority is invalid")
+        proposal = self._v3_validate_canonical_proposal_row(proposal_row)
+        binding = conn.execute(
+            """SELECT manifest_sha256, source_policy_sha256, source_approval_sha256,
+                      catalog_logical_root
+               FROM semantic_v3_revision_bindings WHERE revision_id = ?""",
+            (run["revision_id"],),
+        ).fetchone()
+        if (
+            run["revision_id"] != proposal.revision_id
+            or run["approval_kind"] != proposal.approval_kind
+            or run["project_id"] != proposal.project_id
+            or run["proposal_sha256"] != semantic_proposal_sha256(proposal)
+            or binding is None
+            or binding["manifest_sha256"] != proposal.manifest_sha256
+            or binding["source_policy_sha256"] != proposal.policy_sha256
+            or binding["source_approval_sha256"] != proposal.source_approval_sha256
+            or binding["catalog_logical_root"] != proposal.catalog_root
+        ):
+            raise RepositoryError("semantic proposal authority is invalid")
+        approval = conn.execute(
+            "SELECT * FROM semantic_v3_approvals WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        if approval is not None:
+            budget, phases, budget_binding = self._v3_budget_binding(proposal)
+            expected = {
+                "approval_kind": proposal.approval_kind,
+                "proposal_sha256": semantic_proposal_sha256(proposal),
+                "manifest_sha256": proposal.manifest_sha256,
+                "source_policy_sha256": proposal.policy_sha256,
+                "source_approval_sha256": proposal.source_approval_sha256,
+                "catalog_root": proposal.catalog_root,
+                "selector_version": proposal.selector_version,
+                "private_context_scope": proposal.private_context_scope,
+                "parent_checkpoint_root": proposal.parent_checkpoint_root,
+                "project_boundary_sha256": proposal.project_boundary_sha256,
+                "parent_proposal_sha256": proposal.parent_proposal_sha256,
+                "evidence_policy_sha256": proposal.evidence_policy_sha256,
+                "total_budget_json": budget,
+                "phase_bindings_json": phases,
+                "budget_binding_sha256": budget_binding,
+                "project_id": proposal.project_id,
+            }
+            if any(approval[field] != value for field, value in expected.items()):
+                raise RepositoryError("semantic proposal authority is invalid")
+        return run, proposal, {
+            binding.phase.value: binding.hard_budget for binding in proposal.phase_bindings
+        }
+
     def add_semantic_v3_units(
         self, run_id: str, units: tuple[SemanticPlannedUnit, ...]
     ) -> None:
@@ -1895,23 +1971,10 @@ class SQLiteRepository:
             raise RepositoryError("semantic unit batch is invalid")
         budget_exhausted = False
         with self._connection() as conn:
-            run = conn.execute("SELECT state FROM semantic_v3_runs WHERE run_id = ?", (run_id,)).fetchone()
-            proposal = conn.execute(
-                "SELECT total_budget_json, phase_bindings_json FROM semantic_v3_proposals WHERE run_id = ?",
-                (run_id,),
-            ).fetchone()
+            run, proposal, phase_budgets = self._v3_queue_authority(conn, run_id)
             if run is None or run["state"] != SemanticRunState.PREPARED.value:
                 raise RepositoryError("semantic run is not prepared")
-            if proposal is None:
-                raise RepositoryError("semantic budget authority is invalid")
-            try:
-                total = SemanticBudget(**json.loads(proposal["total_budget_json"]))
-                phase_budgets = {
-                    item["phase"]: SemanticBudget(**item["hard_budget"])
-                    for item in json.loads(proposal["phase_bindings_json"])
-                }
-            except (TypeError, KeyError, ValueError, json.JSONDecodeError) as error:
-                raise RepositoryError("semantic budget authority is invalid") from error
+            total = proposal.budget
             for unit in units:
                 phase_budget = phase_budgets.get(unit.phase.value)
                 if (
