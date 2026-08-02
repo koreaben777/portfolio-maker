@@ -293,7 +293,7 @@ def test_proposal_authority_uses_approval_kind_and_envelope_digest() -> None:
     with pytest.raises(ValueError, match="deepening"):
         replace(
             frontier,
-            approval_kind="deepening",
+            approval_kind="project_deepening",
             phase_bindings=(
                 SemanticPhaseBinding(
                     FrontierPhase.DEEPENING, DEEPENING_BUDGET, 256, 64 * 1024**2, 3_600
@@ -307,6 +307,85 @@ def test_proposal_authority_uses_approval_kind_and_envelope_digest() -> None:
     assert SemanticProposalEnvelope(
         frontier, semantic_proposal_sha256(frontier)
     ).proposal is frontier
+
+
+def test_fixed_v3_enum_wire_sets_and_project_deepening_literal() -> None:
+    assert tuple((member.name, member.value) for member in BaselineCoverage) == (
+        ("COMPLETE", "complete"),
+        ("SAMPLED", "sampled"),
+        ("UNSUPPORTED", "unsupported"),
+        ("UNREADABLE", "unreadable"),
+        ("FAILED", "failed"),
+    )
+    assert tuple((member.name, member.value) for member in FrontierPhase) == (
+        ("ORIENTATION", "orientation"),
+        ("EXPANSION", "expansion"),
+        ("AUDIT", "audit"),
+        ("DEEPENING", "deepening"),
+    )
+    assert tuple((member.name, member.value) for member in FrontierAction) == (
+        ("ACCEPT_BOUNDARY", "accept_boundary"),
+        ("EXPAND_CHILDREN", "expand_children"),
+        ("STOP_NON_PROJECT", "stop_non_project"),
+        ("DEFER_ON_DEMAND", "defer_on_demand"),
+    )
+    assert tuple((member.name, member.value) for member in SemanticRunState) == (
+        ("PREPARED", "prepared"),
+        ("AWAITING_APPROVAL", "awaiting_approval"),
+        ("RUNNING", "running"),
+        ("PAUSED_USER", "paused_user"),
+        ("PAUSED_BUDGET", "paused_budget"),
+        ("BLOCKED", "blocked"),
+        ("CONVERGED", "converged"),
+        ("FINALIZING", "finalizing"),
+        ("FINALIZED", "finalized"),
+        ("FAILED", "failed"),
+    )
+    assert tuple((member.name, member.value) for member in SemanticLeaseState) == (
+        ("MATERIALIZING", "materializing"),
+        ("ISSUED", "issued"),
+        ("EXPIRED", "expired"),
+    )
+    assert tuple((member.name, member.value) for member in SemanticUnitState) == (
+        ("READY", "ready"),
+        ("LEASED", "leased"),
+        ("VALIDATED", "validated"),
+        ("DEFERRED", "deferred"),
+        ("ERROR", "error"),
+    )
+    assert tuple((member.name, member.value) for member in DeepeningOverlayState) == (
+        ("PROPOSED", "proposed"),
+        ("INACTIVE_REVIEW_REQUIRED", "inactive_review_required"),
+        ("CANCELLED", "cancelled"),
+        ("INVALIDATED", "invalidated"),
+    )
+
+    proposal = _project_deepening_proposal()
+
+    assert proposal.approval_kind == "project_deepening"
+    with pytest.raises(ValueError, match="approval_kind"):
+        replace(proposal, approval_kind="deepening")
+
+
+def _project_deepening_proposal() -> SemanticExecutionProposal:
+    return replace(
+        _frontier_proposal(),
+        approval_kind="project_deepening",
+        project_id="project-1",
+        project_boundary_sha256="boundary",
+        parent_proposal_sha256="parent-proposal",
+        evidence_policy_sha256="evidence-policy",
+        phase_bindings=(
+            SemanticPhaseBinding(
+                FrontierPhase.DEEPENING,
+                DEEPENING_BUDGET,
+                DEEPENING_BUDGET.max_units,
+                DEEPENING_BUDGET.max_input_bytes,
+                DEEPENING_BUDGET.max_wall_seconds,
+            ),
+        ),
+        budget=DEEPENING_BUDGET,
+    )
 
 
 def _frontier_proposal() -> SemanticExecutionProposal:

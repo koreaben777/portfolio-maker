@@ -285,7 +285,7 @@ class SemanticExecutionProposal:
                 raise ValueError("frontier proposal cannot carry deepening authority")
             expected_bindings = FRONTIER_PHASE_HARD_BUDGETS
             expected_budget = FRONTIER_BUDGET
-        elif self.approval_kind == "deepening":
+        elif self.approval_kind == "project_deepening":
             if not all(
                 (
                     self.project_id,
@@ -298,7 +298,7 @@ class SemanticExecutionProposal:
             expected_bindings = ((FrontierPhase.DEEPENING, DEEPENING_BUDGET),)
             expected_budget = DEEPENING_BUDGET
         else:
-            raise ValueError("approval_kind must be frontier or deepening")
+            raise ValueError("approval_kind must be frontier or project_deepening")
         phase_hard_budgets = tuple(
             (binding.phase, binding.hard_budget) for binding in self.phase_bindings
         )
