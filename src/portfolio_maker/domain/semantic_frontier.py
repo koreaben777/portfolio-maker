@@ -272,6 +272,8 @@ class SemanticExecutionProposal:
     evidence_policy_sha256: str | None = None
 
     def __post_init__(self) -> None:
+        if not isinstance(self.parent_checkpoint_root, str) or not self.parent_checkpoint_root:
+            raise ValueError("semantic proposal requires a parent checkpoint root")
         if self.approval_kind == "frontier":
             if any(
                 value is not None

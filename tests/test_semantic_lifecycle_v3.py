@@ -36,7 +36,12 @@ def _digest(label: str) -> str:
     return sha256(label.encode("utf-8")).hexdigest()
 
 
-def _proposal(run_id: str, revision_id: str = "revision-1") -> SemanticProposalEnvelope:
+def _proposal(
+    run_id: str,
+    revision_id: str = "revision-1",
+    *,
+    parent_checkpoint_root: str | None = None,
+) -> SemanticProposalEnvelope:
     proposal = SemanticExecutionProposal(
         run_id=run_id,
         revision_id=revision_id,
@@ -50,7 +55,7 @@ def _proposal(run_id: str, revision_id: str = "revision-1") -> SemanticProposalE
         private_context_scope="private",
         authority_root=_digest("authority"),
         plan_sha256=_digest("plan"),
-        parent_checkpoint_root=_digest("checkpoint"),
+        parent_checkpoint_root=parent_checkpoint_root or _digest("checkpoint"),
         target_projection_contract="projection-v1",
         input_schema_version="input-v1",
         output_schema_version="output-v1",
@@ -72,9 +77,9 @@ def _proposal(run_id: str, revision_id: str = "revision-1") -> SemanticProposalE
     return SemanticProposalEnvelope(proposal, semantic_proposal_sha256(proposal))
 
 
-def _stored_proposal(
-    repository: SQLiteRepository, run_id: str, *, project_deepening: bool = False,
-) -> SemanticProposalEnvelope:
+def _bind_revision(
+    repository: SQLiteRepository, *, current_checkpoint_root: str | None = None,
+) -> None:
     binding = SemanticRevisionBinding(
         revision_id="revision-1",
         manifest_sha256=_digest("manifest"),
@@ -84,7 +89,7 @@ def _stored_proposal(
         catalog_logical_root=_digest("catalog"),
         lifecycle_schema_version="v3",
         lifecycle_genesis_root=_digest("genesis"),
-        current_checkpoint_root=_digest("checkpoint"),
+        current_checkpoint_root=current_checkpoint_root or _digest("checkpoint"),
     )
     try:
         repository.create_semantic_revision("revision-1", "source-1", _digest("policy"), "v3")
@@ -94,7 +99,15 @@ def _stored_proposal(
         repository.bind_semantic_v3_revision(binding)
     except RepositoryError:
         pass
-    envelope = _proposal(run_id)
+
+
+def _proposal_material(
+    run_id: str,
+    *,
+    project_deepening: bool = False,
+    parent_checkpoint_root: str | None = None,
+) -> tuple[SemanticProposalEnvelope, bytes, bytes]:
+    envelope = _proposal(run_id, parent_checkpoint_root=parent_checkpoint_root)
     plan = {"run_id": run_id, "units": ["unit-1"]}
     plan_bytes = semantic_canonical_json_bytes(plan)
     proposal = envelope.proposal
@@ -122,10 +135,89 @@ def _stored_proposal(
         }
     )
     envelope = SemanticProposalEnvelope(proposal, semantic_proposal_sha256(proposal))
+    return envelope, semantic_canonical_json_bytes(proposal), plan_bytes
+
+
+def _stored_proposal(
+    repository: SQLiteRepository,
+    run_id: str,
+    *,
+    project_deepening: bool = False,
+    current_checkpoint_root: str | None = None,
+) -> SemanticProposalEnvelope:
+    checkpoint_root = current_checkpoint_root or _digest("checkpoint")
+    _bind_revision(repository, current_checkpoint_root=checkpoint_root)
+    envelope, proposal_bytes, plan_bytes = _proposal_material(
+        run_id,
+        project_deepening=project_deepening,
+        parent_checkpoint_root=checkpoint_root,
+    )
     repository.create_semantic_v3_proposal(
-        envelope, semantic_canonical_json_bytes(proposal), plan_bytes
+        envelope, proposal_bytes, plan_bytes
     )
     return envelope
+
+
+def _unit(unit_id: str, *, project_deepening: bool = False) -> SemanticPlannedUnit:
+    return SemanticPlannedUnit(
+        unit_id,
+        FrontierPhase.DEEPENING if project_deepening else FrontierPhase.ORIENTATION,
+        (f"node-{unit_id}",),
+        (),
+        1,
+        0,
+        "source-1",
+    )
+
+
+def _lifecycle_snapshot(repository: SQLiteRepository, run_id: str) -> dict[str, object]:
+    tables = (
+        "semantic_v3_proposals",
+        "semantic_v3_runs",
+        "semantic_v3_units",
+        "semantic_v3_dependencies",
+        "semantic_v3_leases",
+        "semantic_v3_receipts",
+        "semantic_v3_aggregates",
+        "semantic_v3_checkpoints",
+        "semantic_v3_approvals",
+        "semantic_v3_deferred",
+        "semantic_v3_runtime_deferred",
+        "semantic_v3_expansion_cursors",
+        "semantic_v3_audit_members",
+        "semantic_v3_execution_lock",
+    )
+    with repository._read_connection() as connection:
+        snapshot = {
+            table: tuple(
+                tuple(row)
+                for row in connection.execute(
+                    f"SELECT * FROM {table} WHERE run_id = ? ORDER BY rowid", (run_id,)
+                )
+            )
+            for table in tables
+        }
+        snapshot["revision_checkpoint_root"] = connection.execute(
+            "SELECT current_checkpoint_root FROM semantic_v3_revision_bindings WHERE revision_id = 'revision-1'"
+        ).fetchone()[0]
+    return snapshot
+
+
+def _receipt(run_id: str, unit_id: str, sequence: int) -> SemanticReceiptCommit:
+    return SemanticReceiptCommit(
+        run_id,
+        unit_id,
+        f"nonce-{sequence}",
+        _digest(f"input-{sequence}"),
+        _digest(f"output-{sequence}"),
+        PackRecordRef(sequence - 1, 1, _digest(f"result-{sequence}")),
+        FrontierAction.ACCEPT_BOUNDARY,
+        "validator-v1",
+        _digest(f"receipt-{sequence}"),
+        1.0,
+        sequence,
+        _digest(f"result-pack-{sequence}"),
+    )
 
 
 def _initialized_run(repository: SQLiteRepository, run_id: str) -> SemanticProposalEnvelope:
@@ -939,3 +1031,254 @@ def test_approval_rejects_deepening_projection_drift_without_state_change(
         assert connection.execute(
             "SELECT state FROM semantic_v3_runs WHERE run_id = 'deepening-run'"
         ).fetchone()[0] == SemanticRunState.PREPARED.value
+
+
+@pytest.mark.parametrize("project_deepening", (False, True), ids=("frontier", "deepening"))
+@pytest.mark.parametrize(
+    "boundary",
+    ("proposal", "run", "approval", "queue", "claim", "acquire", "issue", "receipt"),
+)
+def test_current_checkpoint_drift_fails_closed_at_every_authority_boundary(
+    workspace: Path, project_deepening: bool, boundary: str,
+) -> None:
+    repository = SQLiteRepository(WorkspacePaths.from_root(workspace).db_path)
+    repository.initialize()
+    run_id = "deepening-run" if project_deepening else "run-a"
+
+    if boundary == "proposal":
+        _bind_revision(repository)
+        envelope, proposal_bytes, plan_bytes = _proposal_material(
+            run_id, project_deepening=project_deepening,
+        )
+    else:
+        envelope = _stored_proposal(
+            repository, run_id, project_deepening=project_deepening,
+        )
+        proposal_bytes = plan_bytes = b""
+        if boundary in {"run", "approval", "queue", "claim", "acquire", "issue", "receipt"}:
+            if boundary != "run":
+                repository.create_semantic_v3_run(envelope)
+        if boundary in {"claim", "acquire", "issue", "receipt"}:
+            repository.add_semantic_v3_units(
+                run_id, (_unit("unit-1", project_deepening=project_deepening),),
+            )
+            repository.approve_semantic_v3_run(run_id, envelope.proposal_sha256)
+        if boundary in {"acquire", "issue", "receipt"}:
+            repository.claim_semantic_v3_running_slot(run_id)
+        if boundary in {"issue", "receipt"}:
+            repository.acquire_semantic_v3_execution(run_id, "unit-1", "nonce-1")
+        if boundary == "receipt":
+            repository.issue_semantic_v3_input(
+                run_id, "nonce-1", _digest("input-1"), 1,
+            )
+
+    with repository._connection() as connection:
+        connection.execute(
+            "UPDATE semantic_v3_revision_bindings SET current_checkpoint_root = ? WHERE revision_id = 'revision-1'",
+            (_digest("external-checkpoint-drift"),),
+        )
+    before = _lifecycle_snapshot(repository, run_id)
+
+    with pytest.raises(RepositoryError, match="authority"):
+        if boundary == "proposal":
+            repository.create_semantic_v3_proposal(envelope, proposal_bytes, plan_bytes)
+        elif boundary == "run":
+            repository.create_semantic_v3_run(envelope)
+        elif boundary == "approval":
+            repository.approve_semantic_v3_run(run_id, envelope.proposal_sha256)
+        elif boundary == "queue":
+            repository.add_semantic_v3_units(
+                run_id, (_unit("unit-1", project_deepening=project_deepening),),
+            )
+        elif boundary == "claim":
+            repository.claim_semantic_v3_running_slot(run_id)
+        elif boundary == "acquire":
+            repository.acquire_semantic_v3_execution(run_id, "unit-1", "nonce-1")
+        elif boundary == "issue":
+            repository.issue_semantic_v3_input(
+                run_id, "nonce-1", _digest("input-1"), 1,
+            )
+        else:
+            repository.commit_semantic_v3_receipt(_receipt(run_id, "unit-1", 1))
+
+    assert _lifecycle_snapshot(repository, run_id) == before
+
+
+@pytest.mark.parametrize("project_deepening", (False, True), ids=("frontier", "deepening"))
+@pytest.mark.parametrize("parent_checkpoint_root", (None, ""), ids=("null", "empty"))
+def test_parent_checkpoint_root_is_required_for_every_proposal_kind(
+    project_deepening: bool, parent_checkpoint_root: object,
+) -> None:
+    proposal = _proposal_material(
+        "deepening-run" if project_deepening else "run-a",
+        project_deepening=project_deepening,
+    )[0].proposal
+
+    with pytest.raises(ValueError, match="parent checkpoint"):
+        SemanticExecutionProposal(
+            **{**proposal.__dict__, "parent_checkpoint_root": parent_checkpoint_root}
+        )
+
+
+def test_frontier_and_deepening_project_authority_nullability_is_exact() -> None:
+    frontier = _proposal_material("run-a")[0].proposal
+    assert (
+        frontier.project_id,
+        frontier.project_boundary_sha256,
+        frontier.parent_proposal_sha256,
+        frontier.evidence_policy_sha256,
+    ) == (None, None, None, None)
+    with pytest.raises(ValueError, match="frontier proposal"):
+        SemanticExecutionProposal(**{**frontier.__dict__, "project_id": "project-1"})
+
+    deepening = _proposal_material("deepening-run", project_deepening=True)[0].proposal
+    for field in (
+        "project_id",
+        "project_boundary_sha256",
+        "parent_proposal_sha256",
+        "evidence_policy_sha256",
+    ):
+        with pytest.raises(ValueError, match="deepening proposal"):
+            SemanticExecutionProposal(**{**deepening.__dict__, field: None})
+
+
+def test_first_run_checkpoint_chains_from_immutable_proposal_parent(
+    workspace: Path,
+) -> None:
+    repository = SQLiteRepository(WorkspacePaths.from_root(workspace).db_path)
+    repository.initialize()
+    envelope = _initialized_run(repository, "run-a")
+    with repository._read_connection() as connection:
+        aggregate_root = connection.execute(
+            "SELECT aggregate_root FROM semantic_v3_aggregates WHERE run_id = 'run-a'"
+        ).fetchone()[0]
+    checkpoint = SemanticCheckpoint(
+        "run-a",
+        1,
+        0,
+        0,
+        "0" * 64,
+        _digest("queue"),
+        aggregate_root,
+        "{}",
+        "selector-v1",
+        envelope.proposal.parent_checkpoint_root,
+        "0" * 64,
+    )
+    checkpoint = SemanticCheckpoint(
+        **{
+            **checkpoint.__dict__,
+            "checkpoint_root": repository._semantic_v3_checkpoint_root(checkpoint),
+        }
+    )
+
+    repository.checkpoint_semantic_v3_run(checkpoint)
+    repository.claim_semantic_v3_running_slot("run-a")
+
+    with repository._read_connection() as connection:
+        assert connection.execute(
+            "SELECT current_checkpoint_root FROM semantic_v3_revision_bindings WHERE revision_id = 'revision-1'"
+        ).fetchone()[0] == checkpoint.checkpoint_root
+    assert repository.run_state("run-a") is SemanticRunState.RUNNING
+
+
+def test_checkpoint_cadence_advances_current_root_without_blocking_the_same_run(
+    workspace: Path,
+) -> None:
+    repository = SQLiteRepository(WorkspacePaths.from_root(workspace).db_path)
+    repository.initialize()
+    genesis = _digest("genesis")
+    envelope = _stored_proposal(repository, "run-a", current_checkpoint_root=genesis)
+    repository.create_semantic_v3_run(envelope)
+    repository.add_semantic_v3_units(
+        "run-a", tuple(_unit(f"unit-{sequence}") for sequence in range(1, 18)),
+    )
+    repository.approve_semantic_v3_run("run-a", envelope.proposal_sha256)
+    repository.claim_semantic_v3_running_slot("run-a")
+
+    for sequence in range(1, 18):
+        unit_id = f"unit-{sequence}"
+        repository.acquire_semantic_v3_execution("run-a", unit_id, f"nonce-{sequence}")
+        repository.issue_semantic_v3_input(
+            "run-a", f"nonce-{sequence}", _digest(f"input-{sequence}"), 1,
+        )
+        repository.commit_semantic_v3_receipt(_receipt("run-a", unit_id, sequence))
+
+    with repository._read_connection() as connection:
+        checkpoint = connection.execute(
+            "SELECT checkpoint_root FROM semantic_v3_checkpoints WHERE run_id = 'run-a'"
+        ).fetchone()[0]
+        current = connection.execute(
+            "SELECT current_checkpoint_root FROM semantic_v3_revision_bindings WHERE revision_id = 'revision-1'"
+        ).fetchone()[0]
+    assert checkpoint == current
+    assert checkpoint != envelope.proposal.parent_checkpoint_root
+    assert repository.receipt_count("run-a") == 17
+
+
+def test_external_checkpoint_drift_after_cadence_preserves_issued_receipt_state(
+    workspace: Path,
+) -> None:
+    repository = SQLiteRepository(WorkspacePaths.from_root(workspace).db_path)
+    repository.initialize()
+    genesis = _digest("genesis")
+    envelope = _stored_proposal(repository, "run-a", current_checkpoint_root=genesis)
+    repository.create_semantic_v3_run(envelope)
+    repository.add_semantic_v3_units(
+        "run-a", tuple(_unit(f"unit-{sequence}") for sequence in range(1, 18)),
+    )
+    repository.approve_semantic_v3_run("run-a", envelope.proposal_sha256)
+    repository.claim_semantic_v3_running_slot("run-a")
+    for sequence in range(1, 17):
+        unit_id = f"unit-{sequence}"
+        repository.acquire_semantic_v3_execution("run-a", unit_id, f"nonce-{sequence}")
+        repository.issue_semantic_v3_input(
+            "run-a", f"nonce-{sequence}", _digest(f"input-{sequence}"), 1,
+        )
+        repository.commit_semantic_v3_receipt(_receipt("run-a", unit_id, sequence))
+    repository.acquire_semantic_v3_execution("run-a", "unit-17", "nonce-17")
+    repository.issue_semantic_v3_input("run-a", "nonce-17", _digest("input-17"), 1)
+    with repository._connection() as connection:
+        connection.execute(
+            "UPDATE semantic_v3_revision_bindings SET current_checkpoint_root = ? WHERE revision_id = 'revision-1'",
+            (_digest("post-checkpoint-external-drift"),),
+        )
+    before = _lifecycle_snapshot(repository, "run-a")
+
+    with pytest.raises(RepositoryError, match="receipt authority"):
+        repository.commit_semantic_v3_receipt(_receipt("run-a", "unit-17", 17))
+
+    assert _lifecycle_snapshot(repository, "run-a") == before
+
+
+@pytest.mark.parametrize("project_deepening", (False, True), ids=("frontier", "deepening"))
+def test_exact_receipt_replay_revalidates_current_checkpoint_authority(
+    workspace: Path, project_deepening: bool,
+) -> None:
+    repository = SQLiteRepository(WorkspacePaths.from_root(workspace).db_path)
+    repository.initialize()
+    run_id = "deepening-run" if project_deepening else "run-a"
+    envelope = _stored_proposal(
+        repository, run_id, project_deepening=project_deepening,
+    )
+    repository.create_semantic_v3_run(envelope)
+    repository.add_semantic_v3_units(
+        run_id, (_unit("unit-1", project_deepening=project_deepening),),
+    )
+    repository.approve_semantic_v3_run(run_id, envelope.proposal_sha256)
+    repository.claim_semantic_v3_running_slot(run_id)
+    repository.acquire_semantic_v3_execution(run_id, "unit-1", "nonce-1")
+    repository.issue_semantic_v3_input(run_id, "nonce-1", _digest("input-1"), 1)
+    receipt = _receipt(run_id, "unit-1", 1)
+    repository.commit_semantic_v3_receipt(receipt)
+    with repository._connection() as connection:
+        connection.execute(
+            "UPDATE semantic_v3_revision_bindings SET current_checkpoint_root = ? WHERE revision_id = 'revision-1'",
+            (_digest("replay-checkpoint-drift"),),
+        )
+    before = _lifecycle_snapshot(repository, run_id)
+
+    with pytest.raises(RepositoryError, match="receipt authority"):
+        repository.commit_semantic_v3_receipt(receipt)
+
+    assert _lifecycle_snapshot(repository, run_id) == before

@@ -1638,15 +1638,30 @@ class SQLiteRepository:
     ) -> sqlite3.Row:
         binding = conn.execute(
             """SELECT manifest_sha256, source_policy_sha256, source_approval_sha256,
-                      catalog_logical_root
+                      catalog_logical_root, current_checkpoint_root
                FROM semantic_v3_revision_bindings WHERE revision_id = ?""",
             (proposal.revision_id,),
         ).fetchone()
+        latest_checkpoint = conn.execute(
+            """SELECT checkpoint.checkpoint_root
+               FROM semantic_v3_checkpoints AS checkpoint
+               JOIN semantic_v3_runs AS run ON run.run_id = checkpoint.run_id
+               WHERE checkpoint.run_id = ? AND run.revision_id = ?
+                 AND run.proposal_sha256 = ?
+               ORDER BY checkpoint.sequence DESC LIMIT 1""",
+            (proposal.run_id, proposal.revision_id, semantic_proposal_sha256(proposal)),
+        ).fetchone()
+        expected_checkpoint_root = (
+            proposal.parent_checkpoint_root
+            if latest_checkpoint is None
+            else latest_checkpoint["checkpoint_root"]
+        )
         if binding is None or (
             binding["manifest_sha256"] != proposal.manifest_sha256
             or binding["source_policy_sha256"] != proposal.policy_sha256
             or binding["source_approval_sha256"] != proposal.source_approval_sha256
             or binding["catalog_logical_root"] != proposal.catalog_root
+            or binding["current_checkpoint_root"] != expected_checkpoint_root
         ):
             raise RepositoryError(error_message)
         return binding
@@ -2315,6 +2330,9 @@ class SQLiteRepository:
         if len(receipt.runtime_deferred) > 64:
             raise RepositoryError("semantic runtime deferred batch exceeds its bound")
         with self._connection() as conn:
+            authority, _, total_budget, phase_budgets = self._v3_authority(
+                conn, receipt.run_id
+            )
             replay = conn.execute(
                 "SELECT * FROM semantic_v3_receipts WHERE run_id = ? AND unit_id = ?", (receipt.run_id, receipt.unit_id)
             ).fetchone()
@@ -2337,7 +2355,6 @@ class SQLiteRepository:
                 or lease["input_sha256"] != receipt.input_sha256 or run["state"] != SemanticRunState.RUNNING.value
             ):
                 raise RepositoryError("semantic receipt authority is invalid")
-            authority, _, total_budget, phase_budgets = self._v3_authority(conn, receipt.run_id)
             unit = conn.execute(
                 "SELECT phase FROM semantic_v3_units WHERE run_id = ? AND unit_id = ?",
                 (receipt.run_id, receipt.unit_id),
@@ -2517,8 +2534,24 @@ class SQLiteRepository:
         expected_root = self._semantic_v3_checkpoint_root(checkpoint)
         if checkpoint.checkpoint_root != expected_root:
             raise RepositoryError("semantic checkpoint authority is invalid")
-        proposal = conn.execute("SELECT selector_version FROM semantic_v3_proposals WHERE run_id = ?", (checkpoint.run_id,)).fetchone()
-        run = conn.execute("SELECT result_pack_length, result_pack_root FROM semantic_v3_runs WHERE run_id = ?", (checkpoint.run_id,)).fetchone()
+        proposal_row = conn.execute(
+            "SELECT * FROM semantic_v3_proposals WHERE run_id = ?", (checkpoint.run_id,)
+        ).fetchone()
+        run = conn.execute(
+            "SELECT * FROM semantic_v3_runs WHERE run_id = ?", (checkpoint.run_id,)
+        ).fetchone()
+        if proposal_row is None or run is None:
+            raise RepositoryError("semantic checkpoint authority is invalid")
+        try:
+            proposal = self._v3_validate_canonical_proposal_row(proposal_row)
+            self._v3_validate_run_projection(
+                run, proposal, "semantic checkpoint authority is invalid",
+            )
+            self._v3_validate_revision_authority(
+                conn, proposal, "semantic checkpoint authority is invalid",
+            )
+        except RepositoryError as error:
+            raise RepositoryError("semantic checkpoint authority is invalid") from error
         aggregate = conn.execute("SELECT aggregate_root FROM semantic_v3_aggregates WHERE run_id = ?", (checkpoint.run_id,)).fetchone()
         last = conn.execute("SELECT checkpoint_root FROM semantic_v3_checkpoints WHERE run_id = ? ORDER BY sequence DESC LIMIT 1", (checkpoint.run_id,)).fetchone()
         last_sequence = 0 if last is None else int(
@@ -2527,16 +2560,11 @@ class SQLiteRepository:
         last_receipt_sequence = int(conn.execute(
             "SELECT COALESCE(MAX(sequence), 0) FROM semantic_v3_receipts WHERE run_id = ?", (checkpoint.run_id,)
         ).fetchone()[0])
-        binding = conn.execute(
-            """SELECT binding.lifecycle_genesis_root FROM semantic_v3_revision_bindings AS binding
-               JOIN semantic_v3_runs AS run ON run.revision_id = binding.revision_id
-               WHERE run.run_id = ?""", (checkpoint.run_id,)
-        ).fetchone()
         expected_previous = (
             last["checkpoint_root"] if last is not None
-            else (binding["lifecycle_genesis_root"] if binding is not None else None)
+            else proposal.parent_checkpoint_root
         )
-        if proposal is None or run is None or aggregate is None or binding is None or checkpoint.sequence != last_sequence + 1 or checkpoint.receipt_sequence != last_receipt_sequence or proposal["selector_version"] != checkpoint.selector_version or run["result_pack_length"] != checkpoint.result_pack_length or run["result_pack_root"] != checkpoint.result_pack_root or aggregate["aggregate_root"] != checkpoint.aggregate_root or checkpoint.previous_checkpoint_root != expected_previous:
+        if aggregate is None or checkpoint.sequence != last_sequence + 1 or checkpoint.receipt_sequence != last_receipt_sequence or proposal.selector_version != checkpoint.selector_version or run["result_pack_length"] != checkpoint.result_pack_length or run["result_pack_root"] != checkpoint.result_pack_root or aggregate["aggregate_root"] != checkpoint.aggregate_root or checkpoint.previous_checkpoint_root != expected_previous:
             raise RepositoryError("semantic checkpoint authority is invalid")
         conn.execute(
             """INSERT INTO semantic_v3_checkpoints(
