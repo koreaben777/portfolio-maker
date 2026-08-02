@@ -313,6 +313,9 @@ def test_v3_workspace_paths_are_revision_and_run_scoped(workspace: Path) -> None
     assert paths.semantic_v3_pack_path("rev-1", "structural").name == "structural.pm-pack"
     assert paths.semantic_v3_result_pack_path("rev-1", "run-1").name == "results.pm-pack"
     assert paths.semantic_v3_deepening_deferred_index_path("rev-1", "run-1").name == "deferred.sqlite"
+    temp = paths.semantic_v3_deepening_deferred_temp_path("rev-1", "run-1")
+    assert temp.parent == paths.semantic_v3_deepening_deferred_index_path("rev-1", "run-1").parent
+    assert temp.name == "deferred.sqlite.preparing"
     with pytest.raises(ValueError):
         paths.semantic_v3_run_dir("rev-1", "../escape")
 ```
@@ -773,7 +776,8 @@ def test_initialize_adds_v3_lifecycle_without_rewriting_legacy_rows(workspace: P
         "semantic_v3_revision_bindings", "semantic_v3_runs", "semantic_v3_units",
         "semantic_v3_proposals", "semantic_v3_dependencies", "semantic_v3_leases", "semantic_v3_receipts",
         "semantic_v3_aggregates", "semantic_v3_checkpoints", "semantic_v3_approvals",
-        "semantic_v3_deferred", "semantic_v3_expansion_cursors", "semantic_v3_audit_members",
+        "semantic_v3_deferred", "semantic_v3_runtime_deferred",
+        "semantic_v3_expansion_cursors", "semantic_v3_audit_members",
         "semantic_v3_execution_lock",
     }.issubset(repository.table_names())
 
@@ -986,6 +990,22 @@ CREATE TABLE IF NOT EXISTS semantic_v3_deferred (
   PRIMARY KEY(run_id, set_kind)
 );
 
+CREATE TABLE IF NOT EXISTS semantic_v3_runtime_deferred (
+  run_id TEXT NOT NULL REFERENCES semantic_v3_runs(run_id),
+  node_id TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  node_digest TEXT NOT NULL,
+  cursor_order INTEGER NOT NULL,
+  source_transition_unit_id TEXT NOT NULL,
+  created_sequence INTEGER NOT NULL,
+  PRIMARY KEY(run_id, node_id),
+  UNIQUE(run_id, cursor_order),
+  FOREIGN KEY(run_id, source_transition_unit_id)
+    REFERENCES semantic_v3_units(run_id, unit_id)
+);
+CREATE INDEX IF NOT EXISTS semantic_v3_runtime_deferred_sequence
+  ON semantic_v3_runtime_deferred(run_id, created_sequence, cursor_order, node_id);
+
 CREATE TABLE IF NOT EXISTS semantic_v3_expansion_cursors (
   run_id TEXT NOT NULL,
   lane TEXT NOT NULL,
@@ -1028,6 +1048,7 @@ def claim_semantic_v3_running_slot(self, run_id: str) -> None: ...
 def acquire_semantic_v3_execution(self, run_id: str, unit_id: str, lease_nonce: str) -> None: ...
 def issue_semantic_v3_input(self, run_id: str, lease_nonce: str, input_sha256: str, byte_count: int) -> None: ...
 def commit_semantic_v3_receipt(self, receipt: SemanticReceiptCommit) -> None: ...
+def iter_semantic_v3_runtime_deferred(self, run_id: str, fetch_size: int = 256) -> Iterator[SemanticDeferredNode]: ...
 def checkpoint_semantic_v3_run(self, checkpoint: SemanticCheckpoint) -> None: ...
 def commit_semantic_v3_audit_freeze(self, freeze: SemanticAuditFreeze) -> None: ...
 def pause_semantic_v3_run(self, run_id: str, reason: str) -> None: ...
@@ -1037,10 +1058,16 @@ def pause_semantic_v3_run(self, run_id: str, reason: str) -> None: ...
 `envelope.proposal.plan_sha256` to match the canonical plan bytes, and preserves both exact bodies as
 the cross-process approval authority. `commit_semantic_v3_receipt()` must validate the
 exact lock/nonce/input/current authority, insert the receipt, update unit/dependents/aggregate/result
-root/checkpoint, and release the singleton lock in one transaction. Duplicate exact receipt is
+root/checkpoint, insert every bounded runtime `defer_on_demand` row, recompute the
+`runtime_transition` count/root/cursor binding, and release the singleton lock in one transaction.
+The runtime table is bounded by approved work: at most 64 transitioned node IDs per unit and at most
+512 frontier units (32,768 rows), or the separately approved 256-unit deepening budget. Duplicate exact receipt is
 success before any pack append; different replay is conflict. `commit_semantic_v3_audit_freeze()`
 atomically inserts the ordered membership, its audit units, population/ordered-set digests and the
-new checkpoint after the last expansion receipt.
+new checkpoint after the last expansion receipt. Its population authority is the streaming canonical
+merge of sealed-catalog `frontier_deferred` rows and repository `semantic_v3_runtime_deferred` rows,
+ordered by `(set_kind_rank, cursor_order, node_id)` with `initial_catalog` before
+`runtime_transition`; the checkpoint stores the exact combined population digest.
 
 - [ ] **Step 5: Run lifecycle atomicity and DB safety tests**
 
@@ -2024,11 +2051,46 @@ def test_audit_freeze_or_read_rejects_approval_binding_drift(expansion_run, drif
     with pytest.raises(SemanticWorkError, match="new approval"):
         expansion_run.validate_last_expansion_output()
     assert expansion_run.repository.audit_member_count(expansion_run.run_id) == 0
+
+def test_runtime_deferred_transition_is_atomic_restartable_and_row_exact(expansion_run) -> None:
+    transition = expansion_run.validate_defer_on_demand_output(
+        node_id="node-runtime-deferred",
+        reason="bounded_frontier_budget",
+    )
+    expansion_run.restart_process()
+    rows = list(expansion_run.repository.iter_semantic_v3_runtime_deferred(expansion_run.run_id))
+    assert [(row.node_id, row.reason, row.node_digest, row.cursor_json) for row in rows] == [
+        (row.node_id, row.reason, row.node_digest, row.cursor_json)
+        for row in transition.deferred
+    ]
+    assert expansion_run.repository.deferred_binding(expansion_run.run_id, "runtime_transition") == (
+        len(transition.deferred),
+        digest_runtime_deferred(rows),
+        digest_runtime_deferred_cursors(rows),
+    )
+
+@pytest.mark.parametrize("failure_point", ("before_receipt_insert", "after_runtime_deferred_insert", "before_commit"))
+def test_runtime_deferred_receipt_crash_leaves_neither_row_nor_aggregate_drift(expansion_run, failure_point) -> None:
+    before = expansion_run.repository.snapshot_runtime_deferred_state(expansion_run.run_id)
+    expansion_run.inject_receipt_failure(failure_point)
+    with pytest.raises(SemanticWorkError):
+        expansion_run.validate_defer_on_demand_output(node_id="node-rollback", reason="budget")
+    assert expansion_run.repository.snapshot_runtime_deferred_state(expansion_run.run_id) == before
+
+def test_audit_freeze_can_select_runtime_deferred_member_and_binds_combined_population(expansion_run) -> None:
+    runtime = expansion_run.add_runtime_deferred_counter_signal(relevance_rank=0)
+    expansion_run.validate_last_expansion_output()
+    freeze = expansion_run.repository.audit_freeze(expansion_run.run_id)
+    assert runtime.node_id in {member.node_id for member in freeze.members}
+    assert freeze.population_sha256 == digest_combined_deferred_population(
+        expansion_run.catalog.iter_frontier_deferred(fetch_size=64),
+        expansion_run.repository.iter_semantic_v3_runtime_deferred(expansion_run.run_id, fetch_size=64),
+    )
 ```
 
 - [ ] **Step 3: Confirm lifecycle validation tests are RED**
 
-Run: `python -m pytest -q tests/test_semantic_lifecycle_v3.py tests/test_cli.py -k 'validate or result or orphan or pause or resume'`
+Run: `python -m pytest -q tests/test_semantic_lifecycle_v3.py tests/test_cli.py -k 'validate or result or orphan or pause or resume or runtime_deferred'`
 
 Expected: missing v3 validation/pause/resume.
 
@@ -2072,8 +2134,12 @@ try:
     audit_freeze = None
     if transition.ends_expansion:
         audit_freeze = freeze_audit_sample(
-            catalog,
-            repository.expansion_checkpoint(run_id, expected_root=authority.checkpoint_root),
+            catalog_deferred=catalog.iter_frontier_deferred(fetch_size=64),
+            runtime_deferred=repository.iter_semantic_v3_runtime_deferred(run_id, fetch_size=64),
+            pending_runtime_deferred=transition.deferred,
+            checkpoint=repository.expansion_checkpoint(
+                run_id, expected_root=authority.checkpoint_root
+            ),
         )
     committed = repository.commit_semantic_v3_receipt(
         receipt,
@@ -2098,7 +2164,11 @@ exchange.clear_output_if_matches(lease.nonce, validated.output_sha256)
 return validation_result(committed)
 ```
 
-When `audit_freeze` is present, the same DB transaction inserts all 300 ordered member rows, creates
+`transition.deferred` is at most 64 canonical rows. The receipt transaction inserts them into
+`semantic_v3_runtime_deferred`, rejects any node/cursor conflict, and updates the
+`runtime_transition` aggregate binding and checkpoint from those exact rows; receipt failure rolls
+all of those writes back together. When `audit_freeze` is present, the same DB transaction first
+accounts for the pending runtime rows, inserts all 300 ordered member rows, creates
 only membership-bound audit units, records ordered/population digests and selector version in the
 checkpoint, and advances the binding's current checkpoint root. `next` rejects any audit target not
 found under the same run/unit in `semantic_v3_audit_members`. Resume/full verify streams those rows;
@@ -2129,7 +2199,7 @@ private reference only when indispensable and is never copied into default revie
 
 - [ ] **Step 7: Run validation, crash, pause/resume, quality, and CLI tests**
 
-Run: `python -m pytest -q tests/test_semantic_lifecycle_v3.py tests/test_semantic_quality.py tests/test_cli.py -k 'validate or receipt or result_pack or pause or resume or semantic_quality'`
+Run: `python -m pytest -q tests/test_semantic_lifecycle_v3.py tests/test_semantic_quality.py tests/test_cli.py -k 'validate or receipt or result_pack or pause or resume or runtime_deferred or semantic_quality'`
 
 Expected: PASS.
 
@@ -2376,11 +2446,26 @@ def test_structural_pack_and_catalog_topology_or_order_mismatch_fails_full_verif
     v3_run.mutate_catalog_child_order_while_resealing_component_for_test()
     with pytest.raises(SemanticWorkError, match="topology"):
         verify_semantic_v3_full(v3_run.context())
+
+def test_full_verify_streams_initial_and_runtime_deferred_and_binds_combined_root(v3_run) -> None:
+    v3_run.add_runtime_deferred_counter_signal(relevance_rank=0)
+    v3_run.complete()
+    verification = verify_semantic_v3_full(v3_run.context())
+    assert verification.runtime_deferred_count == 1
+    assert verification.combined_deferred_population_sha256 == (
+        v3_run.repository.current_checkpoint(v3_run.run_id).audit_population_sha256
+    )
+
+def test_runtime_deferred_row_tamper_fails_full_verify(v3_run) -> None:
+    runtime = v3_run.add_runtime_deferred_counter_signal(relevance_rank=0)
+    v3_run.repository.mutate_runtime_deferred_digest_for_test(v3_run.run_id, runtime.node_id)
+    with pytest.raises(SemanticWorkError, match="runtime deferred"):
+        verify_semantic_v3_full(v3_run.context())
 ```
 
 - [ ] **Step 4: Confirm finalization/apply/project tests are RED**
 
-Run: `python -m pytest -q tests/test_semantic_finalization_v3.py tests/test_semantic_work_lifecycle.py tests/test_semantic_index.py tests/test_project_review_v3.py -k 'full_verify or finalize or v3_apply or discovery_ready'`
+Run: `python -m pytest -q tests/test_semantic_finalization_v3.py tests/test_semantic_work_lifecycle.py tests/test_semantic_index.py tests/test_project_review_v3.py -k 'full_verify or runtime_deferred or finalize or v3_apply or discovery_ready'`
 
 Expected: missing v3 full verifier/finalizer/apply dispatch.
 
@@ -2403,6 +2488,10 @@ def verify_semantic_v3_full(context: SemanticV3Context) -> FullVerification:
         dependencies=context.repository.iter_semantic_v3_dependencies(context.run_id, fetch_size=256),
         deferred=context.repository.iter_semantic_v3_deferred(context.run_id, fetch_size=256),
         catalog_deferred=catalog.iter_frontier_deferred(fetch_size=256),
+        runtime_deferred=context.repository.iter_semantic_v3_runtime_deferred(
+            context.run_id, fetch_size=256
+        ),
+        deepening_deferred=None,
         audit_members=context.repository.iter_semantic_v3_audit_members(context.run_id, fetch_size=256),
         receipts=context.repository.iter_receipts(context.run_id, fetch_size=256),
         result_pack_path=context.result_pack_path,
@@ -2418,7 +2507,10 @@ input/output/dependency hashes, committed result offsets/lengths/hashes, checkpo
 exact ordered audit membership-to-unit mapping, selector convergence and current source
 approval/policy/content binding. Cross-verify every ordered structural edge and payload reference
 between the structural pack and catalog. Read in bounded batches; never materialize the catalog,
-pack, unit, dependency, audit member or receipt set.
+pack, unit, dependency, audit member or receipt set. Independently recompute the sealed catalog
+initial root, repository runtime root and canonical combined deferred population root; each must match
+its aggregate/checkpoint binding. A runtime row whose reason, node digest, cursor order, source unit,
+or creation sequence does not follow its receipt transition fails verification.
 
 - [ ] **Step 6: Implement result-driven finalization and recoverable publication**
 
@@ -2485,7 +2577,7 @@ review item.
 
 - [ ] **Step 8: Run full-verifier, crash, apply, legacy, and project-review tests**
 
-Run: `python -m pytest -q tests/test_semantic_finalization_v3.py tests/test_semantic_work_lifecycle.py tests/test_semantic_index.py tests/test_project_review_v3.py tests/test_project_decisions.py tests/test_sqlite_repository.py -k 'semantic or revision or project_discovery_ready or medium or lineage'`
+Run: `python -m pytest -q tests/test_semantic_finalization_v3.py tests/test_semantic_work_lifecycle.py tests/test_semantic_index.py tests/test_project_review_v3.py tests/test_project_decisions.py tests/test_sqlite_repository.py -k 'semantic or runtime_deferred or deferred_index or revision or project_discovery_ready or medium or lineage'`
 
 Expected: PASS; legacy v1/v2 active remains readable and unchanged until a fully verified v3 activation transaction succeeds.
 
@@ -2620,6 +2712,7 @@ git commit -m "feat: migrate semantic staging explicitly"
 
 **Files:**
 - Create: `src/portfolio_maker/application/semantic_deepening_v3.py`
+- Modify: `src/portfolio_maker/application/semantic_finalization_v3.py`
 - Modify: `src/portfolio_maker/application/models.py`
 - Modify: `src/portfolio_maker/application/project_boundary.py`
 - Modify: `src/portfolio_maker/application/project_decisions.py`
@@ -2637,6 +2730,7 @@ git commit -m "feat: migrate semantic staging explicitly"
 **Interfaces:**
 - Consumes: current opaque project ID, active v3 boundary digest, verified frontier receipts and a separately approved deepening proposal.
 - Produces: `prepare_semantic_deepening()`, derived deepening run, inactive semantic overlay, cancellation/invalidation, and fail-closed medium automatic inclusion.
+- Extends: `verify_semantic_v3_full()` so a deepening run cannot complete without streaming its exact run-scoped deferred index.
 
 - [ ] **Step 1: Write RED authority and scope tests**
 
@@ -2707,7 +2801,7 @@ def test_retry_and_resume_are_byte_idempotent(deepening_run) -> None:
     assert first.receipt_root == second.receipt_root
 ```
 
-- [ ] **Step 3: Write RED downstream-authority regression test**
+- [ ] **Step 3: Write RED downstream-authority and deferred-index publication tests**
 
 ```python
 def test_deepening_overlay_cannot_upgrade_review_required_medium_candidate(deepening_run, candidate) -> None:
@@ -2715,6 +2809,65 @@ def test_deepening_overlay_cannot_upgrade_review_required_medium_candidate(deepe
     deepening_run.complete_with_high_confidence_overlay(candidate.project_id)
     after = decide_project(candidate, mode="automatic")
     assert before.state == after.state == "review_required"
+
+def test_deepening_deferred_index_paths_are_run_isolated_for_same_project(active_v3_projects) -> None:
+    first = prepare_semantic_deepening(active_v3_projects.request(purpose="portfolio-boundary"))
+    second = prepare_semantic_deepening(active_v3_projects.request(purpose="counter-signal-audit"))
+    assert first.project_id == second.project_id
+    assert first.run_id != second.run_id
+    assert first.deferred_index_path_relative != second.deferred_index_path_relative
+
+def test_deepening_deferred_index_reopens_with_exact_final_path_and_seal(active_v3_projects) -> None:
+    proposal = prepare_semantic_deepening(active_v3_projects.request())
+    active_v3_projects.restart_process()
+    binding = active_v3_projects.repository.deepening_deferred_binding(proposal.run_id)
+    opened = verify_deepening_deferred_index_read_only(
+        active_v3_projects.workspace / binding.path_relative,
+        binding.seal,
+    )
+    assert opened.logical_root == proposal.deferred_root
+    assert opened.count == proposal.deferred_count
+    assert opened.cursor_root == proposal.deferred_cursor_root
+
+@pytest.mark.parametrize("failure_point", ("after_temp_fsync", "after_atomic_publish", "before_db_binding"))
+def test_deepening_deferred_index_crash_recovers_same_intent_byte_idempotently(active_v3_projects, failure_point) -> None:
+    active_v3_projects.inject_prepare_failure(failure_point)
+    with pytest.raises(SemanticDeepeningError):
+        prepare_semantic_deepening(active_v3_projects.request())
+    before = active_v3_projects.repository.only_deepening_prepare_intent()
+    proposal = prepare_semantic_deepening(active_v3_projects.request())
+    after = active_v3_projects.repository.deepening_prepare_intent(before.intent_id)
+    assert proposal.run_id == before.run_id == after.run_id
+    assert after.state == "bound"
+    assert after.deferred_file_sha256 == proposal.deferred_file_sha256
+
+@pytest.mark.parametrize("tamper", ("path", "file", "missing_file", "logical_root", "count", "cursor_root"))
+def test_deepening_deferred_index_tamper_or_binding_mismatch_fails(active_v3_projects, tamper) -> None:
+    proposal = prepare_semantic_deepening(active_v3_projects.request())
+    active_v3_projects.tamper_deepening_deferred_binding(proposal.run_id, tamper)
+    with pytest.raises(SemanticWorkError, match="deferred index"):
+        verify_semantic_v3_full(active_v3_projects.context(proposal.run_id))
+
+def test_deepening_full_verify_opens_and_streams_run_deferred_index(active_v3_projects) -> None:
+    proposal = prepare_semantic_deepening(active_v3_projects.request())
+    active_v3_projects.approve_and_complete(proposal.run_id)
+    verified = verify_semantic_v3_full(active_v3_projects.context(proposal.run_id))
+    assert verified.deepening_deferred_count == proposal.deferred_count
+    assert verified.deepening_deferred_root == proposal.deferred_root
+
+def test_no_bound_deepening_run_points_at_missing_final_index(active_v3_projects) -> None:
+    active_v3_projects.inject_prepare_failure("before_db_binding")
+    with pytest.raises(SemanticDeepeningError):
+        prepare_semantic_deepening(active_v3_projects.request())
+    assert active_v3_projects.repository.bound_deepening_run_count() == 0
+    assert active_v3_projects.only_unbound_final_index().is_file()
+
+def test_unbound_mismatched_deferred_residue_is_not_adopted_deleted_or_overwritten(active_v3_projects) -> None:
+    residue = active_v3_projects.write_unbound_mismatched_final_index()
+    before = residue.read_bytes()
+    with pytest.raises(SemanticDeepeningError, match="unbound"):
+        prepare_semantic_deepening(active_v3_projects.request())
+    assert residue.read_bytes() == before
 ```
 
 - [ ] **Step 4: Confirm deepening/project tests are RED**
@@ -2725,9 +2878,40 @@ Expected: missing deepening planner/schema/CLI and inactive-overlay authority.
 
 - [ ] **Step 5: Add deepening run lineage and bounded proposal**
 
+The run-scoped `deferred.sqlite` uses this complete file contract in
+`semantic_catalog.py`; it is separate from the main lifecycle database:
+
+```python
+@dataclass(frozen=True)
+class DeferredIndexSeal:
+    byte_length: int
+    file_sha256: str
+    logical_root: str
+    deferred_count: int
+    cursor_root: str
+```
+
+```sql
+CREATE TABLE deferred_nodes (
+  node_id TEXT PRIMARY KEY,
+  reason TEXT NOT NULL,
+  node_digest TEXT NOT NULL,
+  cursor_order INTEGER NOT NULL UNIQUE
+);
+CREATE INDEX deferred_nodes_cursor
+  ON deferred_nodes(cursor_order, node_id);
+```
+
+`SemanticDeferredIndexWriter` inserts canonical rows in bounded pages, checkpoints and fsyncs the
+temporary file, rejects WAL/SHM sidecars, and derives `logical_root`, `deferred_count` and
+`cursor_root` by streaming `(cursor_order, node_id)` rows. `seal()` runs integrity check, compacts,
+fsyncs, closes the writer, hashes the final bytes and reopens the file read-only before returning the
+seal. The reader independently recomputes every field rather than trusting file metadata.
+
 ```sql
 CREATE TABLE IF NOT EXISTS semantic_v3_deepening_runs (
   run_id TEXT PRIMARY KEY REFERENCES semantic_v3_runs(run_id),
+  intent_id TEXT NOT NULL UNIQUE REFERENCES semantic_v3_deepening_prepare_intents(intent_id),
   project_id TEXT NOT NULL,
   parent_revision_id TEXT NOT NULL,
   authority_root TEXT NOT NULL,
@@ -2737,6 +2921,12 @@ CREATE TABLE IF NOT EXISTS semantic_v3_deepening_runs (
   evidence_policy_sha256 TEXT NOT NULL,
   deepening_plan_sha256 TEXT NOT NULL,
   unit_queue_root TEXT NOT NULL,
+  deferred_index_path_relative TEXT NOT NULL,
+  deferred_file_sha256 TEXT NOT NULL,
+  deferred_file_bytes INTEGER NOT NULL,
+  deferred_logical_root TEXT NOT NULL,
+  deferred_count INTEGER NOT NULL,
+  deferred_cursor_root TEXT NOT NULL,
   proposal_sha256 TEXT NOT NULL,
   overlay_state TEXT NOT NULL CHECK(overlay_state IN ('proposed','inactive_review_required','cancelled','invalidated')),
   invalidated_reason TEXT,
@@ -2745,6 +2935,29 @@ CREATE TABLE IF NOT EXISTS semantic_v3_deepening_runs (
 );
 CREATE INDEX IF NOT EXISTS semantic_v3_deepening_project
   ON semantic_v3_deepening_runs(project_id, parent_revision_id, overlay_state);
+
+CREATE TABLE IF NOT EXISTS semantic_v3_deepening_prepare_intents (
+  intent_id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL UNIQUE,
+  revision_id TEXT NOT NULL REFERENCES semantic_v3_revision_bindings(revision_id),
+  project_id TEXT NOT NULL,
+  authority_root TEXT NOT NULL,
+  purpose TEXT NOT NULL,
+  temp_path_relative TEXT NOT NULL,
+  final_path_relative TEXT NOT NULL,
+  state TEXT NOT NULL CHECK(state IN ('preparing','published','bound','failed')),
+  expected_file_sha256 TEXT,
+  expected_file_bytes INTEGER,
+  expected_logical_root TEXT,
+  expected_deferred_count INTEGER,
+  expected_cursor_root TEXT,
+  safe_error_code TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(project_id, authority_root, purpose)
+);
+CREATE INDEX IF NOT EXISTS semantic_v3_deepening_intent_state
+  ON semantic_v3_deepening_prepare_intents(state, revision_id, run_id);
 ```
 
 ```python
@@ -2752,11 +2965,25 @@ authority = load_verified_deepening_authority_context(
     workspace=request.workspace,
     project_id=request.project_id,
 )
-deferred_writer = SemanticDeferredIndexWriter(
-    paths.semantic_v3_deepening_deferred_temp_path(authority.base.revision_id, authority.project_id)
+intent = repository.get_or_create_deepening_prepare_intent(
+    project_id=authority.project_id,
+    authority_root=authority.root,
+    purpose=authority.purpose,
+    revision_id=authority.base.revision_id,
+)
+temp_path = paths.semantic_v3_deepening_deferred_temp_path(
+    authority.base.revision_id, intent.run_id
+)
+final_path = paths.semantic_v3_deepening_deferred_index_path(
+    authority.base.revision_id, intent.run_id
+)
+deferred_writer = SemanticDeferredIndexWriter.resume_or_create(
+    temp_path,
+    expected=intent.expected_seal,
 )
 deepening_draft = ProjectDeepeningPlanner(catalog, active_projects).prepare(
     authority=authority,
+    run_id=intent.run_id,
     project_id=request.project_id,
     budget=DEEPENING_BUDGET,
     max_dependencies=MAX_DEPENDENCIES,
@@ -2764,6 +2991,14 @@ deepening_draft = ProjectDeepeningPlanner(catalog, active_projects).prepare(
     deferred_sink=deferred_writer,
 )
 deferred_seal = deferred_writer.seal()
+repository.record_deepening_prepare_seal(intent.intent_id, deferred_seal)
+publish_deepening_deferred_index_atomically(
+    temp_path=temp_path,
+    final_path=final_path,
+    expected_seal=deferred_seal,
+)
+verify_deepening_deferred_index_read_only(final_path, deferred_seal)
+repository.mark_deepening_prepare_published(intent.intent_id, deferred_seal)
 deepening_plan = finalize_deepening_plan(deepening_draft, deferred_seal)
 plan_bytes = canonical_json_bytes(deepening_plan)
 plan_sha256 = sha256_hex(plan_bytes)
@@ -2787,11 +3022,63 @@ repository.create_semantic_v3_deepening_proposal_run_and_units(
     deepening_plan=deepening_plan,
     deepening_plan_bytes=plan_bytes,
     units=deepening_plan.units,
+    intent_id=intent.intent_id,
+    deferred_index_path_relative=paths.workspace_relative(final_path),
+    deferred_index_seal=deferred_seal,
     deferred_binding=(
         deepening_plan.deferred_count,
         deepening_plan.deferred_root,
         deepening_plan.deferred_cursor_root,
     ),
+)
+```
+
+Extend the Task 12 verifier with the run-kind-specific file authority; frontier runs keep `None`,
+while deepening runs must supply an opened, verified stream:
+
+```python
+def verify_deepening_deferred_authority(
+    context: SemanticV3Context,
+    authority: BoundedSemanticV3Authority,
+) -> VerifiedDeferredIndex | None:
+    if authority.approval_kind != "project_deepening":
+        return None
+    binding = context.repository.deepening_deferred_binding(context.run_id)
+    path = context.paths.resolve_safe_workspace_relative(binding.path_relative)
+    opened = verify_deepening_deferred_index_read_only(path, binding.seal)
+    verify_deepening_deferred_binding_equivalence(
+        opened=opened,
+        binding=binding,
+        proposal=authority.proposal,
+        plan=authority.plan,
+        intent=context.repository.bound_deepening_prepare_intent(context.run_id),
+    )
+    return opened
+
+deepening_deferred = verify_deepening_deferred_authority(context, authority)
+catalog_deferred = (
+    None if deepening_deferred is not None
+    else catalog.iter_frontier_deferred(fetch_size=256)
+)
+lifecycle = verify_lifecycle_streaming(
+    proposal=context.repository.get_semantic_v3_proposal_bytes_for_run(context.run_id),
+    approval=context.repository.approval(context.run_id),
+    units=context.repository.iter_semantic_v3_units(context.run_id, fetch_size=256),
+    dependencies=context.repository.iter_semantic_v3_dependencies(context.run_id, fetch_size=256),
+    deferred=context.repository.iter_semantic_v3_deferred(context.run_id, fetch_size=256),
+    catalog_deferred=catalog_deferred,
+    runtime_deferred=context.repository.iter_semantic_v3_runtime_deferred(
+        context.run_id, fetch_size=256
+    ),
+    deepening_deferred=deepening_deferred.iter_rows(fetch_size=256)
+        if deepening_deferred is not None else None,
+    audit_members=context.repository.iter_semantic_v3_audit_members(
+        context.run_id, fetch_size=256
+    ),
+    receipts=context.repository.iter_receipts(context.run_id, fetch_size=256),
+    result_pack_path=context.result_pack_path,
+    checkpoints=context.repository.iter_checkpoints(context.run_id, fetch_size=64),
+    expected_authority=authority,
 )
 ```
 
@@ -2809,9 +3096,25 @@ project boundary, and returns one root-bound context. Planner and proposal build
 same object and reject any plan field mismatch before publication.
 The planner pages the sealed source catalog 64 rows at a time, retains at most 256 selected units,
 and streams all unselected project-scope nodes to a run-scoped temporary `deferred.sqlite`. It seals
-that index before proposal construction and publishes it with the run only after the repository
-transaction verifies its count/root/cursor-root. No deepening deferred row tuple enters the plan or
-Python heap.
+that index before proposal construction. The durable intent allocates the run ID before any path is
+opened, so both temporary and final paths are revision/run scoped and never project scoped. After
+seal/integrity/fsync/read-only verification, publication is one same-directory atomic rename. An
+existing exact final file is an idempotent success; a missing intent or mismatched temp/final file is
+private unbound residue and fails closed without adoption, deletion or overwrite.
+
+The final repository transaction receives the safe workspace-relative final path and the complete
+`DeferredIndexSeal`. It reopens that exact file read-only, verifies file hash/bytes, logical root,
+count and cursor root, stores proposal/plan/run/units/dependencies/aggregate/deepening binding, and
+changes the same intent from `published` to `bound`. A bound run may never reference a missing file.
+Crash recovery reuses `(project_id, authority_root, purpose)` and its existing run ID: before publish
+it verifies/resumes or safely rewrites only that intent's temp; after rename but before DB binding it
+verifies the exact final seal and completes the same binding. Full verification of a deepening run
+must reopen and stream this run-scoped index and match its file/logical/count/cursor bindings to the
+proposal, plan, intent and `semantic_v3_deepening_runs`. For a frontier run, the initial population is
+the sealed catalog index; for a deepening run it is only the run-scoped deferred index. In either
+case, full verification merges that initial authority with the same run's bounded runtime deferred
+rows and verifies the exact combined checkpoint root; it never double-counts the parent frontier
+catalog. No deepening deferred row tuple enters the plan or Python heap.
 
 - [ ] **Step 6: Implement inactive overlay and cancel/replay**
 
@@ -2832,14 +3135,14 @@ state only. It does not accept a path/URL and does not approve or start executio
 
 - [ ] **Step 8: Run deepening, decisions, review, lifecycle, and CLI tests**
 
-Run: `python -m pytest -q tests/test_semantic_deepening_v3.py tests/test_project_review_v3.py tests/test_project_decisions.py tests/test_semantic_catalog_v3.py tests/test_semantic_lifecycle_v3.py tests/test_cli.py -k 'deepening or deferred_index or overlay or project or semantic_v3'`
+Run: `python -m pytest -q tests/test_semantic_deepening_v3.py tests/test_project_review_v3.py tests/test_project_decisions.py tests/test_semantic_catalog_v3.py tests/test_semantic_lifecycle_v3.py tests/test_semantic_finalization_v3.py tests/test_cli.py -k 'deepening or deepening_deferred_index or deferred_index or overlay or project or semantic_v3'`
 
 Expected: PASS; no deepening action changes project/evidence/artifact/delivery authority.
 
 - [ ] **Step 9: Commit Task 14 only**
 
 ```bash
-git add src/portfolio_maker/application/semantic_deepening_v3.py src/portfolio_maker/application/models.py src/portfolio_maker/application/project_boundary.py src/portfolio_maker/application/project_decisions.py src/portfolio_maker/application/project_review_v3.py src/portfolio_maker/infrastructure/sqlite_repository.py src/portfolio_maker/infrastructure/semantic_catalog.py src/portfolio_maker/workspace.py src/portfolio_maker/adapters/cli.py tests/test_semantic_deepening_v3.py tests/test_project_review_v3.py tests/test_project_decisions.py tests/test_semantic_catalog_v3.py tests/test_cli.py
+git add src/portfolio_maker/application/semantic_deepening_v3.py src/portfolio_maker/application/semantic_finalization_v3.py src/portfolio_maker/application/models.py src/portfolio_maker/application/project_boundary.py src/portfolio_maker/application/project_decisions.py src/portfolio_maker/application/project_review_v3.py src/portfolio_maker/infrastructure/sqlite_repository.py src/portfolio_maker/infrastructure/semantic_catalog.py src/portfolio_maker/workspace.py src/portfolio_maker/adapters/cli.py tests/test_semantic_deepening_v3.py tests/test_project_review_v3.py tests/test_project_decisions.py tests/test_semantic_catalog_v3.py tests/test_cli.py
 git commit -m "feat: deepen selected semantic projects"
 ```
 
