@@ -46,11 +46,13 @@ from portfolio_maker.domain.semantic_frontier import (
     FrontierAction,
     FrontierPhase,
     SemanticAuditFreeze,
+    SemanticBudget,
     SemanticCheckpoint,
     SemanticCompletion,
     SemanticExecutionProposal,
     SemanticLeaseState,
     SemanticPlannedUnit,
+    SemanticPhaseBinding,
     SemanticProposalEnvelope,
     SemanticReceiptCommit,
     SemanticRevisionBinding,
@@ -338,7 +340,7 @@ CREATE INDEX IF NOT EXISTS semantic_v3_units_ready ON semantic_v3_units(run_id, 
 CREATE TABLE IF NOT EXISTS semantic_v3_dependencies (run_id TEXT NOT NULL, unit_id TEXT NOT NULL, dependency_unit_id TEXT NOT NULL, dependency_digest TEXT NOT NULL, PRIMARY KEY(run_id, unit_id, dependency_unit_id), FOREIGN KEY(run_id, unit_id) REFERENCES semantic_v3_units(run_id, unit_id));
 CREATE INDEX IF NOT EXISTS semantic_v3_dependencies_reverse ON semantic_v3_dependencies(run_id, dependency_unit_id, unit_id);
 CREATE TABLE IF NOT EXISTS semantic_v3_leases (run_id TEXT NOT NULL, unit_id TEXT NOT NULL, lease_nonce TEXT NOT NULL UNIQUE, state TEXT NOT NULL CHECK(state IN ('materializing','issued','expired')), input_sha256 TEXT, input_bytes INTEGER, lease_started_active_seconds REAL NOT NULL, lease_deadline_active_seconds REAL NOT NULL, PRIMARY KEY(run_id, unit_id), FOREIGN KEY(run_id, unit_id) REFERENCES semantic_v3_units(run_id, unit_id));
-CREATE TABLE IF NOT EXISTS semantic_v3_receipts (run_id TEXT NOT NULL, unit_id TEXT NOT NULL, sequence INTEGER NOT NULL, lease_nonce TEXT NOT NULL, input_sha256 TEXT NOT NULL, output_sha256 TEXT NOT NULL, result_offset INTEGER NOT NULL, result_length INTEGER NOT NULL, result_sha256 TEXT NOT NULL, action TEXT NOT NULL CHECK(action IN ('accept_boundary','expand_children','stop_non_project','defer_on_demand')), validator_version TEXT NOT NULL, receipt_sha256 TEXT NOT NULL, active_seconds REAL NOT NULL DEFAULT 0, PRIMARY KEY(run_id, unit_id), UNIQUE(run_id, sequence));
+CREATE TABLE IF NOT EXISTS semantic_v3_receipts (run_id TEXT NOT NULL, unit_id TEXT NOT NULL, sequence INTEGER NOT NULL, lease_nonce TEXT NOT NULL, input_sha256 TEXT NOT NULL, input_bytes INTEGER NOT NULL DEFAULT 0, output_sha256 TEXT NOT NULL, result_offset INTEGER NOT NULL, result_length INTEGER NOT NULL, result_sha256 TEXT NOT NULL, action TEXT NOT NULL CHECK(action IN ('accept_boundary','expand_children','stop_non_project','defer_on_demand')), validator_version TEXT NOT NULL, receipt_sha256 TEXT NOT NULL, active_seconds REAL NOT NULL DEFAULT 0, commit_canonical_json BLOB, commit_sha256 TEXT, PRIMARY KEY(run_id, unit_id), UNIQUE(run_id, sequence));
 CREATE TABLE IF NOT EXISTS semantic_v3_aggregates (run_id TEXT PRIMARY KEY REFERENCES semantic_v3_runs(run_id), ready_count INTEGER NOT NULL, leased_count INTEGER NOT NULL, validated_count INTEGER NOT NULL, deferred_count INTEGER NOT NULL, error_count INTEGER NOT NULL, used_units INTEGER NOT NULL, used_input_bytes INTEGER NOT NULL, used_active_seconds REAL NOT NULL, phase_usage_json TEXT NOT NULL, completion_json TEXT NOT NULL, aggregate_root TEXT NOT NULL, last_verified_at TEXT);
 CREATE TABLE IF NOT EXISTS semantic_v3_checkpoints (run_id TEXT NOT NULL, sequence INTEGER NOT NULL, receipt_sequence INTEGER NOT NULL, result_pack_length INTEGER NOT NULL, result_pack_root TEXT NOT NULL, queue_root TEXT NOT NULL, aggregate_root TEXT NOT NULL, resume_cursor_json TEXT NOT NULL, audit_ordered_set_sha256 TEXT, audit_population_sha256 TEXT, selector_version TEXT NOT NULL, previous_checkpoint_root TEXT NOT NULL, checkpoint_root TEXT NOT NULL, PRIMARY KEY(run_id, sequence), UNIQUE(run_id, checkpoint_root));
 CREATE INDEX IF NOT EXISTS semantic_v3_checkpoints_lookup ON semantic_v3_checkpoints(run_id, sequence, checkpoint_root);
@@ -1183,6 +1185,7 @@ class SQLiteRepository:
             self._ensure_portfolio_project_decision_columns(conn)
             self._ensure_history_cleanup_plan_columns(conn)
             self._ensure_semantic_import_schema(conn)
+            self._ensure_semantic_v3_receipt_columns(conn)
 
     @staticmethod
     def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
@@ -1226,6 +1229,19 @@ class SQLiteRepository:
             )
             """
         )
+
+    @classmethod
+    def _ensure_semantic_v3_receipt_columns(cls, conn: sqlite3.Connection) -> None:
+        columns = cls._table_columns(conn, "semantic_v3_receipts")
+        for name, definition in (
+            ("input_bytes", "INTEGER NOT NULL DEFAULT 0"),
+            ("commit_canonical_json", "BLOB"),
+            ("commit_sha256", "TEXT"),
+        ):
+            if name not in columns:
+                conn.execute(
+                    f"ALTER TABLE semantic_v3_receipts ADD COLUMN {name} {definition}"
+                )
 
     @classmethod
     def _ensure_legacy_normalized_columns(cls, conn: sqlite3.Connection) -> None:
@@ -1533,6 +1549,86 @@ class SQLiteRepository:
         return budget, phases, sha256((budget + "\0" + phases).encode("utf-8")).hexdigest()
 
     @staticmethod
+    def _v3_receipt_binding(receipt: SemanticReceiptCommit) -> tuple[bytes, str]:
+        body = semantic_canonical_json_bytes({"receipt": receipt})
+        return body, sha256(body).hexdigest()
+
+    def _v3_authority(
+        self, conn: sqlite3.Connection, run_id: str
+    ) -> tuple[sqlite3.Row, sqlite3.Row, SemanticBudget, dict[str, SemanticBudget]]:
+        row = conn.execute(
+            """SELECT run.*, run.approval_kind AS run_approval_kind,
+                      proposal.approval_kind AS proposal_approval_kind,
+                      proposal.manifest_sha256 AS proposal_manifest_sha256,
+                      proposal.source_policy_sha256 AS proposal_source_policy_sha256,
+                      proposal.catalog_root AS proposal_catalog_root,
+                      proposal.selector_version AS proposal_selector_version,
+                      proposal.private_context_scope AS proposal_private_context_scope,
+                      proposal.total_budget_json AS proposal_total_budget_json,
+                      proposal.phase_bindings_json AS proposal_phase_bindings_json,
+                      proposal.budget_binding_sha256 AS proposal_budget_binding_sha256,
+                      approval.approval_kind AS approval_kind, approval.proposal_sha256 AS approval_proposal_sha256,
+                      approval.manifest_sha256 AS approval_manifest_sha256,
+                      approval.source_policy_sha256 AS approval_source_policy_sha256,
+                      approval.catalog_root AS approval_catalog_root,
+                      approval.selector_version AS approval_selector_version,
+                      approval.private_context_scope AS approval_private_context_scope,
+                      approval.total_budget_json AS approval_total_budget_json,
+                      approval.phase_bindings_json AS approval_phase_bindings_json,
+                      approval.budget_binding_sha256 AS approval_budget_binding_sha256,
+                      approval.project_id AS approval_project_id,
+                      binding.manifest_sha256 AS binding_manifest_sha256,
+                      binding.source_policy_sha256 AS binding_source_policy_sha256,
+                      binding.catalog_logical_root AS binding_catalog_root
+               FROM semantic_v3_runs AS run
+               JOIN semantic_v3_proposals AS proposal ON proposal.run_id = run.run_id
+               JOIN semantic_v3_approvals AS approval ON approval.run_id = run.run_id
+               JOIN semantic_v3_revision_bindings AS binding ON binding.revision_id = run.revision_id
+               WHERE run.run_id = ?""", (run_id,),
+        ).fetchone()
+        if row is None:
+            raise RepositoryError("semantic receipt authority is invalid")
+        exact_pairs = (
+            ("proposal_sha256", "approval_proposal_sha256"),
+            ("run_approval_kind", "proposal_approval_kind"),
+            ("run_approval_kind", "approval_kind"),
+            ("proposal_manifest_sha256", "approval_manifest_sha256"),
+            ("proposal_source_policy_sha256", "approval_source_policy_sha256"),
+            ("proposal_catalog_root", "approval_catalog_root"),
+            ("proposal_selector_version", "approval_selector_version"),
+            ("proposal_private_context_scope", "approval_private_context_scope"),
+            ("proposal_total_budget_json", "approval_total_budget_json"),
+            ("proposal_phase_bindings_json", "approval_phase_bindings_json"),
+            ("proposal_budget_binding_sha256", "approval_budget_binding_sha256"),
+        )
+        if (
+            any(row[left] != row[right] for left, right in exact_pairs)
+            or row["project_id"] != row["approval_project_id"]
+            or row["proposal_manifest_sha256"] != row["binding_manifest_sha256"]
+            or row["proposal_source_policy_sha256"] != row["binding_source_policy_sha256"]
+            or row["proposal_catalog_root"] != row["binding_catalog_root"]
+        ):
+            raise RepositoryError("semantic receipt authority is invalid")
+        try:
+            budget = SemanticBudget(**json.loads(row["proposal_total_budget_json"]))
+            phase_budgets = {
+                item["phase"]: SemanticBudget(**item["hard_budget"])
+                for item in json.loads(row["proposal_phase_bindings_json"])
+            }
+        except (TypeError, KeyError, ValueError, json.JSONDecodeError) as error:
+            raise RepositoryError("semantic budget authority is invalid") from error
+        if not phase_budgets:
+            raise RepositoryError("semantic budget authority is invalid")
+        return row, row, budget, phase_budgets
+
+    @staticmethod
+    def _v3_pause_budget(conn: sqlite3.Connection, run_id: str) -> None:
+        conn.execute(
+            """UPDATE semantic_v3_runs SET state = 'paused_budget'
+               WHERE run_id = ? AND state IN ('prepared', 'running')""", (run_id,)
+        )
+
+    @staticmethod
     def _v3_now() -> str:
         return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -1706,11 +1802,48 @@ class SQLiteRepository:
     ) -> None:
         if len(units) > 512 or len({unit.unit_id for unit in units}) != len(units):
             raise RepositoryError("semantic unit batch is invalid")
+        budget_exhausted = False
         with self._connection() as conn:
             run = conn.execute("SELECT state FROM semantic_v3_runs WHERE run_id = ?", (run_id,)).fetchone()
+            proposal = conn.execute(
+                "SELECT total_budget_json, phase_bindings_json FROM semantic_v3_proposals WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
             if run is None or run["state"] != SemanticRunState.PREPARED.value:
                 raise RepositoryError("semantic run is not prepared")
-            for unit in units:
+            if proposal is None:
+                raise RepositoryError("semantic budget authority is invalid")
+            try:
+                total = SemanticBudget(**json.loads(proposal["total_budget_json"]))
+                phase_budgets = {
+                    item["phase"]: SemanticBudget(**item["hard_budget"])
+                    for item in json.loads(proposal["phase_bindings_json"])
+                }
+            except (TypeError, KeyError, ValueError, json.JSONDecodeError) as error:
+                raise RepositoryError("semantic budget authority is invalid") from error
+            existing = {
+                row["phase"]: (row["units"], row["bytes"])
+                for row in conn.execute(
+                    """SELECT phase, COUNT(*) AS units, COALESCE(SUM(estimated_input_bytes), 0) AS bytes
+                       FROM semantic_v3_units WHERE run_id = ? GROUP BY phase""", (run_id,)
+                )
+            }
+            planned_units = sum(value[0] for value in existing.values()) + len(units)
+            planned_bytes = sum(value[1] for value in existing.values()) + sum(
+                unit.estimated_input_bytes for unit in units
+            )
+            if planned_units > total.max_units or planned_bytes > total.max_input_bytes:
+                self._v3_pause_budget(conn, run_id)
+                budget_exhausted = True
+            for phase in {unit.phase.value for unit in units}:
+                phase_budget = phase_budgets.get(phase)
+                phase_units = existing.get(phase, (0, 0))[0] + sum(unit.phase.value == phase for unit in units)
+                phase_bytes = existing.get(phase, (0, 0))[1] + sum(unit.estimated_input_bytes for unit in units if unit.phase.value == phase)
+                if phase_budget is None or phase_units > phase_budget.max_units or phase_bytes > phase_budget.max_input_bytes:
+                    self._v3_pause_budget(conn, run_id)
+                    budget_exhausted = True
+            units_to_insert = () if budget_exhausted else units
+            for unit in units_to_insert:
                 if len(unit.target_node_ids) > 64 or len(unit.dependency_unit_ids) > 64 or unit.estimated_input_bytes < 0:
                     raise RepositoryError("semantic unit is invalid")
                 target = semantic_canonical_json_bytes(unit.target_node_ids).decode("utf-8")
@@ -1732,7 +1865,10 @@ class SQLiteRepository:
                            VALUES (?, ?, ?, ?)""",
                         (run_id, unit.unit_id, dependency, sha256(dependency.encode("utf-8")).hexdigest()),
                     )
-            self._semantic_v3_refresh_aggregate(conn, run_id)
+            if not budget_exhausted:
+                self._semantic_v3_refresh_aggregate(conn, run_id)
+        if budget_exhausted:
+            raise RepositoryError("semantic budget is exhausted")
 
     def approve_semantic_v3_run(self, run_id: str, proposal_sha256: str) -> None:
         with self._connection() as conn:
@@ -1810,13 +1946,38 @@ class SQLiteRepository:
 
     def issue_semantic_v3_input(self, run_id: str, lease_nonce: str, input_sha256: str, byte_count: int) -> None:
         self._v3_digest(input_sha256, "input digest")
-        if type(byte_count) is not int or byte_count < 0 or byte_count > 262_144:
+        if type(byte_count) is not int or byte_count < 0:
             raise RepositoryError("semantic input exceeds its budget")
         with self._connection() as conn:
             lock = conn.execute("SELECT * FROM semantic_v3_execution_lock WHERE singleton = 1").fetchone()
             lease = conn.execute("SELECT * FROM semantic_v3_leases WHERE run_id = ? AND lease_nonce = ?", (run_id, lease_nonce)).fetchone()
             if lock is None or lease is None or lock["run_id"] != run_id or lock["lease_nonce"] != lease_nonce or lock["lease_state"] != SemanticLeaseState.MATERIALIZING.value or lease["state"] != SemanticLeaseState.MATERIALIZING.value:
                 raise RepositoryError("semantic execution lease is invalid")
+            authority, _, total_budget, phase_budgets = self._v3_authority(conn, run_id)
+            unit = conn.execute(
+                "SELECT phase FROM semantic_v3_units WHERE run_id = ? AND unit_id = ?",
+                (run_id, lease["unit_id"]),
+            ).fetchone()
+            if unit is None or unit["phase"] not in phase_budgets:
+                raise RepositoryError("semantic budget authority is invalid")
+            run = conn.execute(
+                "SELECT used_input_bytes FROM semantic_v3_runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            phase_used = conn.execute(
+                """SELECT COALESCE(SUM(receipt.input_bytes), 0) AS input_bytes
+                   FROM semantic_v3_receipts AS receipt JOIN semantic_v3_units AS unit
+                   ON unit.run_id = receipt.run_id AND unit.unit_id = receipt.unit_id
+                   WHERE receipt.run_id = ? AND unit.phase = ?""", (run_id, unit["phase"]),
+            ).fetchone()
+            phase_budget = phase_budgets[unit["phase"]]
+            if (
+                byte_count > total_budget.max_unit_input_bytes
+                or run is None
+                or run["used_input_bytes"] + byte_count > total_budget.max_input_bytes
+                or phase_used["input_bytes"] + byte_count > phase_budget.max_input_bytes
+            ):
+                self._v3_pause_budget(conn, run_id)
+                return
             conn.execute("UPDATE semantic_v3_leases SET state = 'issued', input_sha256 = ?, input_bytes = ? WHERE run_id = ? AND lease_nonce = ?", (input_sha256, byte_count, run_id, lease_nonce))
             conn.execute("UPDATE semantic_v3_execution_lock SET lease_state = 'issued' WHERE singleton = 1")
 
@@ -1909,19 +2070,15 @@ class SQLiteRepository:
 
     @staticmethod
     def _semantic_v3_receipt_matches(row: sqlite3.Row, receipt: SemanticReceiptCommit) -> bool:
+        body, digest = SQLiteRepository._v3_receipt_binding(receipt)
         return (
-            row["lease_nonce"] == receipt.lease_nonce
-            and row["input_sha256"] == receipt.input_sha256
-            and row["output_sha256"] == receipt.output_sha256
-            and row["result_offset"] == receipt.result.offset
-            and row["result_length"] == receipt.result.length
-            and row["result_sha256"] == receipt.result.sha256
-            and row["action"] == receipt.action.value
-            and row["validator_version"] == receipt.validator_version
-            and row["receipt_sha256"] == receipt.receipt_sha256
+            isinstance(row["commit_canonical_json"], bytes)
+            and row["commit_canonical_json"] == body
+            and row["commit_sha256"] == digest
         )
 
     def commit_semantic_v3_receipt(self, receipt: SemanticReceiptCommit) -> None:
+        commit_body, commit_digest = self._v3_receipt_binding(receipt)
         for value, field in (
             (receipt.input_sha256, "input digest"), (receipt.output_sha256, "output digest"),
             (receipt.result.sha256, "result digest"), (receipt.receipt_sha256, "receipt digest"),
@@ -1955,13 +2112,38 @@ class SQLiteRepository:
                 or lock["lease_nonce"] != receipt.lease_nonce or lock["lease_state"] != SemanticLeaseState.ISSUED.value
                 or lease["lease_nonce"] != receipt.lease_nonce or lease["state"] != SemanticLeaseState.ISSUED.value
                 or lease["input_sha256"] != receipt.input_sha256 or run["state"] != SemanticRunState.RUNNING.value
-                or proposal["proposal_sha256"] != approval["proposal_sha256"]
-                or proposal["manifest_sha256"] != approval["manifest_sha256"]
-                or proposal["source_policy_sha256"] != approval["source_policy_sha256"]
-                or proposal["catalog_root"] != approval["catalog_root"]
-                or proposal["selector_version"] != approval["selector_version"]
             ):
                 raise RepositoryError("semantic receipt authority is invalid")
+            authority, _, total_budget, phase_budgets = self._v3_authority(conn, receipt.run_id)
+            unit = conn.execute(
+                "SELECT phase FROM semantic_v3_units WHERE run_id = ? AND unit_id = ?",
+                (receipt.run_id, receipt.unit_id),
+            ).fetchone()
+            if unit is None:
+                raise RepositoryError("semantic receipt authority is invalid")
+            phase_budget = phase_budgets.get(unit["phase"])
+            if phase_budget is None:
+                raise RepositoryError("semantic budget authority is invalid")
+            phase_usage = conn.execute(
+                """SELECT COUNT(*) AS units, COALESCE(SUM(receipt.input_bytes), 0) AS input_bytes,
+                          COALESCE(SUM(receipt.active_seconds), 0) AS active_seconds
+                   FROM semantic_v3_receipts AS receipt
+                   JOIN semantic_v3_units AS unit ON unit.run_id = receipt.run_id AND unit.unit_id = receipt.unit_id
+                   WHERE receipt.run_id = ? AND unit.phase = ?""", (receipt.run_id, unit["phase"]),
+            ).fetchone()
+            if (
+                lease["input_bytes"] > total_budget.max_unit_input_bytes
+                or receipt.result.length > total_budget.max_unit_output_bytes
+                or receipt.active_seconds > total_budget.max_unit_wall_seconds
+                or run["used_units"] + 1 > total_budget.max_units
+                or run["used_input_bytes"] + lease["input_bytes"] > total_budget.max_input_bytes
+                or run["used_active_seconds"] + receipt.active_seconds > total_budget.max_wall_seconds
+                or phase_usage["units"] + 1 > phase_budget.max_units
+                or phase_usage["input_bytes"] + lease["input_bytes"] > phase_budget.max_input_bytes
+                or phase_usage["active_seconds"] + receipt.active_seconds > phase_budget.max_wall_seconds
+            ):
+                self._v3_pause_budget(conn, receipt.run_id)
+                return
             sequence = int(conn.execute(
                 "SELECT COALESCE(MAX(sequence), 0) + 1 FROM semantic_v3_receipts WHERE run_id = ?", (receipt.run_id,)
             ).fetchone()[0])
@@ -1980,12 +2162,13 @@ class SQLiteRepository:
                 if not audit.source_id or not audit.coverage_stratum or audit.relevance_rank < 0 or audit.cursor_order < 0:
                     raise RepositoryError("semantic runtime deferred selector is invalid")
             conn.execute(
-                """INSERT INTO semantic_v3_receipts(run_id, unit_id, sequence, lease_nonce, input_sha256,
+                """INSERT INTO semantic_v3_receipts(run_id, unit_id, sequence, lease_nonce, input_sha256, input_bytes,
                     output_sha256, result_offset, result_length, result_sha256, action, validator_version,
-                    receipt_sha256, active_seconds) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (receipt.run_id, receipt.unit_id, sequence, receipt.lease_nonce, receipt.input_sha256,
+                    receipt_sha256, active_seconds, commit_canonical_json, commit_sha256) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (receipt.run_id, receipt.unit_id, sequence, receipt.lease_nonce, receipt.input_sha256, lease["input_bytes"],
                  receipt.output_sha256, receipt.result.offset, receipt.result.length, receipt.result.sha256,
-                 receipt.action.value, receipt.validator_version, receipt.receipt_sha256, receipt.active_seconds),
+                 receipt.action.value, receipt.validator_version, receipt.receipt_sha256, receipt.active_seconds,
+                 commit_body, commit_digest),
             )
             terminal = SemanticUnitState.DEFERRED.value if receipt.action is FrontierAction.DEFER_ON_DEMAND else SemanticUnitState.VALIDATED.value
             conn.execute("UPDATE semantic_v3_units SET state = ?, terminal_reason = ? WHERE run_id = ? AND unit_id = ?", (terminal, receipt.action.value, receipt.run_id, receipt.unit_id))
@@ -2037,11 +2220,15 @@ class SQLiteRepository:
                 ).fetchone()
                 if previous is None:
                     raise RepositoryError("semantic checkpoint authority is invalid")
-                self._semantic_v3_insert_checkpoint(conn, SemanticCheckpoint(
+                checkpoint = SemanticCheckpoint(
                     receipt.run_id, sequence // 16, sequence, receipt.result_pack_length,
                     receipt.result_pack_root, "0" * 64, aggregate_root, "{}", proposal["selector_version"],
-                    previous["current_checkpoint_root"], sha256((receipt.run_id + str(sequence) + aggregate_root).encode("utf-8")).hexdigest(),
-                ))
+                    previous["current_checkpoint_root"], "0" * 64,
+                )
+                checkpoint = SemanticCheckpoint(
+                    **{**checkpoint.__dict__, "checkpoint_root": self._semantic_v3_checkpoint_root(checkpoint)}
+                )
+                self._semantic_v3_insert_checkpoint(conn, checkpoint)
 
     def iter_semantic_v3_runtime_deferred(self, run_id: str, fetch_size: int = 256) -> Iterator[SemanticRuntimeDeferredRow]:
         if type(fetch_size) is not int or not 0 < fetch_size <= 256:
@@ -2104,10 +2291,19 @@ class SQLiteRepository:
         self._v3_canonical_json(checkpoint.resume_cursor_json, "checkpoint cursor")
         if checkpoint.sequence < 1 or checkpoint.receipt_sequence < 0 or checkpoint.result_pack_length < 0:
             raise RepositoryError("semantic checkpoint is invalid")
+        expected_root = self._semantic_v3_checkpoint_root(checkpoint)
+        if checkpoint.checkpoint_root != expected_root:
+            raise RepositoryError("semantic checkpoint authority is invalid")
         proposal = conn.execute("SELECT selector_version FROM semantic_v3_proposals WHERE run_id = ?", (checkpoint.run_id,)).fetchone()
         run = conn.execute("SELECT result_pack_length, result_pack_root FROM semantic_v3_runs WHERE run_id = ?", (checkpoint.run_id,)).fetchone()
         aggregate = conn.execute("SELECT aggregate_root FROM semantic_v3_aggregates WHERE run_id = ?", (checkpoint.run_id,)).fetchone()
         last = conn.execute("SELECT checkpoint_root FROM semantic_v3_checkpoints WHERE run_id = ? ORDER BY sequence DESC LIMIT 1", (checkpoint.run_id,)).fetchone()
+        last_sequence = 0 if last is None else int(
+            conn.execute("SELECT MAX(sequence) FROM semantic_v3_checkpoints WHERE run_id = ?", (checkpoint.run_id,)).fetchone()[0]
+        )
+        last_receipt_sequence = int(conn.execute(
+            "SELECT COALESCE(MAX(sequence), 0) FROM semantic_v3_receipts WHERE run_id = ?", (checkpoint.run_id,)
+        ).fetchone()[0])
         binding = conn.execute(
             """SELECT binding.lifecycle_genesis_root FROM semantic_v3_revision_bindings AS binding
                JOIN semantic_v3_runs AS run ON run.revision_id = binding.revision_id
@@ -2117,7 +2313,7 @@ class SQLiteRepository:
             last["checkpoint_root"] if last is not None
             else (binding["lifecycle_genesis_root"] if binding is not None else None)
         )
-        if proposal is None or run is None or aggregate is None or binding is None or proposal["selector_version"] != checkpoint.selector_version or run["result_pack_length"] != checkpoint.result_pack_length or run["result_pack_root"] != checkpoint.result_pack_root or aggregate["aggregate_root"] != checkpoint.aggregate_root or checkpoint.previous_checkpoint_root != expected_previous:
+        if proposal is None or run is None or aggregate is None or binding is None or checkpoint.sequence != last_sequence + 1 or checkpoint.receipt_sequence != last_receipt_sequence or proposal["selector_version"] != checkpoint.selector_version or run["result_pack_length"] != checkpoint.result_pack_length or run["result_pack_root"] != checkpoint.result_pack_root or aggregate["aggregate_root"] != checkpoint.aggregate_root or checkpoint.previous_checkpoint_root != expected_previous:
             raise RepositoryError("semantic checkpoint authority is invalid")
         conn.execute(
             """INSERT INTO semantic_v3_checkpoints(
@@ -2133,6 +2329,26 @@ class SQLiteRepository:
         )
         conn.execute("UPDATE semantic_v3_revision_bindings SET current_checkpoint_root = ? WHERE revision_id = (SELECT revision_id FROM semantic_v3_runs WHERE run_id = ?)", (checkpoint.checkpoint_root, checkpoint.run_id))
 
+    @staticmethod
+    def _semantic_v3_checkpoint_root(checkpoint: SemanticCheckpoint) -> str:
+        payload = {
+            "run_id": checkpoint.run_id,
+            "sequence": checkpoint.sequence,
+            "receipt_sequence": checkpoint.receipt_sequence,
+            "result_pack_length": checkpoint.result_pack_length,
+            "result_pack_root": checkpoint.result_pack_root,
+            "queue_root": checkpoint.queue_root,
+            "aggregate_root": checkpoint.aggregate_root,
+            "resume_cursor_json": checkpoint.resume_cursor_json,
+            "audit_ordered_set_sha256": checkpoint.audit_ordered_set_sha256,
+            "audit_population_sha256": checkpoint.audit_population_sha256,
+            "selector_version": checkpoint.selector_version,
+            "previous_checkpoint_root": checkpoint.previous_checkpoint_root,
+        }
+        return sha256(
+            b"portfolio-maker-semantic-v3-checkpoint\0" + semantic_canonical_json_bytes(payload)
+        ).hexdigest()
+
     def checkpoint_semantic_v3_run(self, checkpoint: SemanticCheckpoint) -> None:
         with self._connection() as conn:
             self._semantic_v3_insert_checkpoint(conn, checkpoint)
@@ -2141,6 +2357,18 @@ class SQLiteRepository:
         self, run_id: str, rows: Iterator[object]
     ) -> None:
         """Persist only the streaming summary of the sealed catalog deferred set."""
+        count, root, cursor_root, current = self._semantic_v3_initial_summary(rows)
+        with self._connection() as conn:
+            conn.execute(
+                """UPDATE semantic_v3_deferred SET deferred_count = ?, deferred_root = ?,
+                   deferred_cursor_root = ?, current_cursor_json = ?
+                   WHERE run_id = ? AND set_kind = 'initial_catalog'""",
+                (count, root, cursor_root, current, run_id),
+            )
+
+    def _semantic_v3_initial_summary(
+        self, rows: Iterator[object]
+    ) -> tuple[int, str, str, str]:
         root = bytes(32)
         cursor_root = bytes(32)
         count = 0
@@ -2159,13 +2387,7 @@ class SQLiteRepository:
             ).digest()
             count += 1
             current = audit.cursor_json
-        with self._connection() as conn:
-            conn.execute(
-                """UPDATE semantic_v3_deferred SET deferred_count = ?, deferred_root = ?,
-                   deferred_cursor_root = ?, current_cursor_json = ?
-                   WHERE run_id = ? AND set_kind = 'initial_catalog'""",
-                (count, root.hex(), cursor_root.hex(), current, run_id),
-            )
+        return count, root.hex(), cursor_root.hex(), current
 
     def semantic_v3_audit_population(
         self, run_id: str, initial_rows: Iterator[object]
@@ -2200,47 +2422,117 @@ class SQLiteRepository:
         return tuple(self.iter_semantic_v3_runtime_deferred(run_id, 256))
 
     def commit_semantic_v3_audit_freeze(self, freeze: SemanticAuditFreeze) -> None:
-        sentinel = object()
-        for supplied, persisted in zip_longest(
-            freeze.runtime_deferred,
-            self.iter_semantic_v3_runtime_deferred(freeze.run_id, 256),
-            fillvalue=sentinel,
-        ):
-            if supplied != persisted:
-                raise RepositoryError("semantic audit population authority is invalid")
-        population_count, population_root = self.semantic_v3_audit_population(
-            freeze.run_id, iter(freeze.initial_deferred)
-        )
         ordered_members = tuple(sorted(freeze.members, key=lambda member: member.ordinal))
         if len({member.ordinal for member in ordered_members}) != len(ordered_members) or len({member.node_id for member in ordered_members}) != len(ordered_members):
             raise RepositoryError("semantic audit membership is invalid")
         ordered_root = self._v3_root(
             b"portfolio-maker-semantic-v3-audit-members\0", iter(ordered_members)
         )
-        checkpoint = freeze.checkpoint
-        if checkpoint.audit_population_sha256 not in (None, population_root) or checkpoint.audit_ordered_set_sha256 not in (None, ordered_root):
-            raise RepositoryError("semantic audit population authority is invalid")
-        checkpoint = SemanticCheckpoint(
-            **{**checkpoint.__dict__, "audit_population_sha256": population_root,
-               "audit_ordered_set_sha256": ordered_root}
-        )
         with self._connection() as conn:
             existing = conn.execute("SELECT 1 FROM semantic_v3_audit_members WHERE run_id = ?", (freeze.run_id,)).fetchone()
             if existing is not None:
                 raise RepositoryError("semantic audit is already frozen")
+            initial_count, initial_root, initial_cursor_root, initial_cursor = self._semantic_v3_initial_summary(
+                iter(freeze.initial_deferred)
+            )
+            stored_initial = conn.execute(
+                """SELECT deferred_count, deferred_root, deferred_cursor_root, current_cursor_json
+                   FROM semantic_v3_deferred WHERE run_id = ? AND set_kind = 'initial_catalog'""",
+                (freeze.run_id,),
+            ).fetchone()
+            if stored_initial is None or (
+                stored_initial["deferred_count"], stored_initial["deferred_root"],
+                stored_initial["deferred_cursor_root"], stored_initial["current_cursor_json"],
+            ) != (initial_count, initial_root, initial_cursor_root, initial_cursor):
+                raise RepositoryError("semantic audit population authority is invalid")
+            from portfolio_maker.domain.semantic_frontier import SemanticDeferredAuditRow
+            persisted_runtime = conn.execute(
+                """SELECT node_id, reason, node_digest, cursor_json, cursor_order, source_id,
+                          coverage_stratum, relevance_rank, selector_version, selector_feature_digest,
+                          source_transition_unit_id, created_sequence
+                   FROM semantic_v3_runtime_deferred WHERE run_id = ? ORDER BY cursor_order, node_id""",
+                (freeze.run_id,),
+            )
+            sentinel = object()
+            for supplied, row in zip_longest(freeze.runtime_deferred, persisted_runtime, fillvalue=sentinel):
+                persisted = sentinel if row is sentinel else SemanticRuntimeDeferredRow(
+                    SemanticDeferredAuditRow(*tuple(row)[:10]),
+                    row["source_transition_unit_id"], row["created_sequence"],
+                )
+                if supplied != persisted:
+                    raise RepositoryError("semantic audit population authority is invalid")
+            runtime_rows = conn.execute(
+                """SELECT node_id, reason, node_digest, cursor_json, cursor_order, source_id,
+                          coverage_stratum, relevance_rank, selector_version, selector_feature_digest,
+                          source_transition_unit_id, created_sequence
+                   FROM semantic_v3_runtime_deferred WHERE run_id = ? ORDER BY cursor_order, node_id""",
+                (freeze.run_id,),
+            )
+            runtime_count, runtime_root, runtime_cursor_root, runtime_cursor = self._v3_runtime_roots(
+                (
+                    SemanticRuntimeDeferredRow(
+                        SemanticDeferredAuditRow(*tuple(row)[:10]),
+                        row["source_transition_unit_id"], row["created_sequence"],
+                    )
+                    for row in runtime_rows
+                )
+            )
+            stored_runtime = conn.execute(
+                """SELECT deferred_count, deferred_root, deferred_cursor_root, current_cursor_json
+                   FROM semantic_v3_deferred WHERE run_id = ? AND set_kind = 'runtime_transition'""",
+                (freeze.run_id,),
+            ).fetchone()
+            if runtime_count and stored_runtime is None:
+                raise RepositoryError("semantic audit population authority is invalid")
+            if stored_runtime is not None and (
+                stored_runtime["deferred_count"], stored_runtime["deferred_root"],
+                stored_runtime["deferred_cursor_root"], stored_runtime["current_cursor_json"],
+            ) != (runtime_count, runtime_root, runtime_cursor_root, runtime_cursor):
+                raise RepositoryError("semantic audit population authority is invalid")
+            population_root = bytes(32)
+            population_count = 0
+            remaining = {(member.node_id, member.node_digest) for member in ordered_members}
+            for audit in freeze.initial_deferred:
+                population_root = sha256(
+                    b"portfolio-maker-semantic-v3-audit-population\0" + population_root
+                    + semantic_canonical_json_bytes({"set_kind": "initial_catalog", "row": audit})
+                ).digest()
+                remaining.discard((audit.node_id, audit.node_digest))
+                population_count += 1
+            for runtime in freeze.runtime_deferred:
+                population_root = sha256(
+                    b"portfolio-maker-semantic-v3-audit-population\0" + population_root
+                    + semantic_canonical_json_bytes({"set_kind": "runtime_transition", "row": runtime.audit})
+                ).digest()
+                remaining.discard((runtime.audit.node_id, runtime.audit.node_digest))
+                population_count += 1
+            if remaining or population_count < len(ordered_members):
+                raise RepositoryError("semantic audit membership is invalid")
+            population_root_hex = population_root.hex()
+            checkpoint = freeze.checkpoint
+            if checkpoint.audit_population_sha256 not in (None, population_root_hex) or checkpoint.audit_ordered_set_sha256 not in (None, ordered_root):
+                raise RepositoryError("semantic audit population authority is invalid")
+            checkpoint = SemanticCheckpoint(
+                **{**checkpoint.__dict__, "audit_population_sha256": population_root_hex,
+                   "audit_ordered_set_sha256": ordered_root}
+            )
             for member in ordered_members:
                 if member.ordinal < 0 or member.stratum not in {"relevance", "coverage", "deterministic_random"}:
                     raise RepositoryError("semantic audit membership is invalid")
                 self._v3_digest(member.node_digest, "audit node digest")
+                audit_unit = conn.execute(
+                    """SELECT 1 FROM semantic_v3_units
+                       WHERE run_id = ? AND unit_id = ? AND phase = 'audit'""",
+                    (freeze.run_id, member.audit_unit_id),
+                ).fetchone()
+                if audit_unit is None:
+                    raise RepositoryError("semantic audit membership is invalid")
                 conn.execute(
                     """INSERT INTO semantic_v3_audit_members(run_id, ordinal, stratum, node_id, node_digest, audit_unit_id)
                        VALUES (?, ?, ?, ?, ?, ?)""",
                     (freeze.run_id, member.ordinal, member.stratum, member.node_id, member.node_digest, member.audit_unit_id),
                 )
             self._semantic_v3_insert_checkpoint(conn, checkpoint)
-            # population_count is deliberately not copied into the catalog-scale DB; roots bind it.
-            if population_count < len(ordered_members):
-                raise RepositoryError("semantic audit membership exceeds its population")
 
     def pause_semantic_v3_run(self, run_id: str, reason: str) -> None:
         if not isinstance(reason, str) or not reason:
