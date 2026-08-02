@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import hashlib
+from stat import S_ISDIR
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
+import portfolio_maker.infrastructure.semantic_pack as semantic_pack
 from portfolio_maker.domain.semantic_frontier import PackRecordRef
 from portfolio_maker.infrastructure.semantic_pack import (
     PACK_MAGIC,
@@ -17,6 +19,11 @@ from portfolio_maker.infrastructure.semantic_pack import (
     recover_committed_prefix,
     verify_pack,
 )
+
+
+def _record_frame(payload: object) -> bytes:
+    canonical = canonical_json_bytes(payload)
+    return len(canonical).to_bytes(8, "big") + canonical + hashlib.sha256(canonical).digest()
 
 
 def test_pack_round_trip_binds_offset_length_digest_and_root(tmp_path: Path) -> None:
@@ -112,6 +119,27 @@ def test_verify_pack_rejects_truncation_bit_flip_and_wrong_root(tmp_path: Path) 
         verify_pack(path.with_name("wrong-root.pm-pack"), wrong_root)
 
 
+@pytest.mark.parametrize(
+    "tail",
+    (
+        b"raw-unframed-tail",
+        _record_frame({"node_id": "node-b", "summary": "valid extra record"}),
+    ),
+    ids=("raw", "valid-record"),
+)
+def test_verify_pack_rejects_any_tail_after_a_seal(tmp_path: Path, tail: bytes) -> None:
+    path = tmp_path / "content.pm-pack"
+    with PMPackWriter(path) as writer:
+        writer.append({"node_id": "node-a", "summary": "alpha"})
+        seal = writer.seal()
+
+    with path.open("ab") as handle:
+        handle.write(tail)
+
+    with pytest.raises(SemanticPackError, match="seal"):
+        verify_pack(path, seal)
+
+
 def test_reader_rejects_duplicate_key_and_noncanonical_payloads(tmp_path: Path) -> None:
     duplicate = b'{"node_id":"node-a","node_id":"node-b"}'
     noncanonical = b'{"summary": "alpha","node_id":"node-a"}'
@@ -171,6 +199,30 @@ def test_result_pack_cannot_be_reopened_for_append_after_seal(tmp_path: Path) ->
         PMPackWriter(path, seal_on_close=False)
 
 
+def test_new_result_pack_fsyncs_file_before_parent_directory(tmp_path: Path, monkeypatch) -> None:
+    calls: list[str] = []
+    original_fsync = semantic_pack.os.fsync
+
+    def record_fsync(descriptor: int) -> None:
+        mode = semantic_pack.os.fstat(descriptor).st_mode
+        calls.append("directory" if S_ISDIR(mode) else "file")
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(semantic_pack.os, "fsync", record_fsync)
+    writer = PMPackWriter(tmp_path / "results.pm-pack", seal_on_close=False)
+    try:
+        assert calls[:2] == ["file", "directory"]
+    finally:
+        writer.close()
+
+
+def test_result_writer_exposes_idempotent_public_fsync(tmp_path: Path) -> None:
+    with PMPackWriter(tmp_path / "results.pm-pack", seal_on_close=False) as writer:
+        writer.append({"unit_id": "unit-1", "summary": "ok"})
+        writer.fsync()
+        writer.fsync()
+
+
 def test_recovery_rejects_mismatched_committed_root_without_truncating(tmp_path: Path) -> None:
     path = tmp_path / "results.pm-pack"
     with PMPackWriter(path, seal_on_close=False) as writer:
@@ -178,11 +230,30 @@ def test_recovery_rejects_mismatched_committed_root_without_truncating(tmp_path:
         committed_length = writer.byte_length
         writer.append({"unit_id": "unit-orphan", "summary": "ignored"})
     original = path.read_bytes()
+    original_size = path.stat().st_size
 
     with pytest.raises(SemanticPackError, match="prefix is invalid"):
         recover_committed_prefix(path, committed_length, "0" * 64)
 
     assert path.read_bytes() == original
+    assert path.stat().st_size == original_size
+
+
+def test_recovery_rejects_wrong_length_without_truncating(tmp_path: Path) -> None:
+    path = tmp_path / "results.pm-pack"
+    with PMPackWriter(path, seal_on_close=False) as writer:
+        writer.append({"unit_id": "unit-1", "summary": "ok"})
+        committed_length = writer.byte_length
+        committed_root = writer.record_root
+        writer.append({"unit_id": "unit-orphan", "summary": "ignored"})
+    original = path.read_bytes()
+    original_size = path.stat().st_size
+
+    with pytest.raises(SemanticPackError):
+        recover_committed_prefix(path, committed_length - 1, committed_root)
+
+    assert path.read_bytes() == original
+    assert path.stat().st_size == original_size
 
 
 def _single_record_seal(path: Path, payload: bytes) -> PackSeal:

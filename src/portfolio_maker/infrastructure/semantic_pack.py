@@ -123,6 +123,9 @@ class PMPackWriter:
         self._root = _next_root(self._root, digest, len(canonical))
         return PackRecordRef(offset=offset, length=len(canonical), sha256=digest.hex())
 
+    def fsync(self) -> None:
+        self._flush()
+
     def seal(self) -> PackSeal:
         if self._seal is not None:
             return self._seal
@@ -181,6 +184,7 @@ class PMPackWriter:
             self._handle = _open_new_file(self._directory_descriptor, self._path.name)
             self._write(PACK_MAGIC)
             self._flush()
+            os.fsync(self._directory_descriptor)
             return
         if not S_ISREG(target.st_mode):
             raise OSError("managed output target must be a regular file")
@@ -288,7 +292,13 @@ class PMPackReader:
 def verify_pack(path: Path, seal: PackSeal) -> PackSeal:
     if not isinstance(seal, PackSeal):
         raise SemanticPackError("semantic pack seal is invalid")
-    observed = verify_pack_prefix(path, seal.byte_length)
+    actual_length = _file_size(path)
+    if actual_length < seal.byte_length:
+        verify_pack_prefix(path, seal.byte_length)
+        raise SemanticPackError("semantic pack seal is invalid")
+    if actual_length != seal.byte_length:
+        raise SemanticPackError("semantic pack seal is invalid")
+    observed = verify_pack_prefix(path, actual_length)
     if observed != seal:
         raise SemanticPackError("semantic pack seal is invalid")
     return observed
@@ -468,5 +478,13 @@ def _file_sha256(path: Path) -> str:
         digest = hashlib.sha256()
         _hash_range(descriptor, digest, size)
         return digest.hexdigest()
+    finally:
+        os.close(descriptor)
+
+
+def _file_size(path: Path) -> int:
+    descriptor = _open_existing_file(path, os.O_RDONLY)
+    try:
+        return os.fstat(descriptor).st_size
     finally:
         os.close(descriptor)
