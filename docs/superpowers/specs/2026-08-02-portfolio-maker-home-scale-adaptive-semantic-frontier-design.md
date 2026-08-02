@@ -594,11 +594,13 @@ prepare 뒤 skill은 다음 exact proposal을 사용자에게 보여 주고 명�
 - structural/local-baseline coverage aggregates
 - frontier algorithm/version과 plan hash
 - phase별 예상 unit, input bytes, wall time
+- audit selector rule/version, sealed catalog root와 private-context 범위
 - hard limits와 checkpoint 간격
 - deferred semantics와 자동 budget 증가 금지
 - private data가 Codex context에 노출되는 범위
 
-승인 receipt는 proposal digest, revision, policy, frontier algorithm, budgets,
+승인 receipt는 proposal digest, revision, policy, frontier/audit selector algorithm,
+sealed catalog root, private-context scope, budgets,
 approval kind(`frontier` 또는 `project_deepening`), project ID(해당 시), 승인 시각과
 user-confirmed state를 저장한다. hash나 estimate가 바뀌면 기존 승인은 재사용할 수 없다.
 단순 CLI 실행, source approval 또는 과거 pilot 승인을 실행 승인으로 추정하지 않는다.
@@ -875,10 +877,9 @@ keyword 또는 파일 수만으로는 통과하지 않는다.
 ### 16.1 300-sample false-negative audit
 
 300-sample 감사는 별도 deepening이나 무승인 작업이 아니라 같은 `frontier` approval에
-결합된 audit phase다. sample-set digest, private-context 범위, 최대 64 units/16 MiB/15분이
-frontier proposal과 approval receipt에 미리 포함된다. 300개 node는 bounded unit으로
-batch되며 이 예산을 넘기면 `paused_budget`로 멈추고 `project_discovery_ready`가 될 수
-없다. 더 진행하려면 변경된 proposal digest에 대한 새 frontier 승인을 받아야 한다.
+결합된 audit phase다. 최초 proposal/approval은 아직 존재하지 않는 exact sample digest가
+아니라 audit selector rule/version, sealed catalog root, private-context 범위와 최대
+64 units/16 MiB/15분을 bind한다.
 
 프런티어 expansion 종료 뒤 비선택/deferred 영역에서 정확히 세 층을 만든다.
 
@@ -886,7 +887,17 @@ batch되며 이 예산을 넘기면 `paused_budget`로 멈추고 `project_discov
 2. coverage-stratified 100: source, depth, size, role, coverage/error 상태를 층화해 선택
 3. deterministic-random 100: revision ID와 policy hash를 seed로 stable hash 선택
 
-중복 node는 다음 stable 후보로 대체해 총 300개를 유지한다. 독립 reviewer가 parent/child
+중복 node는 다음 stable 후보로 대체해 총 300개를 유지한다. selector는 expansion의 마지막
+validated checkpoint 이후 이 집합을 결정론적으로 freeze하고, exact ordered node-set digest,
+모집단 digest와 selector version을 새 audit checkpoint에 원자 commit한다. audit unit은 그
+checkpoint가 가리키는 집합만 읽을 수 있다. selector/version, catalog root, privacy scope 또는
+budget이 최초 승인과 달라졌으면 집합을 만들거나 읽지 않고 새 proposal과 명시 승인을
+요구한다. 동일 binding에서 결정론적으로 만들어진 post-expansion digest는 승인 범위를
+확장하지 않으므로 별도 승인을 요구하지 않는다.
+
+300개 node는 bounded unit으로 batch되며 승인된 audit 예산을 넘기면 `paused_budget`로
+멈추고 `project_discovery_ready`가 될 수 없다. 더 진행하려면 변경된 proposal digest에
+대한 새 frontier 승인을 받아야 한다. 독립 reviewer가 parent/child
 맥락과 validated private audit projection을 검토한다. 이 사람/Review Team 검토는 새로운
 raw source read나 Codex context 노출을 만들지 않고 이미 승인·검증된 audit output만
 평가한다. 프런티어가 놓친 high/medium project가 1건이라도 있으면 release gate 실패다.
@@ -934,6 +945,10 @@ low/ambiguous 발견은 severity와 selector 개선 입력으로 기록하되 �
 - Codex가 nonexistent child/evidence 또는 full topology를 출력하면 거부
 - unreadable subtree를 non-project로 자동 판정하지 않음
 - deterministic audit sample을 임의로 교체하면 digest mismatch 실패
+- 같은 prepare state에 서로 다른 유효 Codex action sequence를 적용하면 각
+  post-expansion 모집단에서 다른 sample set을 만들 수 있지만, 모두 동일한 승인 selector
+  계약과 각자의 checkpoint digest에 정확히 bind됨
+- selector version/catalog root/privacy scope/budget drift 뒤 audit sample freeze/read 거부
 - exchange 삭제·process restart 뒤 result pack에서 byte-identical finalize
 
 같은 사용자가 manifest, pack, catalog, ledger와 검증 코드를 모두 일관되게 다시 쓰는 공격은
