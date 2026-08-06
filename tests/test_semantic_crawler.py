@@ -4,12 +4,14 @@ import multiprocessing
 import os
 import signal
 import threading
+import time
 from pathlib import Path
 
 import pytest
 
 import portfolio_maker.infrastructure.semantic_crawler as semantic_crawler_module
 from portfolio_maker.application.approval import SourceApproval
+from portfolio_maker.domain.semantic_frontier import BaselineCoverage
 from portfolio_maker.domain.semantic_models import AnalysisStatus, SemanticNodeKind
 from portfolio_maker.infrastructure.semantic_crawler import (
     CrawlObserver,
@@ -43,6 +45,29 @@ def _termination_resistant_directory_enumerator(_path: Path):
 
 def _crashing_directory_enumerator(_path: Path):
     os._exit(73)
+
+
+def _child_crashing_directory_enumerator(path: Path):
+    if path.name == "fault":
+        os._exit(73)
+    return semantic_crawler_module._materialize_directory(path)
+
+
+def _unreadable_child_entry_enumerator(path: Path):
+    if path.name == "root":
+        yield semantic_crawler_module._MaterializedDirectoryEntry(
+            name="gone.md",
+            st_mode=None,
+            st_dev=None,
+            st_ino=None,
+            readable=False,
+        )
+
+
+def _trickling_directory_enumerator(path: Path):
+    for entry in semantic_crawler_module._materialize_directory(path):
+        yield entry
+        time.sleep(0.035)
 
 
 def _malformed_worker_main(connection, _enumerator):
@@ -254,6 +279,140 @@ def test_high_fanout_worker_streams_without_directory_tuple(tmp_path: Path) -> N
     assert observer.directory_tuple_materializations == 0
 
 
+def test_streaming_reuses_one_global_worker_and_sqlite_sibling_backlog(
+    tmp_path: Path,
+) -> None:
+    """Breaks if each directory depth owns another queue/process or child list."""
+    root = tmp_path / "root"
+    for index in range(40):
+        leaf = root / f"branch-{index:03}" / "deep" / "leaf.md"
+        leaf.parent.mkdir(parents=True, exist_ok=True)
+        leaf.write_text("evidence", encoding="utf-8")
+    observer = CrawlObserver()
+
+    events = list(
+        iter_local_structure_events(
+            root,
+            approval_for(root),
+            worker_queue_size=2,
+            observer=observer,
+        )
+    )
+
+    assert events
+    assert observer.worker_start_count == 1
+    assert observer.max_active_worker_count == 1
+    assert observer.max_in_memory_pending_directories <= 1
+    assert observer.max_spooled_entry_count >= 40
+    assert observer.ephemeral_spool_cleaned is True
+
+
+def test_streaming_backpressure_uses_worker_progress_not_tuple_counter(
+    tmp_path: Path,
+) -> None:
+    """Breaks if a paused consumer cannot prove a full bounded worker queue."""
+    root = tmp_path / "root"
+    root.mkdir()
+    for index in range(32):
+        (root / f"entry-{index:03}.md").write_text("evidence", encoding="utf-8")
+    observer = CrawlObserver()
+    before = {process.pid for process in multiprocessing.active_children()}
+    with semantic_crawler_module._StreamingDirectoryEnumerationWorker(
+        process_context=multiprocessing.get_context("fork"),
+        enumerator=semantic_crawler_module._stream_directory_entries,
+        queue_size=1,
+        observer=observer,
+    ) as worker:
+        entries = worker.iter_entries(
+            root,
+            timeout_seconds=1.0,
+            monotonic_clock=time.monotonic,
+        )
+        first = next(entries)
+        deadline = time.monotonic() + 1.0
+        while (
+            observer.producer_backpressure_count == 0
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+        paused_progress = observer.producer_progress_markers
+        time.sleep(0.05)
+
+        assert paused_progress >= 2
+        assert observer.producer_backpressure_count > 0
+        assert observer.producer_progress_markers == paused_progress
+        assert next(entries).name != first.name
+        deadline = time.monotonic() + 1.0
+        while (
+            observer.producer_progress_markers == paused_progress
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+        assert observer.producer_progress_markers > paused_progress
+        entries.close()
+
+    assert observer.max_active_worker_count == 1
+    assert {process.pid for process in multiprocessing.active_children()} == before
+
+
+def test_streaming_early_close_reaps_worker_and_deletes_ephemeral_spool(
+    tmp_path: Path,
+) -> None:
+    """Breaks if cancelling a consumer leaks the global helper or SQLite spool."""
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "entry.md").write_text("evidence", encoding="utf-8")
+    observer = CrawlObserver()
+    before = {process.pid for process in multiprocessing.active_children()}
+    stream = iter_local_structure_events(root, approval_for(root), observer=observer)
+
+    assert next(stream).kind is StructuralEventKind.NODE_SEEN
+    assert observer.ephemeral_spool_path is not None
+    assert observer.ephemeral_spool_path.exists()
+    stream.close()
+
+    assert {process.pid for process in multiprocessing.active_children()} == before
+    assert observer.active_worker_count == 0
+    assert observer.ephemeral_spool_cleaned is True
+    assert observer.ephemeral_spool_path is not None
+    assert not observer.ephemeral_spool_path.exists()
+
+
+def test_streaming_timeout_budget_does_not_replace_exhausted_worker_and_cleans(
+    tmp_path: Path,
+) -> None:
+    """Breaks if an exhausted budget starts a replacement helper or skips closure."""
+    root = tmp_path / "root"
+    for name in ("blocked-a", "blocked-b"):
+        (root / name).mkdir(parents=True)
+    observer = CrawlObserver(collect_errors=True)
+    before = {process.pid for process in multiprocessing.active_children()}
+    events = []
+    stream = iter_local_structure_events(
+        root,
+        approval_for(root),
+        directory_timeout_seconds=0.04,
+        directory_timeout_budget_seconds=0.05,
+        _process_context=multiprocessing.get_context("fork"),
+        _enumerator=_multiple_blocking_directory_enumerator,
+        observer=observer,
+    )
+
+    with pytest.raises(semantic_crawler_module.StructuralCrawlTimeoutBudgetError):
+        while True:
+            events.append(next(stream))
+
+    terminal = {(event.kind, event.node.relative_hierarchy) for event in events}
+    assert (StructuralEventKind.FILE_ANALYZED, "blocked-b") in terminal
+    assert (StructuralEventKind.SOURCE_CLOSED, ".") in terminal
+    assert observer.worker_start_count == 2
+    assert observer.active_worker_count == 0
+    assert observer.ephemeral_spool_cleaned is True
+    assert observer.ephemeral_spool_path is not None
+    assert not observer.ephemeral_spool_path.exists()
+    assert {process.pid for process in multiprocessing.active_children()} == before
+
+
 def test_stream_emits_one_terminal_baseline_for_every_permitted_node(
     tmp_path: Path,
 ) -> None:
@@ -366,6 +525,95 @@ def test_root_timeout_is_distinct_and_reaps_worker(tmp_path: Path) -> None:
         )
 
     assert {process.pid for process in multiprocessing.active_children()} == before
+
+
+def test_streaming_directory_deadline_is_absolute_despite_entry_trickle(
+    tmp_path: Path,
+) -> None:
+    """Breaks if every streamed entry grants a fresh directory timeout."""
+    root = tmp_path / "root"
+    root.mkdir()
+    for index in range(4):
+        (root / f"entry-{index}.md").write_text("evidence", encoding="utf-8")
+    context = multiprocessing.get_context("fork")
+
+    with pytest.raises(semantic_crawler_module.StructuralCrawlRootTimeoutError):
+        list(
+            iter_local_structure_events(
+                root,
+                approval_for(root),
+                directory_timeout_seconds=0.05,
+                _process_context=context,
+                _enumerator=_trickling_directory_enumerator,
+            )
+        )
+
+
+def test_streaming_worker_fault_emits_failed_baselines_and_bottom_up_closures(
+    tmp_path: Path,
+) -> None:
+    """Breaks if a worker fault aborts the stream before terminal evidence."""
+    root = tmp_path / "root"
+    (root / "fault").mkdir(parents=True)
+    context = multiprocessing.get_context("fork")
+    observer = CrawlObserver()
+    before = {process.pid for process in multiprocessing.active_children()}
+    events = []
+    stream = iter_local_structure_events(
+        root,
+        approval_for(root),
+        _process_context=context,
+        _enumerator=_child_crashing_directory_enumerator,
+        observer=observer,
+    )
+
+    with pytest.raises(semantic_crawler_module.StructuralCrawlWorkerError):
+        while True:
+            events.append(next(stream))
+
+    by_kind = [(event.kind, event.node.relative_hierarchy) for event in events]
+    assert (StructuralEventKind.FILE_ANALYZED, "fault") in by_kind
+    assert (StructuralEventKind.DIRECTORY_CLOSED, "fault") in by_kind
+    assert (StructuralEventKind.SOURCE_CLOSED, ".") in by_kind
+    assert by_kind.index((StructuralEventKind.DIRECTORY_CLOSED, "fault")) < by_kind.index(
+        (StructuralEventKind.DIRECTORY_CLOSED, ".")
+    ) < by_kind.index((StructuralEventKind.SOURCE_CLOSED, "."))
+    failed = {
+        event.node.relative_hierarchy: event.baseline.coverage
+        for event in events
+        if event.kind is StructuralEventKind.FILE_ANALYZED and event.baseline is not None
+    }
+    assert failed["fault"] is BaselineCoverage.FAILED
+    assert failed["."] is BaselineCoverage.FAILED
+    assert {process.pid for process in multiprocessing.active_children()} == before
+    assert observer.active_worker_count == 0
+    assert observer.ephemeral_spool_cleaned is True
+    assert observer.ephemeral_spool_path is not None
+    assert not observer.ephemeral_spool_path.exists()
+
+
+def test_streaming_unreadable_child_still_emits_node_and_terminal_baseline(
+    tmp_path: Path,
+) -> None:
+    """Breaks if a child stat failure disappears from structural authority."""
+    root = tmp_path / "root"
+    root.mkdir()
+    events = list(
+        iter_local_structure_events(
+            root,
+            approval_for(root),
+            _process_context=multiprocessing.get_context("fork"),
+            _enumerator=_unreadable_child_entry_enumerator,
+        )
+    )
+
+    child_events = [event for event in events if event.node.relative_hierarchy == "gone.md"]
+    assert [event.kind for event in child_events] == [
+        StructuralEventKind.NODE_SEEN,
+        StructuralEventKind.FILE_ANALYZED,
+    ]
+    assert child_events[-1].baseline is not None
+    assert child_events[-1].baseline.coverage is BaselineCoverage.UNREADABLE
 
 
 def test_worker_crash_and_malformed_protocol_fail_closed(tmp_path: Path) -> None:
@@ -770,6 +1018,38 @@ def test_structural_crawl_keeps_hard_linked_files_as_distinct_entries(
         "alias.md",
     }
     assert len({entry.node_id for entry in linked_entries}) == 2
+
+
+def test_hardlink_provider_keys_keep_sorted_base_identity_and_alias_locator(
+    tmp_path: Path,
+) -> None:
+    """Breaks if every hard-link alias is downgraded to a relative key."""
+    root = tmp_path / "root"
+    root.mkdir()
+    base = root / "alpha.md"
+    alias = root / "beta.md"
+    base.write_text("evidence", encoding="utf-8")
+    os.link(base, alias)
+
+    first = crawl_local_structure(root, approval_for(root))
+    first_entries = {entry.relative_hierarchy: entry for entry in first.entries}
+    identity = f"{base.stat().st_dev}:{base.stat().st_ino}"
+
+    assert first_entries["alpha.md"].provider_item_key == identity
+    assert first_entries["beta.md"].provider_item_key == "beta.md"
+
+    alias.rename(root / "gamma.md")
+    renamed = crawl_local_structure(
+        root,
+        approval_for(root),
+        prior_entries=first.entries,
+    )
+    renamed_entries = {entry.relative_hierarchy: entry for entry in renamed.entries}
+
+    assert renamed_entries["alpha.md"].provider_item_key == identity
+    assert renamed_entries["gamma.md"].provider_item_key == "beta.md"
+    assert renamed_entries["alpha.md"].node_id == first_entries["alpha.md"].node_id
+    assert renamed_entries["gamma.md"].node_id == first_entries["beta.md"].node_id
 
 
 def test_structural_crawl_retains_hard_link_alias_ids_after_alias_rename(

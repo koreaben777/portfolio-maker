@@ -16,6 +16,10 @@ class SemanticSourceChangedError(ValueError):
     pass
 
 
+class SemanticSourceReadError(ValueError):
+    """A locator-free boundary for operating-system source read failures."""
+
+
 @dataclass(frozen=True)
 class VerifiedRepresentative:
     full_content_sha256: str
@@ -30,6 +34,28 @@ def read_verified_representative(
     max_materialized_bytes: int,
 ) -> VerifiedRepresentative:
     """Hash and sample one regular file through one no-follow descriptor."""
+    os_error: OSError | None = None
+    try:
+        representative = _read_verified_representative(
+            path,
+            ranges,
+            max_materialized_bytes,
+        )
+    except OSError as error:
+        # Do not chain a raw OS error: its args/repr can contain a source path.
+        os_error = error
+    else:
+        return representative
+
+    assert os_error is not None
+    raise SemanticSourceReadError("semantic source could not be read")
+
+
+def _read_verified_representative(
+    path: Path,
+    ranges: tuple[tuple[int, int], ...],
+    max_materialized_bytes: int,
+) -> VerifiedRepresentative:
     _validate_ranges(ranges, max_materialized_bytes)
     descriptor = _open_regular_file(path)
     try:

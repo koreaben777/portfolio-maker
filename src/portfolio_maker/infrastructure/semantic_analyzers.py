@@ -13,6 +13,7 @@ from portfolio_maker.infrastructure.policy import SourcePathPolicyError
 from portfolio_maker.infrastructure.policy import mask_secrets
 from portfolio_maker.infrastructure.semantic_crawler import StructuralEntry
 from portfolio_maker.infrastructure.semantic_source_reader import (
+    SemanticSourceReadError,
     SemanticSourceChangedError,
     read_verified_representative,
 )
@@ -54,6 +55,7 @@ class LocalBaseline:
     sample_sha256: str | None
     full_content_sha256: str | None
     masked_excerpt: str
+    source_changed: bool = False
 
 
 def analyze_file_input(
@@ -150,10 +152,14 @@ def analyze_local_baseline(
             max_materialized_bytes=max_bytes,
         )
     except SemanticSourceChangedError:
-        return _baseline_metadata_only(entry, BaselineCoverage.FAILED)
+        return _baseline_metadata_only(
+            entry,
+            BaselineCoverage.FAILED,
+            source_changed=True,
+        )
     except SourcePathPolicyError:
         return _baseline_metadata_only(entry, BaselineCoverage.UNSUPPORTED)
-    except OSError:
+    except SemanticSourceReadError:
         return _baseline_metadata_only(entry, BaselineCoverage.UNREADABLE)
 
     content = representative.slices[0]
@@ -199,6 +205,8 @@ def _metadata_only(
 def _baseline_metadata_only(
     entry: StructuralEntry,
     coverage: BaselineCoverage,
+    *,
+    source_changed: bool = False,
 ) -> LocalBaseline:
     return LocalBaseline(
         node_id=entry.node_id,
@@ -210,6 +218,7 @@ def _baseline_metadata_only(
         sample_sha256=None,
         full_content_sha256=None,
         masked_excerpt="",
+        source_changed=source_changed,
     )
 
 
