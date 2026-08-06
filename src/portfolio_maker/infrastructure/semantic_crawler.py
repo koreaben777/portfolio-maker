@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import os
 import sqlite3
 import stat
@@ -15,6 +16,7 @@ from pathlib import Path
 from queue import Full
 from time import monotonic
 from typing import Any
+from uuid import uuid4
 
 from portfolio_maker.application.approval import SourceApproval
 from portfolio_maker.domain.semantic_models import (
@@ -1002,74 +1004,297 @@ class StreamingStructureArtifacts:
     catalog_seal: CatalogSeal
 
 
+class StreamingStructureSinkState(StrEnum):
+    ACTIVE = "active"
+    FAILED = "failed"
+    COMPLETE = "complete"
+    SEALED = "sealed"
+    ABORTED = "aborted"
+
+
+class _SinkInvariantStore:
+    """Ephemeral indexed receipt state for one streaming authority build."""
+
+    def __init__(self) -> None:
+        self._directory = tempfile.TemporaryDirectory(
+            prefix="portfolio-semantic-sink-"
+        )
+        self._connection = sqlite3.connect(
+            Path(self._directory.name) / "receipts.sqlite3"
+        )
+        self._connection.executescript(
+            """
+            CREATE TABLE nodes (
+                node_id TEXT PRIMARY KEY,
+                parent_node_id TEXT,
+                node_kind TEXT NOT NULL,
+                terminal_count INTEGER NOT NULL DEFAULT 0,
+                directory_closed INTEGER NOT NULL DEFAULT 0,
+                source_closed INTEGER NOT NULL DEFAULT 0
+            ) WITHOUT ROWID;
+            CREATE TABLE parent_orders (
+                parent_node_id TEXT PRIMARY KEY,
+                next_order INTEGER NOT NULL
+            ) WITHOUT ROWID;
+            CREATE TABLE edges (
+                child_node_id TEXT PRIMARY KEY,
+                parent_node_id TEXT NOT NULL,
+                traversal_order INTEGER NOT NULL,
+                UNIQUE(parent_node_id, traversal_order)
+            ) WITHOUT ROWID;
+            """
+        )
+
+    def add_node(self, entry: StructuralEntry) -> int | None:
+        try:
+            self._connection.execute(
+                """
+                INSERT INTO nodes(node_id, parent_node_id, node_kind)
+                VALUES (?, ?, ?)
+                """,
+                (entry.node_id, entry.parent_node_id, entry.kind.value),
+            )
+        except sqlite3.IntegrityError as error:
+            raise ValueError("streaming structural node is duplicated") from error
+        if entry.parent_node_id is None:
+            return None
+        row = self._connection.execute(
+            "SELECT next_order FROM parent_orders WHERE parent_node_id = ?",
+            (entry.parent_node_id,),
+        ).fetchone()
+        if row is None:
+            traversal_order = 0
+            self._connection.execute(
+                """
+                INSERT INTO parent_orders(parent_node_id, next_order) VALUES (?, ?)
+                """,
+                (entry.parent_node_id, 1),
+            )
+        else:
+            traversal_order = int(row[0])
+            self._connection.execute(
+                """
+                UPDATE parent_orders SET next_order = ? WHERE parent_node_id = ?
+                """,
+                (traversal_order + 1, entry.parent_node_id),
+            )
+        self._connection.execute(
+            """
+            INSERT INTO edges(child_node_id, parent_node_id, traversal_order)
+            VALUES (?, ?, ?)
+            """,
+            (entry.node_id, entry.parent_node_id, traversal_order),
+        )
+        return traversal_order
+
+    def add_terminal(self, node_id: str) -> None:
+        cursor = self._connection.execute(
+            """
+            UPDATE nodes SET terminal_count = 1
+            WHERE node_id = ? AND terminal_count = 0
+            """,
+            (node_id,),
+        )
+        if cursor.rowcount != 1:
+            raise ValueError("streaming terminal baseline is invalid")
+
+    def add_directory_close(self, node_id: str) -> None:
+        cursor = self._connection.execute(
+            """
+            UPDATE nodes SET directory_closed = 1
+            WHERE node_id = ?
+              AND node_kind IN ('source', 'directory')
+              AND directory_closed = 0
+            """,
+            (node_id,),
+        )
+        if cursor.rowcount != 1:
+            raise ValueError("streaming directory closure is invalid")
+
+    def add_source_close(self, node_id: str) -> None:
+        cursor = self._connection.execute(
+            """
+            UPDATE nodes SET source_closed = 1
+            WHERE node_id = ? AND node_kind = 'source' AND source_closed = 0
+            """,
+            (node_id,),
+        )
+        if cursor.rowcount != 1:
+            raise ValueError("streaming source closure is invalid")
+
+    def validate(self) -> tuple[int, int, int]:
+        source_count = int(
+            self._connection.execute(
+                "SELECT COUNT(*) FROM nodes WHERE node_kind = 'source'"
+            ).fetchone()[0]
+        )
+        invalid = self._connection.execute(
+            """
+            SELECT node_id FROM nodes
+            WHERE terminal_count != 1
+               OR (node_kind IN ('source', 'directory') AND directory_closed != 1)
+               OR (node_kind NOT IN ('source', 'directory') AND directory_closed != 0)
+            LIMIT 1
+            """
+        ).fetchone()
+        source_closed = int(
+            self._connection.execute(
+                "SELECT COUNT(*) FROM nodes WHERE source_closed = 1"
+            ).fetchone()[0]
+        )
+        if source_count != 1 or source_closed != 1 or invalid is not None:
+            raise ValueError("streaming authority receipts are incomplete")
+        node_count = int(
+            self._connection.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
+        )
+        edge_count = int(
+            self._connection.execute("SELECT COUNT(*) FROM edges").fetchone()[0]
+        )
+        if edge_count != node_count - 1:
+            raise ValueError("streaming authority edge receipts are invalid")
+        return node_count, edge_count, node_count
+
+    def close(self) -> None:
+        self._connection.close()
+        self._directory.cleanup()
+
+
 class StreamingStructureSink:
-    """Append crawl authority as events arrive; no source path is serialized."""
+    """Fail-closed staging coordinator for streaming structural authority."""
 
     def __init__(self, pack_path: Path, catalog_path: Path) -> None:
-        self._pack_writer = PMPackWriter(pack_path)
+        self._pack_path = Path(pack_path)
+        self._catalog_path = Path(catalog_path)
+        self._pack_stage_path = self._staging_path(self._pack_path, "pack")
+        self._catalog_stage_path = self._staging_path(
+            self._catalog_path,
+            "catalog",
+        )
+        self._receipt_store = _SinkInvariantStore()
+        self._pack_writer = PMPackWriter(self._pack_stage_path)
         try:
-            self._catalog_writer = SemanticCatalogWriter(catalog_path)
+            self._catalog_writer = SemanticCatalogWriter(self._catalog_stage_path)
         except BaseException:
             self._pack_writer._abort()
+            self._receipt_store.close()
             raise
-        self._source_changed = False
-        self._closed = False
+        self._state = StreamingStructureSinkState.ACTIVE
+        self._failure: BaseException | None = None
         self._artifacts: StreamingStructureArtifacts | None = None
-        self._seen_node_ids: set[str] = set()
+
+    @property
+    def state(self) -> StreamingStructureSinkState:
+        return self._state
+
+    def __enter__(self) -> StreamingStructureSink:
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:  # type: ignore[no-untyped-def]
+        if exc_type is None:
+            self.close()
+        else:
+            self.abort()
 
     def consume(self, event: StructuralEvent) -> None:
-        if self._closed:
+        if self._state is StreamingStructureSinkState.FAILED:
+            if self._is_source_changed_failure():
+                return
+            raise ValueError("streaming structure sink failed") from self._failure
+        if self._state is not StreamingStructureSinkState.ACTIVE:
             raise ValueError("streaming structure sink is closed")
-        if self._source_changed:
-            return
-        if event.kind is StructuralEventKind.NODE_SEEN:
-            self._add_node(event.node)
-            return
-        if event.kind is not StructuralEventKind.FILE_ANALYZED:
-            return
-        if event.baseline is None:
-            raise ValueError("streaming baseline event is invalid")
-        if event.baseline.source_changed:
-            self._source_changed = True
-            return
-        self._add_baseline(event)
+        try:
+            self._consume_active(event)
+        except BaseException as error:
+            self._fail(error)
+            raise
 
     def seal(self) -> StreamingStructureArtifacts:
         if self._artifacts is not None:
             return self._artifacts
-        if self._closed:
-            raise ValueError("streaming structure sink is closed")
-        if self._source_changed:
+        if self._state is StreamingStructureSinkState.FAILED:
+            failure = self._failure
             self.abort()
-            from portfolio_maker.infrastructure.semantic_source_reader import (
-                SemanticSourceChangedError,
-            )
-
-            raise SemanticSourceChangedError(
-                "semantic source changed during streaming authority build"
-            )
+            if failure is not None:
+                raise failure
+            raise ValueError("streaming structure sink failed")
+        if self._state is not StreamingStructureSinkState.ACTIVE:
+            raise ValueError("streaming structure sink is closed")
+        published: list[Path] = []
         try:
+            node_count, edge_count, baseline_count = self._receipt_store.validate()
+            if self._pack_writer.record_count != node_count + edge_count + baseline_count:
+                raise ValueError("streaming authority record count is invalid")
+            self._require_missing_final_targets()
+            self._state = StreamingStructureSinkState.COMPLETE
             pack_seal = self._pack_writer.seal()
             catalog_seal = self._catalog_writer.seal()
-        except BaseException:
-            self.abort()
+            self._pack_writer.close()
+            self._catalog_writer.close()
+            self._publish_file(self._pack_stage_path, self._pack_path)
+            published.append(self._pack_path)
+            self._publish_file(self._catalog_stage_path, self._catalog_path)
+            published.append(self._catalog_path)
+            self._remove_stage_files()
+        except BaseException as error:
+            self._rollback_published(published)
+            self._fail(error)
             raise
-        self._closed = True
+        self._close_receipts()
+        self._state = StreamingStructureSinkState.SEALED
         self._artifacts = StreamingStructureArtifacts(pack_seal, catalog_seal)
         return self._artifacts
 
+    def close(self) -> None:
+        if self._state is StreamingStructureSinkState.SEALED:
+            return
+        self.abort()
+
     def abort(self) -> None:
-        if self._closed:
+        if self._state in {
+            StreamingStructureSinkState.SEALED,
+            StreamingStructureSinkState.ABORTED,
+        }:
             return
         try:
             self._catalog_writer._abort()
         finally:
-            self._pack_writer._abort()
-            self._closed = True
+            try:
+                self._pack_writer._abort()
+            finally:
+                self._remove_stage_files()
+                self._close_receipts()
+                self._state = StreamingStructureSinkState.ABORTED
+
+    def _consume_active(self, event: StructuralEvent) -> None:
+        if event.kind is StructuralEventKind.NODE_SEEN:
+            self._add_node(event.node)
+            return
+        if event.kind is StructuralEventKind.FILE_ANALYZED:
+            if event.baseline is None:
+                raise ValueError("streaming baseline event is invalid")
+            if event.baseline.source_changed:
+                from portfolio_maker.infrastructure.semantic_source_reader import (
+                    SemanticSourceChangedError,
+                )
+
+                self._fail(
+                    SemanticSourceChangedError(
+                        "semantic source changed during streaming authority build"
+                    )
+                )
+                return
+            self._add_baseline(event)
+            return
+        if event.kind is StructuralEventKind.DIRECTORY_CLOSED:
+            self._receipt_store.add_directory_close(event.node.node_id)
+            return
+        if event.kind is StructuralEventKind.SOURCE_CLOSED:
+            self._receipt_store.add_source_close(event.node.node_id)
+            return
+        raise ValueError("streaming structural event is invalid")
 
     def _add_node(self, entry: StructuralEntry) -> None:
-        if entry.node_id in self._seen_node_ids:
-            raise ValueError("streaming structural node is duplicated")
+        traversal_order = self._receipt_store.add_node(entry)
         structural_ref = self._pack_writer.append(
             {
                 "kind": "structural-node",
@@ -1096,11 +1321,13 @@ class StreamingStructureSink:
             )
         )
         if entry.parent_node_id is not None:
+            assert traversal_order is not None
             edge_ref = self._pack_writer.append(
                 {
                     "kind": "structural-edge",
                     "parent_node_id": entry.parent_node_id,
                     "child_node_id": entry.node_id,
+                    "traversal_order": traversal_order,
                 }
             )
             self._catalog_writer.add_payload_ref(
@@ -1111,11 +1338,11 @@ class StreamingStructureSink:
                     edge_ref,
                 )
             )
-        self._seen_node_ids.add(entry.node_id)
 
     def _add_baseline(self, event: StructuralEvent) -> None:
         baseline = event.baseline
         assert baseline is not None
+        self._receipt_store.add_terminal(event.node.node_id)
         baseline_ref = self._pack_writer.append(
             {
                 "kind": "local-baseline",
@@ -1145,6 +1372,98 @@ class StreamingStructureSink:
             )
         )
 
+    def _fail(self, error: BaseException) -> None:
+        if self._state in {
+            StreamingStructureSinkState.SEALED,
+            StreamingStructureSinkState.ABORTED,
+        }:
+            return
+        self._failure = error
+        self._state = StreamingStructureSinkState.FAILED
+        self._discard_open_state()
+
+    def _discard_open_state(self) -> None:
+        try:
+            self._catalog_writer._abort()
+        finally:
+            try:
+                self._pack_writer._abort()
+            finally:
+                self._remove_stage_files()
+                self._close_receipts()
+
+    @staticmethod
+    def _staging_path(path: Path, kind: str) -> Path:
+        return path.with_name(f".{path.name}.stream-{uuid4().hex}.{kind}")
+
+    def _require_missing_final_targets(self) -> None:
+        for path in (self._pack_path, self._catalog_path):
+            try:
+                os.lstat(path)
+            except FileNotFoundError:
+                continue
+            raise ValueError("streaming authority target already exists")
+
+    @staticmethod
+    def _publish_file(stage_path: Path, final_path: Path) -> None:
+        try:
+            os.link(stage_path, final_path, follow_symlinks=False)
+            return
+        except OSError as error:
+            if error.errno != errno.EXDEV:
+                raise
+        source = os.open(stage_path, os.O_RDONLY | os.O_NOFOLLOW)
+        destination: int | None = None
+        try:
+            destination = os.open(
+                final_path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o400,
+            )
+            while chunk := os.read(source, 65_536):
+                os.write(destination, chunk)
+            os.fsync(destination)
+        except BaseException:
+            if destination is not None:
+                os.close(destination)
+                destination = None
+                try:
+                    os.unlink(final_path)
+                except FileNotFoundError:
+                    pass
+            raise
+        finally:
+            if destination is not None:
+                os.close(destination)
+            os.close(source)
+
+    def _rollback_published(self, paths: list[Path]) -> None:
+        for path in reversed(paths):
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+
+    def _remove_stage_files(self) -> None:
+        for path in (self._pack_stage_path, self._catalog_stage_path):
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+
+    def _close_receipts(self) -> None:
+        store = getattr(self, "_receipt_store", None)
+        if store is not None:
+            self._receipt_store = None  # type: ignore[assignment]
+            store.close()
+
+    def _is_source_changed_failure(self) -> bool:
+        from portfolio_maker.infrastructure.semantic_source_reader import (
+            SemanticSourceChangedError,
+        )
+
+        return isinstance(self._failure, SemanticSourceChangedError)
+
 
 @dataclass
 class CrawlObserver:
@@ -1164,6 +1483,7 @@ class CrawlObserver:
     max_active_worker_count: int = 0
     max_in_memory_pending_directories: int = 0
     max_spooled_entry_count: int = 0
+    spool_count_query_count: int = 0
     ephemeral_spool_cleaned: bool = False
     ephemeral_spool_path: Path | None = None
     _producer_progress_counter: Any | None = field(default=None, repr=False)
@@ -1201,6 +1521,7 @@ class _EphemeralTraversalSpool:
             """
         )
         self._next_token = 0
+        self._entry_count = 0
 
     def open_directory(self) -> int:
         self._next_token += 1
@@ -1221,12 +1542,10 @@ class _EphemeralTraversalSpool:
                 int(entry.readable),
             ),
         )
-        count = int(
-            self._connection.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
-        )
+        self._entry_count += 1
         self._observer.max_spooled_entry_count = max(
             self._observer.max_spooled_entry_count,
-            count,
+            self._entry_count,
         )
 
     def pop_sorted(self, token: int):
@@ -1243,6 +1562,7 @@ class _EphemeralTraversalSpool:
                 "DELETE FROM entries WHERE directory_token = ? AND name = ?",
                 (token, name),
             )
+            self._entry_count -= 1
             yield _MaterializedDirectoryEntry(
                 name=name,
                 st_mode=st_mode,
@@ -1250,6 +1570,191 @@ class _EphemeralTraversalSpool:
                 st_ino=st_ino,
                 readable=bool(readable),
             )
+
+    def close(self) -> None:
+        self._connection.close()
+
+
+class _StreamingIdentityIndex:
+    """Private SQLite index for prior identities and terminal-event receipts."""
+
+    def __init__(
+        self,
+        directory: Path,
+        root_path: Path,
+        source_id: str,
+        prior_entries: tuple[StructuralEntry, ...],
+        policy: FilePolicy,
+    ) -> None:
+        self._connection = sqlite3.connect(directory / "identities.sqlite3")
+        self._connection.executescript(
+            """
+            CREATE TABLE node_ids (
+                source_id TEXT NOT NULL,
+                provider_item_key TEXT NOT NULL,
+                node_id TEXT NOT NULL,
+                PRIMARY KEY(source_id, provider_item_key)
+            ) WITHOUT ROWID;
+            CREATE TABLE reserved_entries (
+                relative_hierarchy TEXT PRIMARY KEY,
+                provider_item_key TEXT NOT NULL
+            ) WITHOUT ROWID;
+            CREATE TABLE renamed_entries (
+                relative_hierarchy TEXT PRIMARY KEY,
+                device INTEGER NOT NULL,
+                inode INTEGER NOT NULL,
+                provider_item_key TEXT NOT NULL,
+                claimed INTEGER NOT NULL DEFAULT 0
+            ) WITHOUT ROWID;
+            CREATE INDEX renamed_identity ON renamed_entries(device, inode, claimed,
+                relative_hierarchy, provider_item_key);
+            CREATE TABLE reserved_provider_keys (
+                provider_item_key TEXT PRIMARY KEY
+            ) WITHOUT ROWID;
+            CREATE TABLE assigned_provider_keys (
+                provider_item_key TEXT PRIMARY KEY
+            ) WITHOUT ROWID;
+            CREATE TABLE terminal_nodes (
+                node_id TEXT PRIMARY KEY
+            ) WITHOUT ROWID;
+            """
+        )
+        for entry in prior_entries:
+            if entry.source_id != source_id:
+                continue
+            self._connection.execute(
+                """
+                INSERT OR IGNORE INTO node_ids(source_id, provider_item_key, node_id)
+                VALUES (?, ?, ?)
+                """,
+                (entry.source_id, entry.provider_item_key, entry.node_id),
+            )
+            path = (
+                root_path
+                if entry.relative_hierarchy == "."
+                else root_path / entry.relative_hierarchy
+            )
+            if policy.classify_path(path) != "candidate":
+                continue
+            try:
+                _, device, inode = _provider_identity(
+                    _lstat(path), entry.relative_hierarchy
+                )
+            except StructuralCrawlRootError:
+                continue
+            if (device, inode) == (entry.device, entry.inode):
+                self._connection.execute(
+                    """
+                    INSERT INTO reserved_entries(relative_hierarchy, provider_item_key)
+                    VALUES (?, ?)
+                    """,
+                    (entry.relative_hierarchy, entry.provider_item_key),
+                )
+                self._connection.execute(
+                    """
+                    INSERT OR IGNORE INTO reserved_provider_keys(provider_item_key)
+                    VALUES (?)
+                    """,
+                    (entry.provider_item_key,),
+                )
+        for entry in prior_entries:
+            if entry.source_id != source_id or entry.device is None or entry.inode is None:
+                continue
+            reserved = self._connection.execute(
+                "SELECT 1 FROM reserved_entries WHERE relative_hierarchy = ?",
+                (entry.relative_hierarchy,),
+            ).fetchone()
+            if reserved is None:
+                self._connection.execute(
+                    """
+                    INSERT INTO renamed_entries(
+                        relative_hierarchy, device, inode, provider_item_key
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        entry.relative_hierarchy,
+                        entry.device,
+                        entry.inode,
+                        entry.provider_item_key,
+                    ),
+                )
+
+    def provider_key(
+        self,
+        relative_hierarchy: str,
+        device: int | None,
+        inode: int | None,
+    ) -> str:
+        if device is None or inode is None:
+            return relative_hierarchy
+        inode_key = f"{device}:{inode}"
+        reserved = self._connection.execute(
+            """
+            SELECT provider_item_key FROM reserved_entries
+            WHERE relative_hierarchy = ?
+            """,
+            (relative_hierarchy,),
+        ).fetchone()
+        if reserved is not None:
+            provider_item_key = str(reserved[0])
+        else:
+            renamed = self._connection.execute(
+                """
+                SELECT relative_hierarchy, provider_item_key FROM renamed_entries
+                WHERE device = ? AND inode = ? AND claimed = 0
+                ORDER BY relative_hierarchy, provider_item_key LIMIT 1
+                """,
+                (device, inode),
+            ).fetchone()
+            if renamed is not None:
+                provider_item_key = str(renamed[1])
+                self._connection.execute(
+                    "UPDATE renamed_entries SET claimed = 1 WHERE relative_hierarchy = ?",
+                    (renamed[0],),
+                )
+            else:
+                reserved_key = self._connection.execute(
+                    "SELECT 1 FROM reserved_provider_keys WHERE provider_item_key = ?",
+                    (inode_key,),
+                ).fetchone()
+                assigned_key = self._connection.execute(
+                    "SELECT 1 FROM assigned_provider_keys WHERE provider_item_key = ?",
+                    (inode_key,),
+                ).fetchone()
+                provider_item_key = (
+                    relative_hierarchy
+                    if reserved_key is not None or assigned_key is not None
+                    else inode_key
+                )
+        self._connection.execute(
+            "INSERT OR IGNORE INTO assigned_provider_keys(provider_item_key) VALUES (?)",
+            (provider_item_key,),
+        )
+        return provider_item_key
+
+    def node_id(self, source_id: str, provider_item_key: str) -> str:
+        row = self._connection.execute(
+            """
+            SELECT node_id FROM node_ids
+            WHERE source_id = ? AND provider_item_key = ?
+            """,
+            (source_id, provider_item_key),
+        ).fetchone()
+        return (
+            str(row[0])
+            if row is not None
+            else stable_node_id(source_id, provider_item_key)
+        )
+
+    def claim_terminal(self, node_id: str) -> bool:
+        try:
+            self._connection.execute(
+                "INSERT INTO terminal_nodes(node_id) VALUES (?)",
+                (node_id,),
+            )
+        except sqlite3.IntegrityError:
+            return False
+        return True
 
     def close(self) -> None:
         self._connection.close()
@@ -1628,19 +2133,26 @@ def iter_local_structure_events(
         excluded_file_patterns=approval.excluded_file_patterns,
     )
     crawl_observer = observer or CrawlObserver()
-    prior_node_ids = {
-        (entry.source_id, entry.provider_item_key): entry.node_id
-        for entry in prior_entries
-    }
-    (
-        reserved_prior_entries,
-        renamed_prior_entries_by_inode,
-        reserved_provider_keys,
-    ) = _reserve_prior_entries(root_path, source_id, prior_entries, policy)
+    legacy_mode = _DirectoryEnumerationWorker is not _DEFAULT_DIRECTORY_ENUMERATION_WORKER
+    prior_node_ids: dict[tuple[str, str], str] = {}
+    reserved_prior_entries: dict[str, StructuralEntry] = {}
+    renamed_prior_entries_by_inode: dict[tuple[int, int], tuple[StructuralEntry, ...]] = {}
+    reserved_provider_keys: set[str] = set()
     renamed_prior_entry_indexes: dict[tuple[int, int], int] = {}
     assigned_provider_keys: set[str] = set()
+    if legacy_mode:
+        prior_node_ids = {
+            (entry.source_id, entry.provider_item_key): entry.node_id
+            for entry in prior_entries
+        }
+        (
+            reserved_prior_entries,
+            renamed_prior_entries_by_inode,
+            reserved_provider_keys,
+        ) = _reserve_prior_entries(root_path, source_id, prior_entries, policy)
     stream_worker: _StreamingDirectoryEnumerationWorker | None = None
     traversal_spool: _EphemeralTraversalSpool | None = None
+    identity_index: _StreamingIdentityIndex | None = None
     terminalized_node_ids: set[str] = set()
 
     def emit(event: StructuralEvent) -> StructuralEvent:
@@ -1657,14 +2169,28 @@ def iter_local_structure_events(
         path_stat: os.stat_result | _MaterializedDirectoryEntry,
     ) -> StructuralEntry:
         if isinstance(path_stat, _MaterializedDirectoryEntry):
-            device = path_stat.st_dev
-            inode = path_stat.st_ino
+            if (
+                type(path_stat.st_dev) is int
+                and type(path_stat.st_ino) is int
+                and path_stat.st_ino > 0
+            ):
+                device = path_stat.st_dev
+                inode = path_stat.st_ino
+            else:
+                device = None
+                inode = None
         else:
             _identity_key, device, inode = _provider_identity(
                 path_stat, relative_hierarchy
             )
         provider_item_key = relative_hierarchy
-        if device is not None and inode is not None:
+        if identity_index is not None:
+            provider_item_key = identity_index.provider_key(
+                relative_hierarchy,
+                device,
+                inode,
+            )
+        elif device is not None and inode is not None:
             provider_item_key = f"{device}:{inode}"
             inode_key = provider_item_key
             prior_entry = reserved_prior_entries.get(relative_hierarchy)
@@ -1684,9 +2210,13 @@ def iter_local_structure_events(
                 ):
                     provider_item_key = relative_hierarchy
             assigned_provider_keys.add(provider_item_key)
-        node_id = prior_node_ids.get(
-            (source_id, provider_item_key),
-            stable_node_id(source_id, provider_item_key),
+        node_id = (
+            identity_index.node_id(source_id, provider_item_key)
+            if identity_index is not None
+            else prior_node_ids.get(
+                (source_id, provider_item_key),
+                stable_node_id(source_id, provider_item_key),
+            )
         )
         return StructuralEntry(
             node_id=node_id,
@@ -1722,9 +2252,13 @@ def iter_local_structure_events(
             analyze_local_baseline,
         )
 
-        if entry.node_id in terminalized_node_ids:
-            return
-        terminalized_node_ids.add(entry.node_id)
+        if identity_index is not None:
+            if not identity_index.claim_terminal(entry.node_id):
+                return
+        else:
+            if entry.node_id in terminalized_node_ids:
+                return
+            terminalized_node_ids.add(entry.node_id)
         yield emit(
             StructuralEvent(
                 StructuralEventKind.FILE_ANALYZED,
@@ -1948,12 +2482,19 @@ def iter_local_structure_events(
     )
     if policy.classify_path(root_path) != "candidate":
         source = replace(source, status=AnalysisStatus.UNSUPPORTED)
-        yield emit(StructuralEvent(StructuralEventKind.NODE_SEEN, source))
-        yield from terminal_events(source, StructuralEventKind.SOURCE_CLOSED)
+        stream_completed = False
+        try:
+            yield emit(StructuralEvent(StructuralEventKind.NODE_SEEN, source))
+            yield from terminal_events(source, StructuralEventKind.SOURCE_CLOSED)
+            stream_completed = True
+        finally:
+            if sink is not None and not stream_completed:
+                sink.abort()
         return
 
     if _DirectoryEnumerationWorker is _DEFAULT_DIRECTORY_ENUMERATION_WORKER:
         spool_database: Path | None = None
+        stream_completed = False
         try:
             with tempfile.TemporaryDirectory(
                 prefix="portfolio-semantic-traversal-"
@@ -1963,6 +2504,13 @@ def iter_local_structure_events(
                 traversal_spool = _EphemeralTraversalSpool(
                     Path(spool_directory),
                     crawl_observer,
+                )
+                identity_index = _StreamingIdentityIndex(
+                    Path(spool_directory),
+                    root_path,
+                    source_id,
+                    prior_entries,
+                    policy,
                 )
                 try:
                     with _StreamingDirectoryEnumerationWorker(
@@ -1989,8 +2537,12 @@ def iter_local_structure_events(
                                 StructuralEventKind.SOURCE_CLOSED,
                             )
                             raise
+                        stream_completed = True
                 finally:
                     stream_worker = None
+                    if identity_index is not None:
+                        identity_index.close()
+                        identity_index = None
                     if traversal_spool is not None:
                         traversal_spool.close()
                         traversal_spool = None
@@ -1998,28 +2550,36 @@ def iter_local_structure_events(
             crawl_observer.ephemeral_spool_cleaned = (
                 spool_database is None or not spool_database.exists()
             )
+            if sink is not None and not stream_completed:
+                sink.abort()
         return
-    with _DirectoryEnumerationWorker(
-        process_context=_process_context,
-        enumerator=_enumerator,
-    ) as legacy_worker:
-        try:
-            yield from stream_directory(
-                root_path,
-                source,
-                StructuralEventKind.SOURCE_CLOSED,
-                legacy_worker,
-            )
-        except (
-            StructuralCrawlWorkerError,
-            StructuralCrawlTimeoutBudgetError,
-            StructuralCrawlRootTimeoutError,
-        ):
-            yield from failed_terminal_events(
-                source,
-                StructuralEventKind.SOURCE_CLOSED,
-            )
-            raise
+    stream_completed = False
+    try:
+        with _DirectoryEnumerationWorker(
+            process_context=_process_context,
+            enumerator=_enumerator,
+        ) as legacy_worker:
+            try:
+                yield from stream_directory(
+                    root_path,
+                    source,
+                    StructuralEventKind.SOURCE_CLOSED,
+                    legacy_worker,
+                )
+            except (
+                StructuralCrawlWorkerError,
+                StructuralCrawlTimeoutBudgetError,
+                StructuralCrawlRootTimeoutError,
+            ):
+                yield from failed_terminal_events(
+                    source,
+                    StructuralEventKind.SOURCE_CLOSED,
+                )
+                raise
+            stream_completed = True
+    finally:
+        if sink is not None and not stream_completed:
+            sink.abort()
 
 
 def crawl_local_structure(
@@ -2065,6 +2625,15 @@ def crawl_local_structure(
         observer=observer,
     ):
         if event.kind is StructuralEventKind.NODE_SEEN:
+            if (
+                event.node.kind is SemanticNodeKind.FILE
+                and event.node.status is AnalysisStatus.UNREADABLE
+                and event.node.device is None
+                and event.node.inode is None
+            ):
+                # v2 omitted a child whose directory-entry stat failed; retain
+                # that materialized-result compatibility while v3 keeps its event.
+                continue
             latest_entries.setdefault(event.node.node_id, event.node)
         elif event.kind in {
             StructuralEventKind.DIRECTORY_CLOSED,

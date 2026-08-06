@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 import portfolio_maker.infrastructure.semantic_analyzers as semantic_analyzers_module
+import portfolio_maker.infrastructure.semantic_source_reader as source_reader
 from portfolio_maker.domain.semantic_frontier import BaselineCoverage
 from portfolio_maker.domain.semantic_models import AnalysisStatus, SemanticNodeKind
 from portfolio_maker.infrastructure.semantic_analyzers import (
@@ -71,7 +72,35 @@ def test_prefix_analysis_is_sampled_not_full_identity(tmp_path: Path) -> None:
     assert baseline.full_content_sha256 is None
 
 
-def test_baseline_uses_verified_reader_and_masks_managed_excerpt(
+def test_local_baseline_reads_only_the_bounded_sample_of_a_large_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Breaks if baseline sampling regresses to an EOF hash/read loop."""
+    path = tmp_path / "large.md"
+    with path.open("wb") as handle:
+        handle.write(b"a" * 4096)
+        handle.truncate(1_048_576)
+    original_read = source_reader.os.read
+    observed_bytes = 0
+
+    def record_read(descriptor: int, requested_bytes: int) -> bytes:
+        nonlocal observed_bytes
+        result = original_read(descriptor, requested_bytes)
+        observed_bytes += len(result)
+        return result
+
+    monkeypatch.setattr(source_reader.os, "read", record_read)
+
+    baseline = analyze_local_baseline(entry_for(path), max_bytes=4096)
+
+    assert baseline.coverage is BaselineCoverage.SAMPLED
+    assert baseline.inspected_bytes == 4096
+    assert baseline.full_content_sha256 is None
+    assert observed_bytes <= 4096
+
+
+def test_baseline_uses_verified_bounded_reader_and_masks_managed_excerpt(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -79,20 +108,19 @@ def test_baseline_uses_verified_reader_and_masks_managed_excerpt(
     path = tmp_path / "note.md"
     path.write_text("API_TOKEN=secret", encoding="utf-8")
     calls = 0
-    original = semantic_analyzers_module.read_verified_representative
+    original = semantic_analyzers_module.read_verified_sample
 
     def record_verified_read(
         source: Path,
-        ranges: tuple[tuple[int, int], ...],
-        max_materialized_bytes: int,
+        max_bytes: int,
     ):
         nonlocal calls
         calls += 1
-        return original(source, ranges, max_materialized_bytes)
+        return original(source, max_bytes)
 
     monkeypatch.setattr(
         semantic_analyzers_module,
-        "read_verified_representative",
+        "read_verified_sample",
         record_verified_read,
     )
 

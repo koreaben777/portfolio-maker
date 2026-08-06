@@ -15,7 +15,7 @@ from portfolio_maker.infrastructure.semantic_crawler import StructuralEntry
 from portfolio_maker.infrastructure.semantic_source_reader import (
     SemanticSourceReadError,
     SemanticSourceChangedError,
-    read_verified_representative,
+    read_verified_sample,
 )
 
 
@@ -146,11 +146,7 @@ def analyze_local_baseline(
         return _baseline_metadata_only(entry, BaselineCoverage.COMPLETE)
 
     try:
-        representative = read_verified_representative(
-            entry.absolute_path,
-            ranges=((0, max_bytes),),
-            max_materialized_bytes=max_bytes,
-        )
+        sample = read_verified_sample(entry.absolute_path, max_bytes)
     except SemanticSourceChangedError:
         return _baseline_metadata_only(
             entry,
@@ -162,7 +158,7 @@ def analyze_local_baseline(
     except SemanticSourceReadError:
         return _baseline_metadata_only(entry, BaselineCoverage.UNREADABLE)
 
-    content = representative.slices[0]
+    content = sample.content
     if b"\0" in content:
         return _baseline_metadata_only(entry, BaselineCoverage.UNSUPPORTED)
     try:
@@ -170,7 +166,7 @@ def analyze_local_baseline(
     except UnicodeDecodeError:
         return _baseline_metadata_only(entry, BaselineCoverage.UNSUPPORTED)
     inspected_bytes = len(content)
-    sampled = representative.pre_identity[2] > inspected_bytes
+    sampled = sample.pre_identity[2] > inspected_bytes
     sample_sha256 = hashlib.sha256(content).hexdigest()
     return LocalBaseline(
         node_id=entry.node_id,
@@ -180,9 +176,7 @@ def analyze_local_baseline(
         inspected_bytes=inspected_bytes,
         sampled_ranges=((0, inspected_bytes),) if sampled else (),
         sample_sha256=sample_sha256 if sampled else None,
-        full_content_sha256=(
-            None if sampled else representative.full_content_sha256
-        ),
+        full_content_sha256=None,
         masked_excerpt=mask_secrets(excerpt),
     )
 

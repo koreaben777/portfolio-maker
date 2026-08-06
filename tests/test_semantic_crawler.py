@@ -64,6 +64,17 @@ def _unreadable_child_entry_enumerator(path: Path):
         )
 
 
+def _zero_inode_child_entry_enumerator(path: Path):
+    if path.name == "root":
+        yield semantic_crawler_module._MaterializedDirectoryEntry(
+            name="zero.md",
+            st_mode=0o100644,
+            st_dev=17,
+            st_ino=0,
+            readable=True,
+        )
+
+
 def _trickling_directory_enumerator(path: Path):
     for entry in semantic_crawler_module._materialize_directory(path):
         yield entry
@@ -277,6 +288,7 @@ def test_high_fanout_worker_streams_without_directory_tuple(tmp_path: Path) -> N
     assert observer.queue_maxsize == 256
     assert observer.max_buffered_events <= 256
     assert observer.directory_tuple_materializations == 0
+    assert observer.spool_count_query_count == 0
 
 
 def test_streaming_reuses_one_global_worker_and_sqlite_sibling_backlog(
@@ -304,6 +316,7 @@ def test_streaming_reuses_one_global_worker_and_sqlite_sibling_backlog(
     assert observer.max_active_worker_count == 1
     assert observer.max_in_memory_pending_directories <= 1
     assert observer.max_spooled_entry_count >= 40
+    assert observer.spool_count_query_count == 0
     assert observer.ephemeral_spool_cleaned is True
 
 
@@ -614,6 +627,90 @@ def test_streaming_unreadable_child_still_emits_node_and_terminal_baseline(
     ]
     assert child_events[-1].baseline is not None
     assert child_events[-1].baseline.coverage is BaselineCoverage.UNREADABLE
+
+
+def test_v2_wrapper_omits_stat_failed_child_while_v3_stream_preserves_it(
+    tmp_path: Path,
+) -> None:
+    """Breaks if the legacy materialized result adopts v3 unreadable child rows."""
+    root = tmp_path / "root"
+    root.mkdir()
+
+    result = crawl_local_structure(
+        root,
+        approval_for(root),
+        _process_context=multiprocessing.get_context("fork"),
+        _enumerator=_unreadable_child_entry_enumerator,
+    )
+
+    assert "gone.md" not in {entry.relative_hierarchy for entry in result.entries}
+
+
+def test_v3_uses_relative_provider_key_for_zero_inode_directory_entry(
+    tmp_path: Path,
+) -> None:
+    """Breaks if a zero inode is treated as a stable device/inode identity."""
+    root = tmp_path / "root"
+    root.mkdir()
+
+    events = list(
+        iter_local_structure_events(
+            root,
+            approval_for(root),
+            _process_context=multiprocessing.get_context("fork"),
+            _enumerator=_zero_inode_child_entry_enumerator,
+        )
+    )
+    node = next(
+        event.node
+        for event in events
+        if event.kind is StructuralEventKind.NODE_SEEN
+        and event.node.relative_hierarchy == "zero.md"
+    )
+
+    assert node.provider_item_key == "zero.md"
+    assert node.device is None
+    assert node.inode is None
+
+
+def test_v3_prior_identity_resolution_uses_ephemeral_index_not_python_reservation_maps(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Breaks if streaming identity retention rebuilds unbounded Python maps."""
+    root = tmp_path / "root"
+    root.mkdir()
+    original = root / "alpha.md"
+    alias = root / "beta.md"
+    original.write_text("evidence", encoding="utf-8")
+    os.link(original, alias)
+    prior = crawl_local_structure(root, approval_for(root)).entries
+    alias.rename(root / "gamma.md")
+
+    def fail_legacy_reservation(*_args, **_kwargs):
+        raise AssertionError("streaming crawl must not build legacy Python reservation maps")
+
+    monkeypatch.setattr(
+        semantic_crawler_module,
+        "_reserve_prior_entries",
+        fail_legacy_reservation,
+    )
+    events = list(
+        iter_local_structure_events(
+            root,
+            approval_for(root),
+            prior_entries=prior,
+        )
+    )
+    nodes = {
+        event.node.relative_hierarchy: event.node
+        for event in events
+        if event.kind is StructuralEventKind.NODE_SEEN
+    }
+    previous = {entry.relative_hierarchy: entry for entry in prior}
+
+    assert nodes["alpha.md"].node_id == previous["alpha.md"].node_id
+    assert nodes["gamma.md"].node_id == previous["beta.md"].node_id
 
 
 def test_worker_crash_and_malformed_protocol_fail_closed(tmp_path: Path) -> None:

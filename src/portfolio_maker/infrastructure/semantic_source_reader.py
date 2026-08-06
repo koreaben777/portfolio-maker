@@ -28,6 +28,44 @@ class VerifiedRepresentative:
     post_identity: tuple[int, int, int, int, int]
 
 
+@dataclass(frozen=True)
+class VerifiedSample:
+    content: bytes
+    pre_identity: tuple[int, int, int, int, int]
+    post_identity: tuple[int, int, int, int, int]
+
+
+def read_verified_sample(path: Path, max_bytes: int) -> VerifiedSample:
+    """Read at most one bounded prefix through a no-follow verified descriptor."""
+    if type(max_bytes) is not int or max_bytes < 0:
+        raise ValueError("max_bytes must be non-negative")
+    try:
+        return _read_verified_sample(path, max_bytes)
+    except OSError:
+        # Keep the public boundary locator-free, like exhaustive representatives.
+        pass
+    raise SemanticSourceReadError("semantic source could not be read")
+
+
+def _read_verified_sample(path: Path, max_bytes: int) -> VerifiedSample:
+    descriptor = _open_regular_file(path)
+    try:
+        before = os.fstat(descriptor)
+        if not S_ISREG(before.st_mode):
+            raise SemanticSourceChangedError("semantic source is not a regular file")
+        content = os.read(descriptor, max_bytes)
+        after = os.fstat(descriptor)
+        if file_identity(before) != file_identity(after):
+            raise SemanticSourceChangedError("semantic source changed during verified read")
+        return VerifiedSample(
+            content=content,
+            pre_identity=file_identity(before),
+            post_identity=file_identity(after),
+        )
+    finally:
+        os.close(descriptor)
+
+
 def read_verified_representative(
     path: Path,
     ranges: tuple[tuple[int, int], ...],
