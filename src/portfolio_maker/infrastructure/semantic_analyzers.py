@@ -6,11 +6,16 @@ import os
 import stat
 from dataclasses import dataclass
 
+from portfolio_maker.domain.semantic_frontier import BaselineCoverage
 from portfolio_maker.domain.semantic_models import AnalysisStatus, SemanticNodeKind
 from portfolio_maker.infrastructure.extractors import _open_regular_file
 from portfolio_maker.infrastructure.policy import SourcePathPolicyError
 from portfolio_maker.infrastructure.policy import mask_secrets
 from portfolio_maker.infrastructure.semantic_crawler import StructuralEntry
+from portfolio_maker.infrastructure.semantic_source_reader import (
+    SemanticSourceChangedError,
+    read_verified_representative,
+)
 
 
 ANALYZER_VERSION = "semantic-input-v2"
@@ -36,6 +41,19 @@ class FileAnalysisInput:
     masked_excerpt: str
     semantic_roles: tuple[str, ...]
     status: AnalysisStatus
+
+
+@dataclass(frozen=True)
+class LocalBaseline:
+    node_id: str
+    coverage: BaselineCoverage
+    roles: tuple[str, ...]
+    topics: tuple[str, ...]
+    inspected_bytes: int
+    sampled_ranges: tuple[tuple[int, int], ...]
+    sample_sha256: str | None
+    full_content_sha256: str | None
+    masked_excerpt: str
 
 
 def analyze_file_input(
@@ -108,6 +126,61 @@ def analyze_file_input(
     )
 
 
+def analyze_local_baseline(
+    entry: StructuralEntry,
+    *,
+    max_bytes: int = 131_072,
+) -> LocalBaseline:
+    """Return explicit bounded coverage without treating a prefix as full identity."""
+    if max_bytes < 0:
+        raise ValueError("max_bytes must not be negative")
+    if entry.status is AnalysisStatus.UNSUPPORTED:
+        return _baseline_metadata_only(entry, BaselineCoverage.UNSUPPORTED)
+    if entry.status is AnalysisStatus.UNREADABLE:
+        return _baseline_metadata_only(entry, BaselineCoverage.UNREADABLE)
+    if entry.status is AnalysisStatus.FAILED:
+        return _baseline_metadata_only(entry, BaselineCoverage.FAILED)
+    if entry.kind is not SemanticNodeKind.FILE:
+        return _baseline_metadata_only(entry, BaselineCoverage.COMPLETE)
+
+    try:
+        representative = read_verified_representative(
+            entry.absolute_path,
+            ranges=((0, max_bytes),),
+            max_materialized_bytes=max_bytes,
+        )
+    except SemanticSourceChangedError:
+        return _baseline_metadata_only(entry, BaselineCoverage.FAILED)
+    except SourcePathPolicyError:
+        return _baseline_metadata_only(entry, BaselineCoverage.UNSUPPORTED)
+    except OSError:
+        return _baseline_metadata_only(entry, BaselineCoverage.UNREADABLE)
+
+    content = representative.slices[0]
+    if b"\0" in content:
+        return _baseline_metadata_only(entry, BaselineCoverage.UNSUPPORTED)
+    try:
+        excerpt = content.decode("utf-8")
+    except UnicodeDecodeError:
+        return _baseline_metadata_only(entry, BaselineCoverage.UNSUPPORTED)
+    inspected_bytes = len(content)
+    sampled = representative.pre_identity[2] > inspected_bytes
+    sample_sha256 = hashlib.sha256(content).hexdigest()
+    return LocalBaseline(
+        node_id=entry.node_id,
+        coverage=(BaselineCoverage.SAMPLED if sampled else BaselineCoverage.COMPLETE),
+        roles=_infer_roles(entry.absolute_path.name),
+        topics=(),
+        inspected_bytes=inspected_bytes,
+        sampled_ranges=((0, inspected_bytes),) if sampled else (),
+        sample_sha256=sample_sha256 if sampled else None,
+        full_content_sha256=(
+            None if sampled else representative.full_content_sha256
+        ),
+        masked_excerpt=mask_secrets(excerpt),
+    )
+
+
 def _metadata_only(
     entry: StructuralEntry,
     status: AnalysisStatus,
@@ -120,6 +193,23 @@ def _metadata_only(
         masked_excerpt="",
         semantic_roles=_infer_roles(entry.absolute_path.name),
         status=status,
+    )
+
+
+def _baseline_metadata_only(
+    entry: StructuralEntry,
+    coverage: BaselineCoverage,
+) -> LocalBaseline:
+    return LocalBaseline(
+        node_id=entry.node_id,
+        coverage=coverage,
+        roles=_infer_roles(entry.absolute_path.name),
+        topics=(),
+        inspected_bytes=0,
+        sampled_ranges=(),
+        sample_sha256=None,
+        full_content_sha256=None,
+        masked_excerpt="",
     )
 
 

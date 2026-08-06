@@ -12,8 +12,11 @@ import portfolio_maker.infrastructure.semantic_crawler as semantic_crawler_modul
 from portfolio_maker.application.approval import SourceApproval
 from portfolio_maker.domain.semantic_models import AnalysisStatus, SemanticNodeKind
 from portfolio_maker.infrastructure.semantic_crawler import (
+    CrawlObserver,
     StructuralCrawlRootError,
+    StructuralEventKind,
     crawl_local_structure,
+    iter_local_structure_events,
 )
 
 
@@ -201,6 +204,81 @@ def test_structural_crawl_has_no_global_file_count_cap(tmp_path: Path) -> None:
     result = crawl_local_structure(root, approval_for(root))
 
     assert sum(entry.kind == SemanticNodeKind.FILE for entry in result.entries) == 501
+
+
+def test_stream_emits_every_node_then_closes_directories_bottom_up(
+    tmp_path: Path,
+) -> None:
+    """Breaks if the v3 crawler does not emit nodes and close child directories first."""
+    root = tmp_path / "root"
+    (root / "project" / "src").mkdir(parents=True)
+    (root / "project" / "README.md").write_text("purpose", encoding="utf-8")
+    (root / "project" / "src" / "app.py").write_text(
+        "print('ok')", encoding="utf-8"
+    )
+
+    events = list(iter_local_structure_events(root, approval_for(root)))
+
+    seen = [event for event in events if event.kind is StructuralEventKind.NODE_SEEN]
+    closed = [
+        event.node.relative_hierarchy
+        for event in events
+        if event.kind is StructuralEventKind.DIRECTORY_CLOSED
+    ]
+    assert len(seen) == 5
+    assert set(closed) == {".", "project", "project/src"}
+    assert closed.index("project/src") < closed.index("project") < closed.index(".")
+
+
+def test_high_fanout_worker_streams_without_directory_tuple(tmp_path: Path) -> None:
+    """Breaks if v3 buffers a directory population instead of its bounded queue."""
+    root = tmp_path / "high-fanout"
+    root.mkdir()
+    for index in range(10_000):
+        (root / f"file-{index:05}.md").write_text("evidence", encoding="utf-8")
+    observer = CrawlObserver()
+
+    count = sum(
+        1
+        for _ in iter_local_structure_events(
+            root,
+            approval_for(root),
+            worker_queue_size=256,
+            observer=observer,
+        )
+    )
+
+    assert count >= 10_002
+    assert observer.queue_maxsize == 256
+    assert observer.max_buffered_events <= 256
+    assert observer.directory_tuple_materializations == 0
+
+
+def test_stream_emits_one_terminal_baseline_for_every_permitted_node(
+    tmp_path: Path,
+) -> None:
+    """Breaks if a permitted structural record can finish without coverage."""
+    root = tmp_path / "root"
+    (root / "nested").mkdir(parents=True)
+    (root / "nested" / "note.md").write_text("API_TOKEN=secret", encoding="utf-8")
+
+    events = list(iter_local_structure_events(root, approval_for(root)))
+
+    node_ids = {
+        event.node.node_id
+        for event in events
+        if event.kind is StructuralEventKind.NODE_SEEN
+    }
+    baselines = [
+        event.baseline
+        for event in events
+        if event.kind is StructuralEventKind.FILE_ANALYZED
+    ]
+    assert {baseline.node_id for baseline in baselines if baseline is not None} == node_ids
+    assert all(
+        baseline is not None and "secret" not in baseline.masked_excerpt
+        for baseline in baselines
+    )
 
 
 def test_excluded_directory_is_pruned_without_child_names(tmp_path: Path) -> None:

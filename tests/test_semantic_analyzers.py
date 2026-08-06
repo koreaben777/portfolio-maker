@@ -7,8 +7,13 @@ from pathlib import Path
 
 import pytest
 
+import portfolio_maker.infrastructure.semantic_analyzers as semantic_analyzers_module
+from portfolio_maker.domain.semantic_frontier import BaselineCoverage
 from portfolio_maker.domain.semantic_models import AnalysisStatus, SemanticNodeKind
-from portfolio_maker.infrastructure.semantic_analyzers import analyze_file_input
+from portfolio_maker.infrastructure.semantic_analyzers import (
+    analyze_file_input,
+    analyze_local_baseline,
+)
 from portfolio_maker.infrastructure.semantic_crawler import StructuralEntry
 
 
@@ -52,6 +57,49 @@ def test_analysis_input_is_partial_when_content_exceeds_byte_cap(tmp_path: Path)
     assert result.masked_excerpt == "abcd"
     assert result.content_fingerprint == f"sha256:{hashlib.sha256(b'abcd').hexdigest()}"
     assert result.status == AnalysisStatus.PARTIAL
+
+
+def test_prefix_analysis_is_sampled_not_full_identity(tmp_path: Path) -> None:
+    """Breaks if a bounded prefix is represented as an exhaustive file identity."""
+    path = tmp_path / "large.md"
+    path.write_bytes(b"a" * 131_072 + b"tail")
+
+    baseline = analyze_local_baseline(entry_for(path))
+
+    assert baseline.coverage is BaselineCoverage.SAMPLED
+    assert baseline.sample_sha256 is not None
+    assert baseline.full_content_sha256 is None
+
+
+def test_baseline_uses_verified_reader_and_masks_managed_excerpt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Breaks if local baseline reopens the path outside its verified reader."""
+    path = tmp_path / "note.md"
+    path.write_text("API_TOKEN=secret", encoding="utf-8")
+    calls = 0
+    original = semantic_analyzers_module.read_verified_representative
+
+    def record_verified_read(
+        source: Path,
+        ranges: tuple[tuple[int, int], ...],
+        max_materialized_bytes: int,
+    ):
+        nonlocal calls
+        calls += 1
+        return original(source, ranges, max_materialized_bytes)
+
+    monkeypatch.setattr(
+        semantic_analyzers_module,
+        "read_verified_representative",
+        record_verified_read,
+    )
+
+    baseline = analyze_local_baseline(entry_for(path))
+
+    assert calls == 1
+    assert "secret" not in baseline.masked_excerpt
 
 
 def test_binary_input_is_metadata_only(tmp_path: Path) -> None:

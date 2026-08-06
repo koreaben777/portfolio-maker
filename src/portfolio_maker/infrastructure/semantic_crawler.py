@@ -3,7 +3,8 @@ from __future__ import annotations
 import os
 import stat
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
+from enum import StrEnum
 from multiprocessing import get_context
 from multiprocessing.connection import Connection, wait
 from multiprocessing.context import BaseContext
@@ -61,6 +62,7 @@ MIN_DIRECTORY_TIMEOUT_BUDGET_SECONDS = 0.01
 MAX_DIRECTORY_TIMEOUT_BUDGET_SECONDS = 3600.0
 _WORKER_START_SECONDS = 5.0
 _WORKER_JOIN_SECONDS = 1.0
+DEFAULT_STREAMING_WORKER_QUEUE_SIZE = 256
 
 
 @dataclass(frozen=True)
@@ -535,6 +537,321 @@ class _DirectoryEnumerationWorker:
         )
 
 
+_DEFAULT_DIRECTORY_ENUMERATION_WORKER = _DirectoryEnumerationWorker
+_DEFAULT_DIRECTORY_WORKER_REPLACE = _DirectoryEnumerationWorker.replace_after_timeout
+
+
+def _stream_directory_entries(path: Path):
+    """Yield directory entries one at a time for the v3 crawl path."""
+    with os.scandir(path) as scan:
+        for child in scan:
+            try:
+                child_stat = child.stat(follow_symlinks=False)
+            except OSError:
+                yield _MaterializedDirectoryEntry(
+                    name=child.name,
+                    st_mode=None,
+                    st_dev=None,
+                    st_ino=None,
+                    readable=False,
+                )
+                continue
+            yield _MaterializedDirectoryEntry(
+                name=child.name,
+                st_mode=child_stat.st_mode,
+                st_dev=(child_stat.st_dev if type(child_stat.st_dev) is int else None),
+                st_ino=(child_stat.st_ino if type(child_stat.st_ino) is int else None),
+                readable=True,
+            )
+
+
+def _streaming_directory_worker_main(
+    connection: Connection,
+    event_queue: Any,
+    enumerator: Callable[[Path], Any],
+) -> None:
+    try:
+        connection.send({"protocol": _DIRECTORY_WORKER_PROTOCOL, "status": "ready"})
+        while True:
+            request = connection.recv()
+            if request == {"protocol": _DIRECTORY_WORKER_PROTOCOL, "command": "close"}:
+                return
+            if (
+                type(request) is not dict
+                or set(request) != {"protocol", "command", "request_id", "path"}
+                or request.get("protocol") != _DIRECTORY_WORKER_PROTOCOL
+                or request.get("command") != "enumerate"
+                or type(request.get("request_id")) is not int
+                or type(request.get("path")) is not str
+            ):
+                return
+            request_id = request["request_id"]
+            count = 0
+            try:
+                for entry in enumerator(Path(request["path"])):
+                    event_queue.put(
+                        {
+                            "name": entry.name,
+                            "st_mode": entry.st_mode,
+                            "st_dev": entry.st_dev,
+                            "st_ino": entry.st_ino,
+                            "readable": entry.readable,
+                        }
+                    )
+                    count += 1
+                response: dict[str, object] = {
+                    "protocol": _DIRECTORY_WORKER_PROTOCOL,
+                    "request_id": request_id,
+                    "status": "ok",
+                    "entry_count": count,
+                }
+            except OSError:
+                response = {
+                    "protocol": _DIRECTORY_WORKER_PROTOCOL,
+                    "request_id": request_id,
+                    "status": "unreadable",
+                }
+            except BaseException:
+                response = {
+                    "protocol": _DIRECTORY_WORKER_PROTOCOL,
+                    "request_id": request_id,
+                    "status": "internal_error",
+                }
+            connection.send(response)
+    except (EOFError, BrokenPipeError, OSError):
+        return
+    finally:
+        connection.close()
+
+
+class _StreamingDirectoryEnumerationWorker:
+    """A bounded event queue adapter for the v3 traversal path."""
+
+    def __init__(
+        self,
+        *,
+        process_context: BaseContext | None,
+        enumerator: Callable[[Path], Any],
+        queue_size: int,
+        observer: CrawlObserver,
+    ) -> None:
+        self._context = process_context or get_context("spawn")
+        self._enumerator = enumerator
+        self._queue_size = queue_size
+        self._observer = observer
+        self._observer.queue_maxsize = max(
+            self._observer.queue_maxsize,
+            queue_size,
+        )
+        self._request_id = 0
+        self._connection: Connection | None = None
+        self._process: BaseProcess | None = None
+        self._event_queue: Any | None = None
+        self.last_enumeration: _DirectoryEnumeration | None = None
+
+    def __enter__(self) -> _StreamingDirectoryEnumerationWorker:
+        self._start()
+        return self
+
+    def __exit__(self, *_exc_info: object) -> None:
+        self.close()
+
+    def iter_entries(
+        self,
+        path: Path,
+        *,
+        timeout_seconds: float,
+        monotonic_clock: Callable[[], float],
+    ):
+        if self._process is None or self._connection is None or self._event_queue is None:
+            raise StructuralCrawlWorkerError("semantic directory worker failed safely")
+        self._request_id += 1
+        request_id = self._request_id
+        try:
+            self._connection.send(
+                {
+                    "protocol": _DIRECTORY_WORKER_PROTOCOL,
+                    "command": "enumerate",
+                    "request_id": request_id,
+                    "path": os.fspath(path),
+                }
+            )
+        except (BrokenPipeError, EOFError, OSError) as error:
+            raise StructuralCrawlWorkerError("semantic directory worker failed safely") from error
+
+        started_at = monotonic_clock()
+        deadline = started_at + timeout_seconds
+        received = 0
+        expected_count: int | None = None
+        completed = False
+        try:
+            while expected_count is None or received < expected_count:
+                remaining = deadline - monotonic_clock()
+                if remaining <= 0:
+                    self._timeout(started_at, monotonic_clock)
+                    return
+                ready = wait(
+                    [self._connection, self._process.sentinel, self._event_queue._reader],
+                    timeout=remaining,
+                )
+                if not ready:
+                    self._timeout(started_at, monotonic_clock)
+                    return
+                if self._event_queue._reader in ready:
+                    try:
+                        raw_entry = self._event_queue.get()
+                    except (EOFError, OSError) as error:
+                        raise StructuralCrawlWorkerError(
+                            "semantic directory worker failed safely"
+                        ) from error
+                    self._observe_queue_depth()
+                    received += 1
+                    yield _DirectoryEnumerationWorker._validate_entry(raw_entry)
+                    deadline = monotonic_clock() + timeout_seconds
+                if self._connection in ready:
+                    try:
+                        response = self._connection.recv()
+                    except (BrokenPipeError, EOFError, OSError) as error:
+                        raise StructuralCrawlWorkerError(
+                            "semantic directory worker failed safely"
+                        ) from error
+                    expected_count = self._terminal_count(response, request_id, received)
+                    if expected_count is None:
+                        completed = True
+                        return
+                    if received == expected_count:
+                        completed = True
+                        self.last_enumeration = _DirectoryEnumeration(entries=())
+                        return
+                if self._connection not in ready and self._process.sentinel in ready:
+                    raise StructuralCrawlWorkerError("semantic directory worker failed safely")
+            completed = True
+            self.last_enumeration = _DirectoryEnumeration(entries=())
+        finally:
+            if not completed and self._process is not None:
+                self._stop(graceful=False)
+
+    def replace_after_timeout(self) -> None:
+        if self._process is not None or self._connection is not None:
+            raise StructuralCrawlWorkerError("semantic directory worker failed safely")
+        self._start()
+
+    def close(self) -> None:
+        self._stop(graceful=True)
+
+    def _timeout(
+        self,
+        started_at: float,
+        monotonic_clock: Callable[[], float],
+    ) -> None:
+        elapsed = max(0.0, monotonic_clock() - started_at)
+        self._stop(graceful=False)
+        self.last_enumeration = _DirectoryEnumeration(
+            entries=(), timed_out=True, timeout_wait_seconds=elapsed
+        )
+
+    def _terminal_count(
+        self,
+        response: object,
+        request_id: int,
+        received: int,
+    ) -> int | None:
+        if (
+            type(response) is not dict
+            or response.get("protocol") != _DIRECTORY_WORKER_PROTOCOL
+            or response.get("request_id") != request_id
+        ):
+            raise StructuralCrawlWorkerError("semantic directory worker failed safely")
+        status = response.get("status")
+        if status == "unreadable":
+            if set(response) != {"protocol", "request_id", "status"} or received:
+                raise StructuralCrawlWorkerError("semantic directory worker failed safely")
+            self.last_enumeration = _DirectoryEnumeration(entries=(), unreadable=True)
+            return None
+        if status != "ok" or set(response) != {
+            "protocol", "request_id", "status", "entry_count"
+        }:
+            raise StructuralCrawlWorkerError("semantic directory worker failed safely")
+        count = response.get("entry_count")
+        if type(count) is not int or count < received:
+            raise StructuralCrawlWorkerError("semantic directory worker failed safely")
+        return count
+
+    def _start(self) -> None:
+        if not hasattr(self._context, "Queue"):
+            raise StructuralCrawlWorkerError("semantic directory worker failed safely")
+        parent, child = self._context.Pipe(duplex=True)
+        event_queue = self._context.Queue(maxsize=self._queue_size)
+        process = self._context.Process(
+            target=_streaming_directory_worker_main,
+            args=(child, event_queue, self._enumerator),
+            daemon=True,
+        )
+        self._connection = parent
+        self._process = process
+        self._event_queue = event_queue
+        try:
+            process.start()
+            child.close()
+            ready = wait([parent, process.sentinel], timeout=_WORKER_START_SECONDS)
+            if parent not in ready or parent.recv() != {
+                "protocol": _DIRECTORY_WORKER_PROTOCOL,
+                "status": "ready",
+            }:
+                raise StructuralCrawlWorkerError("semantic directory worker failed safely")
+        except BaseException as error:
+            try:
+                child.close()
+            except BaseException:
+                pass
+            self._stop(graceful=False)
+            if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                raise
+            if isinstance(error, StructuralCrawlWorkerError):
+                raise
+            raise StructuralCrawlWorkerError("semantic directory worker failed safely") from error
+
+    def _stop(self, *, graceful: bool) -> None:
+        process = self._process
+        connection = self._connection
+        event_queue = self._event_queue
+        self._process = None
+        self._connection = None
+        self._event_queue = None
+        if process is not None:
+            try:
+                if graceful and process.is_alive() and connection is not None:
+                    connection.send({"protocol": _DIRECTORY_WORKER_PROTOCOL, "command": "close"})
+                    process.join(_WORKER_JOIN_SECONDS)
+                if process.is_alive():
+                    process.terminate()
+                    process.join(_WORKER_JOIN_SECONDS)
+                if process.is_alive():
+                    process.kill()
+                    process.join(_WORKER_JOIN_SECONDS)
+            finally:
+                if connection is not None:
+                    connection.close()
+                process.close()
+        elif connection is not None:
+            connection.close()
+        if event_queue is not None:
+            event_queue.close()
+            event_queue.join_thread()
+
+    def _observe_queue_depth(self) -> None:
+        if self._event_queue is None:
+            return
+        try:
+            queued = self._event_queue.qsize()
+        except (NotImplementedError, OSError):
+            queued = 0
+        self._observer.max_buffered_events = max(
+            self._observer.max_buffered_events,
+            min(self._queue_size, max(0, queued)),
+        )
+
+
 @dataclass(frozen=True)
 class StructuralEntry:
     node_id: str
@@ -567,7 +884,36 @@ class StructuralCrawl:
     consumed_timeout_wait_seconds: float = 0.0
 
 
-def crawl_local_structure(
+class StructuralEventKind(StrEnum):
+    NODE_SEEN = "node_seen"
+    FILE_ANALYZED = "file_analyzed"
+    DIRECTORY_CLOSED = "directory_closed"
+    SOURCE_CLOSED = "source_closed"
+
+
+@dataclass(frozen=True)
+class StructuralEvent:
+    kind: StructuralEventKind
+    node: StructuralEntry
+    baseline: LocalBaseline | None = None
+
+
+@dataclass
+class CrawlObserver:
+    """Optional bounded-memory evidence for the streaming crawler."""
+
+    max_buffered_events: int = 0
+    queue_maxsize: int = 0
+    directory_tuple_materializations: int = 0
+    timed_out_directory_count: int = 0
+    unreadable_directory_count: int = 0
+    consumed_timeout_wait_seconds: float = 0.0
+    timed_out_relative_hierarchies: list[str] = field(default_factory=list)
+    errors: list[StructuralCrawlError] = field(default_factory=list)
+    collect_errors: bool = False
+
+
+def _crawl_local_structure_v2_materialized(
     root: Path,
     approval: SourceApproval,
     prior_entries: tuple[StructuralEntry, ...] = (),
@@ -907,3 +1253,390 @@ def _reserve_prior_entries(
 
 def _relative_hierarchy(root: Path, path: Path) -> str:
     return path.relative_to(root).as_posix()
+
+
+def iter_local_structure_events(
+    root: Path,
+    approval: SourceApproval,
+    prior_entries: tuple[StructuralEntry, ...] = (),
+    *,
+    directory_timeout_seconds: float = DEFAULT_DIRECTORY_TIMEOUT_SECONDS,
+    directory_timeout_budget_seconds: float = DEFAULT_DIRECTORY_TIMEOUT_BUDGET_SECONDS,
+    worker_queue_size: int = DEFAULT_STREAMING_WORKER_QUEUE_SIZE,
+    observer: CrawlObserver | None = None,
+    _process_context: BaseContext | None = None,
+    _enumerator: Callable[[Path], Any] = _stream_directory_entries,
+    _monotonic: Callable[[], float] = monotonic,
+):
+    """Yield one structural record at a time using a bounded worker queue.
+
+    The traversal creates one worker per active directory depth.  A parent worker
+    may block on its bounded queue while a child worker is active, so neither a
+    directory tuple nor a pending sibling list is retained in the v3 path.
+    """
+    if type(worker_queue_size) is not int or worker_queue_size <= 0:
+        raise ValueError("worker_queue_size must be positive")
+    root_path = _resolve_root(root)
+    root_stat = _lstat(root_path)
+    root_key, root_device, root_inode = _provider_identity(root_stat, ".")
+    source_id = stable_source_id("local", root_key)
+    policy = FilePolicy(
+        forbidden_paths=approval.excluded_directories,
+        excluded_file_patterns=approval.excluded_file_patterns,
+    )
+    crawl_observer = observer or CrawlObserver()
+    prior_node_ids = {
+        (entry.source_id, entry.provider_item_key): entry.node_id
+        for entry in prior_entries
+    }
+    (
+        reserved_prior_entries,
+        renamed_prior_entries_by_inode,
+        _reserved_provider_keys,
+    ) = _reserve_prior_entries(root_path, source_id, prior_entries, policy)
+    renamed_prior_entry_indexes: dict[tuple[int, int], int] = {}
+
+    def make_entry(
+        path: Path,
+        relative_hierarchy: str,
+        parent_node_id: str | None,
+        kind: SemanticNodeKind,
+        status: AnalysisStatus,
+        path_stat: os.stat_result | _MaterializedDirectoryEntry,
+    ) -> StructuralEntry:
+        if isinstance(path_stat, _MaterializedDirectoryEntry):
+            device = path_stat.st_dev
+            inode = path_stat.st_ino
+        else:
+            _identity_key, device, inode = _provider_identity(
+                path_stat, relative_hierarchy
+            )
+        provider_item_key = relative_hierarchy
+        if device is not None and inode is not None:
+            provider_item_key = f"{device}:{inode}"
+            if kind is SemanticNodeKind.FILE:
+                try:
+                    if path.lstat().st_nlink > 1:
+                        provider_item_key = relative_hierarchy
+                except OSError:
+                    provider_item_key = relative_hierarchy
+        if device is not None and inode is not None:
+            prior_entry = reserved_prior_entries.get(relative_hierarchy)
+            if prior_entry is not None:
+                provider_item_key = prior_entry.provider_item_key
+            else:
+                prior_inode_entries = renamed_prior_entries_by_inode.get(
+                    (device, inode), ()
+                )
+                prior_index = renamed_prior_entry_indexes.get((device, inode), 0)
+                if prior_index < len(prior_inode_entries):
+                    provider_item_key = prior_inode_entries[prior_index].provider_item_key
+                    renamed_prior_entry_indexes[(device, inode)] = prior_index + 1
+        node_id = prior_node_ids.get(
+            (source_id, provider_item_key),
+            stable_node_id(source_id, provider_item_key),
+        )
+        return StructuralEntry(
+            node_id=node_id,
+            source_id=source_id,
+            parent_node_id=parent_node_id,
+            kind=kind,
+            display_name=normalize_label(path.name),
+            relative_hierarchy=relative_hierarchy,
+            absolute_path=path,
+            provider_item_key=provider_item_key,
+            content_fingerprint=None,
+            device=device,
+            inode=inode,
+            status=status,
+        )
+
+    def record_error(
+        relative_hierarchy: str,
+        status: AnalysisStatus,
+        *,
+        timed_out: bool = False,
+    ) -> None:
+        if crawl_observer.collect_errors:
+            crawl_observer.errors.append(
+                StructuralCrawlError(relative_hierarchy, status, timed_out=timed_out)
+            )
+
+    def terminal_events(
+        entry: StructuralEntry,
+        close_kind: StructuralEventKind | None,
+    ):
+        from portfolio_maker.infrastructure.semantic_analyzers import (
+            analyze_local_baseline,
+        )
+
+        yield StructuralEvent(
+            StructuralEventKind.FILE_ANALYZED,
+            entry,
+            analyze_local_baseline(entry),
+        )
+        if close_kind is StructuralEventKind.SOURCE_CLOSED:
+            yield StructuralEvent(StructuralEventKind.DIRECTORY_CLOSED, entry)
+        if close_kind is not None:
+            yield StructuralEvent(close_kind, entry)
+
+    def stream_directory(
+        directory: Path,
+        entry: StructuralEntry,
+        close_kind: StructuralEventKind,
+        legacy_worker: _DirectoryEnumerationWorker | None,
+    ):
+        yield StructuralEvent(StructuralEventKind.NODE_SEEN, entry)
+        remaining_budget = max(
+            0.0,
+            directory_timeout_budget_seconds
+            - crawl_observer.consumed_timeout_wait_seconds,
+        )
+        requested_timeout = min(directory_timeout_seconds, remaining_budget)
+        if legacy_worker is None:
+            with _StreamingDirectoryEnumerationWorker(
+                process_context=_process_context,
+                enumerator=_enumerator,
+                queue_size=worker_queue_size,
+                observer=crawl_observer,
+            ) as stream_worker:
+                children = stream_worker.iter_entries(
+                    directory,
+                    timeout_seconds=requested_timeout,
+                    monotonic_clock=_monotonic,
+                )
+                for child in children:
+                    yield from visit_child(directory, entry.node_id, child, legacy_worker)
+                enumeration = stream_worker.last_enumeration
+                if enumeration is not None and enumeration.timed_out:
+                    stream_worker.replace_after_timeout()
+        else:
+            enumeration = legacy_worker.enumerate(
+                directory,
+                timeout_seconds=requested_timeout,
+                replace_after_timeout=False,
+                monotonic_clock=_monotonic,
+            )
+            for child in enumeration.entries:
+                yield from visit_child(directory, entry.node_id, child, legacy_worker)
+            if enumeration.timed_out:
+                legacy_worker.replace_after_timeout()
+
+        if enumeration is None:
+            raise StructuralCrawlWorkerError("semantic directory worker failed safely")
+        if enumeration.timed_out:
+            crawl_observer.consumed_timeout_wait_seconds = min(
+                directory_timeout_budget_seconds,
+                crawl_observer.consumed_timeout_wait_seconds
+                + enumeration.timeout_wait_seconds,
+            )
+            crawl_observer.timed_out_relative_hierarchies.append(
+                entry.relative_hierarchy
+            )
+            if (
+                crawl_observer.consumed_timeout_wait_seconds
+                >= directory_timeout_budget_seconds
+            ):
+                raise StructuralCrawlTimeoutBudgetError(
+                    source_id=source_id,
+                    timed_out_relative_hierarchies=tuple(
+                        crawl_observer.timed_out_relative_hierarchies
+                    ),
+                    timed_out_directory_count=(
+                        crawl_observer.timed_out_directory_count + 1
+                    ),
+                    unreadable_directory_count=(
+                        crawl_observer.unreadable_directory_count + 1
+                    ),
+                    consumed_timeout_wait_seconds=(
+                        crawl_observer.consumed_timeout_wait_seconds
+                    ),
+                )
+            if entry.kind is SemanticNodeKind.SOURCE:
+                raise StructuralCrawlRootTimeoutError("Structural crawl root timed out")
+            resolved = replace(entry, status=AnalysisStatus.UNREADABLE)
+            crawl_observer.timed_out_directory_count += 1
+            crawl_observer.unreadable_directory_count += 1
+            record_error(
+                entry.relative_hierarchy,
+                AnalysisStatus.UNREADABLE,
+                timed_out=True,
+            )
+            yield from terminal_events(resolved, close_kind)
+            return
+        if enumeration.unreadable:
+            resolved = replace(entry, status=AnalysisStatus.UNREADABLE)
+            crawl_observer.unreadable_directory_count += 1
+            record_error(entry.relative_hierarchy, AnalysisStatus.UNREADABLE)
+            yield from terminal_events(resolved, close_kind)
+            return
+        yield from terminal_events(entry, close_kind)
+
+    def visit_child(
+        directory: Path,
+        parent_node_id: str,
+        child: _MaterializedDirectoryEntry,
+        legacy_worker: _DirectoryEnumerationWorker | None,
+    ):
+        child_path = directory / child.name
+        child_relative = _relative_hierarchy(root_path, child_path)
+        if not child.readable:
+            record_error(child_relative, AnalysisStatus.UNREADABLE)
+            return
+        assert child.st_mode is not None
+        if stat.S_ISLNK(child.st_mode):
+            entry = make_entry(
+                child_path,
+                child_relative,
+                parent_node_id,
+                SemanticNodeKind.FILE,
+                AnalysisStatus.UNSUPPORTED,
+                child,
+            )
+            yield StructuralEvent(StructuralEventKind.NODE_SEEN, entry)
+            yield from terminal_events(entry, None)
+            record_error(child_relative, AnalysisStatus.UNSUPPORTED)
+            return
+        classification = policy.classify_path(child_path)
+        if stat.S_ISDIR(child.st_mode):
+            entry = make_entry(
+                child_path,
+                child_relative,
+                parent_node_id,
+                SemanticNodeKind.DIRECTORY,
+                (
+                    AnalysisStatus.PENDING
+                    if classification == "candidate"
+                    else AnalysisStatus.UNSUPPORTED
+                ),
+                child,
+            )
+            if classification == "candidate":
+                yield from stream_directory(
+                    child_path,
+                    entry,
+                    StructuralEventKind.DIRECTORY_CLOSED,
+                    legacy_worker,
+                )
+            else:
+                yield StructuralEvent(StructuralEventKind.NODE_SEEN, entry)
+                yield from terminal_events(entry, StructuralEventKind.DIRECTORY_CLOSED)
+            return
+        entry = make_entry(
+            child_path,
+            child_relative,
+            parent_node_id,
+            SemanticNodeKind.FILE,
+            (
+                AnalysisStatus.PENDING
+                if stat.S_ISREG(child.st_mode) and classification == "candidate"
+                else AnalysisStatus.UNSUPPORTED
+            ),
+            child,
+        )
+        yield StructuralEvent(StructuralEventKind.NODE_SEEN, entry)
+        yield from terminal_events(entry, None)
+        if not stat.S_ISREG(child.st_mode):
+            record_error(child_relative, AnalysisStatus.UNSUPPORTED)
+
+    source = StructuralEntry(
+        node_id=stable_node_id(source_id, root_key),
+        source_id=source_id,
+        parent_node_id=None,
+        kind=SemanticNodeKind.SOURCE,
+        display_name=normalize_label(root_path.name),
+        relative_hierarchy=".",
+        absolute_path=root_path,
+        provider_item_key=root_key,
+        content_fingerprint=None,
+        device=root_device,
+        inode=root_inode,
+        status=AnalysisStatus.PENDING,
+    )
+    if policy.classify_path(root_path) != "candidate":
+        source = replace(source, status=AnalysisStatus.UNSUPPORTED)
+        yield StructuralEvent(StructuralEventKind.NODE_SEEN, source)
+        yield from terminal_events(source, StructuralEventKind.SOURCE_CLOSED)
+        return
+
+    if _DirectoryEnumerationWorker is _DEFAULT_DIRECTORY_ENUMERATION_WORKER:
+        yield from stream_directory(
+            root_path,
+            source,
+            StructuralEventKind.SOURCE_CLOSED,
+            None,
+        )
+        return
+    with _DirectoryEnumerationWorker(
+        process_context=_process_context,
+        enumerator=_enumerator,
+    ) as legacy_worker:
+        yield from stream_directory(
+            root_path,
+            source,
+            StructuralEventKind.SOURCE_CLOSED,
+            legacy_worker,
+        )
+
+
+def crawl_local_structure(
+    root: Path,
+    approval: SourceApproval,
+    prior_entries: tuple[StructuralEntry, ...] = (),
+    *,
+    directory_timeout_seconds: float = DEFAULT_DIRECTORY_TIMEOUT_SECONDS,
+    directory_timeout_budget_seconds: float = DEFAULT_DIRECTORY_TIMEOUT_BUDGET_SECONDS,
+    _process_context: BaseContext | None = None,
+    _enumerator: Callable[[Path], Any] = _stream_directory_entries,
+    _monotonic: Callable[[], float] = monotonic,
+) -> StructuralCrawl:
+    """Legacy v2 compatibility wrapper; this is the only full entry materializer."""
+    process_context = _process_context or get_context("spawn")
+    if (
+        _DirectoryEnumerationWorker is not _DEFAULT_DIRECTORY_ENUMERATION_WORKER
+        or _DirectoryEnumerationWorker.replace_after_timeout
+        is not _DEFAULT_DIRECTORY_WORKER_REPLACE
+        or not hasattr(process_context, "Queue")
+    ):
+        return _crawl_local_structure_v2_materialized(
+            root,
+            approval,
+            prior_entries,
+            directory_timeout_seconds=directory_timeout_seconds,
+            directory_timeout_budget_seconds=directory_timeout_budget_seconds,
+            _process_context=process_context,
+            _enumerator=_enumerator,
+            _monotonic=_monotonic,
+        )
+    observer = CrawlObserver(collect_errors=True)
+    latest_entries: dict[str, StructuralEntry] = {}
+    for event in iter_local_structure_events(
+        root,
+        approval,
+        prior_entries,
+        directory_timeout_seconds=directory_timeout_seconds,
+        directory_timeout_budget_seconds=directory_timeout_budget_seconds,
+        _process_context=process_context,
+        _enumerator=_enumerator,
+        _monotonic=_monotonic,
+        observer=observer,
+    ):
+        if event.kind is StructuralEventKind.NODE_SEEN:
+            latest_entries.setdefault(event.node.node_id, event.node)
+        elif event.kind in {
+            StructuralEventKind.DIRECTORY_CLOSED,
+            StructuralEventKind.SOURCE_CLOSED,
+        }:
+            latest_entries[event.node.node_id] = event.node
+    return StructuralCrawl(
+        entries=tuple(
+            sorted(
+                latest_entries.values(),
+                key=lambda entry: (entry.relative_hierarchy, entry.node_id),
+            )
+        ),
+        errors=tuple(observer.errors),
+        timed_out_directory_count=observer.timed_out_directory_count,
+        unreadable_directory_count=observer.unreadable_directory_count,
+        consumed_timeout_wait_seconds=observer.consumed_timeout_wait_seconds,
+    )
