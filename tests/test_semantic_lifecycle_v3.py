@@ -1216,6 +1216,119 @@ def test_checkpoint_cadence_advances_current_root_without_blocking_the_same_run(
     assert repository.receipt_count("run-a") == 17
 
 
+def test_irregular_checkpoint_sequences_remain_monotonic_across_automatic_cadences(
+    workspace: Path,
+) -> None:
+    repository = SQLiteRepository(WorkspacePaths.from_root(workspace).db_path)
+    repository.initialize()
+    genesis = _digest("genesis")
+    envelope = _stored_proposal(repository, "run-a", current_checkpoint_root=genesis)
+    repository.create_semantic_v3_run(envelope)
+    repository.add_semantic_v3_units(
+        "run-a", tuple(_unit(f"unit-{sequence}") for sequence in range(1, 33)),
+    )
+    repository.approve_semantic_v3_run("run-a", envelope.proposal_sha256)
+    repository.claim_semantic_v3_running_slot("run-a")
+
+    for sequence in range(1, 8):
+        unit_id = f"unit-{sequence}"
+        repository.acquire_semantic_v3_execution("run-a", unit_id, f"nonce-{sequence}")
+        repository.issue_semantic_v3_input(
+            "run-a", f"nonce-{sequence}", _digest(f"input-{sequence}"), 1,
+        )
+        repository.commit_semantic_v3_receipt(_receipt("run-a", unit_id, sequence))
+
+    repository.pause_semantic_v3_run("run-a", "manual checkpoint")
+    with repository._read_connection() as connection:
+        aggregate_root = connection.execute(
+            "SELECT aggregate_root FROM semantic_v3_aggregates WHERE run_id = 'run-a'"
+        ).fetchone()[0]
+    irregular = SemanticCheckpoint(
+        "run-a", 1, 7, 7, _digest("result-pack-7"), "0" * 64,
+        aggregate_root, "{}", "selector-v1", envelope.proposal.parent_checkpoint_root,
+        "0" * 64,
+    )
+    irregular = SemanticCheckpoint(
+        **{
+            **irregular.__dict__,
+            "checkpoint_root": repository._semantic_v3_checkpoint_root(irregular),
+        }
+    )
+    repository.checkpoint_semantic_v3_run(irregular)
+    repository.claim_semantic_v3_running_slot("run-a")
+
+    for sequence in range(8, 33):
+        unit_id = f"unit-{sequence}"
+        repository.acquire_semantic_v3_execution("run-a", unit_id, f"nonce-{sequence}")
+        repository.issue_semantic_v3_input(
+            "run-a", f"nonce-{sequence}", _digest(f"input-{sequence}"), 1,
+        )
+        repository.commit_semantic_v3_receipt(_receipt("run-a", unit_id, sequence))
+
+    with repository._read_connection() as connection:
+        receipt_rows = connection.execute(
+            """SELECT sequence, unit_id, input_bytes, active_seconds
+               FROM semantic_v3_receipts WHERE run_id = 'run-a' ORDER BY sequence"""
+        ).fetchall()
+        checkpoint_rows = connection.execute(
+            """SELECT sequence, receipt_sequence, result_pack_length, result_pack_root,
+                      queue_root, aggregate_root, resume_cursor_json,
+                      audit_ordered_set_sha256, audit_population_sha256, selector_version,
+                      previous_checkpoint_root, checkpoint_root
+               FROM semantic_v3_checkpoints WHERE run_id = 'run-a' ORDER BY sequence"""
+        ).fetchall()
+        run_usage = tuple(connection.execute(
+            """SELECT used_units, used_input_bytes, used_active_seconds,
+                      result_pack_length, result_pack_root
+               FROM semantic_v3_runs WHERE run_id = 'run-a'"""
+        ).fetchone())
+        aggregate_usage = tuple(connection.execute(
+            """SELECT validated_count, used_units, used_input_bytes, used_active_seconds
+               FROM semantic_v3_aggregates WHERE run_id = 'run-a'"""
+        ).fetchone())
+        lease_count = connection.execute(
+            "SELECT COUNT(*) FROM semantic_v3_leases WHERE run_id = 'run-a'"
+        ).fetchone()[0]
+        current_checkpoint_root = connection.execute(
+            """SELECT current_checkpoint_root FROM semantic_v3_revision_bindings
+               WHERE revision_id = 'revision-1'"""
+        ).fetchone()[0]
+
+    assert [tuple(row) for row in receipt_rows] == [
+        (sequence, f"unit-{sequence}", 1, 1.0) for sequence in range(1, 33)
+    ]
+    assert run_usage == (32, 32, 32.0, 32, _digest("result-pack-32"))
+    assert aggregate_usage == (32, 32, 32, 32.0)
+    assert repository.execution_lock() is None
+    assert lease_count == 0
+    assert [row[0] for row in checkpoint_rows] == [1, 2, 3]
+    assert [row[1] for row in checkpoint_rows] == [7, 16, 32]
+
+    previous_root = envelope.proposal.parent_checkpoint_root
+    for row in checkpoint_rows:
+        assert row[10] == previous_root
+        payload = {
+            "run_id": "run-a",
+            "sequence": row[0],
+            "receipt_sequence": row[1],
+            "result_pack_length": row[2],
+            "result_pack_root": row[3],
+            "queue_root": row[4],
+            "aggregate_root": row[5],
+            "resume_cursor_json": row[6],
+            "audit_ordered_set_sha256": row[7],
+            "audit_population_sha256": row[8],
+            "selector_version": row[9],
+            "previous_checkpoint_root": row[10],
+        }
+        assert row[11] == sha256(
+            b"portfolio-maker-semantic-v3-checkpoint\0"
+            + semantic_canonical_json_bytes(payload)
+        ).hexdigest()
+        previous_root = row[11]
+    assert current_checkpoint_root == previous_root
+
+
 def test_external_checkpoint_drift_after_cadence_preserves_issued_receipt_state(
     workspace: Path,
 ) -> None:

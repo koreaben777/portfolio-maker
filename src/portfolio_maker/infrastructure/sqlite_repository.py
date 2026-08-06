@@ -2454,6 +2454,16 @@ class SQLiteRepository:
             conn.execute("DELETE FROM semantic_v3_leases WHERE run_id = ? AND unit_id = ?", (receipt.run_id, receipt.unit_id))
             # A bounded checkpoint is published exactly at the configured default interval.
             if sequence % 16 == 0:
+                last_checkpoint = conn.execute(
+                    """SELECT sequence FROM semantic_v3_checkpoints
+                       WHERE run_id = ? ORDER BY sequence DESC LIMIT 1""",
+                    (receipt.run_id,),
+                ).fetchone()
+                checkpoint_sequence = (
+                    1
+                    if last_checkpoint is None
+                    else int(last_checkpoint["sequence"]) + 1
+                )
                 previous = conn.execute(
                     """SELECT current_checkpoint_root FROM semantic_v3_revision_bindings
                        WHERE revision_id = ?""", (run["revision_id"],)
@@ -2461,7 +2471,7 @@ class SQLiteRepository:
                 if previous is None:
                     raise RepositoryError("semantic checkpoint authority is invalid")
                 checkpoint = SemanticCheckpoint(
-                    receipt.run_id, sequence // 16, sequence, receipt.result_pack_length,
+                    receipt.run_id, checkpoint_sequence, sequence, receipt.result_pack_length,
                     receipt.result_pack_root, "0" * 64, aggregate_root, "{}", proposal["selector_version"],
                     previous["current_checkpoint_root"], "0" * 64,
                 )
