@@ -801,6 +801,44 @@ def test_cross_device_publish_retries_partial_writes_until_complete(
     assert final_path.read_bytes() == payload
 
 
+def test_cross_device_publish_preserves_preexisting_final_on_exclusive_open_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Breaks if failed exclusive creation deletes a final owned by another call."""
+    stage_path = tmp_path / "stage.pack"
+    final_path = tmp_path / "final.pack"
+    stage_path.write_bytes(b"new staged bytes")
+    final_path.write_bytes(b"existing")
+    final_path.chmod(0o640)
+    os.utime(final_path, ns=(1_700_000_000_000_000_000,) * 2)
+    before = final_path.stat()
+    _force_cross_device_publish(monkeypatch)
+
+    with pytest.raises(FileExistsError):
+        StreamingStructureSink._publish_file(stage_path, final_path)
+
+    assert final_path.exists()
+    assert final_path.read_bytes() == b"existing"
+    after = final_path.stat()
+    assert (
+        after.st_dev,
+        after.st_ino,
+        after.st_mode,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    ) == (
+        before.st_dev,
+        before.st_ino,
+        before.st_mode,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    )
+    assert stage_path.read_bytes() == b"new staged bytes"
+
+
 @pytest.mark.parametrize("progress", (0, -1))
 def test_cross_device_publish_rejects_nonpositive_write_progress(
     tmp_path: Path,

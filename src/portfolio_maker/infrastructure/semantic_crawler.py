@@ -1442,6 +1442,7 @@ class StreamingStructureSink:
                 raise
         source: int | None = os.open(stage_path, os.O_RDONLY | os.O_NOFOLLOW)
         destination: int | None = None
+        destination_created = False
         verification: int | None = None
         try:
             destination = os.open(
@@ -1449,6 +1450,7 @@ class StreamingStructureSink:
                 os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                 0o400,
             )
+            destination_created = True
             source_stat = os.fstat(source)
             if not stat.S_ISREG(source_stat.st_mode):
                 raise OSError("streaming authority stage is not a regular file")
@@ -1525,10 +1527,11 @@ class StreamingStructureSink:
                 except OSError:
                     pass
                 source = None
-            try:
-                os.unlink(final_path)
-            except FileNotFoundError:
-                pass
+            if destination_created:
+                try:
+                    os.unlink(final_path)
+                except FileNotFoundError:
+                    pass
             raise
         finally:
             if verification is not None:
