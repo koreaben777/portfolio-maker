@@ -5,9 +5,10 @@ import json
 import os
 import sqlite3
 from dataclasses import dataclass
+from functools import wraps
 from pathlib import Path
 from stat import S_ISREG
-from typing import Iterator
+from typing import Callable, Iterator
 from uuid import uuid4
 
 from portfolio_maker.domain.semantic_frontier import (
@@ -291,6 +292,8 @@ class SemanticCatalogWriter:
         self._closed = False
         self._sealed = False
         self._seal: CatalogSeal | None = None
+        self._planning_session: SemanticCatalogPlanningSession | None = None
+        self._planning_session_open = False
         try:
             _require_missing_regular_target(self._directory_descriptor, self._path.name)
             descriptor = os.open(
@@ -574,13 +577,28 @@ class SemanticCatalogWriter:
         *,
         observer: PlanningQueryObserver | None = None,
     ) -> SemanticCatalogPlanningSession:
-        return SemanticCatalogPlanningSession(
-            self._require_writable(), selector_version, observer=observer
-        )
+        connection = self._require_writable()
+        if self._planning_session_open:
+            raise CatalogError("catalog selector planning session is already active")
+        self._planning_session_open = True
+        try:
+            session = SemanticCatalogPlanningSession(
+                connection,
+                selector_version,
+                observer=observer,
+                release_owner=self._release_planning_session,
+            )
+        except BaseException:
+            self._release_planning_session()
+            raise
+        self._planning_session = session
+        return session
 
     def seal(self) -> CatalogSeal:
         if self._seal is not None:
             return self._seal
+        if self._planning_session_open:
+            raise CatalogError("catalog selector planning session is active")
         connection = self._require_writable()
         try:
             connection.execute("PRAGMA temp_store = FILE")
@@ -630,6 +648,8 @@ class SemanticCatalogWriter:
         if self._closed:
             return
         try:
+            if self._planning_session is not None:
+                self._planning_session.abort()
             if not self._sealed:
                 self.seal()
         finally:
@@ -640,6 +660,10 @@ class SemanticCatalogWriter:
                 os.close(self._directory_descriptor)
                 self._directory_descriptor = None
             self._closed = True
+
+    def _release_planning_session(self) -> None:
+        self._planning_session = None
+        self._planning_session_open = False
 
     def _abort(self) -> None:
         if self._closed:
@@ -666,6 +690,8 @@ class SemanticCatalogWriter:
             raise CatalogError("semantic catalog is sealed")
         if self._closed or self._connection is None:
             raise CatalogError("semantic catalog is closed")
+        if self._planning_session_open:
+            raise CatalogError("catalog selector planning session is active")
         return self._connection
 
     def _create_schema(self) -> None:
@@ -768,6 +794,21 @@ class SemanticCatalogWriter:
         _validate_adaptive_selector_bindings(connection)
 
 
+def _planning_operation(
+    method: Callable[..., object],
+) -> Callable[..., object]:
+    @wraps(method)
+    def guarded(self: SemanticCatalogPlanningSession, *args: object, **kwargs: object) -> object:
+        self._require_active()
+        try:
+            return method(self, *args, **kwargs)
+        except BaseException:
+            self._fail()
+            raise
+
+    return guarded
+
+
 class SemanticCatalogPlanningSession:
     """Narrow pre-seal selector surface over a live catalog writer."""
 
@@ -777,33 +818,45 @@ class SemanticCatalogPlanningSession:
         selector_version: str,
         *,
         observer: PlanningQueryObserver | None = None,
+        release_owner: Callable[[], None],
     ) -> None:
         _require_text(selector_version, "selector version")
         self._connection = connection
         self.selector_version = selector_version
         self.observer = observer or PlanningQueryObserver()
-        self._finished = False
-        if connection.execute(
-            "SELECT 1 FROM frontier_selector_authorities WHERE selector_version = ?",
-            (selector_version,),
-        ).fetchone() is not None:
-            raise CatalogError("catalog selector planning session already exists")
+        self._release_owner = release_owner
+        self._state = "initializing"
+        self._savepoint_open = False
         connection.execute("PRAGMA temp_store = FILE")
         self.observer.temp_store_file = (
             connection.execute("PRAGMA temp_store").fetchone()[0] == 1
         )
         if not self.observer.temp_store_file:
             raise CatalogError("catalog planning requires file-backed temporary storage")
-        _build_frontier_order(connection)
-        self.selector_digest = _frontier_feature_root(connection)
-        connection.execute(
-            """
-            INSERT INTO frontier_selector_authorities(selector_version, selector_digest)
-            VALUES (?, ?)
-            """,
-            (selector_version, self.selector_digest),
-        )
+        connection.execute("SAVEPOINT semantic_catalog_planning")
+        self._savepoint_open = True
+        try:
+            if connection.execute(
+                "SELECT 1 FROM frontier_selector_authorities WHERE selector_version = ?",
+                (selector_version,),
+            ).fetchone() is not None:
+                raise CatalogError("catalog selector planning session already exists")
+            _build_frontier_order(connection)
+            self.selector_digest = _frontier_feature_root(connection)
+            connection.execute(
+                """
+                INSERT INTO frontier_selector_authorities(selector_version, selector_digest)
+                VALUES (?, ?)
+                """,
+                (selector_version, self.selector_digest),
+            )
+            self._fault_point("after_authority")
+        except BaseException:
+            self._fail()
+            raise
+        self._state = "active"
 
+    @_planning_operation
     def fair_seed_page(
         self, cursor: tuple[int, str] | None, limit: int
     ) -> list[FrontierPlanningRow]:
@@ -846,6 +899,7 @@ class SemanticCatalogPlanningSession:
         self._observe_page(rows)
         return [_planning_row_from_tuple(row) for row in rows]
 
+    @_planning_operation
     def ancestor_projection(
         self, node_id: str, *, limit: int = 64
     ) -> tuple[PlanningNodeProjection, ...] | None:
@@ -894,6 +948,7 @@ class SemanticCatalogPlanningSession:
             )
         return tuple(projections)
 
+    @_planning_operation
     def append_selector_result(self, result: FrontierSelectorResult) -> None:
         self._require_active()
         if result.selector_version != self.selector_version:
@@ -915,9 +970,11 @@ class SemanticCatalogPlanningSession:
                     result.relevance_rank, result.selector_feature_digest,
                 ),
             )
+            self._fault_point("after_selector_result")
         except sqlite3.IntegrityError as error:
             raise CatalogError("catalog selector planning result is invalid") from error
 
+    @_planning_operation
     def append_deferred(self, row: SemanticDeferredAuditRow) -> None:
         self._require_active()
         if row.selector_version != self.selector_version:
@@ -937,17 +994,32 @@ class SemanticCatalogPlanningSession:
                 """,
                 tuple(record.__dict__.values()),
             )
+            self._fault_point("after_deferred")
         except sqlite3.IntegrityError as error:
             raise CatalogError("catalog selector planning deferred row is invalid") from error
 
+    @_planning_operation
     def deferred_summary(self) -> DeferredSummary:
         self._require_active()
         return _deferred_summary(self._connection, self.selector_version)
 
+    @_planning_operation
     def finish(self) -> DeferredSummary:
         summary = self.deferred_summary()
-        self._finished = True
+        SemanticCatalogWriter._validate_before_seal(self._connection)
+        self._fault_point("after_finish_summary")
+        self._connection.execute("RELEASE SAVEPOINT semantic_catalog_planning")
+        self._savepoint_open = False
+        self._state = "finished"
+        self._release_owner()
         return summary
+
+    def abort(self) -> None:
+        if self._state in {"finished", "failed", "aborted"}:
+            return
+        self._rollback_savepoint()
+        self._state = "aborted"
+        self._release_owner()
 
     def _observe_page(self, rows: object) -> None:
         size = len(rows)  # type: ignore[arg-type]
@@ -955,8 +1027,35 @@ class SemanticCatalogPlanningSession:
         self.observer.max_python_rows = max(self.observer.max_python_rows, size)
 
     def _require_active(self) -> None:
-        if self._finished:
+        if self._state == "finished":
             raise CatalogError("catalog selector planning session is finished")
+        if self._state == "failed":
+            raise CatalogError("catalog selector planning session failed")
+        if self._state == "aborted":
+            raise CatalogError("catalog selector planning session was aborted")
+        if self._state != "active":
+            raise CatalogError("catalog selector planning session is not active")
+
+    def _fail(self) -> None:
+        if self._state in {"finished", "failed", "aborted"}:
+            return
+        self._rollback_savepoint()
+        self._state = "failed"
+        self._release_owner()
+
+    def _rollback_savepoint(self) -> None:
+        if not self._savepoint_open:
+            return
+        try:
+            self._connection.execute("ROLLBACK TO SAVEPOINT semantic_catalog_planning")
+        finally:
+            try:
+                self._connection.execute("RELEASE SAVEPOINT semantic_catalog_planning")
+            finally:
+                self._savepoint_open = False
+
+    def _fault_point(self, point: str) -> None:
+        del point
 
 
 class SemanticCatalogReader:
@@ -1290,9 +1389,12 @@ def _validate_adaptive_selector_bindings(connection: sqlite3.Connection) -> None
                ordering.top_level_lane, ordering.project_like,
                ordering.ambiguous, ordering.independent_child,
                ordering.evidence_linked, ordering.uncertainty,
-               feature.feature_digest
+               feature.feature_digest, node.relative_hierarchy,
+               baseline.roles_json, baseline.inspected_bytes
         FROM frontier_order AS ordering
         JOIN frontier_features AS feature ON feature.node_id = ordering.node_id
+        JOIN nodes AS node ON node.node_id = ordering.node_id
+        JOIN local_baselines AS baseline ON baseline.node_id = ordering.node_id
         JOIN frontier_selector_results AS result ON result.node_id = ordering.node_id
         WHERE result.selector_version = ?
         ORDER BY ordering.fair_round, ordering.top_level_lane,
@@ -1307,11 +1409,16 @@ def _validate_adaptive_selector_bindings(connection: sqlite3.Connection) -> None
             raise CatalogError("adaptive selector cursor order is invalid")
         cursor = _canonical_json_from_text(row[1])
         expected_cursor = {
+            "depth_band": _catalog_depth_band(str(row[12])),
             "fair_round": row[4],
             "lane": row[5],
             "node_id": row[0],
             "order": expected_order,
+            "role_band": _catalog_role_band(
+                _text_tuple(row[13], "baseline roles")
+            ),
             "selector_feature_digest": row[11],
+            "size_band": _catalog_size_band(int(row[14])),
         }
         if cursor != expected_cursor:
             raise CatalogError("adaptive selector cursor binding is invalid")
@@ -1324,6 +1431,47 @@ def _validate_adaptive_selector_bindings(connection: sqlite3.Connection) -> None
         )
         if row[3] != relevance_rank:
             raise CatalogError("adaptive selector relevance binding is invalid")
+
+
+_CATALOG_ROLE_ORDER = (
+    "project-description",
+    "entrypoint",
+    "package-manifest",
+    "test",
+    "deployment",
+    "documentation",
+    "data",
+    "generated-output",
+)
+
+
+def _catalog_depth_band(relative_hierarchy: str) -> str:
+    normalized = relative_hierarchy.strip("/")
+    if normalized in {"", "."}:
+        return "root"
+    depth = len([part for part in normalized.split("/") if part and part != "."])
+    if depth <= 2:
+        return "shallow"
+    if depth <= 5:
+        return "medium"
+    return "deep"
+
+
+def _catalog_size_band(inspected_bytes: int) -> str:
+    if inspected_bytes == 0:
+        return "empty"
+    if inspected_bytes <= 4 * 1024:
+        return "small"
+    if inspected_bytes <= 1024 * 1024:
+        return "medium"
+    return "large"
+
+
+def _catalog_role_band(roles: tuple[str, ...]) -> str:
+    for role in _CATALOG_ROLE_ORDER:
+        if role in roles:
+            return role
+    return "other"
 
 
 def _frontier_feature_root(connection: sqlite3.Connection) -> str:

@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import unicodedata
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -72,9 +74,22 @@ _REPRESENTATIVE_KEYS = {
     "coverage",
     "role_reason",
 }
-_UNSAFE_TEXT = re.compile(
-    r"(?:https?://|file://|(?:^|\s)[~/\\]|\.\.?/|\\[^\s]+\\|[\x00-\x1f])",
-    re.IGNORECASE,
+_LOCATOR_PATTERNS = (
+    re.compile(r"(?:https?|file|ssh)://"),
+    re.compile(r"(?<![a-z0-9])[a-z]:[\\/]"),
+    re.compile(r"(?<![a-z0-9])\\\\[^\\\s]+\\[^\\\s]+"),
+    re.compile(r"(?<![a-z0-9_.-])/(?:[^\s/]+(?:/[^\s/]+)*)"),
+    re.compile(r"(?:^|[\s(\"'])\.{1,2}[\\/][^\s\"')]+"),
+    re.compile(
+        r"(?:^|[\s(\"'])(?:\.{1,2}[\\/]|[a-z0-9_.-]+[\\/])"
+        r"[^\s\"')]*\.[a-z0-9]{1,12}(?:$|[\s\"')])"
+    ),
+    re.compile(
+        r"(?:^|[\s(\"'])[^/\\\s\"')]+\."
+        r"(?:md|py|js|ts|tsx|jsx|json|ya?ml|toml|pdf|docx|xlsx|pptx|"
+        r"csv|txt|html|css|sql|db)(?:$|[\s\"')])"
+    ),
+    re.compile(r"(?:git@[^:\s]+:[^\s]+|portfolio\.db|\.portfolio-maker)"),
 )
 
 
@@ -83,12 +98,8 @@ def validate_v3_semantic_output(
 ) -> ValidatedV3SemanticOutput:
     """Validate a closed v3 action against only its bounded input projection."""
 
-    if isinstance(output_payload, str) and len(output_payload.encode("utf-8")) > MAX_UNIT_BYTES:
-        raise SemanticQualityV3Error("v3 output exceeds the hard byte limit")
-    if isinstance(output_payload, bytes) and len(output_payload) > MAX_UNIT_BYTES:
-        raise SemanticQualityV3Error("v3 output exceeds the hard byte limit")
-    work_input = _object(input_payload, "input")
-    output = _object(output_payload, "output")
+    work_input = _bounded_canonical_object(input_payload, "input")
+    output = _bounded_canonical_object(output_payload, "output")
     if set(work_input) != _INPUT_KEYS:
         raise SemanticQualityV3Error("v3 input schema is invalid")
     if work_input.get("schema_version") != SEMANTIC_INPUT_SCHEMA_V3:
@@ -179,8 +190,6 @@ def validate_v3_semantic_output(
             raise SemanticQualityV3Error("v3 requested child binding is invalid")
     elif requested_children or next_cursor is not None:
         raise SemanticQualityV3Error("v3 terminal action cannot request child expansion")
-    if len(_canonical_bytes(output)) > MAX_UNIT_BYTES:
-        raise SemanticQualityV3Error("v3 output exceeds the hard byte limit")
     return ValidatedV3SemanticOutput(
         revision_id,
         run_id,
@@ -222,24 +231,40 @@ def _representatives(value: object) -> tuple[tuple[str, str], ...]:
     return tuple(result)
 
 
-def _object(value: object, name: str) -> dict[str, Any]:
-    if isinstance(value, dict):
-        return dict(value)
-    if isinstance(value, bytes):
+def _bounded_canonical_object(value: object, name: str) -> dict[str, Any]:
+    raw: bytes | None = None
+    if isinstance(value, Mapping):
+        parsed: object = dict(value)
+    else:
+        if isinstance(value, str):
+            try:
+                raw = value.encode("utf-8")
+            except UnicodeEncodeError as error:
+                raise SemanticQualityV3Error(f"v3 {name} JSON is invalid") from error
+        elif isinstance(value, bytes):
+            raw = value
+        else:
+            raise SemanticQualityV3Error(f"v3 {name} must be an object")
+        if len(raw) > MAX_UNIT_BYTES:
+            raise SemanticQualityV3Error(f"v3 {name} exceeds the hard byte limit")
         try:
-            value = value.decode("utf-8")
+            text = raw.decode("utf-8")
         except UnicodeDecodeError as error:
             raise SemanticQualityV3Error(f"v3 {name} JSON is invalid") from error
-    if isinstance(value, str):
         try:
-            parsed = json.loads(value, object_pairs_hook=_no_duplicate_keys)
+            parsed = json.loads(text, object_pairs_hook=_no_duplicate_keys)
         except SemanticQualityV3Error:
             raise
         except (TypeError, ValueError, json.JSONDecodeError) as error:
             raise SemanticQualityV3Error(f"v3 {name} JSON is invalid") from error
-        if isinstance(parsed, dict):
-            return parsed
-    raise SemanticQualityV3Error(f"v3 {name} must be an object")
+    if not isinstance(parsed, dict):
+        raise SemanticQualityV3Error(f"v3 {name} must be an object")
+    canonical = _canonical_bytes(parsed)
+    if len(canonical) > MAX_UNIT_BYTES:
+        raise SemanticQualityV3Error(f"v3 {name} exceeds the hard byte limit")
+    if raw is not None and raw != canonical:
+        raise SemanticQualityV3Error(f"v3 {name} JSON must be canonical")
+    return parsed
 
 
 def _no_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -328,9 +353,17 @@ def _bounded_safe_text(value: object, name: str, minimum: int, maximum: int) -> 
     text = _text(value, name)
     if not minimum <= len(text) <= maximum:
         raise SemanticQualityV3Error(f"v3 {name} length is invalid")
-    if _UNSAFE_TEXT.search(text):
+    if (
+        any(unicodedata.category(character).startswith("C") for character in text)
+        or _looks_like_locator(text)
+    ):
         raise SemanticQualityV3Error(f"v3 {name} contains unsafe locator text")
     return text
+
+
+def _looks_like_locator(value: str) -> bool:
+    normalized = unicodedata.normalize("NFKC", value).casefold()
+    return any(pattern.search(normalized) is not None for pattern in _LOCATOR_PATTERNS)
 
 
 def _text(value: object, name: str) -> str:

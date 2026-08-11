@@ -33,6 +33,7 @@ from portfolio_maker.infrastructure.semantic_catalog import (
     NodeRecord,
     PlanningNodeProjection,
     PlanningQueryObserver,
+    SemanticCatalogPlanningSession,
     SemanticCatalogReader,
     SemanticCatalogWriter,
     canonical_json_text,
@@ -286,27 +287,38 @@ def _audit_row(
     *,
     cursor_order: int | None = None,
     selector_version: str = FRONTIER_SELECTOR_VERSION,
+    source_id: str | None = None,
+    coverage_stratum: str | None = None,
+    depth_band: str = "shallow",
+    size_band: str = "small",
+    role_band: str = "documentation",
+    relevance_rank: int | None = None,
 ) -> SemanticDeferredAuditRow:
     order = index if cursor_order is None else cursor_order
     node_id = f"audit-{index:04}"
-    coverage = ("complete", "sampled", "unsupported", "unreadable", "failed")[
-        index % 5
-    ]
+    coverage = coverage_stratum or (
+        "complete", "sampled", "unsupported", "unreadable", "failed"
+    )[index % 5]
     return SemanticDeferredAuditRow(
         node_id=node_id,
         reason="budget",
         node_digest=_digest(f"node:{node_id}"),
         cursor_json=canonical_json_text(
             {
+                "depth_band": depth_band,
+                "fair_round": order,
+                "lane": "audit-lane",
                 "node_id": node_id,
                 "order": order,
+                "role_band": role_band,
                 "selector_feature_digest": _digest(f"feature:{node_id}"),
+                "size_band": size_band,
             }
         ),
         cursor_order=order,
-        source_id=f"source-{index % 7}",
+        source_id=source_id or f"source-{index % 7}",
         coverage_stratum=coverage,
-        relevance_rank=index,
+        relevance_rank=index if relevance_rank is None else relevance_rank,
         selector_version=selector_version,
         selector_feature_digest=_digest(f"feature:{node_id}"),
     )
@@ -356,7 +368,169 @@ def test_audit_freeze_returns_exact_deterministic_300_unique_members_boundedly()
     assert first_observer.max_relevance_candidates <= 300
     assert first_observer.max_random_candidates <= 300
     assert first_observer.max_coverage_stratum_candidates <= 300
+    assert first_observer.max_total_python_candidates <= 2_100
+    assert first_observer.axis_index_file_backed is True
+    assert first_observer.temporary_state_closed is True
     assert first_observer.max_pending_rows == 0
+
+
+@pytest.mark.parametrize(
+    ("axis", "dominant", "minority"),
+    (
+        ("source_id", "source-dominant", "source-minority"),
+        ("depth_band", "shallow", "deep"),
+        ("size_band", "small", "large"),
+        ("role_band", "documentation", "test"),
+        ("coverage_stratum", "complete", "failed"),
+    ),
+)
+def test_coverage_sample_includes_each_minority_axis(
+    axis: str, dominant: str, minority: str
+) -> None:
+    """Catches coverage selection that only stratifies coverage/error."""
+    rows = []
+    for index in range(500):
+        value = dominant if index < 400 else minority
+        kwargs: dict[str, object] = {
+            "source_id": "source-dominant",
+            "coverage_stratum": "complete",
+            "depth_band": "shallow",
+            "size_band": "small",
+            "role_band": "documentation",
+        }
+        kwargs[axis] = value
+        rows.append(_audit_row(index, **kwargs))
+
+    sample = freeze_audit_sample(
+        catalog_deferred=iter(rows),
+        runtime_deferred=iter(()),
+        pending_runtime_deferred=(),
+        checkpoint=_audit_checkpoint(),
+    )
+
+    coverage_ids = {
+        member.node_id for member in sample.members if member.stratum == "coverage"
+    }
+    assert any(int(node_id.rsplit("-", 1)[1]) >= 400 for node_id in coverage_ids)
+
+
+@pytest.mark.parametrize("axis", ("depth_band", "size_band", "role_band"))
+def test_coverage_membership_is_bound_to_each_semantic_axis(axis: str) -> None:
+    values = {
+        "depth_band": ("shallow", "deep"),
+        "size_band": ("small", "large"),
+        "role_band": ("documentation", "test"),
+    }
+
+    def sample(minority_start: int) -> set[str]:
+        rows = []
+        for index in range(500):
+            kwargs: dict[str, object] = {
+                "source_id": "source",
+                "coverage_stratum": "complete",
+                "depth_band": "shallow",
+                "size_band": "small",
+                "role_band": "documentation",
+            }
+            kwargs[axis] = values[axis][int(index >= minority_start)]
+            rows.append(_audit_row(index, **kwargs))
+        frozen = freeze_audit_sample(
+            catalog_deferred=iter(rows),
+            runtime_deferred=iter(()),
+            pending_runtime_deferred=(),
+            checkpoint=_audit_checkpoint(),
+        )
+        return {
+            member.node_id
+            for member in frozen.members
+            if member.stratum == "coverage"
+        }
+
+    assert sample(400) != sample(100)
+
+
+@pytest.mark.parametrize("mutation", ("missing", "invented", "noncanonical"))
+def test_audit_cursor_rejects_missing_invented_or_noncanonical_axes(
+    mutation: str,
+) -> None:
+    rows = [_audit_row(index) for index in range(300)]
+    cursor = {
+        "depth_band": "shallow",
+        "fair_round": rows[0].cursor_order,
+        "lane": "audit-lane",
+        "node_id": rows[0].node_id,
+        "order": rows[0].cursor_order,
+        "role_band": "documentation",
+        "selector_feature_digest": rows[0].selector_feature_digest,
+        "size_band": "small",
+    }
+    if mutation == "missing":
+        cursor.pop("depth_band")
+    elif mutation == "invented":
+        cursor["invented_axis"] = "value"
+    else:
+        cursor["depth_band"] = "Shallow"
+    rows[0] = SemanticDeferredAuditRow(
+        **{**rows[0].__dict__, "cursor_json": canonical_json_text(cursor)}
+    )
+
+    with pytest.raises(FrontierSelectionError, match="axis|cursor"):
+        freeze_audit_sample(
+            catalog_deferred=iter(rows),
+            runtime_deferred=iter(()),
+            pending_runtime_deferred=(),
+            checkpoint=_audit_checkpoint(),
+        )
+
+
+def test_audit_many_unique_sources_keeps_fixed_python_state_and_cleans_temp_state() -> None:
+    observer = AuditSelectionObserver()
+    rows = tuple(
+        _audit_row(index, source_id=f"source-{index:04}") for index in range(500)
+    )
+    freeze_audit_sample(
+        catalog_deferred=iter(rows),
+        runtime_deferred=iter(()),
+        pending_runtime_deferred=(),
+        checkpoint=_audit_checkpoint(),
+        observer=observer,
+    )
+    assert observer.max_total_python_candidates <= 2_100
+    assert observer.max_coverage_axis_values == 0
+    assert observer.axis_index_file_backed is True
+    assert observer.temporary_state_closed is True
+
+    failure_observer = AuditSelectionObserver()
+    with pytest.raises(FrontierSelectionError, match="duplicate"):
+        freeze_audit_sample(
+            catalog_deferred=iter(rows),
+            runtime_deferred=iter(
+                (SemanticRuntimeDeferredRow(rows[-1], "unit-duplicate", 0),)
+            ),
+            pending_runtime_deferred=(),
+            checkpoint=_audit_checkpoint(),
+            observer=failure_observer,
+        )
+    assert failure_observer.temporary_state_closed is True
+
+
+def test_audit_equal_rank_overlap_still_returns_exact_unique_sample() -> None:
+    rows = tuple(
+        _audit_row(
+            index,
+            source_id="source",
+            coverage_stratum="complete",
+            relevance_rank=0,
+        )
+        for index in range(450)
+    )
+    sample = freeze_audit_sample(
+        catalog_deferred=iter(rows),
+        runtime_deferred=iter(()),
+        pending_runtime_deferred=(),
+        checkpoint=_audit_checkpoint(),
+    )
+    assert len(sample.members) == len({member.node_id for member in sample.members}) == 300
 
 
 @pytest.mark.parametrize(
@@ -486,6 +660,74 @@ def test_audit_population_digest_binds_runtime_transition_authority() -> None:
     assert first.sample_digest != second.sample_digest
 
 
+@pytest.mark.parametrize("stream", ("catalog", "runtime", "pending"))
+def test_audit_streams_require_their_exact_authority_row_types(stream: str) -> None:
+    """Catches runtime/pending rows losing transition unit and sequence authority."""
+    catalog = tuple(_audit_row(index) for index in range(299))
+    audit = _audit_row(299)
+    kwargs: dict[str, object] = {
+        "catalog_deferred": iter(catalog),
+        "runtime_deferred": iter((SemanticRuntimeDeferredRow(audit, "unit-a", 1),)),
+        "pending_runtime_deferred": (),
+    }
+    if stream == "catalog":
+        kwargs["catalog_deferred"] = iter(
+            (SemanticRuntimeDeferredRow(catalog[0], "unit-a", 0), *catalog[1:])
+        )
+        kwargs["runtime_deferred"] = iter(
+            (SemanticRuntimeDeferredRow(audit, "unit-a", 1),)
+        )
+    elif stream == "runtime":
+        kwargs["runtime_deferred"] = iter((audit,))
+    else:
+        kwargs["runtime_deferred"] = iter(())
+        kwargs["pending_runtime_deferred"] = (audit,)
+
+    with pytest.raises(FrontierSelectionError, match="authority row type"):
+        freeze_audit_sample(checkpoint=_audit_checkpoint(), **kwargs)
+
+
+@pytest.mark.parametrize(
+    ("rows", "message"),
+    (
+        ((SemanticRuntimeDeferredRow(_audit_row(298), "unit-a", -1),), "sequence"),
+        (
+            (
+                SemanticRuntimeDeferredRow(_audit_row(298), "unit-a", 2),
+                SemanticRuntimeDeferredRow(_audit_row(299), "unit-b", 1),
+            ),
+            "sequence",
+        ),
+        ((SemanticRuntimeDeferredRow(_audit_row(298), "", 1),), "unit"),
+    ),
+)
+def test_runtime_audit_authority_is_nonempty_nonnegative_and_canonical(
+    rows: tuple[SemanticRuntimeDeferredRow, ...], message: str
+) -> None:
+    catalog = tuple(_audit_row(index) for index in range(298))
+    with pytest.raises(FrontierSelectionError, match=message):
+        freeze_audit_sample(
+            catalog_deferred=iter(catalog),
+            runtime_deferred=iter(rows),
+            pending_runtime_deferred=(),
+            checkpoint=_audit_checkpoint(),
+        )
+
+
+def test_pending_runtime_row_uses_same_transition_authority_contract() -> None:
+    catalog = tuple(_audit_row(index) for index in range(299))
+    pending = SemanticRuntimeDeferredRow(_audit_row(299), "unit-pending", 7)
+
+    sample = freeze_audit_sample(
+        catalog_deferred=iter(catalog),
+        runtime_deferred=iter(()),
+        pending_runtime_deferred=(pending,),
+        checkpoint=_audit_checkpoint(),
+    )
+
+    assert len(sample.members) == 300
+
+
 def test_frontier_run_and_unit_ids_bind_revision_policy_and_feature_digest(
     tmp_path: Path,
 ) -> None:
@@ -549,6 +791,9 @@ def test_planning_session_rejects_wrong_version_finished_and_sealed_mutation(
                     row.feature_digest,
                 )
             )
+        with pytest.raises(CatalogError, match="failed"):
+            session.fair_seed_page(None, 1)
+        session = writer.planning_session(FRONTIER_SELECTOR_VERSION)
         build_frontier_plan(
             session, revision_id="revision", policy_hash="a" * 64
         )
@@ -560,6 +805,153 @@ def test_planning_session_rejects_wrong_version_finished_and_sealed_mutation(
 
     with SemanticCatalogReader(path, seal) as reader:
         assert reader.frontier_page(None, 1)[0].node_id == "project"
+
+
+@pytest.mark.parametrize(
+    ("fault_point", "project_like"),
+    (
+        ("after_authority", True),
+        ("after_selector_result", True),
+        ("after_deferred", False),
+        ("after_finish_summary", True),
+    ),
+)
+def test_planning_session_rolls_back_every_owned_write_and_allows_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault_point: str,
+    project_like: bool,
+) -> None:
+    """Catches partial planning authority blocking a same-writer retry."""
+    path = tmp_path / f"rollback-{fault_point}.sqlite"
+    fired = False
+
+    def inject(_session: object, point: str) -> None:
+        nonlocal fired
+        if point == fault_point and not fired:
+            fired = True
+            raise RuntimeError(f"fault:{point}")
+
+    monkeypatch.setattr(
+        SemanticCatalogPlanningSession, "_fault_point", inject, raising=False
+    )
+    with SemanticCatalogWriter(path) as writer:
+        _add_feature(
+            writer,
+            "project",
+            source_id="source",
+            lane="source",
+            project_like=project_like,
+        )
+        failed_session: SemanticCatalogPlanningSession | None = None
+        with pytest.raises(RuntimeError, match=fault_point):
+            failed_session = writer.planning_session(FRONTIER_SELECTOR_VERSION)
+            build_frontier_plan(
+                failed_session,
+                revision_id="revision-failed",
+                policy_hash="a" * 64,
+            )
+        if failed_session is not None:
+            with pytest.raises(CatalogError, match="failed"):
+                failed_session.fair_seed_page(None, 1)
+
+        plan = build_frontier_plan(
+            writer.planning_session(FRONTIER_SELECTOR_VERSION),
+            revision_id="revision-retry",
+            policy_hash="a" * 64,
+        )
+        seal = writer.seal()
+
+    assert fired is True
+    assert plan.deferred_count == (0 if project_like else 1)
+    with SemanticCatalogReader(path, seal) as reader:
+        assert reader.frontier_page(None, 1)[0].node_id == "project"
+
+
+def test_planning_session_abort_is_idempotent_and_exposes_no_connection(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "abort.sqlite"
+    with SemanticCatalogWriter(path) as writer:
+        _add_feature(writer, "project", source_id="source", lane="source")
+        session = writer.planning_session(FRONTIER_SELECTOR_VERSION)
+        assert not hasattr(session, "connection")
+        session.abort()
+        session.abort()
+        with pytest.raises(CatalogError, match="aborted"):
+            session.fair_seed_page(None, 1)
+        build_frontier_plan(
+            writer.planning_session(FRONTIER_SELECTOR_VERSION),
+            revision_id="revision-retry",
+            policy_hash="a" * 64,
+        )
+
+
+def test_failed_empty_planning_session_can_close_without_corrupting_catalog(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "close-after-failure.sqlite"
+    writer = SemanticCatalogWriter(path)
+    writer.add_node(NodeRecord("root", None, "source", ".", "source"))
+    writer.add_baseline(
+        BaselineRecord("root", BaselineCoverage.COMPLETE, (), (), 0, None)
+    )
+
+    def inject(_session: object, point: str) -> None:
+        if point == "after_authority":
+            raise RuntimeError("fault:after_authority")
+
+    monkeypatch.setattr(
+        SemanticCatalogPlanningSession, "_fault_point", inject, raising=False
+    )
+    with pytest.raises(RuntimeError, match="after_authority"):
+        writer.planning_session(FRONTIER_SELECTOR_VERSION)
+    writer.close()
+    seal = writer.seal_value
+    assert seal is not None
+    with SemanticCatalogReader(path, seal) as reader:
+        assert reader.node("root") is not None
+
+
+def test_build_failure_aborts_planning_ownership_before_any_page(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "build-failure.sqlite"
+    with SemanticCatalogWriter(path) as writer:
+        _add_feature(writer, "project", source_id="source", lane="source")
+        failed_session = writer.planning_session(FRONTIER_SELECTOR_VERSION)
+        with pytest.raises(ValueError, match="revision_id"):
+            build_frontier_plan(
+                failed_session, revision_id="", policy_hash="a" * 64
+            )
+        with pytest.raises(CatalogError, match="aborted"):
+            failed_session.fair_seed_page(None, 1)
+        build_frontier_plan(
+            writer.planning_session(FRONTIER_SELECTOR_VERSION),
+            revision_id="revision-retry",
+            policy_hash="a" * 64,
+        )
+
+
+def test_active_planning_session_exclusively_owns_writer_mutation(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "exclusive-session.sqlite"
+    with SemanticCatalogWriter(path) as writer:
+        _add_feature(writer, "project", source_id="source", lane="source")
+        session = writer.planning_session(FRONTIER_SELECTOR_VERSION)
+        with pytest.raises(CatalogError, match="planning session is active"):
+            writer.add_node(NodeRecord("intruder", None, "source", ".", "source"))
+        session.abort()
+        writer.add_node(NodeRecord("allowed", None, "source", ".", "source"))
+        writer.add_baseline(
+            BaselineRecord("allowed", BaselineCoverage.COMPLETE, (), (), 0, None)
+        )
+        build_frontier_plan(
+            writer.planning_session(FRONTIER_SELECTOR_VERSION),
+            revision_id="revision-retry",
+            policy_hash="a" * 64,
+        )
 
 
 def test_catalog_seal_rejects_adaptive_selector_cursor_not_bound_to_fair_order(

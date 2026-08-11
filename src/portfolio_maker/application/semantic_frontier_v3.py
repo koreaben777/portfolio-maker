@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import heapq
 import json
+import re
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -94,6 +95,10 @@ class AuditSelectionObserver:
     max_relevance_candidates: int = 0
     max_random_candidates: int = 0
     max_coverage_stratum_candidates: int = 0
+    max_total_python_candidates: int = 0
+    max_coverage_axis_values: int = 0
+    axis_index_file_backed: bool = False
+    temporary_state_closed: bool = False
     max_pending_rows: int = 0
     population_count: int = 0
 
@@ -115,6 +120,18 @@ class AuditSample:
 
 
 def build_frontier_plan(
+    session: SemanticCatalogPlanningSession,
+    revision_id: str,
+    policy_hash: str,
+) -> SemanticFrontierPlan:
+    try:
+        return _build_frontier_plan(session, revision_id, policy_hash)
+    except BaseException:
+        session.abort()
+        raise
+
+
+def _build_frontier_plan(
     session: SemanticCatalogPlanningSession,
     revision_id: str,
     policy_hash: str,
@@ -209,11 +226,14 @@ def build_frontier_plan(
             node_digest = _seed_digest(seed)
             cursor_json = canonical_json_text(
                 {
+                    "depth_band": _depth_band(seed.relative_hierarchy),
                     "fair_round": seed.fair_round,
                     "lane": seed.top_level_lane,
                     "node_id": seed.node_id,
                     "order": cursor_order,
+                    "role_band": _role_band(seed.roles),
                     "selector_feature_digest": seed.feature_digest,
+                    "size_band": _size_band(seed.inspected_bytes),
                 }
             )
             result = FrontierSelectorResult(
@@ -315,7 +335,11 @@ def representative_nodes(
 
 
 def transition_frontier(
-    validated_output: object, *, budget_exhausted: bool
+    validated_output: object,
+    *,
+    budget_exhausted: bool,
+    remaining_deferred_node_ids: tuple[str, ...] = (),
+    resume_cursor: str | None = None,
 ) -> FrontierTransition:
     """Apply one already-validated action without reading or mutating authority."""
 
@@ -338,19 +362,40 @@ def transition_frontier(
         or not isinstance(budget_exhausted, bool)
     ):
         raise ValueError("frontier transition requires validated bounded output")
+    remaining = _bounded_unique_ids(
+        remaining_deferred_node_ids, "remaining deferred node ids"
+    )
+    canonical_resume = _canonical_cursor_or_none(resume_cursor)
+    if not budget_exhausted and (remaining or canonical_resume is not None):
+        raise ValueError("frontier resume authority requires an exhausted budget")
+    accepted = targets if action is FrontierAction.ACCEPT_BOUNDARY else ()
+    stopped = targets if action is FrontierAction.STOP_NON_PROJECT else ()
+    unit_deferred = (
+        targets
+        if action is FrontierAction.DEFER_ON_DEMAND
+        else requested if action is FrontierAction.EXPAND_CHILDREN else ()
+    )
+    if budget_exhausted:
+        deferred = _bounded_unique_ids(
+            (*unit_deferred, *remaining), "budget deferred node ids"
+        )
+        effective_cursor = canonical_resume or next_cursor
+        if not deferred and effective_cursor is None:
+            raise ValueError("exhausted budget requires resume or deferred authority")
+        return FrontierTransition(
+            action,
+            accepted_node_ids=accepted,
+            stopped_node_ids=stopped,
+            deferred_node_ids=deferred,
+            next_child_cursor=effective_cursor,
+            paused_budget=True,
+        )
     if action is FrontierAction.ACCEPT_BOUNDARY:
         return FrontierTransition(action, accepted_node_ids=targets)
     if action is FrontierAction.STOP_NON_PROJECT:
         return FrontierTransition(action, stopped_node_ids=targets)
     if action is FrontierAction.DEFER_ON_DEMAND:
         return FrontierTransition(action, deferred_node_ids=targets)
-    if budget_exhausted:
-        return FrontierTransition(
-            action,
-            deferred_node_ids=requested,
-            next_child_cursor=next_cursor,
-            paused_budget=True,
-        )
     return FrontierTransition(
         action,
         enqueued_child_node_ids=requested,
@@ -358,15 +403,35 @@ def transition_frontier(
     )
 
 
+def _bounded_unique_ids(values: object, name: str) -> tuple[str, ...]:
+    if not isinstance(values, tuple) or len(values) > MAX_DEPENDENCIES:
+        raise ValueError(f"frontier {name} are invalid")
+    if any(not isinstance(value, str) or not value for value in values):
+        raise ValueError(f"frontier {name} are invalid")
+    if len(values) != len(set(values)):
+        raise ValueError(f"frontier {name} must be unique")
+    return values
+
+
+def _canonical_cursor_or_none(value: object) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("frontier resume cursor is invalid")
+    try:
+        parsed = json.loads(value, object_pairs_hook=_audit_no_duplicate_keys)
+    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        raise ValueError("frontier resume cursor is invalid") from error
+    if canonical_json_text(parsed) != value:
+        raise ValueError("frontier resume cursor must be canonical")
+    return value
+
+
 def freeze_audit_sample(
     *,
     catalog_deferred: Iterable[SemanticDeferredAuditRow],
-    runtime_deferred: Iterable[
-        SemanticRuntimeDeferredRow | SemanticDeferredAuditRow
-    ],
-    pending_runtime_deferred: Sequence[
-        SemanticRuntimeDeferredRow | SemanticDeferredAuditRow
-    ],
+    runtime_deferred: Iterable[SemanticRuntimeDeferredRow],
+    pending_runtime_deferred: Sequence[SemanticRuntimeDeferredRow],
     checkpoint: AuditCheckpointBinding,
     observer: AuditSelectionObserver | None = None,
 ) -> AuditSample:
@@ -383,16 +448,16 @@ def freeze_audit_sample(
     ] = []
     coverage: dict[
         str, list[tuple[tuple[object, ...], SemanticDeferredAuditRow]]
-    ] = {name: [] for name in _AUDIT_COVERAGE_ORDER}
+    ] = {name: [] for name in _AUDIT_AXIS_ORDER}
     population = bytes(32)
     streams = (
         _audit_stream("catalog", catalog_deferred, checkpoint),
         _audit_stream("runtime", runtime_deferred, checkpoint),
         _audit_stream("pending", iter(pending_runtime_deferred), checkpoint),
     )
-    with _audit_seen_index() as seen:
+    with _audit_disk_state(measurement) as disk_state:
         for _, set_kind, row in heapq.merge(*streams):
-            seen(row)
+            axis_ranks = disk_state.add(row)
             encoded = canonical_json_text(
                 {"set_kind": set_kind, "row": row.__dict__}
             ).encode("utf-8")
@@ -418,17 +483,18 @@ def freeze_audit_sample(
                 ((random_key, row.node_id), row),
                 300,
             )
-            coverage_key = hashlib.sha256(
-                (
-                    row.source_id
-                    + "\0"
-                    + row.coverage_stratum
-                    + "\0"
-                    + row.node_id
-                ).encode("utf-8")
-            ).hexdigest()
-            bucket = coverage[row.coverage_stratum]
-            _retain_smallest(bucket, ((coverage_key, row.node_id), row), 300)
+            for axis_name, axis_value, occurrence_rank in axis_ranks:
+                value_hash = hashlib.sha256(
+                    (axis_name + "\0" + axis_value).encode("utf-8")
+                ).hexdigest()
+                node_hash = hashlib.sha256(
+                    (axis_name + "\0" + row.node_id).encode("utf-8")
+                ).hexdigest()
+                _retain_smallest(
+                    coverage[axis_name],
+                    ((occurrence_rank, value_hash, node_hash, row.node_id), row),
+                    300,
+                )
             measurement.population_count += 1
             measurement.max_relevance_candidates = max(
                 measurement.max_relevance_candidates, len(relevance)
@@ -439,6 +505,12 @@ def freeze_audit_sample(
             measurement.max_coverage_stratum_candidates = max(
                 measurement.max_coverage_stratum_candidates,
                 max(len(items) for items in coverage.values()),
+            )
+            measurement.max_total_python_candidates = max(
+                measurement.max_total_python_candidates,
+                len(relevance)
+                + len(random_reservoir)
+                + sum(len(items) for items in coverage.values()),
             )
     if measurement.population_count < 300:
         raise FrontierSelectionError("audit population cannot provide 300 unique members")
@@ -451,11 +523,12 @@ def freeze_audit_sample(
         chosen,
         ordered,
     )
-    coverage_candidates = {
-        name: [row for _, row in sorted(coverage[name], key=lambda item: item[0])]
-        for name in _AUDIT_COVERAGE_ORDER
-    }
-    _take_coverage_unique(coverage_candidates, 100, chosen, ordered)
+    relevance.clear()
+    for candidates in coverage.values():
+        candidates.sort(key=lambda item: item[0])
+    _take_axis_coverage_unique(coverage, 100, chosen, ordered)
+    for candidates in coverage.values():
+        candidates.clear()
     _take_unique(
         "random",
         (row for _, row in sorted(random_reservoir, key=lambda item: item[0])),
@@ -499,17 +572,45 @@ _AUDIT_COVERAGE_ORDER = (
     "failed",
 )
 
+_AUDIT_DEPTH_BANDS = ("root", "shallow", "medium", "deep")
+_AUDIT_SIZE_BANDS = ("empty", "small", "medium", "large")
+_AUDIT_ROLE_BANDS = (*REPRESENTATIVE_ROLE_ORDER, "other")
+_AUDIT_AXIS_ORDER = ("source", "depth", "size", "role", "coverage")
+_AUDIT_CURSOR_KEYS = {
+    "depth_band",
+    "fair_round",
+    "lane",
+    "node_id",
+    "order",
+    "role_band",
+    "selector_feature_digest",
+    "size_band",
+}
+
 
 def _audit_stream(
     set_kind: str,
-    rows: Iterable[SemanticRuntimeDeferredRow | SemanticDeferredAuditRow],
+    rows: Iterable[SemanticRuntimeDeferredRow] | Iterable[SemanticDeferredAuditRow],
     checkpoint: AuditCheckpointBinding,
 ) -> Iterator[tuple[tuple[object, ...], str, SemanticDeferredAuditRow]]:
     set_rank = {"catalog": 0, "runtime": 1, "pending": 2}[set_kind]
     previous_key: tuple[object, ...] | None = None
     for raw in rows:
-        if isinstance(raw, SemanticRuntimeDeferredRow):
+        if set_kind == "catalog":
+            if not isinstance(raw, SemanticDeferredAuditRow):
+                raise FrontierSelectionError(
+                    "audit stream authority row type is invalid"
+                )
+            row = raw
+            population_kind = set_kind
+            authority_key: tuple[object, ...] = ()
+        else:
+            if not isinstance(raw, SemanticRuntimeDeferredRow):
+                raise FrontierSelectionError(
+                    "audit stream authority row type is invalid"
+                )
             row = raw.audit
+            _validate_runtime_deferred_authority(raw)
             population_kind = canonical_json_text(
                 {
                     "created_sequence": raw.created_sequence,
@@ -517,27 +618,47 @@ def _audit_stream(
                     "source_transition_unit_id": raw.source_transition_unit_id,
                 }
             )
-        else:
-            row = raw
-            population_kind = set_kind
+            authority_key = (
+                raw.created_sequence,
+                raw.source_transition_unit_id,
+            )
         if not isinstance(row, SemanticDeferredAuditRow):
             raise FrontierSelectionError("audit population row is invalid")
         _validate_audit_row(row, checkpoint)
-        canonical_key = (
+        audit_key = (
             row.relevance_rank,
             row.coverage_stratum,
             row.source_id,
             row.cursor_order,
             row.node_id,
         )
+        canonical_key = (*authority_key, *audit_key)
         if previous_key is not None and canonical_key <= previous_key:
-            raise FrontierSelectionError("audit stream order is not canonical")
+            detail = "sequence" if set_kind != "catalog" else "stream"
+            raise FrontierSelectionError(f"audit {detail} order is not canonical")
         previous_key = canonical_key
         yield (
-            (*canonical_key, set_rank),
+            (set_rank, *canonical_key),
             population_kind,
             row,
         )
+
+
+_RUNTIME_TRANSITION_UNIT_ID = re.compile(r"[A-Za-z0-9:._-]{1,256}")
+
+
+def _validate_runtime_deferred_authority(row: SemanticRuntimeDeferredRow) -> None:
+    if (
+        not isinstance(row.source_transition_unit_id, str)
+        or _RUNTIME_TRANSITION_UNIT_ID.fullmatch(row.source_transition_unit_id) is None
+    ):
+        raise FrontierSelectionError("audit runtime transition unit is invalid")
+    if (
+        not isinstance(row.created_sequence, int)
+        or isinstance(row.created_sequence, bool)
+        or row.created_sequence < 0
+    ):
+        raise FrontierSelectionError("audit runtime created sequence is invalid")
 
 
 def _validate_audit_checkpoint(checkpoint: AuditCheckpointBinding) -> None:
@@ -583,11 +704,25 @@ def _validate_audit_row(
         raise FrontierSelectionError("audit cursor JSON must be canonical")
     if (
         not isinstance(cursor, dict)
+        or set(cursor) != _AUDIT_CURSOR_KEYS
         or cursor.get("order") != row.cursor_order
         or cursor.get("node_id") != row.node_id
         or cursor.get("selector_feature_digest") != row.selector_feature_digest
     ):
         raise FrontierSelectionError("audit cursor feature binding is invalid")
+    if (
+        cursor["depth_band"] not in _AUDIT_DEPTH_BANDS
+        or cursor["size_band"] not in _AUDIT_SIZE_BANDS
+        or cursor["role_band"] not in _AUDIT_ROLE_BANDS
+        or not isinstance(cursor["fair_round"], int)
+        or isinstance(cursor["fair_round"], bool)
+        or cursor["fair_round"] < 0
+        or not isinstance(cursor["lane"], str)
+        or not cursor["lane"]
+    ):
+        raise FrontierSelectionError("audit cursor axis metadata is invalid")
+    if not isinstance(row.source_id, str) or not row.source_id:
+        raise FrontierSelectionError("audit source axis is invalid")
 
 
 def _audit_no_duplicate_keys(
@@ -601,36 +736,84 @@ def _audit_no_duplicate_keys(
     return result
 
 
+class _AuditDiskState:
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self._connection = connection
+
+    def add(
+        self, row: SemanticDeferredAuditRow
+    ) -> tuple[tuple[str, str, int], ...]:
+        try:
+            self._connection.execute(
+                "INSERT INTO seen_audit_population(node_id, cursor_order) VALUES (?, ?)",
+                (row.node_id, row.cursor_order),
+            )
+        except sqlite3.IntegrityError as error:
+            raise FrontierSelectionError(
+                "audit population contains a duplicate node or cursor order"
+            ) from error
+        cursor = json.loads(row.cursor_json)
+        axes = (
+            ("source", row.source_id),
+            ("depth", cursor["depth_band"]),
+            ("size", cursor["size_band"]),
+            ("role", cursor["role_band"]),
+            ("coverage", row.coverage_stratum),
+        )
+        ranked: list[tuple[str, str, int]] = []
+        for axis_name, axis_value in axes:
+            self._connection.execute(
+                """
+                INSERT INTO audit_axis_counts(axis_name, axis_value, occurrence_count)
+                VALUES (?, ?, 1)
+                ON CONFLICT(axis_name, axis_value)
+                DO UPDATE SET occurrence_count = occurrence_count + 1
+                """,
+                (axis_name, axis_value),
+            )
+            occurrence = self._connection.execute(
+                """
+                SELECT occurrence_count FROM audit_axis_counts
+                WHERE axis_name = ? AND axis_value = ?
+                """,
+                (axis_name, axis_value),
+            ).fetchone()
+            if occurrence is None:
+                raise FrontierSelectionError("audit axis counter is unavailable")
+            ranked.append((axis_name, axis_value, int(occurrence[0])))
+        return tuple(ranked)
+
+
 @contextmanager
-def _audit_seen_index():  # type: ignore[no-untyped-def]
+def _audit_disk_state(
+    observer: AuditSelectionObserver,
+) -> Iterator[_AuditDiskState]:
     connection = sqlite3.connect("")
     try:
         connection.execute("PRAGMA temp_store = FILE")
-        if connection.execute("PRAGMA temp_store").fetchone()[0] != 1:
+        observer.axis_index_file_backed = (
+            connection.execute("PRAGMA temp_store").fetchone()[0] == 1
+        )
+        if not observer.axis_index_file_backed:
             raise FrontierSelectionError("audit duplicate index is not file-backed")
-        connection.execute(
+        connection.executescript(
             """
             CREATE TABLE seen_audit_population(
                 node_id TEXT PRIMARY KEY,
                 cursor_order INTEGER NOT NULL UNIQUE
-            )
+            );
+            CREATE TABLE audit_axis_counts(
+                axis_name TEXT NOT NULL,
+                axis_value TEXT NOT NULL,
+                occurrence_count INTEGER NOT NULL,
+                PRIMARY KEY(axis_name, axis_value)
+            );
             """
         )
-
-        def add(row: SemanticDeferredAuditRow) -> None:
-            try:
-                connection.execute(
-                    "INSERT INTO seen_audit_population(node_id, cursor_order) VALUES (?, ?)",
-                    (row.node_id, row.cursor_order),
-                )
-            except sqlite3.IntegrityError as error:
-                raise FrontierSelectionError(
-                    "audit population contains a duplicate node or cursor order"
-                ) from error
-
-        yield add
+        yield _AuditDiskState(connection)
     finally:
         connection.close()
+        observer.temporary_state_closed = True
 
 
 def _retain_smallest(
@@ -664,20 +847,22 @@ def _take_unique(
             return
 
 
-def _take_coverage_unique(
-    candidates: dict[str, list[SemanticDeferredAuditRow]],
+def _take_axis_coverage_unique(
+    candidates: dict[
+        str, list[tuple[tuple[object, ...], SemanticDeferredAuditRow]]
+    ],
     count: int,
     chosen: set[str],
     ordered: list[tuple[str, SemanticDeferredAuditRow]],
 ) -> None:
-    indexes = {name: 0 for name in _AUDIT_COVERAGE_ORDER}
+    indexes = {name: 0 for name in _AUDIT_AXIS_ORDER}
     added = 0
     while added < count:
         progressed = False
-        for name in _AUDIT_COVERAGE_ORDER:
+        for name in _AUDIT_AXIS_ORDER:
             items = candidates[name]
             while indexes[name] < len(items):
-                row = items[indexes[name]]
+                row = items[indexes[name]][1]
                 indexes[name] += 1
                 if row.node_id in chosen:
                     continue
@@ -702,6 +887,35 @@ def _eligible(seed: FrontierPlanningRow) -> bool:
             seed.uncertainty,
         )
     )
+
+
+def _depth_band(relative_hierarchy: str) -> str:
+    normalized = relative_hierarchy.strip("/")
+    if normalized in {"", "."}:
+        return "root"
+    depth = len([part for part in normalized.split("/") if part and part != "."])
+    if depth <= 2:
+        return "shallow"
+    if depth <= 5:
+        return "medium"
+    return "deep"
+
+
+def _size_band(inspected_bytes: int) -> str:
+    if inspected_bytes == 0:
+        return "empty"
+    if inspected_bytes <= 4 * 1024:
+        return "small"
+    if inspected_bytes <= 1024 * 1024:
+        return "medium"
+    return "large"
+
+
+def _role_band(roles: tuple[str, ...]) -> str:
+    for role in REPRESENTATIVE_ROLE_ORDER:
+        if role in roles:
+            return role
+    return "other"
 
 
 def _relevance_rank(seed: FrontierPlanningRow) -> int:

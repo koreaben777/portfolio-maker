@@ -20,7 +20,10 @@ from portfolio_maker.application.semantic_quality_v3 import (
     validate_v3_semantic_output,
 )
 from portfolio_maker.application.semantic_frontier_v3 import transition_frontier
-from portfolio_maker.domain.semantic_frontier import FrontierAction
+from portfolio_maker.domain.semantic_frontier import (
+    MAX_UNIT_BYTES,
+    FrontierAction,
+)
 
 
 NODE_RESULT_KEYS = {
@@ -864,3 +867,190 @@ def test_budget_exhaustion_defers_expansion_without_stop_or_convergence() -> Non
     assert transition.stopped_node_ids == ()
     assert transition.paused_budget is True
     assert transition.converged is False
+
+
+@pytest.mark.parametrize("action", tuple(FrontierAction))
+@pytest.mark.parametrize("budget_exhausted", (False, True))
+def test_budget_state_is_global_and_separate_from_every_unit_action(
+    action: FrontierAction, budget_exhausted: bool
+) -> None:
+    """Catches terminal unit receipts hiding a globally exhausted frontier budget."""
+    validated = validate_v3_semantic_output(_v3_input(), _v3_output(action))
+    kwargs: dict[str, object] = {"budget_exhausted": budget_exhausted}
+    if budget_exhausted:
+        kwargs.update(
+            {
+                "remaining_deferred_node_ids": ("remaining-node",),
+                "resume_cursor": '{"after":"remaining-node"}',
+            }
+        )
+
+    transition = transition_frontier(validated, **kwargs)
+
+    assert transition.action is action
+    assert transition.paused_budget is budget_exhausted
+    assert transition.converged is False
+    if budget_exhausted:
+        assert transition.enqueued_child_node_ids == ()
+        assert "remaining-node" in transition.deferred_node_ids
+        assert transition.next_child_cursor == '{"after":"remaining-node"}'
+    elif action is FrontierAction.EXPAND_CHILDREN:
+        assert transition.enqueued_child_node_ids == ("child-2",)
+
+
+@pytest.mark.parametrize("side", ("input", "output"))
+@pytest.mark.parametrize("form", ("pretty", "reordered"))
+def test_v3_quality_rejects_noncanonical_raw_json(side: str, form: str) -> None:
+    """Catches accepting semantically equal bytes outside the canonical wire contract."""
+    work_input = _v3_input()
+    output = _v3_output(FrontierAction.ACCEPT_BOUNDARY)
+    payload = work_input if side == "input" else output
+    if form == "pretty":
+        raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2)
+    else:
+        raw = json.dumps(
+            dict(reversed(tuple(payload.items()))),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+    with pytest.raises(SemanticQualityV3Error, match="canonical"):
+        validate_v3_semantic_output(
+            raw if side == "input" else _canonical_bytes(work_input),
+            raw if side == "output" else _canonical_bytes(output),
+        )
+
+
+@pytest.mark.parametrize("side", ("input", "output"))
+def test_v3_quality_accepts_only_canonical_raw_json(side: str) -> None:
+    work_input = _v3_input()
+    output = _v3_output(FrontierAction.ACCEPT_BOUNDARY)
+
+    validated = validate_v3_semantic_output(
+        _canonical_bytes(work_input) if side == "input" else work_input,
+        _canonical_bytes(output) if side == "output" else output,
+    )
+
+    assert validated.action is FrontierAction.ACCEPT_BOUNDARY
+
+
+@pytest.mark.parametrize("form", ("escaped_text", "alternate_number"))
+def test_v3_quality_rejects_noncanonical_escapes_and_numbers(form: str) -> None:
+    work_input = _v3_input()
+    output = _v3_output(FrontierAction.ACCEPT_BOUNDARY)
+    if form == "escaped_text":
+        raw = json.dumps(output, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    else:
+        raw = _canonical_bytes(output).decode("utf-8").replace(
+            '"confidence":0.8', '"confidence":8e-1'
+        )
+    with pytest.raises(SemanticQualityV3Error, match="canonical"):
+        validate_v3_semantic_output(work_input, raw)
+
+
+@pytest.mark.parametrize("side", ("input", "output"))
+def test_v3_quality_rejects_oversized_raw_whitespace_before_parse(side: str) -> None:
+    """Catches parser work on a tiny payload padded beyond the raw byte cap."""
+    work_input = _v3_input()
+    output = _v3_output(FrontierAction.ACCEPT_BOUNDARY)
+    payload = work_input if side == "input" else output
+    raw = b" " * (MAX_UNIT_BYTES + 1) + _canonical_bytes(payload)
+
+    with pytest.raises(SemanticQualityV3Error, match="byte limit"):
+        validate_v3_semantic_output(
+            raw if side == "input" else work_input,
+            raw if side == "output" else output,
+        )
+
+
+@pytest.mark.parametrize("side", ("input", "output"))
+def test_v3_quality_rejects_invalid_utf8_and_duplicate_keys_on_both_sides(
+    side: str,
+) -> None:
+    work_input = _v3_input()
+    output = _v3_output(FrontierAction.ACCEPT_BOUNDARY)
+    with pytest.raises(SemanticQualityV3Error, match="JSON"):
+        validate_v3_semantic_output(
+            b"\xff" if side == "input" else work_input,
+            b"\xff" if side == "output" else output,
+        )
+
+    payload = work_input if side == "input" else output
+    raw = _canonical_bytes(payload).decode("utf-8")
+    duplicate = raw[:-1] + ',"schema_version":"duplicate"}'
+    with pytest.raises(SemanticQualityV3Error, match="duplicate"):
+        validate_v3_semantic_output(
+            duplicate if side == "input" else work_input,
+            duplicate if side == "output" else output,
+        )
+
+
+def test_v3_quality_caps_canonical_input_and_output_mappings() -> None:
+    """Catches applying the hard byte cap only to the model output."""
+    work_input = _v3_input()
+    work_input["approved_local_signal_ids"].append("x" * 299_910)
+    unsigned = dict(work_input)
+    unsigned.pop("input_sha256")
+    work_input["input_sha256"] = _sha256(unsigned)
+    output = _v3_output(FrontierAction.ACCEPT_BOUNDARY)
+    output["input_sha256"] = work_input["input_sha256"]
+    assert len(_canonical_bytes(work_input)) == 300_473
+    with pytest.raises(SemanticQualityV3Error, match="input.*byte limit"):
+        validate_v3_semantic_output(work_input, output)
+
+    work_input = _v3_input()
+    output = _v3_output(FrontierAction.ACCEPT_BOUNDARY)
+    output["rationale"] = "가" * 100_000
+    assert len(_canonical_bytes(output)) > MAX_UNIT_BYTES
+    with pytest.raises(SemanticQualityV3Error, match="output.*byte limit"):
+        validate_v3_semantic_output(work_input, output)
+
+
+@pytest.mark.parametrize(
+    "locator",
+    (
+        "ssh://private.example/repo",
+        "src/main.py",
+        "HTTP://PRIVATE.EXAMPLE/repo",
+        "src／main.py",
+        "./private-source",
+        "../private-source",
+        "C:\\private\\main.py",
+        "git@private.example:repo/project.git",
+    ),
+)
+def test_v3_quality_rejects_concrete_locator_invention_after_nfkc(
+    locator: str,
+) -> None:
+    """Catches concrete locator disclosure hidden by case or Unicode separators."""
+    work_input = _v3_input()
+    output = _v3_output(FrontierAction.ACCEPT_BOUNDARY)
+    output["rationale"] = f"검증 근거는 충분하지만 {locator} 위치는 노출하지 않는다."
+
+    with pytest.raises(SemanticQualityV3Error, match="locator"):
+        validate_v3_semantic_output(work_input, output)
+
+
+def test_v3_quality_rejects_locator_in_representative_role_reason() -> None:
+    work_input = _v3_input()
+    work_input["representatives"][0]["role_reason"] = "src/main.py"
+    unsigned = dict(work_input)
+    unsigned.pop("input_sha256")
+    work_input["input_sha256"] = _sha256(unsigned)
+    output = _v3_output(FrontierAction.ACCEPT_BOUNDARY)
+    output["input_sha256"] = work_input["input_sha256"]
+
+    with pytest.raises(SemanticQualityV3Error, match="locator"):
+        validate_v3_semantic_output(work_input, output)
+
+
+def test_v3_quality_allows_generic_locator_concepts_without_concrete_value() -> None:
+    work_input = _v3_input()
+    output = _v3_output(FrontierAction.ACCEPT_BOUNDARY)
+    output["rationale"] = (
+        "URL path file repository 개념만 설명하며 구체적인 위치 값은 포함하지 않는다."
+    )
+
+    validated = validate_v3_semantic_output(work_input, output)
+
+    assert validated.action is FrontierAction.ACCEPT_BOUNDARY
