@@ -35,24 +35,51 @@ class VerifiedSample:
     post_identity: tuple[int, int, int, int, int]
 
 
-def read_verified_sample(path: Path, max_bytes: int) -> VerifiedSample:
+def read_verified_sample(
+    path: Path,
+    max_bytes: int,
+    *,
+    expected_device: int | None = None,
+    expected_inode: int | None = None,
+) -> VerifiedSample:
     """Read at most one bounded prefix through a no-follow verified descriptor."""
     if type(max_bytes) is not int or max_bytes < 0:
         raise ValueError("max_bytes must be non-negative")
     try:
-        return _read_verified_sample(path, max_bytes)
+        return _read_verified_sample(
+            path,
+            max_bytes,
+            expected_device=expected_device,
+            expected_inode=expected_inode,
+        )
     except OSError:
         # Keep the public boundary locator-free, like exhaustive representatives.
         pass
     raise SemanticSourceReadError("semantic source could not be read")
 
 
-def _read_verified_sample(path: Path, max_bytes: int) -> VerifiedSample:
+def _read_verified_sample(
+    path: Path,
+    max_bytes: int,
+    *,
+    expected_device: int | None,
+    expected_inode: int | None,
+) -> VerifiedSample:
     descriptor = _open_regular_file(path)
     try:
         before = os.fstat(descriptor)
         if not S_ISREG(before.st_mode):
             raise SemanticSourceChangedError("semantic source is not a regular file")
+        if (
+            expected_device is not None
+            and before.st_dev != expected_device
+        ) or (
+            expected_inode is not None
+            and before.st_ino != expected_inode
+        ):
+            raise SemanticSourceChangedError(
+                "semantic source changed before verified read"
+            )
         content = os.read(descriptor, max_bytes)
         after = os.fstat(descriptor)
         if file_identity(before) != file_identity(after):

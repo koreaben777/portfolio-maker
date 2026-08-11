@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import os
 from pathlib import Path
 
 import pytest
 
+import portfolio_maker.infrastructure.semantic_analyzers as semantic_analyzers_module
 import portfolio_maker.infrastructure.semantic_crawler as semantic_crawler_module
 import portfolio_maker.infrastructure.semantic_source_reader as source_reader
 from portfolio_maker.application.approval import SourceApproval
@@ -45,6 +47,13 @@ def _completed_sink(root: Path, pack_path: Path, catalog_path: Path) -> Streamin
     sink = StreamingStructureSink(pack_path, catalog_path)
     list(iter_local_structure_events(root, _approval_for(root), sink=sink))
     return sink
+
+
+def _force_cross_device_publish(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fail_link(*_args, **_kwargs) -> None:
+        raise OSError(errno.EXDEV, "synthetic cross-device publish")
+
+    monkeypatch.setattr(semantic_crawler_module.os, "link", fail_link)
 
 
 def test_verified_representative_uses_same_descriptor_for_hash_and_slice(
@@ -232,6 +241,41 @@ def test_streaming_sink_persists_exact_node_edge_and_baseline_authorities(
     assert len({(ref.offset, ref.length, ref.sha256) for ref in references}) == len(references)
 
 
+def test_streaming_baseline_payload_persists_only_the_masked_excerpt(
+    tmp_path: Path,
+) -> None:
+    """Breaks if baseline authority omits the excerpt or stores its raw secret."""
+    root = tmp_path / "source"
+    root.mkdir()
+    raw_secret = "synthetic-round3-secret"
+    (root / "note.md").write_text(
+        f"API_TOKEN={raw_secret}\nproject evidence",
+        encoding="utf-8",
+    )
+    pack_path = tmp_path / "authority.pm-pack"
+    catalog_path = tmp_path / "authority.catalog.sqlite"
+    sink = StreamingStructureSink(pack_path, catalog_path)
+
+    events = list(iter_local_structure_events(root, _approval_for(root), sink=sink))
+    artifacts = sink.seal()
+    baseline_event = next(
+        event
+        for event in events
+        if event.kind is StructuralEventKind.FILE_ANALYZED
+        and event.node.relative_hierarchy == "note.md"
+    )
+    assert baseline_event.baseline is not None
+    with SemanticCatalogReader(catalog_path, artifacts.catalog_seal) as catalog:
+        baseline = catalog.baseline(baseline_event.node.node_id)
+    assert baseline is not None and baseline.payload_ref is not None
+    payload = PMPackReader(pack_path).read(baseline.payload_ref)
+
+    assert payload["masked_excerpt"] == baseline_event.baseline.masked_excerpt
+    assert raw_secret not in payload["masked_excerpt"]
+    assert raw_secret.encode("utf-8") not in pack_path.read_bytes()
+    assert raw_secret.encode("utf-8") not in catalog_path.read_bytes()
+
+
 def test_source_change_aborts_streaming_catalog_and_pack_publication(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -271,6 +315,62 @@ def test_source_change_aborts_streaming_catalog_and_pack_publication(
     assert not list(tmp_path.glob(".authority.catalog.sqlite.*.tmp"))
 
 
+def test_atomic_path_replacement_before_reader_open_aborts_both_authorities(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Breaks if crawler metadata can be paired with replacement-file content."""
+    root = tmp_path / "source"
+    root.mkdir()
+    source = root / "changing.md"
+    source.write_text("original evidence", encoding="utf-8")
+    replacement = root / "replacement.md"
+    replacement.write_text("replacement evidence", encoding="utf-8")
+    pack_path = tmp_path / "authority.pm-pack"
+    catalog_path = tmp_path / "authority.catalog.sqlite"
+    original_read = semantic_analyzers_module.read_verified_sample
+    replaced = False
+
+    def replace_before_open(
+        path: Path,
+        max_bytes: int,
+        *,
+        expected_device: int | None = None,
+        expected_inode: int | None = None,
+    ):
+        nonlocal replaced
+        if path == source and not replaced:
+            os.replace(replacement, source)
+            replaced = True
+        return original_read(
+            path,
+            max_bytes,
+            expected_device=expected_device,
+            expected_inode=expected_inode,
+        )
+
+    monkeypatch.setattr(
+        semantic_analyzers_module,
+        "read_verified_sample",
+        replace_before_open,
+    )
+    sink = StreamingStructureSink(pack_path, catalog_path)
+    events = list(iter_local_structure_events(root, _approval_for(root), sink=sink))
+
+    assert any(
+        event.node.relative_hierarchy == "changing.md"
+        and event.baseline is not None
+        and event.baseline.coverage.value == "failed"
+        and event.baseline.source_changed
+        for event in events
+        if event.kind is StructuralEventKind.FILE_ANALYZED
+    )
+    with pytest.raises(SemanticSourceChangedError):
+        sink.seal()
+    assert not pack_path.exists()
+    assert not catalog_path.exists()
+
+
 def test_sink_rolls_back_pack_when_catalog_seal_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -295,6 +395,148 @@ def test_sink_rolls_back_pack_when_catalog_seal_fails(
     with pytest.raises(RuntimeError, match="synthetic catalog seal failure"):
         sink.seal()
 
+    assert not pack_path.exists()
+    assert not catalog_path.exists()
+
+
+def test_sink_cleans_exact_pack_temp_when_first_writer_init_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Breaks if a failed first writer constructor leaks its known temp file."""
+    unrelated = tmp_path / ".authority.pm-pack.stream-unrelated.tmp"
+    unrelated.write_bytes(b"preserve")
+    original_flush = semantic_crawler_module.PMPackWriter._flush
+    original_receipt_close = semantic_crawler_module._SinkInvariantStore.close
+    receipt_close_count = 0
+
+    def flush_then_fail(writer) -> None:
+        original_flush(writer)
+        raise OSError("synthetic pack init failure")
+
+    def record_receipt_close(store) -> None:
+        nonlocal receipt_close_count
+        receipt_close_count += 1
+        original_receipt_close(store)
+
+    monkeypatch.setattr(
+        semantic_crawler_module.PMPackWriter,
+        "_flush",
+        flush_then_fail,
+    )
+    monkeypatch.setattr(
+        semantic_crawler_module._SinkInvariantStore,
+        "close",
+        record_receipt_close,
+    )
+
+    with pytest.raises(OSError, match="synthetic pack init failure"):
+        StreamingStructureSink(
+            tmp_path / "authority.pm-pack",
+            tmp_path / "authority.catalog.sqlite",
+        )
+
+    assert receipt_close_count == 1
+    assert unrelated.read_bytes() == b"preserve"
+    assert list(tmp_path.iterdir()) == [unrelated]
+
+
+def test_sink_receipt_cleanup_failure_prevents_both_final_publishes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Breaks if receipt cleanup can fail after either final becomes visible."""
+    root = tmp_path / "source"
+    root.mkdir()
+    (root / "note.md").write_text("evidence", encoding="utf-8")
+    pack_path = tmp_path / "authority.pm-pack"
+    catalog_path = tmp_path / "authority.catalog.sqlite"
+    sink = _completed_sink(root, pack_path, catalog_path)
+    publish_calls: list[tuple[Path, Path]] = []
+
+    def fail_cleanup() -> None:
+        raise OSError("synthetic receipt cleanup failure")
+
+    def record_publish(stage_path: Path, final_path: Path) -> None:
+        publish_calls.append((stage_path, final_path))
+
+    monkeypatch.setattr(sink._receipt_store, "close", fail_cleanup)
+    monkeypatch.setattr(
+        StreamingStructureSink,
+        "_publish_file",
+        staticmethod(record_publish),
+    )
+
+    with pytest.raises(OSError, match="synthetic receipt cleanup failure"):
+        sink.seal()
+
+    assert publish_calls == []
+    assert sink.state is StreamingStructureSinkState.FAILED
+    assert sink._artifacts is None
+    assert not pack_path.exists()
+    assert not catalog_path.exists()
+    assert not list(tmp_path.glob(".authority.*.stream-*"))
+
+
+def test_sink_cleanup_close_then_error_remains_repeatably_abortable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Breaks if a post-close cleanup error leaves finals or a stuck COMPLETE state."""
+    root = tmp_path / "source"
+    root.mkdir()
+    (root / "note.md").write_text("evidence", encoding="utf-8")
+    pack_path = tmp_path / "authority.pm-pack"
+    catalog_path = tmp_path / "authority.catalog.sqlite"
+    sink = _completed_sink(root, pack_path, catalog_path)
+    receipt_store = sink._receipt_store
+    original_close = receipt_store.close
+
+    def close_then_fail() -> None:
+        original_close()
+        raise OSError("synthetic post-close cleanup failure")
+
+    monkeypatch.setattr(receipt_store, "close", close_then_fail)
+
+    with pytest.raises(OSError, match="synthetic post-close cleanup failure"):
+        sink.seal()
+
+    assert sink.state is StreamingStructureSinkState.FAILED
+    assert sink._artifacts is None
+    assert not pack_path.exists()
+    assert not catalog_path.exists()
+    sink.abort()
+    sink.abort()
+    sink.close()
+    assert sink.state is StreamingStructureSinkState.ABORTED
+
+
+def test_sink_artifact_construction_failure_prevents_final_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Breaks if a post-publish artifact error leaves finals with no artifact."""
+    root = tmp_path / "source"
+    root.mkdir()
+    (root / "note.md").write_text("evidence", encoding="utf-8")
+    pack_path = tmp_path / "authority.pm-pack"
+    catalog_path = tmp_path / "authority.catalog.sqlite"
+    sink = _completed_sink(root, pack_path, catalog_path)
+
+    def fail_artifacts(*_args, **_kwargs):
+        raise RuntimeError("synthetic artifact construction failure")
+
+    monkeypatch.setattr(
+        semantic_crawler_module,
+        "StreamingStructureArtifacts",
+        fail_artifacts,
+    )
+
+    with pytest.raises(RuntimeError, match="synthetic artifact construction failure"):
+        sink.seal()
+
+    assert sink.state is StreamingStructureSinkState.FAILED
+    assert sink._artifacts is None
     assert not pack_path.exists()
     assert not catalog_path.exists()
 
@@ -534,6 +776,116 @@ def test_sink_rolls_back_first_publish_when_second_publish_fails(
     assert not pack_path.exists()
     assert not catalog_path.exists()
     assert not list(tmp_path.glob(".authority.*.stream-*"))
+
+
+def test_cross_device_publish_retries_partial_writes_until_complete(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Breaks if a short os.write silently publishes a truncated final."""
+    stage_path = tmp_path / "stage.pack"
+    final_path = tmp_path / "final.pack"
+    payload = b"partial-write-evidence" * 4096
+    stage_path.write_bytes(payload)
+    original_write = semantic_crawler_module.os.write
+
+    def partial_write(descriptor: int, content) -> int:
+        written = max(1, len(content) // 3)
+        return original_write(descriptor, content[:written])
+
+    _force_cross_device_publish(monkeypatch)
+    monkeypatch.setattr(semantic_crawler_module.os, "write", partial_write)
+
+    StreamingStructureSink._publish_file(stage_path, final_path)
+
+    assert final_path.read_bytes() == payload
+
+
+@pytest.mark.parametrize("progress", (0, -1))
+def test_cross_device_publish_rejects_nonpositive_write_progress(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    progress: int,
+) -> None:
+    """Breaks if a stalled write is accepted as a successful publication."""
+    stage_path = tmp_path / "stage.pack"
+    final_path = tmp_path / "final.pack"
+    stage_path.write_bytes(b"evidence")
+    _force_cross_device_publish(monkeypatch)
+    monkeypatch.setattr(
+        semantic_crawler_module.os,
+        "write",
+        lambda _descriptor, _content: progress,
+    )
+
+    with pytest.raises(OSError, match="progress"):
+        StreamingStructureSink._publish_file(stage_path, final_path)
+
+    assert not final_path.exists()
+
+
+def test_cross_device_publish_removes_final_after_mid_copy_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Protects cleanup when a later copy chunk raises."""
+    stage_path = tmp_path / "stage.pack"
+    final_path = tmp_path / "final.pack"
+    stage_path.write_bytes(b"a" * 70_000)
+    original_write = semantic_crawler_module.os.write
+    calls = 0
+
+    def fail_second_write(descriptor: int, content) -> int:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("synthetic mid-copy failure")
+        return original_write(descriptor, content)
+
+    _force_cross_device_publish(monkeypatch)
+    monkeypatch.setattr(semantic_crawler_module.os, "write", fail_second_write)
+
+    with pytest.raises(OSError, match="synthetic mid-copy failure"):
+        StreamingStructureSink._publish_file(stage_path, final_path)
+
+    assert not final_path.exists()
+
+
+def test_cross_device_publish_rejects_same_length_digest_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Breaks if copied bytes are not verified against the sealed stage."""
+    stage_path = tmp_path / "stage.pack"
+    final_path = tmp_path / "final.pack"
+    stage_path.write_bytes(b"trusted staged bytes")
+    original_write = semantic_crawler_module.os.write
+
+    def corrupt_write(descriptor: int, content) -> int:
+        return original_write(descriptor, b"x" * len(content))
+
+    _force_cross_device_publish(monkeypatch)
+    monkeypatch.setattr(semantic_crawler_module.os, "write", corrupt_write)
+
+    with pytest.raises(OSError, match="verification"):
+        StreamingStructureSink._publish_file(stage_path, final_path)
+
+    assert not final_path.exists()
+
+
+def test_cross_device_publish_copies_and_verifies_exact_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stage_path = tmp_path / "stage.pack"
+    final_path = tmp_path / "final.pack"
+    payload = os.urandom(150_000)
+    stage_path.write_bytes(payload)
+    _force_cross_device_publish(monkeypatch)
+
+    StreamingStructureSink._publish_file(stage_path, final_path)
+
+    assert final_path.read_bytes() == payload
 
 
 def test_sink_preserves_existing_final_targets_on_incomplete_seal(tmp_path: Path) -> None:

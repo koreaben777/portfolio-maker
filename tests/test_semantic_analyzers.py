@@ -107,16 +107,27 @@ def test_baseline_uses_verified_bounded_reader_and_masks_managed_excerpt(
     """Breaks if local baseline reopens the path outside its verified reader."""
     path = tmp_path / "note.md"
     path.write_text("API_TOKEN=secret", encoding="utf-8")
+    entry = entry_for(path)
     calls = 0
+    expected_identities: list[tuple[int | None, int | None]] = []
     original = semantic_analyzers_module.read_verified_sample
 
     def record_verified_read(
         source: Path,
         max_bytes: int,
+        *,
+        expected_device: int | None = None,
+        expected_inode: int | None = None,
     ):
         nonlocal calls
         calls += 1
-        return original(source, max_bytes)
+        expected_identities.append((expected_device, expected_inode))
+        return original(
+            source,
+            max_bytes,
+            expected_device=expected_device,
+            expected_inode=expected_inode,
+        )
 
     monkeypatch.setattr(
         semantic_analyzers_module,
@@ -124,10 +135,29 @@ def test_baseline_uses_verified_bounded_reader_and_masks_managed_excerpt(
         record_verified_read,
     )
 
-    baseline = analyze_local_baseline(entry_for(path))
+    baseline = analyze_local_baseline(entry)
 
     assert calls == 1
+    assert expected_identities == [(entry.device, entry.inode)]
     assert "secret" not in baseline.masked_excerpt
+
+
+def test_local_baseline_rejects_atomic_path_replacement_after_crawl_stat(
+    tmp_path: Path,
+) -> None:
+    """Breaks if a new inode can be analyzed under the crawler's old identity."""
+    path = tmp_path / "note.md"
+    path.write_text("original evidence", encoding="utf-8")
+    entry = entry_for(path)
+    replacement = tmp_path / "replacement.md"
+    replacement.write_text("replacement evidence", encoding="utf-8")
+    os.replace(replacement, path)
+
+    baseline = analyze_local_baseline(entry)
+
+    assert baseline.coverage is BaselineCoverage.FAILED
+    assert baseline.source_changed is True
+    assert baseline.inspected_bytes == 0
 
 
 def test_binary_input_is_metadata_only(tmp_path: Path) -> None:

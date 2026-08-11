@@ -146,7 +146,12 @@ def analyze_local_baseline(
         return _baseline_metadata_only(entry, BaselineCoverage.COMPLETE)
 
     try:
-        sample = read_verified_sample(entry.absolute_path, max_bytes)
+        sample = read_verified_sample(
+            entry.absolute_path,
+            max_bytes,
+            expected_device=entry.device,
+            expected_inode=entry.inode,
+        )
     except SemanticSourceChangedError:
         return _baseline_metadata_only(
             entry,

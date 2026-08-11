@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import errno
+import hashlib
 import os
 import sqlite3
 import stat
@@ -1171,7 +1172,16 @@ class StreamingStructureSink:
             "catalog",
         )
         self._receipt_store = _SinkInvariantStore()
-        self._pack_writer = PMPackWriter(self._pack_stage_path)
+        pack_writer = PMPackWriter.__new__(PMPackWriter)
+        try:
+            PMPackWriter.__init__(pack_writer, self._pack_stage_path)
+        except BaseException:
+            try:
+                self._cleanup_failed_pack_constructor(pack_writer)
+            finally:
+                self._receipt_store.close()
+            raise
+        self._pack_writer = pack_writer
         try:
             self._catalog_writer = SemanticCatalogWriter(self._catalog_stage_path)
         except BaseException:
@@ -1225,11 +1235,13 @@ class StreamingStructureSink:
             if self._pack_writer.record_count != node_count + edge_count + baseline_count:
                 raise ValueError("streaming authority record count is invalid")
             self._require_missing_final_targets()
-            self._state = StreamingStructureSinkState.COMPLETE
             pack_seal = self._pack_writer.seal()
             catalog_seal = self._catalog_writer.seal()
             self._pack_writer.close()
             self._catalog_writer.close()
+            self._close_receipts()
+            self._state = StreamingStructureSinkState.COMPLETE
+            artifacts = StreamingStructureArtifacts(pack_seal, catalog_seal)
             self._publish_file(self._pack_stage_path, self._pack_path)
             published.append(self._pack_path)
             self._publish_file(self._catalog_stage_path, self._catalog_path)
@@ -1239,10 +1251,9 @@ class StreamingStructureSink:
             self._rollback_published(published)
             self._fail(error)
             raise
-        self._close_receipts()
+        self._artifacts = artifacts
         self._state = StreamingStructureSinkState.SEALED
-        self._artifacts = StreamingStructureArtifacts(pack_seal, catalog_seal)
-        return self._artifacts
+        return artifacts
 
     def close(self) -> None:
         if self._state is StreamingStructureSinkState.SEALED:
@@ -1354,6 +1365,7 @@ class StreamingStructureSink:
                 "sampled_ranges": baseline.sampled_ranges,
                 "sample_sha256": baseline.sample_sha256,
                 "full_content_sha256": baseline.full_content_sha256,
+                "masked_excerpt": baseline.masked_excerpt,
                 "analyzer_version": "semantic-input-v2",
             }
         )
@@ -1396,6 +1408,22 @@ class StreamingStructureSink:
     def _staging_path(path: Path, kind: str) -> Path:
         return path.with_name(f".{path.name}.stream-{uuid4().hex}.{kind}")
 
+    @staticmethod
+    def _cleanup_failed_pack_constructor(writer: PMPackWriter) -> None:
+        handle = getattr(writer, "_handle", None)
+        temporary_name = getattr(writer, "_temporary_name", None)
+        writer_path = getattr(writer, "_path", None)
+        try:
+            if handle is not None:
+                handle.close()
+                writer._handle = None
+        finally:
+            if temporary_name and isinstance(writer_path, Path):
+                try:
+                    os.unlink(writer_path.with_name(temporary_name))
+                except FileNotFoundError:
+                    pass
+
     def _require_missing_final_targets(self) -> None:
         for path in (self._pack_path, self._catalog_path):
             try:
@@ -1412,30 +1440,112 @@ class StreamingStructureSink:
         except OSError as error:
             if error.errno != errno.EXDEV:
                 raise
-        source = os.open(stage_path, os.O_RDONLY | os.O_NOFOLLOW)
+        source: int | None = os.open(stage_path, os.O_RDONLY | os.O_NOFOLLOW)
         destination: int | None = None
+        verification: int | None = None
         try:
             destination = os.open(
                 final_path,
                 os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                 0o400,
             )
+            source_stat = os.fstat(source)
+            if not stat.S_ISREG(source_stat.st_mode):
+                raise OSError("streaming authority stage is not a regular file")
+            source_digest = hashlib.sha256()
+            source_length = 0
             while chunk := os.read(source, 65_536):
-                os.write(destination, chunk)
+                source_digest.update(chunk)
+                source_length += len(chunk)
+                remaining = memoryview(chunk)
+                while remaining:
+                    written = os.write(destination, remaining)
+                    if written <= 0 or written > len(remaining):
+                        raise OSError(
+                            "streaming authority publish made no write progress"
+                        )
+                    remaining = remaining[written:]
+            source_after = os.fstat(source)
+            source_identity = (
+                source_stat.st_dev,
+                source_stat.st_ino,
+                source_stat.st_size,
+                source_stat.st_mtime_ns,
+                source_stat.st_ctime_ns,
+            )
+            source_identity_after = (
+                source_after.st_dev,
+                source_after.st_ino,
+                source_after.st_size,
+                source_after.st_mtime_ns,
+                source_after.st_ctime_ns,
+            )
+            if (
+                source_length != source_stat.st_size
+                or source_identity_after != source_identity
+            ):
+                raise OSError("streaming authority publish verification failed")
             os.fsync(destination)
+            if os.fstat(destination).st_size != source_length:
+                raise OSError("streaming authority publish verification failed")
+            os.close(destination)
+            destination = None
+            os.close(source)
+            source = None
+
+            verification = os.open(final_path, os.O_RDONLY | os.O_NOFOLLOW)
+            final_digest = hashlib.sha256()
+            final_length = 0
+            while chunk := os.read(verification, 65_536):
+                final_digest.update(chunk)
+                final_length += len(chunk)
+            os.close(verification)
+            verification = None
+            if (
+                final_length != source_length
+                or final_digest.digest() != source_digest.digest()
+            ):
+                raise OSError("streaming authority publish verification failed")
         except BaseException:
-            if destination is not None:
-                os.close(destination)
-                destination = None
+            if verification is not None:
                 try:
-                    os.unlink(final_path)
-                except FileNotFoundError:
+                    os.close(verification)
+                except OSError:
                     pass
+                verification = None
+            if destination is not None:
+                try:
+                    os.close(destination)
+                except OSError:
+                    pass
+                destination = None
+            if source is not None:
+                try:
+                    os.close(source)
+                except OSError:
+                    pass
+                source = None
+            try:
+                os.unlink(final_path)
+            except FileNotFoundError:
+                pass
             raise
         finally:
+            if verification is not None:
+                try:
+                    os.close(verification)
+                except OSError:
+                    pass
             if destination is not None:
-                os.close(destination)
-            os.close(source)
+                try:
+                    os.close(destination)
+                except OSError:
+                    pass
+            if source is not None:
+                try:
+                    os.close(source)
+                except OSError:
+                    pass
 
     def _rollback_published(self, paths: list[Path]) -> None:
         for path in reversed(paths):
