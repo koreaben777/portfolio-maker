@@ -74,6 +74,15 @@ _REPRESENTATIVE_KEYS = {
     "coverage",
     "role_reason",
 }
+_RESERVED_EXTENSIONLESS_STANDALONE = re.compile(
+    r"(?<![a-z0-9_.-])(?:dockerfile|readme|makefile|license)"
+    r"(?![a-z0-9_.-])"
+)
+_RESERVED_EXTENSIONLESS_RELATIVE_PATH = re.compile(
+    r"(?<![a-z0-9_.-])(?:[a-z0-9_.-]+[\\/])+"
+    r"[a-z0-9_.-]*(?:dockerfile|readme|makefile|license)[a-z0-9_.-]*"
+    r"(?![a-z0-9_.\\/-])"
+)
 _LOCATOR_PATTERNS = (
     re.compile(r"(?:https?|file|ssh)://"),
     re.compile(r"(?<![a-z0-9])[a-z]:[\\/]"),
@@ -89,10 +98,8 @@ _LOCATOR_PATTERNS = (
         r"(?:md|py|js|ts|tsx|jsx|json|ya?ml|toml|pdf|docx|xlsx|pptx|"
         r"csv|txt|html|css|sql|db)(?:$|[\s\"')])"
     ),
-    re.compile(
-        r"(?<![a-z0-9_.-])(?:dockerfile|readme|makefile|license)"
-        r"(?![a-z0-9_.-])"
-    ),
+    _RESERVED_EXTENSIONLESS_STANDALONE,
+    _RESERVED_EXTENSIONLESS_RELATIVE_PATH,
     re.compile(r"(?:git@[^:\s]+:[^\s]+|portfolio\.db|\.portfolio-maker)"),
 )
 

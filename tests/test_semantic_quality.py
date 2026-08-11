@@ -1158,6 +1158,59 @@ def test_v3_quality_rejects_concrete_extensionless_locator_tokens(
         validate_v3_semantic_output(work_input, output)
 
 
+@pytest.mark.parametrize("field", ("rationale", "role_reason"))
+@pytest.mark.parametrize(
+    "locator",
+    (
+        "deploy/Dockerfile-old",
+        "build/Makefile_2026",
+        "legal/LICENSE2",
+        "docs/README.bak",
+        "deploy/custom-Dockerfile",
+        "DOCS/ReAdMe.BAK",
+        "Ｄｅｐｌｏｙ／ｃｕｓｔｏｍ－Ｄｏｃｋｅｒｆｉｌｅ",
+    ),
+)
+def test_v3_quality_rejects_reserved_stem_inside_relative_path_leaf(
+    field: str, locator: str
+) -> None:
+    work_input = _v3_input()
+    output = _v3_output(FrontierAction.ACCEPT_BOUNDARY)
+    if field == "rationale":
+        output["rationale"] = f"검증 근거와 함께 {locator} 위치를 언급한다."
+    else:
+        work_input["representatives"][0]["role_reason"] = locator
+        unsigned = dict(work_input)
+        unsigned.pop("input_sha256")
+        work_input["input_sha256"] = _sha256(unsigned)
+        output["input_sha256"] = work_input["input_sha256"]
+    with pytest.raises(SemanticQualityV3Error, match="locator"):
+        validate_v3_semantic_output(work_input, output)
+
+
+@pytest.mark.parametrize("field", ("rationale", "role_reason"))
+@pytest.mark.parametrize(
+    "ordinary",
+    ("preDockerfile", "Dockerfiles", "makefiled", "licensed", "readable"),
+)
+def test_v3_quality_allows_reserved_substrings_without_path_context(
+    field: str, ordinary: str
+) -> None:
+    work_input = _v3_input()
+    output = _v3_output(FrontierAction.ACCEPT_BOUNDARY)
+    prose = f"The ordinary word {ordinary} is prose, not a concrete locator."
+    if field == "rationale":
+        output["rationale"] = prose
+    else:
+        work_input["representatives"][0]["role_reason"] = prose
+        unsigned = dict(work_input)
+        unsigned.pop("input_sha256")
+        work_input["input_sha256"] = _sha256(unsigned)
+        output["input_sha256"] = work_input["input_sha256"]
+    validated = validate_v3_semantic_output(work_input, output)
+    assert validated.action is FrontierAction.ACCEPT_BOUNDARY
+
+
 def test_v3_quality_allows_generic_locator_concepts_without_concrete_value() -> None:
     work_input = _v3_input()
     output = _v3_output(FrontierAction.ACCEPT_BOUNDARY)
