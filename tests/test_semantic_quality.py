@@ -1098,6 +1098,7 @@ def test_v3_quality_caps_canonical_input_and_output_mappings() -> None:
         "./private-source",
         "../private-source",
         "C:\\private\\main.py",
+        r"\\server\share\main.py",
         "git@private.example:repo/project.git",
     ),
 )
@@ -1174,6 +1175,37 @@ def test_v3_quality_rejects_concrete_extensionless_locator_tokens(
 def test_v3_quality_rejects_reserved_stem_inside_relative_path_leaf(
     field: str, locator: str
 ) -> None:
+    work_input = _v3_input()
+    output = _v3_output(FrontierAction.ACCEPT_BOUNDARY)
+    if field == "rationale":
+        output["rationale"] = f"검증 근거와 함께 {locator} 위치를 언급한다."
+    else:
+        work_input["representatives"][0]["role_reason"] = locator
+        unsigned = dict(work_input)
+        unsigned.pop("input_sha256")
+        work_input["input_sha256"] = _sha256(unsigned)
+        output["input_sha256"] = work_input["input_sha256"]
+    with pytest.raises(SemanticQualityV3Error, match="locator"):
+        validate_v3_semantic_output(work_input, output)
+
+
+@pytest.mark.parametrize("field", ("rationale", "role_reason"))
+@pytest.mark.parametrize(
+    "locator",
+    (
+        r"deploy\\Dockerfile-old",
+        "deploy＼＼custom-Dockerfile_2026",
+        r"deploy/\Dockerfile-old",
+        r"deploy\\\Makefile_2026",
+        r"release/deploy\\Dockerfile-old",
+        "release/build＼＼custom-Makefile_2026",
+        r"release/legal/\LICENSE2",
+    ),
+)
+def test_v3_quality_rejects_reserved_relative_path_with_separator_runs(
+    field: str, locator: str
+) -> None:
+    """Catches repeated or mixed separators bypassing concrete path detection."""
     work_input = _v3_input()
     output = _v3_output(FrontierAction.ACCEPT_BOUNDARY)
     if field == "rationale":

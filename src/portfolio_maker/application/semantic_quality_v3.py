@@ -79,7 +79,7 @@ _RESERVED_EXTENSIONLESS_STANDALONE = re.compile(
     r"(?![a-z0-9_.-])"
 )
 _RESERVED_EXTENSIONLESS_RELATIVE_PATH = re.compile(
-    r"(?<![a-z0-9_.-])(?:[a-z0-9_.-]+[\\/])+"
+    r"(?<![a-z0-9_.-])(?:[a-z0-9_.-]+[\\/]+)+"
     r"[a-z0-9_.-]*(?:dockerfile|readme|makefile|license)[a-z0-9_.-]*"
     r"(?![a-z0-9_.\\/-])"
 )
