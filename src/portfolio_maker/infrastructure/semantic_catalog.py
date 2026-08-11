@@ -22,6 +22,7 @@ from portfolio_maker.infrastructure.managed_files import (
 
 
 _ROOT_DOMAIN = b"portfolio-maker-semantic-catalog-v1\0"
+_ADAPTIVE_FRONTIER_SELECTOR_VERSION = "adaptive-frontier-v1"
 _AUTHORITATIVE_TABLES = (
     ("nodes", ("node_id",)),
     ("children", ("parent_node_id", "child_node_id")),
@@ -201,6 +202,66 @@ class DeferredSummary:
     count: int
     root: str
     cursor_root: str
+
+
+@dataclass
+class PlanningQueryObserver:
+    page_calls: int = 0
+    max_python_rows: int = 0
+    sequence_sort_calls: int = 0
+    temp_store_file: bool = False
+
+
+@dataclass(frozen=True)
+class FrontierPlanningRow:
+    node_id: str
+    parent_node_id: str | None
+    node_kind: str
+    relative_hierarchy: str
+    source_id: str
+    fair_round: int
+    top_level_lane: str
+    project_like: bool
+    ambiguous: bool
+    independent_child: bool
+    evidence_linked: bool
+    uncertainty: bool
+    feature_digest: str
+    coverage: BaselineCoverage
+    roles: tuple[str, ...]
+    topics: tuple[str, ...]
+    inspected_bytes: int
+    full_content_sha256: str | None
+
+    @property
+    def cursor(self) -> tuple[int, str]:
+        return (self.fair_round, self.top_level_lane)
+
+
+@dataclass(frozen=True)
+class PlanningNodeProjection:
+    node_id: str
+    parent_node_id: str | None
+    node_kind: str
+    relative_hierarchy: str
+    source_id: str
+    coverage: BaselineCoverage | None
+    roles: tuple[str, ...]
+    topics: tuple[str, ...]
+    inspected_bytes: int
+    full_content_sha256: str | None
+
+
+@dataclass(frozen=True)
+class RepresentativeCandidate:
+    node_id: str
+    roles: tuple[str, ...]
+    coverage: BaselineCoverage
+    sample_sha256: str | None
+    full_content_sha256: str | None
+    independent_child: bool
+    evidence_linked: bool
+    uncertainty: bool
 
 
 def canonical_json_text(value: object) -> str:
@@ -507,31 +568,24 @@ class SemanticCatalogWriter:
         except sqlite3.IntegrityError as error:
             raise CatalogError("catalog frontier deferred row is invalid") from error
 
+    def planning_session(
+        self,
+        selector_version: str,
+        *,
+        observer: PlanningQueryObserver | None = None,
+    ) -> SemanticCatalogPlanningSession:
+        return SemanticCatalogPlanningSession(
+            self._require_writable(), selector_version, observer=observer
+        )
+
     def seal(self) -> CatalogSeal:
         if self._seal is not None:
             return self._seal
         connection = self._require_writable()
         try:
-            self._validate_before_seal(connection)
             connection.execute("PRAGMA temp_store = FILE")
-            connection.execute("DELETE FROM frontier_order")
-            connection.execute(
-                """
-                INSERT INTO frontier_order(
-                    node_id, fair_round, top_level_lane, project_like, ambiguous,
-                    independent_child, evidence_linked, uncertainty
-                )
-                SELECT node_id,
-                    row_number() OVER (
-                        PARTITION BY top_level_lane
-                        ORDER BY project_like DESC, ambiguous DESC, independent_child DESC,
-                            evidence_linked DESC, uncertainty DESC, node_id
-                    ) - 1,
-                    top_level_lane, project_like, ambiguous, independent_child,
-                    evidence_linked, uncertainty
-                FROM frontier_features
-                """
-            )
+            _build_frontier_order(connection)
+            self._validate_before_seal(connection)
             connection.commit()
             checkpoint = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
             if checkpoint is None or checkpoint[0] != 0:
@@ -711,6 +765,198 @@ class SemanticCatalogWriter:
         ).fetchone()
         if invalid is not None:
             raise CatalogError("frontier selector deferred row is invalid")
+        _validate_adaptive_selector_bindings(connection)
+
+
+class SemanticCatalogPlanningSession:
+    """Narrow pre-seal selector surface over a live catalog writer."""
+
+    def __init__(
+        self,
+        connection: sqlite3.Connection,
+        selector_version: str,
+        *,
+        observer: PlanningQueryObserver | None = None,
+    ) -> None:
+        _require_text(selector_version, "selector version")
+        self._connection = connection
+        self.selector_version = selector_version
+        self.observer = observer or PlanningQueryObserver()
+        self._finished = False
+        if connection.execute(
+            "SELECT 1 FROM frontier_selector_authorities WHERE selector_version = ?",
+            (selector_version,),
+        ).fetchone() is not None:
+            raise CatalogError("catalog selector planning session already exists")
+        connection.execute("PRAGMA temp_store = FILE")
+        self.observer.temp_store_file = (
+            connection.execute("PRAGMA temp_store").fetchone()[0] == 1
+        )
+        if not self.observer.temp_store_file:
+            raise CatalogError("catalog planning requires file-backed temporary storage")
+        _build_frontier_order(connection)
+        self.selector_digest = _frontier_feature_root(connection)
+        connection.execute(
+            """
+            INSERT INTO frontier_selector_authorities(selector_version, selector_digest)
+            VALUES (?, ?)
+            """,
+            (selector_version, self.selector_digest),
+        )
+
+    def fair_seed_page(
+        self, cursor: tuple[int, str] | None, limit: int
+    ) -> list[FrontierPlanningRow]:
+        self._require_active()
+        _page_limit(limit)
+        select = """
+            SELECT feature.node_id, node.parent_node_id, node.node_kind,
+                   node.relative_hierarchy, node.source_id, ordering.fair_round,
+                   ordering.top_level_lane, ordering.project_like,
+                   ordering.ambiguous, ordering.independent_child,
+                   ordering.evidence_linked, ordering.uncertainty,
+                   feature.feature_digest, baseline.coverage, baseline.roles_json,
+                   baseline.topics_json, baseline.inspected_bytes,
+                   baseline.full_content_sha256
+            FROM frontier_order AS ordering
+            JOIN frontier_features AS feature ON feature.node_id = ordering.node_id
+            JOIN nodes AS node ON node.node_id = ordering.node_id
+            JOIN local_baselines AS baseline ON baseline.node_id = ordering.node_id
+        """
+        order = """
+            ORDER BY ordering.fair_round, ordering.top_level_lane,
+                     ordering.project_like DESC, ordering.ambiguous DESC,
+                     ordering.independent_child DESC, ordering.evidence_linked DESC,
+                     ordering.uncertainty DESC, ordering.node_id
+            LIMIT ?
+        """
+        if cursor is None:
+            rows = self._connection.execute(select + order, (limit,)).fetchall()
+        else:
+            fair_round, lane = cursor
+            rows = self._connection.execute(
+                select
+                + """
+                  WHERE ordering.fair_round > ?
+                     OR (ordering.fair_round = ? AND ordering.top_level_lane > ?)
+                """
+                + order,
+                (fair_round, fair_round, lane, limit),
+            ).fetchall()
+        self._observe_page(rows)
+        return [_planning_row_from_tuple(row) for row in rows]
+
+    def ancestor_projection(
+        self, node_id: str, *, limit: int = 64
+    ) -> tuple[PlanningNodeProjection, ...] | None:
+        self._require_active()
+        _page_limit(limit)
+        rows = self._connection.execute(
+            """
+            WITH RECURSIVE ancestors(
+                node_id, parent_node_id, node_kind, relative_hierarchy, source_id, depth
+            ) AS (
+                SELECT node_id, parent_node_id, node_kind, relative_hierarchy, source_id, 0
+                FROM nodes WHERE node_id = ?
+                UNION ALL
+                SELECT parent.node_id, parent.parent_node_id, parent.node_kind,
+                       parent.relative_hierarchy, parent.source_id, ancestors.depth + 1
+                FROM nodes AS parent
+                JOIN ancestors ON parent.node_id = ancestors.parent_node_id
+                WHERE ancestors.depth < ?
+            )
+            SELECT ancestors.node_id, ancestors.parent_node_id, ancestors.node_kind,
+                   ancestors.relative_hierarchy, ancestors.source_id, ancestors.depth,
+                   baseline.coverage, baseline.roles_json, baseline.topics_json,
+                   COALESCE(baseline.inspected_bytes, 0), baseline.full_content_sha256
+            FROM ancestors
+            LEFT JOIN local_baselines AS baseline ON baseline.node_id = ancestors.node_id
+            ORDER BY ancestors.depth DESC
+            LIMIT ?
+            """,
+            (node_id, limit, limit),
+        ).fetchall()
+        self._observe_page(rows)
+        if not rows:
+            raise CatalogError("catalog planning node is missing")
+        if rows[0][1] is not None:
+            return None
+        projections: list[PlanningNodeProjection] = []
+        for row in rows:
+            roles = () if row[7] is None else _text_tuple(row[7], "baseline roles")
+            topics = () if row[8] is None else _text_tuple(row[8], "baseline topics")
+            projections.append(
+                PlanningNodeProjection(
+                    row[0], row[1], row[2], row[3], row[4],
+                    None if row[6] is None else BaselineCoverage(row[6]),
+                    roles, topics, int(row[9]), row[10],
+                )
+            )
+        return tuple(projections)
+
+    def append_selector_result(self, result: FrontierSelectorResult) -> None:
+        self._require_active()
+        if result.selector_version != self.selector_version:
+            raise CatalogError("catalog selector planning session does not match")
+        _validate_selector_row(result)
+        try:
+            self._connection.execute(
+                """
+                INSERT INTO frontier_selector_results(
+                    selector_version, node_id, selected, reason, node_digest,
+                    cursor_json, cursor_order, source_id, coverage_stratum,
+                    relevance_rank, selector_feature_digest
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    result.selector_version, result.node_id, int(result.selected),
+                    result.reason, result.node_digest, result.cursor_json,
+                    result.cursor_order, result.source_id, result.coverage_stratum,
+                    result.relevance_rank, result.selector_feature_digest,
+                ),
+            )
+        except sqlite3.IntegrityError as error:
+            raise CatalogError("catalog selector planning result is invalid") from error
+
+    def append_deferred(self, row: SemanticDeferredAuditRow) -> None:
+        self._require_active()
+        if row.selector_version != self.selector_version:
+            raise CatalogError("catalog selector planning session does not match")
+        record = FrontierDeferredRecord(**row.__dict__)
+        _validate_selector_row(
+            FrontierSelectorResult(False, *record.__dict__.values())
+        )
+        try:
+            self._connection.execute(
+                """
+                INSERT INTO frontier_deferred(
+                    node_id, reason, node_digest, cursor_json, cursor_order, source_id,
+                    coverage_stratum, relevance_rank, selector_version,
+                    selector_feature_digest
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                tuple(record.__dict__.values()),
+            )
+        except sqlite3.IntegrityError as error:
+            raise CatalogError("catalog selector planning deferred row is invalid") from error
+
+    def deferred_summary(self) -> DeferredSummary:
+        self._require_active()
+        return _deferred_summary(self._connection, self.selector_version)
+
+    def finish(self) -> DeferredSummary:
+        summary = self.deferred_summary()
+        self._finished = True
+        return summary
+
+    def _observe_page(self, rows: object) -> None:
+        size = len(rows)  # type: ignore[arg-type]
+        self.observer.page_calls += 1
+        self.observer.max_python_rows = max(self.observer.max_python_rows, size)
+
+    def _require_active(self) -> None:
+        if self._finished:
+            raise CatalogError("catalog selector planning session is finished")
 
 
 class SemanticCatalogReader:
@@ -882,6 +1128,42 @@ class SemanticCatalogReader:
             ).fetchall()
         return [_node_from_row(row) for row in rows]
 
+    def representative_page(
+        self, parent_node_id: str, after_node_id: str | None, limit: int
+    ) -> list[RepresentativeCandidate]:
+        _page_limit(limit)
+        parameters: tuple[object, ...]
+        after_clause = ""
+        if after_node_id is None:
+            parameters = (parent_node_id, limit)
+        else:
+            after_clause = " AND child.child_node_id > ?"
+            parameters = (parent_node_id, after_node_id, limit)
+        rows = self.connection.execute(
+            """
+            SELECT child.child_node_id, baseline.roles_json, baseline.coverage,
+                   baseline.sample_sha256, baseline.full_content_sha256,
+                   COALESCE(feature.independent_child, 0),
+                   COALESCE(feature.evidence_linked, 0),
+                   COALESCE(feature.uncertainty, 0)
+            FROM children AS child
+            JOIN local_baselines AS baseline ON baseline.node_id = child.child_node_id
+            LEFT JOIN frontier_features AS feature ON feature.node_id = child.child_node_id
+            WHERE child.parent_node_id = ?
+            """
+            + after_clause
+            + " ORDER BY child.child_node_id LIMIT ?",
+            parameters,
+        ).fetchall()
+        return [
+            RepresentativeCandidate(
+                str(row[0]), _text_tuple(row[1], "baseline roles"),
+                BaselineCoverage(row[2]), row[3], row[4], bool(row[5]),
+                bool(row[6]), bool(row[7]),
+            )
+            for row in rows
+        ]
+
     def frontier_page(
         self, cursor: tuple[int, str] | None, limit: int
     ) -> list[FrontierOrderRow]:
@@ -976,23 +1258,180 @@ class SemanticCatalogReader:
         )
 
     def deferred_summary(self, *, selector_version: str) -> DeferredSummary:
-        root = bytes(32)
-        cursor_root = bytes(32)
-        count = 0
-        cursor: tuple[str, int, str, str, int, str] | None = None
-        while True:
-            page = self.frontier_deferred_page(selector_version, cursor, 64)
-            if not page:
-                break
-            for row in page:
-                row_json = canonical_json_text(row.__dict__).encode("utf-8")
-                root = hashlib.sha256(_ROOT_DOMAIN + b"deferred\0" + root + row_json).digest()
-                cursor_root = hashlib.sha256(
-                    _ROOT_DOMAIN + b"deferred-cursor\0" + cursor_root + row.cursor_json.encode("utf-8")
-                ).digest()
-                count += 1
-            cursor = self.frontier_deferred_cursor(page[-1])
-        return DeferredSummary(count, root.hex(), cursor_root.hex())
+        return _deferred_summary(self.connection, selector_version)
+
+
+def _build_frontier_order(connection: sqlite3.Connection) -> None:
+    connection.execute("DELETE FROM frontier_order")
+    connection.execute(
+        """
+        INSERT INTO frontier_order(
+            node_id, fair_round, top_level_lane, project_like, ambiguous,
+            independent_child, evidence_linked, uncertainty
+        )
+        SELECT node_id,
+            row_number() OVER (
+                PARTITION BY top_level_lane
+                ORDER BY project_like DESC, ambiguous DESC, independent_child DESC,
+                    evidence_linked DESC, uncertainty DESC, node_id
+            ) - 1,
+            top_level_lane, project_like, ambiguous, independent_child,
+            evidence_linked, uncertainty
+        FROM frontier_features
+        """
+    )
+
+
+def _validate_adaptive_selector_bindings(connection: sqlite3.Connection) -> None:
+    rows = connection.execute(
+        """
+        SELECT result.node_id, result.cursor_json, result.cursor_order,
+               result.relevance_rank, ordering.fair_round,
+               ordering.top_level_lane, ordering.project_like,
+               ordering.ambiguous, ordering.independent_child,
+               ordering.evidence_linked, ordering.uncertainty,
+               feature.feature_digest
+        FROM frontier_order AS ordering
+        JOIN frontier_features AS feature ON feature.node_id = ordering.node_id
+        JOIN frontier_selector_results AS result ON result.node_id = ordering.node_id
+        WHERE result.selector_version = ?
+        ORDER BY ordering.fair_round, ordering.top_level_lane,
+                 ordering.project_like DESC, ordering.ambiguous DESC,
+                 ordering.independent_child DESC, ordering.evidence_linked DESC,
+                 ordering.uncertainty DESC, ordering.node_id
+        """,
+        (_ADAPTIVE_FRONTIER_SELECTOR_VERSION,),
+    )
+    for expected_order, row in enumerate(rows):
+        if row[2] != expected_order:
+            raise CatalogError("adaptive selector cursor order is invalid")
+        cursor = _canonical_json_from_text(row[1])
+        expected_cursor = {
+            "fair_round": row[4],
+            "lane": row[5],
+            "node_id": row[0],
+            "order": expected_order,
+            "selector_feature_digest": row[11],
+        }
+        if cursor != expected_cursor:
+            raise CatalogError("adaptive selector cursor binding is invalid")
+        relevance_rank = (
+            (int(not bool(row[6])) << 4)
+            | (int(not bool(row[7])) << 3)
+            | (int(not bool(row[8])) << 2)
+            | (int(not bool(row[9])) << 1)
+            | int(not bool(row[10]))
+        )
+        if row[3] != relevance_rank:
+            raise CatalogError("adaptive selector relevance binding is invalid")
+
+
+def _frontier_feature_root(connection: sqlite3.Connection) -> str:
+    root = bytes(32)
+    for row in connection.execute(
+        """
+        SELECT node_id, feature_version, project_like, ambiguous,
+               independent_child, evidence_linked, uncertainty,
+               top_level_lane, feature_digest
+        FROM frontier_features ORDER BY node_id
+        """
+    ):
+        encoded = canonical_json_text(
+            {
+                "ambiguous": row[3],
+                "evidence_linked": row[5],
+                "feature_digest": row[8],
+                "feature_version": row[1],
+                "independent_child": row[4],
+                "node_id": row[0],
+                "project_like": row[2],
+                "top_level_lane": row[7],
+                "uncertainty": row[6],
+            }
+        ).encode("utf-8")
+        root = hashlib.sha256(
+            _ROOT_DOMAIN + b"frontier-features\0" + root + encoded
+        ).digest()
+    return root.hex()
+
+
+def _planning_row_from_tuple(row: sqlite3.Row | tuple[object, ...]) -> FrontierPlanningRow:
+    roles = _text_tuple(row[14], "baseline roles")
+    topics = _text_tuple(row[15], "baseline topics")
+    return FrontierPlanningRow(
+        str(row[0]), None if row[1] is None else str(row[1]), str(row[2]),
+        str(row[3]), str(row[4]), int(row[5]), str(row[6]), bool(row[7]),
+        bool(row[8]), bool(row[9]), bool(row[10]), bool(row[11]), str(row[12]),
+        BaselineCoverage(row[13]), roles, topics, int(row[16]),
+        None if row[17] is None else str(row[17]),
+    )
+
+
+def _text_tuple(value: object, name: str) -> tuple[str, ...]:
+    if not isinstance(value, str):
+        raise CatalogError(f"catalog {name} is invalid")
+    parsed = _canonical_json_from_text(value)
+    if (
+        not isinstance(parsed, list)
+        or any(not isinstance(item, str) for item in parsed)
+        or len(parsed) != len(set(parsed))
+    ):
+        raise CatalogError(f"catalog {name} is invalid")
+    return tuple(parsed)
+
+
+def _deferred_summary(
+    connection: sqlite3.Connection, selector_version: str
+) -> DeferredSummary:
+    root = bytes(32)
+    cursor_root = bytes(32)
+    count = 0
+    cursor: tuple[str, int, str, str, int, str] | None = None
+    while True:
+        parameters: tuple[object, ...]
+        if cursor is None:
+            statement = (
+                _DEFERRED_PAGE_SELECT
+                + " WHERE selector_version = ?"
+                + _DEFERRED_PAGE_ORDER
+                + " LIMIT 64"
+            )
+            parameters = (selector_version,)
+        else:
+            statement = (
+                _DEFERRED_PAGE_SELECT
+                + " WHERE selector_version = ? AND "
+                + "(relevance_rank, coverage_stratum, source_id, cursor_order, node_id) > (?, ?, ?, ?, ?)"
+                + _DEFERRED_PAGE_ORDER
+                + " LIMIT 64"
+            )
+            parameters = (selector_version, *cursor[1:])
+        rows = connection.execute(statement, parameters).fetchall()
+        if not rows:
+            break
+        for raw in rows:
+            row = SemanticDeferredAuditRow(*tuple(raw))
+            row_json = canonical_json_text(row.__dict__).encode("utf-8")
+            root = hashlib.sha256(
+                _ROOT_DOMAIN + b"deferred\0" + root + row_json
+            ).digest()
+            cursor_root = hashlib.sha256(
+                _ROOT_DOMAIN
+                + b"deferred-cursor\0"
+                + cursor_root
+                + row.cursor_json.encode("utf-8")
+            ).digest()
+            count += 1
+        final = SemanticDeferredAuditRow(*tuple(rows[-1]))
+        cursor = (
+            final.selector_version,
+            final.relevance_rank,
+            final.coverage_stratum,
+            final.source_id,
+            final.cursor_order,
+            final.node_id,
+        )
+    return DeferredSummary(count, root.hex(), cursor_root.hex())
 
 
 def _node_from_row(row: sqlite3.Row) -> NodeRecord:

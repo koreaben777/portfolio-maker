@@ -13,6 +13,14 @@ from portfolio_maker.application.semantic_quality import (
     ValidatedSemanticNodeResult,
     validate_semantic_work_output,
 )
+from portfolio_maker.application.semantic_quality_v3 import (
+    SEMANTIC_INPUT_SCHEMA_V3,
+    SEMANTIC_OUTPUT_SCHEMA_V3,
+    SemanticQualityV3Error,
+    validate_v3_semantic_output,
+)
+from portfolio_maker.application.semantic_frontier_v3 import transition_frontier
+from portfolio_maker.domain.semantic_frontier import FrontierAction
 
 
 NODE_RESULT_KEYS = {
@@ -704,3 +712,155 @@ def test_fixture_hashes_are_canonical_and_self_consistent() -> None:
         assert output["coverage"] == work_input["coverage"]
         assert output["input_sha256"] == input_sha256
         assert set(output["results"][0]) == NODE_RESULT_KEYS
+
+
+def _v3_input() -> dict[str, object]:
+    payload: dict[str, object] = {
+        "schema_version": SEMANTIC_INPUT_SCHEMA_V3,
+        "revision_id": "revision-v3",
+        "run_id": "run-v3",
+        "unit_id": "unit-v3",
+        "target_node_ids": ["target"],
+        "approved_local_signal_ids": ["signal-purpose", "signal-counter"],
+        "representatives": [
+            {
+                "node_id": "target",
+                "full_content_sha256": "b" * 64,
+                "coverage": "complete",
+                "role_reason": "entrypoint",
+            }
+        ],
+        "exposed_child_node_ids": ["child-1", "child-2"],
+        "next_child_cursor": '{"after":"child-2"}',
+    }
+    return {**payload, "input_sha256": _sha256(payload)}
+
+
+def _v3_output(action: FrontierAction) -> dict[str, object]:
+    work_input = _v3_input()
+    expanding = action is FrontierAction.EXPAND_CHILDREN
+    return {
+        "schema_version": SEMANTIC_OUTPUT_SCHEMA_V3,
+        "revision_id": work_input["revision_id"],
+        "run_id": work_input["run_id"],
+        "unit_id": work_input["unit_id"],
+        "input_sha256": work_input["input_sha256"],
+        "action": action.value,
+        "target_node_ids": ["target"],
+        "grounding_signal_ids": ["signal-purpose"],
+        "representative_digests": ["b" * 64],
+        "rationale": "검증된 목적과 실행 진입점 신호를 함께 근거로 경계를 판단한다.",
+        "counter_signal_ids": ["signal-counter"],
+        "confidence": 0.8,
+        "requested_child_node_ids": ["child-2"] if expanding else [],
+        "next_child_cursor": work_input["next_child_cursor"] if expanding else None,
+    }
+
+
+@pytest.mark.parametrize("action", tuple(FrontierAction))
+def test_v3_quality_accepts_exactly_four_grounded_actions(
+    action: FrontierAction,
+) -> None:
+    """Catches a missing closed action branch or changing the enum contract."""
+    validated = validate_v3_semantic_output(_v3_input(), _v3_output(action))
+
+    assert validated.action is action
+    assert validated.target_node_ids == ("target",)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        ("action", "action"),
+        ("schema", "schema"),
+        ("locator", "schema"),
+        ("topology", "schema"),
+        ("target", "target"),
+        ("grounding", "grounding"),
+        ("digest", "representative"),
+        ("child", "child"),
+        ("sampled", "full-content"),
+    ),
+)
+def test_v3_quality_rejects_unbound_or_invented_output(
+    mutation: str, message: str
+) -> None:
+    """Catches accepting invented topology/locator/evidence or stale bindings."""
+    work_input = _v3_input()
+    output = _v3_output(FrontierAction.EXPAND_CHILDREN)
+    if mutation == "action":
+        output["action"] = "complete"
+    elif mutation == "schema":
+        output["schema_version"] = "semantic-frontier-output-v4"
+    elif mutation == "locator":
+        output["locator"] = "/private/source"
+    elif mutation == "topology":
+        output["topology"] = ["child-3"]
+    elif mutation == "target":
+        output["target_node_ids"] = ["invented-target"]
+    elif mutation == "grounding":
+        output["grounding_signal_ids"] = ["invented-signal"]
+    elif mutation == "digest":
+        output["representative_digests"] = ["c" * 64]
+    elif mutation == "child":
+        output["requested_child_node_ids"] = ["child-3"]
+    else:
+        work_input["representatives"][0]["coverage"] = "sampled"
+        unsigned = dict(work_input)
+        unsigned.pop("input_sha256")
+        work_input["input_sha256"] = _sha256(unsigned)
+
+    with pytest.raises(SemanticQualityV3Error, match=message):
+        validate_v3_semantic_output(work_input, output)
+
+
+def test_v3_quality_rejects_duplicate_json_keys_and_nonexpansion_smuggling() -> None:
+    """Catches parser key collapse and child IDs hidden in a terminal action."""
+    work_input = _v3_input()
+    output = _v3_output(FrontierAction.ACCEPT_BOUNDARY)
+    output["requested_child_node_ids"] = ["child-1"]
+    with pytest.raises(SemanticQualityV3Error, match="child"):
+        validate_v3_semantic_output(work_input, output)
+
+    duplicate = json.dumps(_v3_output(FrontierAction.ACCEPT_BOUNDARY))
+    duplicate = duplicate[:-1] + ',"confidence":0.1}'
+    with pytest.raises(SemanticQualityV3Error, match="duplicate"):
+        validate_v3_semantic_output(work_input, duplicate)
+
+
+@pytest.mark.parametrize(
+    ("action", "field", "expected"),
+    (
+        (FrontierAction.ACCEPT_BOUNDARY, "accepted_node_ids", ("target",)),
+        (FrontierAction.STOP_NON_PROJECT, "stopped_node_ids", ("target",)),
+        (FrontierAction.DEFER_ON_DEMAND, "deferred_node_ids", ("target",)),
+        (FrontierAction.EXPAND_CHILDREN, "enqueued_child_node_ids", ("child-2",)),
+    ),
+)
+def test_frontier_transition_is_pure_and_closed(
+    action: FrontierAction, field: str, expected: tuple[str, ...]
+) -> None:
+    """Catches conflating one closed action with another state transition."""
+    validated = validate_v3_semantic_output(_v3_input(), _v3_output(action))
+
+    transition = transition_frontier(validated, budget_exhausted=False)
+
+    assert transition.action is action
+    assert getattr(transition, field) == expected
+    assert transition.paused_budget is False
+    assert transition.converged is False
+
+
+def test_budget_exhaustion_defers_expansion_without_stop_or_convergence() -> None:
+    """Catches turning a hard budget into a semantic non-project conclusion."""
+    validated = validate_v3_semantic_output(
+        _v3_input(), _v3_output(FrontierAction.EXPAND_CHILDREN)
+    )
+
+    transition = transition_frontier(validated, budget_exhausted=True)
+
+    assert transition.enqueued_child_node_ids == ()
+    assert transition.deferred_node_ids == ("child-2",)
+    assert transition.stopped_node_ids == ()
+    assert transition.paused_budget is True
+    assert transition.converged is False
