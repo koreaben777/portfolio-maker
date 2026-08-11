@@ -5,6 +5,7 @@ import heapq
 import json
 import re
 import sqlite3
+import unicodedata
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Iterable, Iterator, Sequence
@@ -368,6 +369,8 @@ def transition_frontier(
     canonical_resume = _canonical_cursor_or_none(resume_cursor)
     if not budget_exhausted and (remaining or canonical_resume is not None):
         raise ValueError("frontier resume authority requires an exhausted budget")
+    if budget_exhausted and canonical_resume is None:
+        raise ValueError("frontier resume cursor is required for an exhausted budget")
     accepted = targets if action is FrontierAction.ACCEPT_BOUNDARY else ()
     stopped = targets if action is FrontierAction.STOP_NON_PROJECT else ()
     unit_deferred = (
@@ -379,15 +382,12 @@ def transition_frontier(
         deferred = _bounded_unique_ids(
             (*unit_deferred, *remaining), "budget deferred node ids"
         )
-        effective_cursor = canonical_resume or next_cursor
-        if not deferred and effective_cursor is None:
-            raise ValueError("exhausted budget requires resume or deferred authority")
         return FrontierTransition(
             action,
             accepted_node_ids=accepted,
             stopped_node_ids=stopped,
             deferred_node_ids=deferred,
-            next_child_cursor=effective_cursor,
+            next_child_cursor=canonical_resume,
             paused_budget=True,
         )
     if action is FrontierAction.ACCEPT_BOUNDARY:
@@ -419,12 +419,46 @@ def _canonical_cursor_or_none(value: object) -> str | None:
     if not isinstance(value, str):
         raise ValueError("frontier resume cursor is invalid")
     try:
+        raw = value.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise ValueError("frontier resume cursor is invalid") from error
+    if len(raw) > 4_096:
+        raise ValueError("frontier resume cursor exceeds the byte limit")
+    try:
         parsed = json.loads(value, object_pairs_hook=_audit_no_duplicate_keys)
     except (TypeError, ValueError, json.JSONDecodeError) as error:
         raise ValueError("frontier resume cursor is invalid") from error
     if canonical_json_text(parsed) != value:
         raise ValueError("frontier resume cursor must be canonical")
+    if not isinstance(parsed, dict):
+        raise ValueError("frontier resume cursor schema is invalid")
+    if set(parsed) == {"after"}:
+        _validate_resume_identifier(parsed["after"])
+    elif set(parsed) == {"lane", "offset"}:
+        _validate_resume_identifier(parsed["lane"])
+        offset = parsed["offset"]
+        if (
+            not isinstance(offset, int)
+            or isinstance(offset, bool)
+            or offset < 0
+        ):
+            raise ValueError("frontier resume cursor offset is invalid")
+    else:
+        raise ValueError("frontier resume cursor schema is invalid")
     return value
+
+
+def _validate_resume_identifier(value: object) -> None:
+    if not isinstance(value, str) or not value or value.strip() != value:
+        raise ValueError("frontier resume cursor identifier is invalid")
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise ValueError("frontier resume cursor identifier is invalid") from error
+    if len(encoded) > 1_024 or any(
+        unicodedata.category(character).startswith("C") for character in value
+    ):
+        raise ValueError("frontier resume cursor identifier is invalid")
 
 
 def freeze_audit_sample(
@@ -687,6 +721,23 @@ def _validate_audit_checkpoint(checkpoint: AuditCheckpointBinding) -> None:
 def _validate_audit_row(
     row: SemanticDeferredAuditRow, checkpoint: AuditCheckpointBinding
 ) -> None:
+    _validate_audit_text(row.node_id, "node id", 1_024)
+    _validate_audit_text(row.reason, "reason", 4_096)
+    _validate_audit_text(row.source_id, "source id", 1_024)
+    _validate_audit_text(row.coverage_stratum, "coverage stratum", 64)
+    _validate_audit_text(row.selector_version, "selector version", 1_024)
+    if (
+        not isinstance(row.cursor_order, int)
+        or isinstance(row.cursor_order, bool)
+        or row.cursor_order < 0
+    ):
+        raise FrontierSelectionError("audit cursor order is invalid")
+    if (
+        not isinstance(row.relevance_rank, int)
+        or isinstance(row.relevance_rank, bool)
+        or row.relevance_rank < 0
+    ):
+        raise FrontierSelectionError("audit relevance rank is invalid")
     if row.selector_version != checkpoint.selector_version:
         raise FrontierSelectionError("audit selector version does not match")
     try:
@@ -696,6 +747,7 @@ def _validate_audit_row(
         raise FrontierSelectionError("audit feature or node digest is invalid") from error
     if row.coverage_stratum not in _AUDIT_COVERAGE_ORDER:
         raise FrontierSelectionError("audit coverage stratum is invalid")
+    _validate_audit_text(row.cursor_json, "cursor JSON", 4_096)
     try:
         cursor = json.loads(row.cursor_json, object_pairs_hook=_audit_no_duplicate_keys)
     except (TypeError, ValueError, json.JSONDecodeError) as error:
@@ -705,6 +757,8 @@ def _validate_audit_row(
     if (
         not isinstance(cursor, dict)
         or set(cursor) != _AUDIT_CURSOR_KEYS
+        or not isinstance(cursor.get("order"), int)
+        or isinstance(cursor.get("order"), bool)
         or cursor.get("order") != row.cursor_order
         or cursor.get("node_id") != row.node_id
         or cursor.get("selector_feature_digest") != row.selector_feature_digest
@@ -718,11 +772,22 @@ def _validate_audit_row(
         or isinstance(cursor["fair_round"], bool)
         or cursor["fair_round"] < 0
         or not isinstance(cursor["lane"], str)
-        or not cursor["lane"]
     ):
         raise FrontierSelectionError("audit cursor axis metadata is invalid")
-    if not isinstance(row.source_id, str) or not row.source_id:
-        raise FrontierSelectionError("audit source axis is invalid")
+    _validate_audit_text(cursor["lane"], "cursor lane", 1_024)
+
+
+def _validate_audit_text(value: object, name: str, max_bytes: int) -> None:
+    if not isinstance(value, str) or not value or value.strip() != value:
+        raise FrontierSelectionError(f"audit {name} is invalid")
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise FrontierSelectionError(f"audit {name} is invalid") from error
+    if len(encoded) > max_bytes or any(
+        unicodedata.category(character).startswith("C") for character in value
+    ):
+        raise FrontierSelectionError(f"audit {name} is invalid")
 
 
 def _audit_no_duplicate_keys(

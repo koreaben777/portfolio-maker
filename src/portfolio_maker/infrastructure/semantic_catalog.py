@@ -290,6 +290,7 @@ class SemanticCatalogWriter:
         self._temporary_path = self._path.with_name(self._temporary_name)
         self._connection: sqlite3.Connection | None = None
         self._closed = False
+        self._poisoned = False
         self._sealed = False
         self._seal: CatalogSeal | None = None
         self._planning_session: SemanticCatalogPlanningSession | None = None
@@ -587,6 +588,7 @@ class SemanticCatalogWriter:
                 selector_version,
                 observer=observer,
                 release_owner=self._release_planning_session,
+                poison_owner=self._poison_planning_writer,
             )
         except BaseException:
             self._release_planning_session()
@@ -595,6 +597,8 @@ class SemanticCatalogWriter:
         return session
 
     def seal(self) -> CatalogSeal:
+        if self._poisoned:
+            raise CatalogError("semantic catalog writer is poisoned")
         if self._seal is not None:
             return self._seal
         if self._planning_session_open:
@@ -665,27 +669,48 @@ class SemanticCatalogWriter:
         self._planning_session = None
         self._planning_session_open = False
 
+    def _poison_planning_writer(self) -> None:
+        self._poisoned = True
+        self._release_planning_session()
+        self._abort()
+
     def _abort(self) -> None:
         if self._closed:
             return
         try:
-            if self._connection is not None:
-                self._connection.close()
-                self._connection = None
-            if self._temporary_name and self._directory_descriptor is not None:
-                try:
-                    os.unlink(self._temporary_name, dir_fd=self._directory_descriptor)
-                except FileNotFoundError:
-                    pass
-                else:
-                    os.fsync(self._directory_descriptor)
+            try:
+                if self._connection is not None:
+                    connection = self._connection
+                    self._connection = None
+                    connection.close()
+            finally:
+                if self._temporary_name and self._directory_descriptor is not None:
+                    unlinked = False
+                    for name in (
+                        self._temporary_name,
+                        f"{self._temporary_name}-journal",
+                        f"{self._temporary_name}-wal",
+                        f"{self._temporary_name}-shm",
+                    ):
+                        try:
+                            os.unlink(name, dir_fd=self._directory_descriptor)
+                        except FileNotFoundError:
+                            pass
+                        else:
+                            unlinked = True
+                    if unlinked:
+                        os.fsync(self._directory_descriptor)
         finally:
+            self._connection = None
+            self._release_planning_session()
             if self._directory_descriptor is not None:
                 os.close(self._directory_descriptor)
                 self._directory_descriptor = None
             self._closed = True
 
     def _require_writable(self) -> sqlite3.Connection:
+        if self._poisoned:
+            raise CatalogError("semantic catalog writer is poisoned")
         if self._sealed:
             raise CatalogError("semantic catalog is sealed")
         if self._closed or self._connection is None:
@@ -819,12 +844,14 @@ class SemanticCatalogPlanningSession:
         *,
         observer: PlanningQueryObserver | None = None,
         release_owner: Callable[[], None],
+        poison_owner: Callable[[], None],
     ) -> None:
         _require_text(selector_version, "selector version")
         self._connection = connection
         self.selector_version = selector_version
         self.observer = observer or PlanningQueryObserver()
         self._release_owner = release_owner
+        self._poison_owner = poison_owner
         self._state = "initializing"
         self._savepoint_open = False
         connection.execute("PRAGMA temp_store = FILE")
@@ -1008,7 +1035,13 @@ class SemanticCatalogPlanningSession:
         summary = self.deferred_summary()
         SemanticCatalogWriter._validate_before_seal(self._connection)
         self._fault_point("after_finish_summary")
-        self._connection.execute("RELEASE SAVEPOINT semantic_catalog_planning")
+        try:
+            self._fault_point("before_finish_release")
+            self._connection.execute("RELEASE SAVEPOINT semantic_catalog_planning")
+        except BaseException as error:
+            self._poison_failed_session(
+                "catalog planning savepoint release failed", error
+            )
         self._savepoint_open = False
         self._state = "finished"
         self._release_owner()
@@ -1017,7 +1050,10 @@ class SemanticCatalogPlanningSession:
     def abort(self) -> None:
         if self._state in {"finished", "failed", "aborted"}:
             return
-        self._rollback_savepoint()
+        try:
+            self._rollback_savepoint()
+        except BaseException as error:
+            self._poison_failed_session("catalog planning recovery failed", error)
         self._state = "aborted"
         self._release_owner()
 
@@ -1039,20 +1075,46 @@ class SemanticCatalogPlanningSession:
     def _fail(self) -> None:
         if self._state in {"finished", "failed", "aborted"}:
             return
-        self._rollback_savepoint()
+        try:
+            self._rollback_savepoint()
+        except BaseException as error:
+            self._poison_failed_session("catalog planning recovery failed", error)
         self._state = "failed"
         self._release_owner()
 
     def _rollback_savepoint(self) -> None:
         if not self._savepoint_open:
             return
+        rollback_error: BaseException | None = None
+        release_error: BaseException | None = None
         try:
-            self._connection.execute("ROLLBACK TO SAVEPOINT semantic_catalog_planning")
-        finally:
             try:
+                self._fault_point("before_rollback_savepoint")
+                self._connection.execute(
+                    "ROLLBACK TO SAVEPOINT semantic_catalog_planning"
+                )
+            except BaseException as error:
+                rollback_error = error
+            try:
+                self._fault_point("before_recovery_release")
                 self._connection.execute("RELEASE SAVEPOINT semantic_catalog_planning")
-            finally:
-                self._savepoint_open = False
+            except BaseException as error:
+                release_error = error
+        finally:
+            self._savepoint_open = False
+        if rollback_error is not None:
+            raise rollback_error
+        if release_error is not None:
+            raise release_error
+
+    def _poison_failed_session(
+        self, message: str, recovery_error: BaseException
+    ) -> None:
+        self._savepoint_open = False
+        self._state = "failed"
+        self._release_owner()
+        self._poison_owner()
+        raise CatalogError(message) from recovery_error
 
     def _fault_point(self, point: str) -> None:
         del point

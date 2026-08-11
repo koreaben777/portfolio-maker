@@ -860,7 +860,11 @@ def test_budget_exhaustion_defers_expansion_without_stop_or_convergence() -> Non
         _v3_input(), _v3_output(FrontierAction.EXPAND_CHILDREN)
     )
 
-    transition = transition_frontier(validated, budget_exhausted=True)
+    transition = transition_frontier(
+        validated,
+        budget_exhausted=True,
+        resume_cursor='{"after":"child-2"}',
+    )
 
     assert transition.enqueued_child_node_ids == ()
     assert transition.deferred_node_ids == ("child-2",)
@@ -896,6 +900,84 @@ def test_budget_state_is_global_and_separate_from_every_unit_action(
         assert transition.next_child_cursor == '{"after":"remaining-node"}'
     elif action is FrontierAction.EXPAND_CHILDREN:
         assert transition.enqueued_child_node_ids == ("child-2",)
+
+
+@pytest.mark.parametrize("action", tuple(FrontierAction))
+def test_every_exhausted_action_requires_explicit_resume_cursor(
+    action: FrontierAction,
+) -> None:
+    validated = validate_v3_semantic_output(_v3_input(), _v3_output(action))
+    with pytest.raises(ValueError, match="resume cursor.*required"):
+        transition_frontier(
+            validated,
+            budget_exhausted=True,
+            remaining_deferred_node_ids=("remaining-node",),
+        )
+
+
+@pytest.mark.parametrize(
+    "resume_cursor",
+    (
+        '"after-node"',
+        '["after-node"]',
+        '{"unknown":"after-node"}',
+        '{"lane":"lane-a"}',
+        '{"lane":"lane-a","offset":true}',
+        '{"lane":"lane-a","offset":-1}',
+        '{"after":""}',
+        '{"after":" after-node "}',
+        '{ "after": "after-node" }',
+        '{"after":"a","after":"b"}',
+        '{"after":"' + ("x" * 4_097) + '"}',
+    ),
+)
+def test_resume_cursor_rejects_noncanonical_or_open_schema(
+    resume_cursor: str,
+) -> None:
+    validated = validate_v3_semantic_output(
+        _v3_input(), _v3_output(FrontierAction.DEFER_ON_DEMAND)
+    )
+    with pytest.raises(ValueError, match="resume cursor"):
+        transition_frontier(
+            validated,
+            budget_exhausted=True,
+            remaining_deferred_node_ids=("remaining-node",),
+            resume_cursor=resume_cursor,
+        )
+
+
+@pytest.mark.parametrize(
+    "resume_cursor",
+    ('{"after":"after-node"}', '{"lane":"lane-a","offset":0}'),
+)
+def test_resume_cursor_accepts_only_two_closed_variants(resume_cursor: str) -> None:
+    validated = validate_v3_semantic_output(
+        _v3_input(), _v3_output(FrontierAction.DEFER_ON_DEMAND)
+    )
+    transition = transition_frontier(
+        validated,
+        budget_exhausted=True,
+        remaining_deferred_node_ids=("remaining-node",),
+        resume_cursor=resume_cursor,
+    )
+    assert transition.next_child_cursor == resume_cursor
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    (
+        {"resume_cursor": '{"after":"after-node"}'},
+        {"remaining_deferred_node_ids": ("remaining-node",)},
+    ),
+)
+def test_nonexhausted_transition_rejects_run_resume_authority(
+    kwargs: dict[str, object],
+) -> None:
+    validated = validate_v3_semantic_output(
+        _v3_input(), _v3_output(FrontierAction.ACCEPT_BOUNDARY)
+    )
+    with pytest.raises(ValueError, match="exhausted budget"):
+        transition_frontier(validated, budget_exhausted=False, **kwargs)
 
 
 @pytest.mark.parametrize("side", ("input", "output"))
@@ -1044,6 +1126,38 @@ def test_v3_quality_rejects_locator_in_representative_role_reason() -> None:
         validate_v3_semantic_output(work_input, output)
 
 
+@pytest.mark.parametrize("field", ("rationale", "role_reason"))
+@pytest.mark.parametrize(
+    "locator",
+    (
+        "Dockerfile",
+        "readme",
+        "MAKEFILE",
+        "License",
+        "Ｄｏｃｋｅｒｆｉｌｅ",
+        "deploy/Dockerfile",
+        "docs／README",
+        "build/Makefile",
+        "legal/LICENSE",
+    ),
+)
+def test_v3_quality_rejects_concrete_extensionless_locator_tokens(
+    field: str, locator: str
+) -> None:
+    work_input = _v3_input()
+    output = _v3_output(FrontierAction.ACCEPT_BOUNDARY)
+    if field == "rationale":
+        output["rationale"] = f"검증 근거와 함께 {locator} 위치를 언급한다."
+    else:
+        work_input["representatives"][0]["role_reason"] = locator
+        unsigned = dict(work_input)
+        unsigned.pop("input_sha256")
+        work_input["input_sha256"] = _sha256(unsigned)
+        output["input_sha256"] = work_input["input_sha256"]
+    with pytest.raises(SemanticQualityV3Error, match="locator"):
+        validate_v3_semantic_output(work_input, output)
+
+
 def test_v3_quality_allows_generic_locator_concepts_without_concrete_value() -> None:
     work_input = _v3_input()
     output = _v3_output(FrontierAction.ACCEPT_BOUNDARY)
@@ -1053,4 +1167,15 @@ def test_v3_quality_allows_generic_locator_concepts_without_concrete_value() -> 
 
     validated = validate_v3_semantic_output(work_input, output)
 
+    assert validated.action is FrontierAction.ACCEPT_BOUNDARY
+
+
+def test_v3_quality_does_not_overblock_ordinary_extensionless_words() -> None:
+    work_input = _v3_input()
+    output = _v3_output(FrontierAction.ACCEPT_BOUNDARY)
+    output["rationale"] = (
+        "Licensed software uses a readable build process while generic URL, path, "
+        "file, and repository concepts remain abstract."
+    )
+    validated = validate_v3_semantic_output(work_input, output)
     assert validated.action is FrontierAction.ACCEPT_BOUNDARY

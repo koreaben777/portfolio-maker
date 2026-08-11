@@ -89,6 +89,10 @@ _LOCATOR_PATTERNS = (
         r"(?:md|py|js|ts|tsx|jsx|json|ya?ml|toml|pdf|docx|xlsx|pptx|"
         r"csv|txt|html|css|sql|db)(?:$|[\s\"')])"
     ),
+    re.compile(
+        r"(?<![a-z0-9_.-])(?:dockerfile|readme|makefile|license)"
+        r"(?![a-z0-9_.-])"
+    ),
     re.compile(r"(?:git@[^:\s]+:[^\s]+|portfolio\.db|\.portfolio-maker)"),
 )
 

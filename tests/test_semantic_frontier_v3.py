@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import sqlite3
 from collections import Counter
 from pathlib import Path
 
@@ -340,6 +342,22 @@ def _audit_checkpoint(**changes: object) -> AuditCheckpointBinding:
     return AuditCheckpointBinding(**values)
 
 
+def _mutated_audit_row(
+    row: SemanticDeferredAuditRow, **changes: object
+) -> SemanticDeferredAuditRow:
+    values = dict(row.__dict__)
+    values.update(changes)
+    cursor = json.loads(row.cursor_json)
+    if "node_id" in changes:
+        cursor["node_id"] = changes["node_id"]
+    if "cursor_order" in changes:
+        cursor["order"] = changes["cursor_order"]
+    if "selector_feature_digest" in changes:
+        cursor["selector_feature_digest"] = changes["selector_feature_digest"]
+    values["cursor_json"] = canonical_json_text(cursor)
+    return SemanticDeferredAuditRow(**values)
+
+
 def test_audit_freeze_returns_exact_deterministic_300_unique_members_boundedly() -> None:
     """Catches population materialization, overlap loss, or unstable membership."""
     rows = tuple(_audit_row(index) for index in range(450))
@@ -372,6 +390,102 @@ def test_audit_freeze_returns_exact_deterministic_300_unique_members_boundedly()
     assert first_observer.axis_index_file_backed is True
     assert first_observer.temporary_state_closed is True
     assert first_observer.max_pending_rows == 0
+
+
+@pytest.mark.parametrize("stream", ("catalog", "runtime", "pending"))
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    (
+        ({"cursor_order": -1}, "cursor order"),
+        ({"cursor_order": True}, "cursor order"),
+        ({"relevance_rank": -1}, "relevance"),
+        ({"relevance_rank": True}, "relevance"),
+        ({"reason": " "}, "reason"),
+        ({"source_id": " source "}, "source"),
+        ({"node_digest": "A" * 64}, "digest"),
+    ),
+)
+def test_all_audit_streams_reject_noncanonical_row_payloads(
+    stream: str, changes: dict[str, object], message: str
+) -> None:
+    catalog = tuple(_audit_row(index) for index in range(299))
+    bad = _mutated_audit_row(_audit_row(299), **changes)
+    kwargs: dict[str, object] = {
+        "catalog_deferred": iter((*catalog, bad)),
+        "runtime_deferred": iter(()),
+        "pending_runtime_deferred": (),
+    }
+    runtime = SemanticRuntimeDeferredRow(bad, "unit-a", 0)
+    if stream == "runtime":
+        kwargs["catalog_deferred"] = iter(catalog)
+        kwargs["runtime_deferred"] = iter((runtime,))
+    elif stream == "pending":
+        kwargs["catalog_deferred"] = iter(catalog)
+        kwargs["pending_runtime_deferred"] = (runtime,)
+    observer = AuditSelectionObserver()
+    with pytest.raises(FrontierSelectionError, match=message):
+        freeze_audit_sample(
+            checkpoint=_audit_checkpoint(), observer=observer, **kwargs
+        )
+    assert observer.temporary_state_closed is True
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    (
+        ({"node_id": ""}, "node"),
+        ({"node_id": " node "}, "node"),
+        ({"reason": ""}, "reason"),
+        ({"reason": " reason "}, "reason"),
+        ({"reason": "bad\nreason"}, "reason"),
+        ({"reason": "x" * 4_097}, "reason"),
+        ({"source_id": ""}, "source"),
+        ({"source_id": "bad\nsource"}, "source"),
+        ({"selector_version": " "}, "selector"),
+        ({"selector_feature_digest": "B" * 64}, "digest"),
+    ),
+)
+def test_audit_row_rejects_empty_control_oversized_or_noncanonical_fields(
+    changes: dict[str, object], message: str
+) -> None:
+    rows = [_audit_row(index) for index in range(300)]
+    rows[-1] = _mutated_audit_row(rows[-1], **changes)
+    with pytest.raises(FrontierSelectionError, match=message):
+        freeze_audit_sample(
+            catalog_deferred=iter(rows),
+            runtime_deferred=iter(()),
+            pending_runtime_deferred=(),
+            checkpoint=_audit_checkpoint(),
+        )
+
+
+def test_audit_row_rejects_cursor_binding_mismatch() -> None:
+    rows = [_audit_row(index) for index in range(300)]
+    cursor = json.loads(rows[-1].cursor_json)
+    cursor["order"] += 1
+    rows[-1] = SemanticDeferredAuditRow(
+        **{**rows[-1].__dict__, "cursor_json": canonical_json_text(cursor)}
+    )
+    with pytest.raises(FrontierSelectionError, match="cursor.*binding"):
+        freeze_audit_sample(
+            catalog_deferred=iter(rows),
+            runtime_deferred=iter(()),
+            pending_runtime_deferred=(),
+            checkpoint=_audit_checkpoint(),
+        )
+
+
+@pytest.mark.parametrize("stream", ("runtime", "pending"))
+def test_runtime_audit_zero_sequence_and_zero_row_order_are_valid(stream: str) -> None:
+    catalog = tuple(_audit_row(index) for index in range(1, 300))
+    zero = SemanticRuntimeDeferredRow(_audit_row(0), "unit-zero", 0)
+    sample = freeze_audit_sample(
+        catalog_deferred=iter(catalog),
+        runtime_deferred=iter((zero,)) if stream == "runtime" else iter(()),
+        pending_runtime_deferred=(zero,) if stream == "pending" else (),
+        checkpoint=_audit_checkpoint(),
+    )
+    assert len(sample.members) == 300
 
 
 @pytest.mark.parametrize(
@@ -691,6 +805,7 @@ def test_audit_streams_require_their_exact_authority_row_types(stream: str) -> N
     ("rows", "message"),
     (
         ((SemanticRuntimeDeferredRow(_audit_row(298), "unit-a", -1),), "sequence"),
+        ((SemanticRuntimeDeferredRow(_audit_row(298), "unit-a", True),), "sequence"),
         (
             (
                 SemanticRuntimeDeferredRow(_audit_row(298), "unit-a", 2),
@@ -699,6 +814,8 @@ def test_audit_streams_require_their_exact_authority_row_types(stream: str) -> N
             "sequence",
         ),
         ((SemanticRuntimeDeferredRow(_audit_row(298), "", 1),), "unit"),
+        ((SemanticRuntimeDeferredRow(_audit_row(298), "x" * 257, 1),), "unit"),
+        ((SemanticRuntimeDeferredRow(_audit_row(298), "unit\nbad", 1),), "unit"),
     ),
 )
 def test_runtime_audit_authority_is_nonempty_nonnegative_and_canonical(
@@ -952,6 +1069,68 @@ def test_active_planning_session_exclusively_owns_writer_mutation(
             revision_id="revision-retry",
             policy_hash="a" * 64,
         )
+
+
+@pytest.mark.parametrize(
+    "failure_mode",
+    ("rollback", "release_after_rollback", "release_on_finish"),
+)
+def test_savepoint_recovery_sql_failure_poisons_and_removes_private_catalog(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_mode: str,
+) -> None:
+    path = tmp_path / f"poison-{failure_mode}.sqlite"
+    writer = SemanticCatalogWriter(path)
+    _add_feature(writer, "project", source_id="source", lane="source")
+    session = writer.planning_session(FRONTIER_SELECTOR_VERSION)
+
+    def inject(_session: object, point: str) -> None:
+        if failure_mode != "release_on_finish" and point == "after_selector_result":
+            raise RuntimeError("primary selector failure")
+        if failure_mode == "rollback" and point == "before_rollback_savepoint":
+            raise sqlite3.OperationalError("injected rollback failure")
+        if (
+            failure_mode == "release_after_rollback"
+            and point == "before_recovery_release"
+        ):
+            raise sqlite3.OperationalError("injected recovery release failure")
+        if failure_mode == "release_on_finish" and point == "before_finish_release":
+            raise sqlite3.OperationalError("injected finish release failure")
+
+    monkeypatch.setattr(SemanticCatalogPlanningSession, "_fault_point", inject)
+    message = "release" if failure_mode == "release_on_finish" else "recovery"
+    with pytest.raises(CatalogError, match=message) as caught:
+        build_frontier_plan(
+            session,
+            revision_id="revision-poison",
+            policy_hash="a" * 64,
+        )
+
+    assert isinstance(caught.value.__cause__, sqlite3.Error)
+    with pytest.raises(CatalogError, match="failed"):
+        session.fair_seed_page(None, 1)
+    assert writer.seal_value is None
+    with pytest.raises(CatalogError, match="poisoned"):
+        writer.add_node(NodeRecord("later", None, "source", ".", "source"))
+    with pytest.raises(CatalogError, match="poisoned"):
+        writer.planning_session(FRONTIER_SELECTOR_VERSION)
+    with pytest.raises(CatalogError, match="poisoned"):
+        writer.seal()
+    writer.close()
+    assert not path.exists()
+    assert not tuple(tmp_path.glob(f".{path.name}.*"))
+
+    with SemanticCatalogWriter(path) as fresh:
+        fresh.add_node(NodeRecord("fresh-root", None, "source", ".", "source"))
+        fresh.add_baseline(
+            BaselineRecord(
+                "fresh-root", BaselineCoverage.COMPLETE, (), (), 0, None
+            )
+        )
+        seal = fresh.seal()
+    with SemanticCatalogReader(path, seal) as reader:
+        assert reader.node("fresh-root") is not None
 
 
 def test_catalog_seal_rejects_adaptive_selector_cursor_not_bound_to_fair_order(
