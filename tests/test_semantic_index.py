@@ -38,6 +38,7 @@ from portfolio_maker.domain.semantic_models import SemanticEdge
 from portfolio_maker.domain.models import Source, SourceStatus, SourceType
 from portfolio_maker.infrastructure.sqlite_repository import SQLiteRepository
 from portfolio_maker.infrastructure.semantic_crawler import crawl_local_structure
+from portfolio_maker.infrastructure.semantic_pack import PackSeal, verify_pack
 from portfolio_maker.workspace import WorkspacePaths
 
 
@@ -367,6 +368,207 @@ def test_v3_prepare_rejects_plan_units_that_disagree_with_canonical_plan_bytes(
 
     with pytest.raises(SemanticIndexError, match="failed safely"):
         prepare_semantic_index(PrepareSemanticIndexRequest(workspace=workspace, root=root))
+
+
+@pytest.mark.parametrize(
+    "tamper_manifest",
+    (
+        pytest.param(
+            lambda path, payload: path.write_bytes(
+                path.read_bytes().replace(
+                    b'"safe_source_label":"approved-root"',
+                    b'"safe_source_label":"approved-root","safe_source_label":"approved-root"',
+                    1,
+                )
+            ),
+            id="duplicate-key",
+        ),
+        pytest.param(
+            lambda path, payload: _write_v3_manifest(
+                path,
+                {**payload, "private_url": "https://private.example.invalid/repository"},
+            ),
+            id="unknown-private-url-field",
+        ),
+        pytest.param(
+            lambda path, payload: path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
+                encoding="utf-8",
+            ),
+            id="noncanonical-bytes",
+        ),
+        pytest.param(
+            lambda path, payload: _write_v3_manifest(
+                path,
+                {key: value for key, value in payload.items() if key != "safe_source_label"},
+            ),
+            id="missing-required-field",
+        ),
+        pytest.param(
+            lambda path, payload: _write_v3_manifest(
+                path,
+                {**payload, "structural_node_count": "one"},
+            ),
+            id="wrong-required-field-type",
+        ),
+        pytest.param(
+            lambda path, payload: _write_v3_manifest(
+                path,
+                {**payload, "safe_source_label": "file:///synthetic/private-source"},
+            ),
+            id="unsafe-locator-value",
+        ),
+        pytest.param(
+            lambda path, payload: _write_v3_manifest(
+                path,
+                {**payload, "safe_source_label": "Bearer synthetic-token-value"},
+            ),
+            id="unsafe-credential-value",
+        ),
+    ),
+)
+def test_v3_prepare_rejects_noncanonical_or_unbound_manifest_before_db_binding(
+    workspace: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tamper_manifest,
+) -> None:
+    """Breaks if sealed authority accepts duplicate, unbound, or unsafe manifest data."""
+    root = tmp_path / "approved-root"
+    root.mkdir()
+    (root / "README.md").write_text("Project purpose", encoding="utf-8")
+    approve_root(workspace, root)
+    original_publish = semantic_prepare_v3_module._publish_revision_directory
+
+    def publish_then_tamper(temporary: Path, final: Path) -> None:
+        original_publish(temporary, final)
+        manifest_path = final / "manifest.v3.json"
+        tamper_manifest(manifest_path, json.loads(manifest_path.read_text(encoding="utf-8")))
+
+    monkeypatch.setattr(
+        semantic_prepare_v3_module, "_publish_revision_directory", publish_then_tamper
+    )
+
+    with pytest.raises(SemanticIndexError, match="failed safely") as captured:
+        prepare_semantic_index(PrepareSemanticIndexRequest(workspace=workspace, root=root))
+
+    assert "private.example.invalid" not in str(captured.value)
+    assert not WorkspacePaths.from_root(workspace).db_path.exists()
+
+
+@pytest.mark.parametrize(
+    "tamper_pack",
+    (
+        pytest.param(
+            lambda path, manifest: path.open("ab").write(b"unbound-tail"),
+            id="post-publication-append",
+        ),
+        pytest.param(
+            lambda path, manifest: _flip_pack_byte(path, 8),
+            id="framing-corruption",
+        ),
+        pytest.param(
+            lambda path, manifest: _flip_pack_byte(path, -1),
+            id="record-digest-corruption",
+        ),
+        pytest.param(
+            lambda path, manifest: _write_v3_manifest(
+                manifest["path"],
+                {
+                    **manifest["payload"],
+                    "pack": {
+                        **manifest["payload"]["pack"],
+                        "record_count": manifest["payload"]["pack"]["record_count"] + 1,
+                    },
+                },
+            ),
+            id="record-count-mismatch",
+        ),
+        pytest.param(
+            lambda path, manifest: _write_v3_manifest(
+                manifest["path"],
+                {
+                    **manifest["payload"],
+                    "pack": {
+                        **manifest["payload"]["pack"],
+                        "record_root": "0" * 64,
+                    },
+                },
+            ),
+            id="record-root-mismatch",
+        ),
+    ),
+)
+def test_v3_prepare_rejects_published_pack_tamper_before_db_binding(
+    workspace: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tamper_pack,
+) -> None:
+    """Breaks if DB genesis can bind a pack that differs from its sealed manifest."""
+    root = tmp_path / "approved-root"
+    root.mkdir()
+    (root / "README.md").write_text("Project purpose", encoding="utf-8")
+    approve_root(workspace, root)
+    first = prepare_semantic_index(PrepareSemanticIndexRequest(workspace=workspace, root=root))
+    original_publish = semantic_prepare_v3_module._publish_revision_directory
+
+    def publish_then_tamper(temporary: Path, final: Path) -> None:
+        original_publish(temporary, final)
+        manifest_path = final / "manifest.v3.json"
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        tamper_pack(
+            final / "packs" / "structural.pm-pack",
+            {"path": manifest_path, "payload": payload},
+        )
+
+    monkeypatch.setattr(
+        semantic_prepare_v3_module, "_publish_revision_directory", publish_then_tamper
+    )
+
+    with pytest.raises(SemanticIndexError, match="failed safely"):
+        prepare_semantic_index(PrepareSemanticIndexRequest(workspace=workspace, root=root))
+
+    with sqlite3.connect(WorkspacePaths.from_root(workspace).db_path) as connection:
+        rows = connection.execute(
+            "SELECT revision_id, state FROM semantic_v3_runs ORDER BY revision_id"
+        ).fetchall()
+    assert rows == [(first.revision_id, "awaiting_approval")]
+
+
+def test_v3_prepare_reopens_valid_published_pack_against_manifest_seal(
+    workspace: Path,
+    tmp_path: Path,
+) -> None:
+    """Breaks if valid seal readback no longer covers every persisted pack record."""
+    root = tmp_path / "approved-root"
+    root.mkdir()
+    (root / "README.md").write_text("Project purpose", encoding="utf-8")
+    approve_root(workspace, root)
+
+    result = prepare_semantic_index(PrepareSemanticIndexRequest(workspace=workspace, root=root))
+    manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    seal = PackSeal(**manifest["pack"])
+
+    assert verify_pack(result.manifest_path.parent / "packs" / "structural.pm-pack", seal) == seal
+
+
+def _write_v3_manifest(path: Path, payload: dict[str, object]) -> None:
+    unsigned = {key: value for key, value in payload.items() if key != "manifest_sha256"}
+    path.write_bytes(
+        semantic_prepare_v3_module.semantic_canonical_json_bytes(
+            {
+                **unsigned,
+                "manifest_sha256": semantic_prepare_v3_module._sha256(unsigned),
+            }
+        )
+    )
+
+
+def _flip_pack_byte(path: Path, offset: int) -> None:
+    data = bytearray(path.read_bytes())
+    data[offset] ^= 1
+    path.write_bytes(bytes(data))
 
 
 def prepare_fixture_revision(workspace: Path, tmp_path: Path):

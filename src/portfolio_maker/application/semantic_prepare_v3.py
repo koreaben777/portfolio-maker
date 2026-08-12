@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
+import re
 import resource
 import shutil
 import stat
@@ -37,8 +39,16 @@ from portfolio_maker.infrastructure.managed_files import (
     read_managed_bytes,
     write_managed_text,
 )
-from portfolio_maker.infrastructure.policy import FilePolicy
-from portfolio_maker.infrastructure.presentation import normalize_label
+from portfolio_maker.infrastructure.github_connector import contains_unicode_control
+from portfolio_maker.infrastructure.policy import (
+    FilePolicy,
+    contains_hidden_secret_shaped_public_value,
+    mask_secrets,
+)
+from portfolio_maker.infrastructure.presentation import (
+    is_path_like_public_label,
+    normalize_label,
+)
 from portfolio_maker.infrastructure.semantic_crawler import (
     CrawlObserver,
     StructuralEventKind,
@@ -46,6 +56,7 @@ from portfolio_maker.infrastructure.semantic_crawler import (
     iter_local_structure_events,
 )
 from portfolio_maker.infrastructure.semantic_catalog import CatalogSeal, SemanticCatalogReader
+from portfolio_maker.infrastructure.semantic_pack import PackSeal, verify_pack
 from portfolio_maker.infrastructure.sqlite_repository import RepositoryError, SQLiteRepository
 from portfolio_maker.workspace import WorkspacePaths
 
@@ -57,6 +68,34 @@ class SemanticPrepareV3Error(ValueError):
 _MAX_MANAGED_PREPARE_BYTES = 3 * 1024**3
 _MAX_PREPARE_WALL_SECONDS = 3_600.0
 _MAX_PREPARE_RSS_BYTES = 4 * 1024**3
+_SHA256 = re.compile(r"[0-9a-f]{64}")
+_SOURCE_ID = re.compile(r"sha256:[0-9a-f]{64}")
+_REVISION_ID = re.compile(r"[0-9a-f]{32}")
+_MANIFEST_KEYS = frozenset(
+    {
+        "baseline_coverage_counts",
+        "catalog",
+        "frontier_plan_sha256",
+        "lifecycle_genesis_root",
+        "manifest_sha256",
+        "pack",
+        "private_context_scope",
+        "protocol",
+        "resource_observation",
+        "revision_id",
+        "safe_source_label",
+        "schema_version",
+        "source_approval_sha256",
+        "source_id",
+        "source_policy_sha256",
+        "structural_node_count",
+    }
+)
+_CATALOG_KEYS = frozenset({"byte_length", "file_sha256", "logical_root", "node_count"})
+_PACK_KEYS = frozenset({"byte_length", "file_sha256", "record_count", "record_root"})
+_RESOURCE_OBSERVATION_KEYS = frozenset(
+    {"elapsed_seconds", "managed_bytes", "max_peak_rss_bytes", "peak_rss_bytes"}
+)
 
 
 def prepare_semantic_index_v3(
@@ -303,18 +342,18 @@ def _reopen_sealed_authority(
         source_approval_sha256,
     )
     try:
-        manifest = json.loads(read_managed_bytes(revision_directory / "manifest.v3.json"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        manifest = _parse_canonical_v3_manifest(
+            read_managed_bytes(revision_directory / "manifest.v3.json")
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
         raise SemanticPrepareV3Error("semantic v3 sealed authority is invalid") from error
-    if not isinstance(manifest, dict):
-        raise SemanticPrepareV3Error("semantic v3 sealed authority is invalid")
-    stored_hash = manifest.pop("manifest_sha256", None)
-    if not isinstance(stored_hash, str) or _sha256(manifest) != stored_hash:
-        raise SemanticPrepareV3Error("semantic v3 sealed authority is invalid")
+    stored_hash = manifest["manifest_sha256"]
     catalog = manifest.get("catalog")
+    pack = manifest.get("pack")
     coverage_counts = manifest.get("baseline_coverage_counts")
     if (
         not isinstance(catalog, dict)
+        or not isinstance(pack, dict)
         or not isinstance(coverage_counts, list)
         or manifest.get("protocol") != "codex-semantic-v3"
         or manifest.get("schema_version") != "codex-semantic-v3"
@@ -336,6 +375,13 @@ def _reopen_sealed_authority(
             logical_root=str(catalog["logical_root"]),
             node_count=int(catalog["node_count"]),
         )
+        pack_seal = PackSeal(
+            byte_length=int(pack["byte_length"]),
+            file_sha256=str(pack["file_sha256"]),
+            record_count=int(pack["record_count"]),
+            record_root=str(pack["record_root"]),
+        )
+        verify_pack(revision_directory / "packs" / "structural.pm-pack", pack_seal)
         with SemanticCatalogReader(revision_directory / "catalog.sqlite", seal) as reader:
             deferred = reader.deferred_summary(
                 selector_version=getattr(plan, "selector_version")
@@ -343,7 +389,7 @@ def _reopen_sealed_authority(
         normalized_coverage = tuple(
             (str(name), int(count)) for name, count in coverage_counts
         )
-    except (KeyError, TypeError, ValueError) as error:
+    except (KeyError, OSError, TypeError, ValueError) as error:
         raise SemanticPrepareV3Error("semantic v3 sealed authority is invalid") from error
     if (
         len(normalized_coverage) != len(BaselineCoverage)
@@ -388,6 +434,139 @@ def _reopen_sealed_authority(
         output_schema_version=getattr(plan, "output_schema_version"),
         validator_version=getattr(plan, "validator_version"),
         root=_sha256(authority_without_root),
+    )
+
+
+def _parse_canonical_v3_manifest(raw: bytes) -> dict[str, object]:
+    try:
+        manifest = json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_constant=_reject_non_json_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+        raise SemanticPrepareV3Error("semantic v3 sealed authority is invalid") from error
+    if not isinstance(manifest, dict) or semantic_canonical_json_bytes(manifest) != raw:
+        raise SemanticPrepareV3Error("semantic v3 sealed authority is invalid")
+    if set(manifest) != _MANIFEST_KEYS:
+        raise SemanticPrepareV3Error("semantic v3 sealed authority is invalid")
+    stored_hash = manifest["manifest_sha256"]
+    unsigned = {key: value for key, value in manifest.items() if key != "manifest_sha256"}
+    if not _is_sha256(stored_hash) or _sha256(unsigned) != stored_hash:
+        raise SemanticPrepareV3Error("semantic v3 sealed authority is invalid")
+    if not _has_valid_v3_manifest_types(manifest):
+        raise SemanticPrepareV3Error("semantic v3 sealed authority is invalid")
+    return manifest
+
+
+def _has_valid_v3_manifest_types(manifest: dict[str, object]) -> bool:
+    catalog = manifest["catalog"]
+    pack = manifest["pack"]
+    resources = manifest["resource_observation"]
+    coverage_counts = manifest["baseline_coverage_counts"]
+    if (
+        not isinstance(catalog, dict)
+        or set(catalog) != _CATALOG_KEYS
+        or not isinstance(pack, dict)
+        or set(pack) != _PACK_KEYS
+        or not isinstance(resources, dict)
+        or set(resources) != _RESOURCE_OBSERVATION_KEYS
+        or not isinstance(coverage_counts, list)
+        or manifest["protocol"] != "codex-semantic-v3"
+        or manifest["schema_version"] != "codex-semantic-v3"
+        or manifest["private_context_scope"] != "approved_local_source"
+        or not _is_revision_id(manifest["revision_id"])
+        or not _is_safe_label(manifest["safe_source_label"])
+        or not _is_nonnegative_int(manifest["structural_node_count"])
+    ):
+        return False
+    if not all(
+        _is_sha256(manifest[field])
+        for field in (
+            "frontier_plan_sha256",
+            "lifecycle_genesis_root",
+            "manifest_sha256",
+            "source_approval_sha256",
+            "source_policy_sha256",
+        )
+    ):
+        return False
+    if not _is_source_id(manifest["source_id"]):
+        return False
+    if not (
+        _is_nonnegative_int(catalog["byte_length"])
+        and _is_nonnegative_int(catalog["node_count"])
+        and _is_sha256(catalog["file_sha256"])
+        and _is_sha256(catalog["logical_root"])
+        and _is_nonnegative_int(pack["byte_length"])
+        and _is_nonnegative_int(pack["record_count"])
+        and _is_sha256(pack["file_sha256"])
+        and _is_sha256(pack["record_root"])
+        and type(resources["elapsed_seconds"]) is float
+        and math.isfinite(resources["elapsed_seconds"])
+        and resources["elapsed_seconds"] >= 0.0
+        and all(
+            _is_nonnegative_int(resources[field])
+            for field in ("managed_bytes", "max_peak_rss_bytes", "peak_rss_bytes")
+        )
+    ):
+        return False
+    expected_coverage = {coverage.value for coverage in BaselineCoverage}
+    normalized_coverage: list[tuple[str, int]] = []
+    for item in coverage_counts:
+        if (
+            not isinstance(item, list)
+            or len(item) != 2
+            or not isinstance(item[0], str)
+            or not _is_nonnegative_int(item[1])
+        ):
+            return False
+        normalized_coverage.append((item[0], item[1]))
+    return (
+        len(normalized_coverage) == len(BaselineCoverage)
+        and {name for name, _ in normalized_coverage} == expected_coverage
+        and normalized_coverage == sorted(normalized_coverage)
+    )
+
+
+def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON key")
+        result[key] = value
+    return result
+
+
+def _reject_non_json_constant(value: str) -> object:
+    raise ValueError("invalid JSON constant")
+
+
+def _is_sha256(value: object) -> bool:
+    return type(value) is str and _SHA256.fullmatch(value) is not None
+
+
+def _is_revision_id(value: object) -> bool:
+    return type(value) is str and _REVISION_ID.fullmatch(value) is not None
+
+
+def _is_source_id(value: object) -> bool:
+    return type(value) is str and _SOURCE_ID.fullmatch(value) is not None
+
+
+def _is_nonnegative_int(value: object) -> bool:
+    return type(value) is int and value >= 0
+
+
+def _is_safe_label(value: object) -> bool:
+    return (
+        type(value) is str
+        and bool(value)
+        and value == normalize_label(value)
+        and not is_path_like_public_label(value)
+        and not contains_unicode_control(value)
+        and not contains_hidden_secret_shaped_public_value(value)
+        and mask_secrets(value) == value
     )
 
 
