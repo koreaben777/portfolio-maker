@@ -64,6 +64,7 @@ def _prepare_completed_v2(
         PrepareSemanticIndexRequest(
             workspace=workspace,
             root=root,
+            protocol="codex-semantic-v2",
             chunk_size=2,
         )
     )

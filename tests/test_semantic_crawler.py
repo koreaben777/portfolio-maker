@@ -17,6 +17,8 @@ from portfolio_maker.infrastructure.semantic_crawler import (
     CrawlObserver,
     StructuralCrawlRootError,
     StructuralEventKind,
+    StreamingStructureSink,
+    StreamingStructureSinkState,
     crawl_local_structure,
     iter_local_structure_events,
 )
@@ -1224,3 +1226,57 @@ def test_structural_crawl_is_deterministic_and_retains_ids_after_rename(tmp_path
         entry for entry in renamed.entries if entry.relative_hierarchy == "renamed.md"
     )
     assert renamed_file.node_id == first_file.node_id
+
+
+def test_streaming_sink_exposes_only_a_completed_preseal_planning_session(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "README.md").write_text("safe baseline", encoding="utf-8")
+    sink = StreamingStructureSink(
+        tmp_path / "authority.pm-pack",
+        tmp_path / "authority.catalog.sqlite",
+    )
+
+    with pytest.raises(ValueError, match="authority receipts are incomplete"):
+        sink.planning_session("adaptive-frontier-v1")
+
+    list(iter_local_structure_events(root, approval_for(root), sink=sink))
+    session = sink.planning_session("adaptive-frontier-v1")
+    with pytest.raises(ValueError, match="planning session is active"):
+        sink.planning_session("adaptive-frontier-v1")
+    session.finish()
+
+    artifacts = sink.seal()
+
+    assert sink.state is StreamingStructureSinkState.SEALED
+    assert artifacts.catalog_seal.node_count > 0
+    assert "_catalog_writer" not in StreamingStructureSink.__dict__
+    assert "connection" not in StreamingStructureSink.__dict__
+
+
+def test_streaming_sink_planning_fault_aborts_without_new_authority(
+    tmp_path: Path,
+) -> None:
+    """Breaks if an aborted selector session can still publish a partial catalog."""
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "README.md").write_text("safe baseline", encoding="utf-8")
+    pack_path = tmp_path / "authority.pm-pack"
+    catalog_path = tmp_path / "authority.catalog.sqlite"
+    sink = StreamingStructureSink(pack_path, catalog_path)
+    list(iter_local_structure_events(root, approval_for(root), sink=sink))
+
+    session = sink.planning_session("adaptive-frontier-v1")
+    session.abort()
+    with pytest.raises(ValueError, match="aborted"):
+        session.fair_seed_page(None, 1)
+    # The prepare caller owns an unsuccessful session and aborts the whole staging sink.
+    sink.abort()
+
+    with pytest.raises(ValueError, match="not available"):
+        sink.planning_session("adaptive-frontier-v1")
+    assert sink.state is StreamingStructureSinkState.ABORTED
+    assert not pack_path.exists()
+    assert not catalog_path.exists()

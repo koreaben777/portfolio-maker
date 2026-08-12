@@ -7,11 +7,13 @@ import multiprocessing
 import os
 import sqlite3
 import threading
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 import portfolio_maker.application.semantic_index as semantic_index_module
+import portfolio_maker.application.semantic_prepare_v3 as semantic_prepare_v3_module
 from portfolio_maker.application.approval import load_approval, write_sample_approval
 from portfolio_maker.application.artifact_approval import write_sample_artifact_policy
 from portfolio_maker.application.build_profile import build_profile
@@ -26,6 +28,11 @@ from portfolio_maker.application.semantic_index import (
     SemanticIndexError,
     apply_semantic_index,
     prepare_semantic_index,
+)
+from portfolio_maker.domain.semantic_frontier import (
+    FrontierPhase,
+    SemanticPlannedUnit,
+    SemanticRunState,
 )
 from portfolio_maker.domain.semantic_models import SemanticEdge
 from portfolio_maker.domain.models import Source, SourceStatus, SourceType
@@ -43,6 +50,325 @@ def approve_root(workspace: Path, root: Path, *, excluded: tuple[Path, ...] = ()
     paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
 
 
+def test_prepare_semantic_index_defaults_to_v3_frontier_staging(
+    workspace: Path,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "approved-root"
+    root.mkdir()
+    (root / "README.md").write_text("Project purpose", encoding="utf-8")
+    approve_root(workspace, root)
+
+    result = prepare_semantic_index(
+        PrepareSemanticIndexRequest(workspace=workspace, root=root)
+    )
+
+    manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    repository = SQLiteRepository(WorkspacePaths.from_root(workspace).db_path)
+
+    assert result.protocol == "codex-semantic-v3"
+    assert manifest["schema_version"] == "codex-semantic-v3"
+    assert manifest["manifest_sha256"] == hashlib.sha256(
+        json.dumps(
+            {key: value for key, value in manifest.items() if key != "manifest_sha256"},
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    assert result.run_id is not None
+    assert result.proposal_sha256 is not None
+    assert repository.run_state(result.run_id) is SemanticRunState.AWAITING_APPROVAL
+
+
+def test_v3_prepare_revalidates_source_approval_before_publication(
+    workspace: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Breaks if a changed approval can bind a completed crawl after its authority moved."""
+    root = tmp_path / "approved-root"
+    root.mkdir()
+    (root / "README.md").write_text("Project purpose", encoding="utf-8")
+    approve_root(workspace, root)
+    original_load = semantic_prepare_v3_module.load_approval
+    calls = 0
+
+    def drift_after_crawl(paths: WorkspacePaths):
+        nonlocal calls
+        calls += 1
+        approval = original_load(paths)
+        if calls == 1:
+            return approval
+        return approval.__class__(
+            approved_source_uris=(),
+            legacy_forbidden_paths=approval.legacy_forbidden_paths,
+            excluded_directories=approval.excluded_directories,
+            excluded_repositories=approval.excluded_repositories,
+            private_sources_allowed=approval.private_sources_allowed,
+            allowed_repositories=approval.allowed_repositories,
+            excluded_file_patterns=approval.excluded_file_patterns,
+            approved_github_activity_urls=approval.approved_github_activity_urls,
+            approved_private_github_activity_urls=(
+                approval.approved_private_github_activity_urls
+            ),
+        )
+
+    monkeypatch.setattr(semantic_prepare_v3_module, "load_approval", drift_after_crawl)
+
+    with pytest.raises(SemanticIndexError, match="failed safely"):
+        prepare_semantic_index(PrepareSemanticIndexRequest(workspace=workspace, root=root))
+
+    assert calls == 2
+    db_path = WorkspacePaths.from_root(workspace).db_path
+    if db_path.exists():
+        with sqlite3.connect(db_path) as connection:
+            table = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'semantic_v3_runs'"
+            ).fetchone()
+            if table is not None:
+                assert connection.execute("SELECT COUNT(*) FROM semantic_v3_runs").fetchone()[0] == 0
+
+
+def test_v3_prepare_resource_gate_removes_unpublished_owned_staging(
+    workspace: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Breaks if pre-publication resource rejection leaves new managed authority behind."""
+    root = tmp_path / "approved-root"
+    root.mkdir()
+    (root / "README.md").write_text("Project purpose", encoding="utf-8")
+    approve_root(workspace, root)
+    monkeypatch.setattr(semantic_prepare_v3_module, "_MAX_MANAGED_PREPARE_BYTES", 1)
+
+    with pytest.raises(SemanticIndexError, match="failed safely"):
+        prepare_semantic_index(PrepareSemanticIndexRequest(workspace=workspace, root=root))
+
+    revision_root = WorkspacePaths.from_root(workspace).raw_dir / "semantic-index"
+    assert not revision_root.exists() or list(revision_root.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "observation",
+    (
+        {
+            "elapsed_seconds": 3_600.001,
+            "managed_bytes": 1,
+            "max_peak_rss_bytes": 100,
+            "peak_rss_bytes": 1,
+        },
+        {
+            "elapsed_seconds": 0.0,
+            "managed_bytes": 1,
+            "max_peak_rss_bytes": 100,
+            "peak_rss_bytes": 101,
+        },
+    ),
+)
+def test_v3_prepare_measured_resource_excess_has_no_binding_or_staging(
+    workspace: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    observation: dict[str, int | float],
+) -> None:
+    """Breaks if measurable wall/RSS excess is treated as successful preparation."""
+    root = tmp_path / "approved-root"
+    root.mkdir()
+    (root / "README.md").write_text("Project purpose", encoding="utf-8")
+    approve_root(workspace, root)
+    monkeypatch.setattr(
+        semantic_prepare_v3_module,
+        "_resource_observation",
+        lambda _root, _started_at: observation,
+    )
+
+    with pytest.raises(SemanticIndexError, match="failed safely"):
+        prepare_semantic_index(PrepareSemanticIndexRequest(workspace=workspace, root=root))
+
+    revision_root = WorkspacePaths.from_root(workspace).raw_dir / "semantic-index"
+    assert not revision_root.exists() or list(revision_root.iterdir()) == []
+
+
+def test_v3_prepare_persists_restart_readable_manifest_proposal_and_no_exchange_input(
+    workspace: Path,
+    tmp_path: Path,
+) -> None:
+    """Breaks if the sealed staging authority cannot be independently reopened."""
+    root = tmp_path / "approved-root"
+    (root / "project" / "src").mkdir(parents=True)
+    (root / "project" / "README.md").write_text("Project purpose", encoding="utf-8")
+    (root / "project" / "src" / "app.py").write_text("print('ok')", encoding="utf-8")
+    approve_root(workspace, root)
+
+    result = prepare_semantic_index(PrepareSemanticIndexRequest(workspace=workspace, root=root))
+    manifest_bytes = result.manifest_path.read_bytes()
+    manifest = json.loads(manifest_bytes)
+    repository = SQLiteRepository(WorkspacePaths.from_root(workspace).db_path)
+    envelope, proposal_bytes, plan_bytes = repository.get_semantic_v3_proposal_for_run(
+        result.run_id or ""
+    )
+
+    assert manifest_bytes == json.dumps(
+        manifest, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+    assert hashlib.sha256(proposal_bytes).hexdigest() == result.proposal_sha256
+    assert hashlib.sha256(plan_bytes).hexdigest() == manifest["frontier_plan_sha256"]
+    assert envelope.proposal.manifest_sha256 == manifest["manifest_sha256"]
+    assert envelope.proposal.catalog_root == manifest["catalog"]["logical_root"]
+    assert not WorkspacePaths.from_root(workspace).semantic_v3_exchange_input_path(
+        result.revision_id, result.run_id or ""
+    ).exists()
+
+
+def test_v3_prepare_writes_manifest_last_before_directory_publication(
+    workspace: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Breaks if a revision can publish an authenticating manifest before its authority."""
+    root = tmp_path / "approved-root"
+    root.mkdir()
+    (root / "README.md").write_text("Project purpose", encoding="utf-8")
+    approve_root(workspace, root)
+    original_write = semantic_prepare_v3_module.write_managed_text
+    original_publish = semantic_prepare_v3_module._publish_revision_directory
+    events: list[str] = []
+
+    def observe_write(path: Path, content: str, *, overwrite: bool = True) -> Path:
+        if path.name == "manifest.v3.json":
+            events.append("manifest")
+            assert (path.parent / "catalog.sqlite").is_file()
+            assert (path.parent / "packs" / "structural.pm-pack").is_file()
+            assert not path.exists()
+        return original_write(path, content, overwrite=overwrite)
+
+    def observe_publish(temporary: Path, final: Path) -> None:
+        events.append("publish")
+        assert (temporary / "manifest.v3.json").is_file()
+        original_publish(temporary, final)
+
+    monkeypatch.setattr(semantic_prepare_v3_module, "write_managed_text", observe_write)
+    monkeypatch.setattr(semantic_prepare_v3_module, "_publish_revision_directory", observe_publish)
+
+    prepare_semantic_index(PrepareSemanticIndexRequest(workspace=workspace, root=root))
+
+    assert events == ["manifest", "publish"]
+
+
+def test_v3_prepare_keeps_library_and_containers_in_structural_authority(
+    workspace: Path,
+    tmp_path: Path,
+) -> None:
+    """Breaks if a home-like source receives an implicit directory exclusion."""
+    root = tmp_path / "approved-root"
+    (root / "Library").mkdir(parents=True)
+    (root / "Containers").mkdir(parents=True)
+    (root / "Library" / "notes.md").write_text("Library evidence", encoding="utf-8")
+    (root / "Containers" / "notes.md").write_text("Container evidence", encoding="utf-8")
+    approve_root(workspace, root)
+
+    result = prepare_semantic_index(PrepareSemanticIndexRequest(workspace=workspace, root=root))
+    with sqlite3.connect(result.manifest_path.parent / "catalog.sqlite") as connection:
+        rows = {
+            row[0]
+            for row in connection.execute("SELECT relative_hierarchy FROM nodes")
+        }
+
+    assert "Library" in rows
+    assert "Library/notes.md" in rows
+    assert "Containers" in rows
+    assert "Containers/notes.md" in rows
+
+
+def test_v3_prepare_leaves_published_unbound_directory_as_residue_on_db_failure(
+    workspace: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Breaks if a post-publication DB failure is reported as a successfully bound revision."""
+    root = tmp_path / "approved-root"
+    root.mkdir()
+    (root / "README.md").write_text("Project purpose", encoding="utf-8")
+    approve_root(workspace, root)
+
+    def fail_binding(self: SQLiteRepository, **_kwargs: object) -> None:
+        raise semantic_index_module.RepositoryError("synthetic database failure")
+
+    monkeypatch.setattr(
+        SQLiteRepository,
+        "bind_semantic_v3_revision_genesis_proposal_and_units",
+        fail_binding,
+    )
+
+    with pytest.raises(SemanticIndexError, match="failed safely"):
+        prepare_semantic_index(PrepareSemanticIndexRequest(workspace=workspace, root=root))
+
+    revision_root = WorkspacePaths.from_root(workspace).raw_dir / "semantic-index"
+    residues = [path for path in revision_root.iterdir() if path.name and not path.name.startswith(".")]
+    assert len(residues) == 1
+    assert (residues[0] / "manifest.v3.json").is_file()
+    with sqlite3.connect(WorkspacePaths.from_root(workspace).db_path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM semantic_v3_runs").fetchone()[0] == 0
+
+
+def test_v3_prepare_rejects_plan_deferred_summary_that_disagrees_with_sealed_catalog(
+    workspace: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Breaks if caller-supplied deferred counts can diverge from sealed authority."""
+    root = tmp_path / "approved-root"
+    root.mkdir()
+    (root / "README.md").write_text("Project purpose", encoding="utf-8")
+    approve_root(workspace, root)
+    original_plan = semantic_prepare_v3_module.build_frontier_plan
+
+    def mismatched_plan(*args: object, **kwargs: object):
+        plan = original_plan(*args, **kwargs)
+        return replace(plan, deferred_count=plan.deferred_count + 1)
+
+    monkeypatch.setattr(semantic_prepare_v3_module, "build_frontier_plan", mismatched_plan)
+
+    with pytest.raises(SemanticIndexError, match="failed safely"):
+        prepare_semantic_index(PrepareSemanticIndexRequest(workspace=workspace, root=root))
+
+
+def test_v3_prepare_rejects_plan_units_that_disagree_with_canonical_plan_bytes(
+    workspace: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Breaks if a caller can bind different units than the persisted frontier plan."""
+    root = tmp_path / "approved-root"
+    (root / "project" / "src").mkdir(parents=True)
+    (root / "project" / "README.md").write_text("Project purpose", encoding="utf-8")
+    (root / "project" / "src" / "app.py").write_text("print('ok')", encoding="utf-8")
+    approve_root(workspace, root)
+    original_bind = SQLiteRepository.bind_semantic_v3_revision_genesis_proposal_and_units
+    injected = SemanticPlannedUnit(
+        unit_id="unit-injected",
+        phase=FrontierPhase.ORIENTATION,
+        target_node_ids=(),
+        dependency_unit_ids=(),
+        estimated_input_bytes=0,
+        priority=0,
+        fairness_lane="injected",
+    )
+
+    def bind_with_stripped_units(self: SQLiteRepository, **kwargs: object) -> None:
+        original_bind(self, **{**kwargs, "units": (injected,)})
+
+    monkeypatch.setattr(
+        SQLiteRepository,
+        "bind_semantic_v3_revision_genesis_proposal_and_units",
+        bind_with_stripped_units,
+    )
+
+    with pytest.raises(SemanticIndexError, match="failed safely"):
+        prepare_semantic_index(PrepareSemanticIndexRequest(workspace=workspace, root=root))
+
+
 def prepare_fixture_revision(workspace: Path, tmp_path: Path):
     root = tmp_path / "approved-root"
     root.mkdir()
@@ -52,7 +378,7 @@ def prepare_fixture_revision(workspace: Path, tmp_path: Path):
     (nested / "setup.md").write_text("Setup guidance", encoding="utf-8")
     approve_root(workspace, root)
     prepared = prepare_semantic_index(
-        PrepareSemanticIndexRequest(workspace=workspace, root=root, chunk_size=1)
+        PrepareSemanticIndexRequest(workspace=workspace, root=root, chunk_size=1, protocol="codex-semantic-v2")
     )
     publish_legacy_v1_fixture(workspace, root, prepared, chunk_size=1)
     return prepared
@@ -310,7 +636,7 @@ def test_prepare_semantic_index_links_current_approved_file_evidence_to_file_nod
     root, _, _, repository, evidence_id = profile_approved_file(workspace, tmp_path)
 
     prepared = prepare_semantic_index(
-        PrepareSemanticIndexRequest(workspace=workspace, root=root, chunk_size=1)
+        PrepareSemanticIndexRequest(workspace=workspace, root=root, chunk_size=1, protocol="codex-semantic-v2")
     )
 
     capsules = read_protocol_v2_capsules(prepared)
@@ -332,7 +658,7 @@ def test_prepare_semantic_index_does_not_link_evidence_after_profiled_file_chang
     assert source.status is SourceStatus.INGESTED
 
     prepared = prepare_semantic_index(
-        PrepareSemanticIndexRequest(workspace=workspace, root=root, chunk_size=1)
+        PrepareSemanticIndexRequest(workspace=workspace, root=root, chunk_size=1, protocol="codex-semantic-v2")
     )
 
     staged_file = next(
@@ -357,7 +683,7 @@ def test_prepare_semantic_index_evidence_mapping_ignores_artifact_policy(
         paths.artifact_approval_path.write_text("{not-json", encoding="utf-8")
 
     prepared = prepare_semantic_index(
-        PrepareSemanticIndexRequest(workspace=workspace, root=root, chunk_size=1)
+        PrepareSemanticIndexRequest(workspace=workspace, root=root, chunk_size=1, protocol="codex-semantic-v2")
     )
 
     staged_file = next(
@@ -444,7 +770,7 @@ def test_apply_semantic_index_invalid_output_keeps_previous_active_revision(
     root = tmp_path / "approved-root"
     (root / "CHANGELOG.md").write_text("Second revision", encoding="utf-8")
     second = prepare_semantic_index(
-        PrepareSemanticIndexRequest(workspace=workspace, root=root, chunk_size=1)
+        PrepareSemanticIndexRequest(workspace=workspace, root=root, chunk_size=1, protocol="codex-semantic-v2")
     )
     publish_legacy_v1_fixture(workspace, root, second, chunk_size=1)
     write_valid_outputs(second)
@@ -493,7 +819,7 @@ def test_apply_semantic_index_rejects_changed_approval_policy_and_keeps_previous
     root = tmp_path / "approved-root"
     (root / "CHANGELOG.md").write_text("Second revision", encoding="utf-8")
     second = prepare_semantic_index(
-        PrepareSemanticIndexRequest(workspace=workspace, root=root, chunk_size=1)
+        PrepareSemanticIndexRequest(workspace=workspace, root=root, chunk_size=1, protocol="codex-semantic-v2")
     )
     publish_legacy_v1_fixture(workspace, root, second, chunk_size=1)
     write_valid_outputs(second)
@@ -528,7 +854,7 @@ def test_apply_semantic_index_rejects_relative_file_locator_and_keeps_previous_a
     root = tmp_path / "approved-root"
     (root / "CHANGELOG.md").write_text("Second revision", encoding="utf-8")
     second = prepare_semantic_index(
-        PrepareSemanticIndexRequest(workspace=workspace, root=root, chunk_size=1)
+        PrepareSemanticIndexRequest(workspace=workspace, root=root, chunk_size=1, protocol="codex-semantic-v2")
     )
     publish_legacy_v1_fixture(workspace, root, second, chunk_size=1)
     write_valid_outputs(second)
@@ -587,7 +913,7 @@ def test_apply_semantic_index_preserves_partial_status(workspace: Path, tmp_path
     (root / "large.md").write_text("x" * 131_073, encoding="utf-8")
     approve_root(workspace, root)
     prepared = prepare_semantic_index(
-        PrepareSemanticIndexRequest(workspace=workspace, root=root, chunk_size=1)
+        PrepareSemanticIndexRequest(workspace=workspace, root=root, chunk_size=1, protocol="codex-semantic-v2")
     )
     publish_legacy_v1_fixture(workspace, root, prepared, chunk_size=1)
     write_valid_outputs(prepared)
@@ -613,7 +939,7 @@ def test_apply_semantic_index_interruption_keeps_previous_active_revision(
     root = tmp_path / "approved-root"
     (root / "CHANGELOG.md").write_text("Second revision", encoding="utf-8")
     second = prepare_semantic_index(
-        PrepareSemanticIndexRequest(workspace=workspace, root=root, chunk_size=1)
+        PrepareSemanticIndexRequest(workspace=workspace, root=root, chunk_size=1, protocol="codex-semantic-v2")
     )
     publish_legacy_v1_fixture(workspace, root, second, chunk_size=1)
     write_valid_outputs(second)
@@ -654,7 +980,7 @@ def test_prepare_semantic_index_writes_locator_free_chunks_and_staging_revision(
     approve_root(workspace, root, excluded=(excluded,))
 
     result = prepare_semantic_index(
-        PrepareSemanticIndexRequest(workspace=workspace, root=root, chunk_size=1)
+        PrepareSemanticIndexRequest(workspace=workspace, root=root, chunk_size=1, protocol="codex-semantic-v2")
     )
 
     manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
@@ -766,7 +1092,7 @@ def test_protocol_v2_prepare_publishes_bounded_inputs_without_staging_graph(
     )
 
     result = prepare_semantic_index(
-        PrepareSemanticIndexRequest(workspace=workspace, root=root, chunk_size=2)
+        PrepareSemanticIndexRequest(workspace=workspace, root=root, chunk_size=2, protocol="codex-semantic-v2")
     )
 
     paths = WorkspacePaths.from_root(workspace)
@@ -844,7 +1170,7 @@ def test_prepare_semantic_index_scans_only_the_requested_root(
     outside.mkdir()
     (outside / "not-in-scope.md").write_text("outside", encoding="utf-8")
 
-    result = prepare_semantic_index(PrepareSemanticIndexRequest(workspace=workspace, root=root))
+    result = prepare_semantic_index(PrepareSemanticIndexRequest(workspace=workspace, root=root, protocol="codex-semantic-v2"))
 
     serialized = result.manifest_path.read_text(encoding="utf-8") + "\n".join(
         path.read_text(encoding="utf-8")
@@ -872,6 +1198,7 @@ def test_prepare_rejects_invalid_directory_timeout_before_workspace_write(
                 workspace=workspace,
                 root=root,
                 directory_timeout_seconds=value,
+                protocol="codex-semantic-v2",
             )
         )
 
@@ -898,7 +1225,7 @@ def test_prepare_root_timeout_is_controlled_without_semantic_publication(
 
     with pytest.raises(SemanticIndexError, match="timed out"):
         prepare_semantic_index(
-            PrepareSemanticIndexRequest(workspace=workspace, root=root)
+            PrepareSemanticIndexRequest(workspace=workspace, root=root, protocol="codex-semantic-v2")
         )
 
     paths = WorkspacePaths.from_root(workspace)
@@ -935,7 +1262,7 @@ def test_prepare_worker_failure_is_controlled_without_semantic_publication(
 
     with pytest.raises(SemanticIndexError) as captured:
         prepare_semantic_index(
-            PrepareSemanticIndexRequest(workspace=workspace, root=root)
+            PrepareSemanticIndexRequest(workspace=workspace, root=root, protocol="codex-semantic-v2")
         )
 
     assert str(captured.value) == "semantic index crawl failed safely"
@@ -1000,7 +1327,7 @@ def test_prepare_process_start_oserror_is_controlled_without_publication(
 
     with pytest.raises(SemanticIndexError) as captured:
         prepare_semantic_index(
-            PrepareSemanticIndexRequest(workspace=workspace, root=root)
+            PrepareSemanticIndexRequest(workspace=workspace, root=root, protocol="codex-semantic-v2")
         )
 
     assert str(captured.value) == "semantic index crawl failed safely"
@@ -1037,6 +1364,7 @@ def test_prepare_rejects_invalid_directory_timeout_budget_before_workspace_creat
                 workspace=workspace,
                 root=root,
                 directory_timeout_budget_seconds=value,
+                protocol="codex-semantic-v2",
             )
         )
 
@@ -1072,6 +1400,7 @@ def test_prepare_budget_exhaustion_publishes_only_private_timeout_review(
                 workspace=workspace,
                 root=root,
                 directory_timeout_budget_seconds=0.01,
+                protocol="codex-semantic-v2",
             )
         )
 
@@ -1255,6 +1584,7 @@ def test_prepare_postwrite_timeout_review_failure_has_no_semantic_publication(
                 workspace=workspace,
                 root=root,
                 directory_timeout_budget_seconds=0.01,
+                protocol="codex-semantic-v2",
             )
         )
 
@@ -1326,6 +1656,7 @@ def test_prepare_timeout_review_restore_failure_blocks_semantic_publication(
                 workspace=workspace,
                 root=root,
                 directory_timeout_budget_seconds=0.01,
+                protocol="codex-semantic-v2",
             )
         )
 
@@ -1362,6 +1693,7 @@ def test_timeout_review_rejects_hash_symlink_and_stale_bindings(
                 workspace=workspace,
                 root=root,
                 directory_timeout_budget_seconds=0.01,
+                protocol="codex-semantic-v2",
             )
         )
 
@@ -1517,6 +1849,7 @@ def test_timeout_failure_does_not_replace_other_root_review(
                 workspace=workspace,
                 root=second_root,
                 directory_timeout_budget_seconds=0.01,
+                protocol="codex-semantic-v2",
             )
         )
 
@@ -1618,6 +1951,7 @@ def test_successful_prepare_resolves_timeout_review_without_reusing_hierarchy(
                 workspace=workspace,
                 root=root,
                 directory_timeout_budget_seconds=0.01,
+                protocol="codex-semantic-v2",
             )
         )
 
@@ -1629,7 +1963,7 @@ def test_successful_prepare_resolves_timeout_review_without_reusing_hierarchy(
     monkeypatch.setattr(semantic_index_module, "crawl_local_structure", original_crawl)
 
     prepared = prepare_semantic_index(
-        PrepareSemanticIndexRequest(workspace=workspace, root=root)
+        PrepareSemanticIndexRequest(workspace=workspace, root=root, protocol="codex-semantic-v2")
     )
 
     resolved = semantic_index_module.read_semantic_crawl_timeout_review(workspace, root)
@@ -1675,7 +2009,7 @@ def test_prepare_analysis_failure_preserves_timeout_review_bytes(
 
     with pytest.raises(SemanticIndexError, match="synthetic analysis failure"):
         prepare_semantic_index(
-            PrepareSemanticIndexRequest(workspace=workspace, root=root)
+            PrepareSemanticIndexRequest(workspace=workspace, root=root, protocol="codex-semantic-v2")
         )
 
     assert paths.semantic_crawl_timeout_review_path.read_bytes() == before
@@ -1722,7 +2056,7 @@ def test_prepare_publish_failure_restores_timeout_review_bytes(
     monkeypatch.setattr(semantic_index_module, "write_managed_text", fail_manifest_once)
     with pytest.raises(OSError, match="synthetic manifest publication failure"):
         prepare_semantic_index(
-            PrepareSemanticIndexRequest(workspace=workspace, root=root)
+            PrepareSemanticIndexRequest(workspace=workspace, root=root, protocol="codex-semantic-v2")
         )
 
     assert paths.semantic_crawl_timeout_review_path.read_bytes() == before
@@ -1752,7 +2086,7 @@ def test_prepare_publish_failure_without_prior_review_leaves_no_review(
     monkeypatch.setattr(semantic_index_module, "write_managed_text", fail_manifest_once)
     with pytest.raises(OSError, match="synthetic manifest publication failure"):
         prepare_semantic_index(
-            PrepareSemanticIndexRequest(workspace=workspace, root=root)
+            PrepareSemanticIndexRequest(workspace=workspace, root=root, protocol="codex-semantic-v2")
         )
 
     assert not paths.semantic_crawl_timeout_review_path.exists()
@@ -1810,7 +2144,7 @@ def test_prepare_resolved_review_write_failure_has_no_semantic_publication(
     )
     with pytest.raises(OSError, match="synthetic resolved review failure"):
         prepare_semantic_index(
-            PrepareSemanticIndexRequest(workspace=workspace, root=root)
+            PrepareSemanticIndexRequest(workspace=workspace, root=root, protocol="codex-semantic-v2")
         )
 
     assert paths.semantic_crawl_timeout_review_path.read_bytes() == before
@@ -1835,6 +2169,7 @@ def test_prepare_manifest_binds_crawl_watchdog_aggregates(
             workspace=workspace,
             root=root,
             directory_timeout_seconds=12.5,
+            protocol="codex-semantic-v2",
         )
     )
     manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
@@ -1891,6 +2226,7 @@ def test_prepare_child_timeout_is_bound_and_responsive_rerun_is_fresh(
             workspace=workspace,
             root=root,
             directory_timeout_seconds=0.05,
+            protocol="codex-semantic-v2",
         )
     )
     manifest = json.loads(timed_out.manifest_path.read_text(encoding="utf-8"))
@@ -1918,7 +2254,7 @@ def test_prepare_child_timeout_is_bound_and_responsive_rerun_is_fresh(
         original_crawl,
     )
     responsive = prepare_semantic_index(
-        PrepareSemanticIndexRequest(workspace=workspace, root=root)
+        PrepareSemanticIndexRequest(workspace=workspace, root=root, protocol="codex-semantic-v2")
     )
     assert responsive.revision_id != timed_out.revision_id
     assert responsive.timed_out_directory_count == 0
@@ -1942,7 +2278,7 @@ def test_prepare_semantic_index_skips_unsupported_symlink_analysis(
     monkeypatch.setattr(semantic_index_module, "analyze_file_input", record_analysis)
 
     result = prepare_semantic_index(
-        PrepareSemanticIndexRequest(workspace=workspace, root=root)
+        PrepareSemanticIndexRequest(workspace=workspace, root=root, protocol="codex-semantic-v2")
     )
 
     nodes = read_protocol_v2_capsules(result)
@@ -1974,7 +2310,7 @@ def test_prepare_semantic_index_skips_evidence_for_file_missing_after_analysis(
     monkeypatch.setattr(semantic_index_module, "_canonical_file_uri", disappear)
 
     result = prepare_semantic_index(
-        PrepareSemanticIndexRequest(workspace=workspace, root=root)
+        PrepareSemanticIndexRequest(workspace=workspace, root=root, protocol="codex-semantic-v2")
     )
 
     structural = read_private_structural_records(workspace, result.revision_id)
@@ -2000,7 +2336,7 @@ def test_prepare_semantic_index_replaces_only_prior_managed_chunks(
     approve_root(workspace, root)
 
     first = prepare_semantic_index(
-        PrepareSemanticIndexRequest(workspace=workspace, root=root, chunk_size=1)
+        PrepareSemanticIndexRequest(workspace=workspace, root=root, chunk_size=1, protocol="codex-semantic-v2")
     )
     input_dir = first.manifest_path.parent / "input"
     unrelated_path = input_dir / "user-note.txt"
@@ -2008,7 +2344,7 @@ def test_prepare_semantic_index_replaces_only_prior_managed_chunks(
 
     (root / "first-only.md").unlink()
     second = prepare_semantic_index(
-        PrepareSemanticIndexRequest(workspace=workspace, root=root, chunk_size=1)
+        PrepareSemanticIndexRequest(workspace=workspace, root=root, chunk_size=1, protocol="codex-semantic-v2")
     )
 
     manifest = json.loads(second.manifest_path.read_text(encoding="utf-8"))
@@ -2033,7 +2369,7 @@ def test_prepare_semantic_index_reader_never_observes_incoherent_generation(
     approve_root(workspace, root)
 
     first = prepare_semantic_index(
-        PrepareSemanticIndexRequest(workspace=workspace, root=root, chunk_size=1)
+        PrepareSemanticIndexRequest(workspace=workspace, root=root, chunk_size=1, protocol="codex-semantic-v2")
     )
     (root / "first-only.md").unlink()
 
@@ -2070,7 +2406,7 @@ def test_prepare_semantic_index_reader_never_observes_incoherent_generation(
     )
 
     second = prepare_semantic_index(
-        PrepareSemanticIndexRequest(workspace=workspace, root=root, chunk_size=1)
+        PrepareSemanticIndexRequest(workspace=workspace, root=root, chunk_size=1, protocol="codex-semantic-v2")
     )
 
     assert reader_thread is not None
@@ -2105,7 +2441,7 @@ def test_published_semantic_input_reader_rejects_v2_manifest_self_hash_tamper(
     (root / "README.md").write_text("Project overview", encoding="utf-8")
     approve_root(workspace, root)
     prepared = prepare_semantic_index(
-        PrepareSemanticIndexRequest(workspace=workspace, root=root)
+        PrepareSemanticIndexRequest(workspace=workspace, root=root, protocol="codex-semantic-v2")
     )
     paths = WorkspacePaths.from_root(workspace)
     manifest = json.loads(
@@ -2131,7 +2467,7 @@ def test_prepare_semantic_index_restores_previous_input_when_publication_fails(
     approve_root(workspace, root)
 
     first = prepare_semantic_index(
-        PrepareSemanticIndexRequest(workspace=workspace, root=root, chunk_size=1)
+        PrepareSemanticIndexRequest(workspace=workspace, root=root, chunk_size=1, protocol="codex-semantic-v2")
     )
     repository = SQLiteRepository(WorkspacePaths.from_root(workspace).db_path)
     repository.activate_semantic_revision(first.revision_id)
@@ -2174,7 +2510,7 @@ def test_prepare_semantic_index_restores_previous_input_when_publication_fails(
 
     with pytest.raises(OSError, match="synthetic publication failure"):
         prepare_semantic_index(
-            PrepareSemanticIndexRequest(workspace=workspace, root=root, chunk_size=1)
+            PrepareSemanticIndexRequest(workspace=workspace, root=root, chunk_size=1, protocol="codex-semantic-v2")
         )
 
     assert first.manifest_path.read_text(encoding="utf-8") == previous_manifest

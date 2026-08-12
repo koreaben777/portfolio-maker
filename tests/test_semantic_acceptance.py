@@ -115,7 +115,12 @@ def semantic_runner(tmp_path: Path) -> Callable[[str, str], SemanticAcceptanceRe
             )
         )
         prepared = prepare_semantic_index(
-            PrepareSemanticIndexRequest(workspace=workspace, root=source_root, chunk_size=1)
+            PrepareSemanticIndexRequest(
+                workspace=workspace,
+                root=source_root,
+                chunk_size=1,
+                protocol="codex-semantic-v2",
+            )
         )
         _complete_fixture_semantic_work(workspace, paths, manifest)
         finalized = finalize_semantic_index(

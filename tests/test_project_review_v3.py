@@ -178,6 +178,7 @@ def _activate_v2_workspace(
         PrepareSemanticIndexRequest(
             workspace=workspace,
             root=root,
+            protocol="codex-semantic-v2",
             chunk_size=128,
         )
     )

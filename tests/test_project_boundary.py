@@ -435,7 +435,12 @@ def _write_active_semantic_revision(workspace: Path, tmp_path: Path) -> Workspac
     ingest_sources(IngestSourcesRequest(workspace=workspace))
 
     prepared = prepare_semantic_index(
-        PrepareSemanticIndexRequest(workspace=workspace, root=root, chunk_size=1)
+        PrepareSemanticIndexRequest(
+            workspace=workspace,
+            root=root,
+            chunk_size=1,
+            protocol="codex-semantic-v2",
+        )
     )
     finalization = PreparedFinalization(
         workspace=workspace,

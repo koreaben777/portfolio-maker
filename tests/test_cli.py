@@ -16,6 +16,7 @@ from portfolio_maker.application.history import HistoryError
 from portfolio_maker.application.models import (
     ApplyVisionAnalysisRequest,
     NextSemanticWorkRequest,
+    PrepareSemanticIndexRequest,
     PrepareVisionAnalysisRequest,
     ValidateSemanticWorkRequest,
 )
@@ -24,6 +25,7 @@ from portfolio_maker.application.semantic_work import (
     next_semantic_work,
     validate_semantic_work,
 )
+from portfolio_maker.application.semantic_index import prepare_semantic_index
 from portfolio_maker.application.vision_analysis import (
     VisionAnalysisError,
     apply_vision_analysis,
@@ -159,6 +161,17 @@ def complete_cli_semantic_work(workspace: Path) -> WorkspacePaths:
                 unit_id=current.unit_id,
             )
         )
+
+
+def prepare_v2_semantic_fixture(workspace: Path, root: Path) -> None:
+    """Keep legacy lifecycle tests on their explicitly selected v2 contract."""
+    prepare_semantic_index(
+        PrepareSemanticIndexRequest(
+            workspace=workspace,
+            root=root,
+            protocol="codex-semantic-v2",
+        )
+    )
 
 
 def seed_v2_candidate(workspace, *, confidence="medium") -> tuple[WorkspacePaths, str]:
@@ -316,14 +329,6 @@ def test_cli_prepare_semantic_index_reports_chunks_without_locator_values(
     for index in range(501):
         (root / f"item-{index:03}.md").write_text("evidence", encoding="utf-8")
     approve_semantic_root(workspace, root)
-    monkeypatch.setattr(
-        SQLiteRepository,
-        "list_semantic_nodes",
-        lambda *_args, **_kwargs: pytest.fail(
-            "protocol-v2 preparation must not read staging graph nodes"
-        ),
-    )
-
     exit_code = main(
         [
             "prepare-semantic-index",
@@ -344,15 +349,15 @@ def test_cli_prepare_semantic_index_reports_chunks_without_locator_values(
     )
     assert exit_code == 0
     assert "Semantic index input" in captured.out
-    assert "Chunks: 6" in captured.out
+    assert "Chunks: 0" in captured.out
     assert str(workspace) not in captured.out
     assert str(root) not in captured.out
     assert report.exists()
     report_text = report.read_text(encoding="utf-8")
     assert "Nodes: 502" in report_text
-    assert "Work units: 510" in report_text
-    assert "Analysis targets: 502" in report_text
-    assert "Structural only: 0" in report_text
+    assert "Work units: 0" in report_text
+    assert "Analysis targets: 0" in report_text
+    assert "Structural only: 502" in report_text
     assert "Directory timeout seconds: 12.5" in captured.out
     assert "Directory timeout budget seconds: 22.5" in captured.out
     assert "Timed-out directories: 0" in captured.out
@@ -447,15 +452,7 @@ def test_cli_apply_semantic_index_is_controlled_when_output_missing(
     root.mkdir()
     (root / "README.md").write_text("evidence", encoding="utf-8")
     approve_semantic_root(workspace, root)
-    assert main(
-        [
-            "prepare-semantic-index",
-            "--workspace",
-            str(workspace),
-            "--root",
-            str(root),
-        ]
-    ) == 0
+    prepare_v2_semantic_fixture(workspace, root)
     capsys.readouterr()
 
     exit_code = main(["apply-semantic-index", "--workspace", str(workspace)])
@@ -502,15 +499,7 @@ def test_cli_semantic_work_lifecycle_outputs_only_safe_identifiers_and_counts(
         encoding="utf-8",
     )
     approve_semantic_root(workspace, root)
-    assert main(
-        [
-            "prepare-semantic-index",
-            "--workspace",
-            str(workspace),
-            "--root",
-            str(root),
-        ]
-    ) == 0
+    prepare_v2_semantic_fixture(workspace, root)
     capsys.readouterr()
 
     assert main(
@@ -647,15 +636,7 @@ def test_cli_semantic_quality_failure_is_controlled_without_receipt_or_echo(
     root.mkdir()
     (root / "README.md").write_text("# Safe evidence", encoding="utf-8")
     approve_semantic_root(workspace, root)
-    assert main(
-        [
-            "prepare-semantic-index",
-            "--workspace",
-            str(workspace),
-            "--root",
-            str(root),
-        ]
-    ) == 0
+    prepare_v2_semantic_fixture(workspace, root)
     capsys.readouterr()
     assert main(["next-semantic-work", "--workspace", str(workspace)]) == 0
     capsys.readouterr()
@@ -714,15 +695,7 @@ def test_cli_semantic_work_missing_output_is_controlled_without_locator(
     root.mkdir()
     (root / "README.md").write_text("# Safe evidence", encoding="utf-8")
     approve_semantic_root(workspace, root)
-    assert main(
-        [
-            "prepare-semantic-index",
-            "--workspace",
-            str(workspace),
-            "--root",
-            str(root),
-        ]
-    ) == 0
+    prepare_v2_semantic_fixture(workspace, root)
     capsys.readouterr()
     assert main(["next-semantic-work", "--workspace", str(workspace)]) == 0
     capsys.readouterr()
@@ -763,15 +736,7 @@ def test_cli_semantic_work_rejects_undeclared_artifact_without_false_completion(
     root.mkdir()
     (root / "README.md").write_text("# Safe evidence", encoding="utf-8")
     approve_semantic_root(workspace, root)
-    assert main(
-        [
-            "prepare-semantic-index",
-            "--workspace",
-            str(workspace),
-            "--root",
-            str(root),
-        ]
-    ) == 0
+    prepare_v2_semantic_fixture(workspace, root)
     capsys.readouterr()
     paths = complete_cli_semantic_work(workspace)
     canary = "unexpected-private-canary"
@@ -809,7 +774,7 @@ def test_cli_prepare_semantic_index_invalid_root_is_controlled_without_locator(
 
     captured = capsys.readouterr()
     assert exit_code == 1
-    assert "semantic index root is invalid" in captured.err
+    assert captured.err == "semantic index preparation failed safely\n"
     assert "Traceback" not in captured.err
     assert str(workspace) not in captured.err
     assert str(missing_root) not in captured.err
@@ -841,7 +806,7 @@ def test_cli_prepare_semantic_index_rejects_unapproved_root_without_writing_inde
 
     captured = capsys.readouterr()
     assert exit_code == 1
-    assert "semantic index root is not approved" in captured.err
+    assert captured.err == "semantic index preparation failed safely\n"
     assert "Traceback" not in captured.err
     assert str(workspace) not in captured.err
     assert str(root) not in captured.err

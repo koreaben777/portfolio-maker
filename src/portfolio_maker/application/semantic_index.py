@@ -587,6 +587,24 @@ def _validated_directory_timeout_budget(value: object) -> float:
 def prepare_semantic_index(
     request: PrepareSemanticIndexRequest,
 ) -> PrepareSemanticIndexResult:
+    if request.protocol == "codex-semantic-v2":
+        return _prepare_v2_semantic_index(request)
+    if request.protocol != "codex-semantic-v3":
+        raise SemanticIndexError("semantic index protocol is invalid")
+    from portfolio_maker.application.semantic_prepare_v3 import (
+        SemanticPrepareV3Error,
+        prepare_semantic_index_v3,
+    )
+
+    try:
+        return prepare_semantic_index_v3(request)
+    except SemanticPrepareV3Error as error:
+        raise SemanticIndexError("semantic index preparation failed safely") from error
+
+
+def _prepare_v2_semantic_index(
+    request: PrepareSemanticIndexRequest,
+) -> PrepareSemanticIndexResult:
     directory_timeout_seconds = _validated_directory_timeout(
         request.directory_timeout_seconds
     )

@@ -83,7 +83,12 @@ def prepared_work(workspace: Path, tmp_path: Path) -> PreparedWork:
     (root / "guide.md").write_text("# Guide\nSetup details", encoding="utf-8")
     _approve_root(workspace, root)
     prepared = prepare_semantic_index(
-        PrepareSemanticIndexRequest(workspace=workspace, root=root, chunk_size=2)
+        PrepareSemanticIndexRequest(
+            workspace=workspace,
+            root=root,
+            chunk_size=2,
+            protocol="codex-semantic-v2",
+        )
     )
     return PreparedWork(
         workspace=workspace,

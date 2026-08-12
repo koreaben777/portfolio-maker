@@ -131,6 +131,7 @@ def prepared_finalization(
         PrepareSemanticIndexRequest(
             workspace=workspace,
             root=root,
+            protocol="codex-semantic-v2",
             chunk_size=2,
         )
     )
@@ -383,6 +384,7 @@ def test_high_fanout_finalization_restores_exact_private_child_topology(
         PrepareSemanticIndexRequest(
             workspace=workspace,
             root=root,
+            protocol="codex-semantic-v2",
             chunk_size=1_000,
         )
     )

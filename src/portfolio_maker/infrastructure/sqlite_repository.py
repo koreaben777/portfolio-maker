@@ -50,6 +50,7 @@ from portfolio_maker.domain.semantic_frontier import (
     SemanticCheckpoint,
     SemanticCompletion,
     SemanticExecutionProposal,
+    SemanticFrontierPlan,
     SemanticLeaseState,
     SemanticPlannedUnit,
     SemanticPhaseBinding,
@@ -1813,6 +1814,187 @@ class SQLiteRepository:
                     binding.current_checkpoint_root,
                 ),
             )
+
+    def bind_semantic_v3_revision_genesis_proposal_and_units(
+        self,
+        *,
+        revision_id: str,
+        source_id: str,
+        binding: SemanticRevisionBinding,
+        envelope: SemanticProposalEnvelope,
+        proposal_bytes: bytes,
+        plan_bytes: bytes,
+        units: tuple[SemanticPlannedUnit, ...],
+        deferred_count: int,
+        deferred_root: str,
+        deferred_cursor_root: str,
+    ) -> None:
+        """Persist the complete v3 prepare genesis in one database transaction."""
+        proposal = envelope.proposal
+        if (
+            binding.revision_id != revision_id
+            or proposal.revision_id != revision_id
+            or proposal.run_id != envelope.proposal.run_id
+            or proposal.approval_kind != "frontier"
+            or not isinstance(source_id, str)
+            or not source_id
+            or not isinstance(deferred_count, int)
+            or deferred_count < 0
+            or len(units) > proposal.budget.max_units
+        ):
+            raise RepositoryError("semantic v3 preparation authority is invalid")
+        for value, field in (
+            (binding.manifest_sha256, "manifest digest"),
+            (binding.source_policy_sha256, "source policy digest"),
+            (binding.source_approval_sha256, "source approval digest"),
+            (binding.catalog_file_sha256, "catalog file digest"),
+            (binding.catalog_logical_root, "catalog root"),
+            (binding.lifecycle_genesis_root, "genesis root"),
+            (binding.current_checkpoint_root, "checkpoint root"),
+            (deferred_root, "deferred root"),
+            (deferred_cursor_root, "deferred cursor root"),
+        ):
+            self._v3_digest(value, field)
+        if binding.current_checkpoint_root != binding.lifecycle_genesis_root:
+            raise RepositoryError("semantic v3 preparation authority is invalid")
+        if proposal_bytes != semantic_canonical_json_bytes(proposal):
+            raise RepositoryError("semantic proposal bytes are not canonical")
+        try:
+            plan_value = json.loads(plan_bytes, object_pairs_hook=self._v3_no_duplicates)
+        except (TypeError, ValueError) as error:
+            raise RepositoryError("semantic plan bytes are not canonical") from error
+        if semantic_canonical_json_bytes(plan_value) != plan_bytes:
+            raise RepositoryError("semantic plan bytes are not canonical")
+        if sha256(plan_bytes).hexdigest() != proposal.plan_sha256:
+            raise RepositoryError("semantic plan binding is invalid")
+        expected_plan = SemanticFrontierPlan(
+            run_id=proposal.run_id,
+            revision_id=revision_id,
+            policy_sha256=proposal.policy_sha256,
+            selector_version=proposal.selector_version,
+            target_projection_contract=proposal.target_projection_contract,
+            input_schema_version=proposal.input_schema_version,
+            output_schema_version=proposal.output_schema_version,
+            validator_version=proposal.validator_version,
+            purpose=proposal.purpose,
+            units=units,
+            deferred_count=deferred_count,
+            deferred_root=deferred_root,
+            deferred_cursor_root=deferred_cursor_root,
+        )
+        if plan_bytes != semantic_canonical_json_bytes(expected_plan):
+            raise RepositoryError("semantic plan authority is invalid")
+        unit_ids = {unit.unit_id for unit in units}
+        if len(unit_ids) != len(units):
+            raise RepositoryError("semantic unit authority is invalid")
+        for unit in units:
+            if (
+                unit.phase not in {binding.phase for binding in proposal.phase_bindings}
+                or len(unit.target_node_ids) > 64
+                or len(unit.dependency_unit_ids) > 64
+                or unit.estimated_input_bytes < 0
+                or not set(unit.dependency_unit_ids).issubset(unit_ids)
+            ):
+                raise RepositoryError("semantic unit authority is invalid")
+        budget, phases, budget_binding = self._v3_budget_binding(proposal)
+        with self._connection() as conn:
+            conn.execute(
+                """INSERT INTO semantic_index_revisions
+                   (id, source_id, policy_hash, analyzer_version, status)
+                   VALUES (?, ?, ?, ?, 'staging')""",
+                (revision_id, source_id, binding.source_policy_sha256, "semantic-frontier-v3"),
+            )
+            conn.execute(
+                """INSERT INTO semantic_v3_revision_bindings(
+                    revision_id, manifest_sha256, source_policy_sha256, source_approval_sha256,
+                    catalog_file_sha256, catalog_logical_root, lifecycle_schema_version,
+                    lifecycle_genesis_root, current_checkpoint_root, protocol
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'codex-semantic-v3')""",
+                (
+                    revision_id, binding.manifest_sha256, binding.source_policy_sha256,
+                    binding.source_approval_sha256, binding.catalog_file_sha256,
+                    binding.catalog_logical_root, binding.lifecycle_schema_version,
+                    binding.lifecycle_genesis_root, binding.current_checkpoint_root,
+                ),
+            )
+            conn.execute(
+                """INSERT INTO semantic_v3_proposals(
+                    run_id, revision_id, approval_kind, project_id, proposal_canonical_json,
+                    proposal_sha256, plan_canonical_json, plan_sha256, manifest_sha256,
+                    source_policy_sha256, source_approval_sha256, catalog_root,
+                    selector_version, private_context_scope, authority_root,
+                    parent_checkpoint_root, project_boundary_sha256, parent_proposal_sha256,
+                    evidence_policy_sha256, total_budget_json, phase_bindings_json,
+                    budget_binding_sha256, state, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?)""",
+                (
+                    proposal.run_id, revision_id, proposal.approval_kind, proposal.project_id,
+                    proposal_bytes, envelope.proposal_sha256, plan_bytes, proposal.plan_sha256,
+                    proposal.manifest_sha256, proposal.policy_sha256,
+                    proposal.source_approval_sha256, proposal.catalog_root,
+                    proposal.selector_version, proposal.private_context_scope,
+                    proposal.authority_root, proposal.parent_checkpoint_root,
+                    proposal.project_boundary_sha256, proposal.parent_proposal_sha256,
+                    proposal.evidence_policy_sha256, budget, phases, budget_binding,
+                    self._v3_now(),
+                ),
+            )
+            phase = proposal.phase_bindings[0].phase.value
+            conn.execute(
+                """INSERT INTO semantic_v3_runs(
+                    run_id, revision_id, approval_kind, project_id, state, phase,
+                    proposal_sha256, result_pack_root
+                ) VALUES (?, ?, ?, ?, 'awaiting_approval', ?, ?, ?)""",
+                (
+                    proposal.run_id, revision_id, proposal.approval_kind, proposal.project_id,
+                    phase, envelope.proposal_sha256, "0" * 64,
+                ),
+            )
+            conn.execute(
+                """INSERT INTO semantic_v3_aggregates(
+                    run_id, ready_count, leased_count, validated_count, deferred_count,
+                    error_count, used_units, used_input_bytes, used_active_seconds,
+                    phase_usage_json, completion_json, aggregate_root
+                ) VALUES (?, 0, 0, 0, 0, 0, 0, 0, 0, ?, ?, ?)""",
+                (proposal.run_id, "{}", "{}", "0" * 64),
+            )
+            conn.execute(
+                """INSERT INTO semantic_v3_deferred(
+                    run_id, set_kind, deferred_count, deferred_root, deferred_cursor_root,
+                    current_cursor_json
+                ) VALUES (?, 'initial_catalog', ?, ?, ?, '{}')""",
+                (proposal.run_id, deferred_count, deferred_root, deferred_cursor_root),
+            )
+            for unit in units:
+                target = semantic_canonical_json_bytes(unit.target_node_ids).decode("utf-8")
+                target_sha = sha256(target.encode("utf-8")).hexdigest()
+                dependency_root = self._v3_root(
+                    b"portfolio-maker-semantic-v3-dependency\0",
+                    iter(unit.dependency_unit_ids),
+                )
+                conn.execute(
+                    """INSERT INTO semantic_v3_units(
+                        run_id, unit_id, phase, state, priority, fairness_lane,
+                        target_ref_json, target_ref_sha256, dependency_root,
+                        estimated_input_bytes
+                    ) VALUES (?, ?, ?, 'ready', ?, ?, ?, ?, ?, ?)""",
+                    (
+                        proposal.run_id, unit.unit_id, unit.phase.value, unit.priority,
+                        unit.fairness_lane, target, target_sha, dependency_root,
+                        unit.estimated_input_bytes,
+                    ),
+                )
+                for dependency in unit.dependency_unit_ids:
+                    conn.execute(
+                        """INSERT INTO semantic_v3_dependencies(
+                            run_id, unit_id, dependency_unit_id, dependency_digest
+                        ) VALUES (?, ?, ?, ?)""",
+                        (
+                            proposal.run_id, unit.unit_id, dependency,
+                            sha256(dependency.encode("utf-8")).hexdigest(),
+                        ),
+                    )
+            self._semantic_v3_refresh_aggregate(conn, proposal.run_id)
 
     def create_semantic_v3_proposal(
         self, envelope: SemanticProposalEnvelope, canonical_bytes: bytes, plan_bytes: bytes

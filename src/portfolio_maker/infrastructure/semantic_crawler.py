@@ -33,6 +33,8 @@ from portfolio_maker.infrastructure.semantic_catalog import (
     CatalogSeal,
     NodeRecord,
     PayloadRefRecord,
+    PlanningQueryObserver,
+    SemanticCatalogPlanningSession,
     SemanticCatalogWriter,
 )
 from portfolio_maker.infrastructure.semantic_pack import (
@@ -1217,6 +1219,23 @@ class StreamingStructureSink:
         except BaseException as error:
             self._fail(error)
             raise
+
+    def planning_session(
+        self,
+        selector_version: str,
+        *,
+        observer: PlanningQueryObserver | None = None,
+    ) -> SemanticCatalogPlanningSession:
+        """Open the catalog's narrow selector interface before authority sealing."""
+        if self._state is not StreamingStructureSinkState.ACTIVE:
+            raise ValueError("streaming structure sink is not available for planning")
+        node_count, edge_count, baseline_count = self._receipt_store.validate()
+        if self._pack_writer.record_count != node_count + edge_count + baseline_count:
+            raise ValueError("streaming authority record count is invalid")
+        return self._catalog_writer.planning_session(
+            selector_version,
+            observer=observer,
+        )
 
     def seal(self) -> StreamingStructureArtifacts:
         if self._artifacts is not None:
