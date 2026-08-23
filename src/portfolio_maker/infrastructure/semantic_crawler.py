@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import errno
 import hashlib
+import json
 import os
 import sqlite3
 import stat
@@ -31,6 +32,7 @@ from portfolio_maker.infrastructure.presentation import normalize_label
 from portfolio_maker.infrastructure.semantic_catalog import (
     BaselineRecord,
     CatalogSeal,
+    FrontierFeatureRecord,
     NodeRecord,
     PayloadRefRecord,
     PlanningQueryObserver,
@@ -1015,6 +1017,24 @@ class StreamingStructureSinkState(StrEnum):
     ABORTED = "aborted"
 
 
+_FRONTIER_FEATURE_VERSION = "frontier-feature-v1"
+_FRONTIER_COMPLETE_COVERAGE = "complete"
+_FRONTIER_UNCERTAIN_COVERAGE = frozenset(
+    {"sampled", "unsupported", "unreadable", "failed"}
+)
+_FRONTIER_ENTRYPOINT_NAMES = frozenset(
+    {"app.py", "index.py", "main.py", "manage.py", "server.py"}
+)
+
+
+@dataclass
+class _FrontierFeatureFrame:
+    entry: StructuralEntry
+    material_signals: dict[str, str] = field(default_factory=dict)
+    coverage_states: set[str] = field(default_factory=set)
+    recorded: bool = False
+
+
 class _SinkInvariantStore:
     """Ephemeral indexed receipt state for one streaming authority build."""
 
@@ -1193,6 +1213,8 @@ class StreamingStructureSink:
         self._state = StreamingStructureSinkState.ACTIVE
         self._failure: BaseException | None = None
         self._artifacts: StreamingStructureArtifacts | None = None
+        self._frontier_feature_frames: list[_FrontierFeatureFrame] = []
+        self._frontier_feature_count = 0
 
     @property
     def state(self) -> StreamingStructureSinkState:
@@ -1230,6 +1252,8 @@ class StreamingStructureSink:
         if self._state is not StreamingStructureSinkState.ACTIVE:
             raise ValueError("streaming structure sink is not available for planning")
         node_count, edge_count, baseline_count = self._receipt_store.validate()
+        if self._frontier_feature_frames or self._frontier_feature_count != node_count:
+            raise ValueError("streaming frontier feature authority is incomplete")
         if self._pack_writer.record_count != node_count + edge_count + baseline_count:
             raise ValueError("streaming authority record count is invalid")
         return self._catalog_writer.planning_session(
@@ -1317,9 +1341,14 @@ class StreamingStructureSink:
             return
         if event.kind is StructuralEventKind.DIRECTORY_CLOSED:
             self._receipt_store.add_directory_close(event.node.node_id)
+            if event.node.kind is SemanticNodeKind.DIRECTORY:
+                self._finish_frontier_feature_frame(event.node)
             return
         if event.kind is StructuralEventKind.SOURCE_CLOSED:
             self._receipt_store.add_source_close(event.node.node_id)
+            if event.node.kind is not SemanticNodeKind.SOURCE:
+                raise ValueError("streaming source closure is invalid")
+            self._finish_frontier_feature_frame(event.node)
             return
         raise ValueError("streaming structural event is invalid")
 
@@ -1350,6 +1379,7 @@ class StreamingStructureSink:
                 entry.display_name,
             )
         )
+        self._frontier_feature_frames.append(_FrontierFeatureFrame(entry))
         if entry.parent_node_id is not None:
             assert traversal_order is not None
             edge_ref = self._pack_writer.append(
@@ -1372,6 +1402,7 @@ class StreamingStructureSink:
     def _add_baseline(self, event: StructuralEvent) -> None:
         baseline = event.baseline
         assert baseline is not None
+        frame = self._frontier_feature_frame(event.node)
         self._receipt_store.add_terminal(event.node.node_id)
         baseline_ref = self._pack_writer.append(
             {
@@ -1402,6 +1433,98 @@ class StreamingStructureSink:
                 baseline_ref,
             )
         )
+        frame.coverage_states.add(baseline.coverage.value)
+        if baseline.coverage.value == _FRONTIER_COMPLETE_COVERAGE:
+            for category in _frontier_signal_categories(event.node, baseline.roles):
+                frame.material_signals.setdefault(category, event.node.node_id)
+        self._record_frontier_feature(frame)
+        if event.node.kind is SemanticNodeKind.FILE:
+            self._finish_frontier_feature_frame(event.node)
+
+    def _frontier_feature_frame(self, entry: StructuralEntry) -> _FrontierFeatureFrame:
+        if not self._frontier_feature_frames:
+            raise ValueError("streaming frontier feature stack is invalid")
+        frame = self._frontier_feature_frames[-1]
+        if frame.entry.node_id != entry.node_id:
+            raise ValueError("streaming frontier feature order is invalid")
+        return frame
+
+    def _record_frontier_feature(self, frame: _FrontierFeatureFrame) -> None:
+        if frame.recorded:
+            raise ValueError("streaming frontier feature is duplicated")
+        entry = frame.entry
+        material_signals = tuple(sorted(frame.material_signals))
+        unique_signal_nodes = set(frame.material_signals.values())
+        project_like = (
+            entry.kind is not SemanticNodeKind.FILE
+            and len(material_signals) >= 2
+            and len(unique_signal_nodes) >= 2
+        )
+        independent_child = (
+            entry.kind is SemanticNodeKind.DIRECTORY
+            and entry.parent_node_id is not None
+            and "package-manifest" in frame.material_signals
+            and any(
+                category in frame.material_signals
+                and frame.material_signals[category]
+                != frame.material_signals["package-manifest"]
+                for category in ("purpose", "release", "execution")
+            )
+        )
+        uncertainty = bool(
+            frame.coverage_states.intersection(_FRONTIER_UNCERTAIN_COVERAGE)
+        )
+        lane = _frontier_top_level_lane(entry)
+        digest_payload = {
+            "coverage_states": sorted(frame.coverage_states),
+            "feature_version": _FRONTIER_FEATURE_VERSION,
+            "flags": {
+                "ambiguous": uncertainty,
+                "evidence_linked": False,
+                "independent_child": independent_child,
+                "project_like": project_like,
+                "uncertainty": uncertainty,
+            },
+            "node_id": entry.node_id,
+            "signals": material_signals,
+            "source_id": entry.source_id,
+            "top_level_lane": lane,
+        }
+        feature_digest = hashlib.sha256(
+            json.dumps(
+                digest_payload,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        self._catalog_writer.add_frontier_feature(
+            FrontierFeatureRecord(
+                node_id=entry.node_id,
+                feature_version=_FRONTIER_FEATURE_VERSION,
+                project_like=project_like,
+                ambiguous=uncertainty,
+                independent_child=independent_child,
+                evidence_linked=False,
+                uncertainty=uncertainty,
+                top_level_lane=lane,
+                feature_digest=feature_digest,
+            )
+        )
+        frame.recorded = True
+        self._frontier_feature_count += 1
+
+    def _finish_frontier_feature_frame(self, entry: StructuralEntry) -> None:
+        frame = self._frontier_feature_frame(entry)
+        if not frame.recorded:
+            raise ValueError("streaming frontier feature is incomplete")
+        self._frontier_feature_frames.pop()
+        if not self._frontier_feature_frames:
+            return
+        parent = self._frontier_feature_frames[-1]
+        parent.coverage_states.update(frame.coverage_states)
+        for category, node_id in frame.material_signals.items():
+            parent.material_signals.setdefault(category, node_id)
 
     def _fail(self, error: BaseException) -> None:
         if self._state in {
@@ -2232,6 +2355,47 @@ def _reserve_prior_entries(
 
 def _relative_hierarchy(root: Path, path: Path) -> str:
     return path.relative_to(root).as_posix()
+
+
+def _frontier_signal_categories(
+    entry: StructuralEntry,
+    roles: tuple[str, ...],
+) -> tuple[str, ...]:
+    categories: set[str] = set()
+    name = entry.display_name.casefold()
+    if "project-description" in roles:
+        categories.add("purpose")
+    if "package-manifest" in roles:
+        categories.add("package-manifest")
+    if "deployment" in roles:
+        categories.add("deployment")
+    if "code" in roles:
+        categories.add("implementation")
+    if name in _FRONTIER_ENTRYPOINT_NAMES:
+        categories.add("execution")
+    if name.startswith("test_") or name.endswith("_test.py"):
+        categories.add("test")
+    if name in {"release.md", "changelog.md"}:
+        categories.add("release")
+    return tuple(sorted(categories))
+
+
+def _frontier_top_level_lane(entry: StructuralEntry) -> str:
+    hierarchy = entry.relative_hierarchy
+    if hierarchy == ".":
+        component = "."
+    else:
+        parts = hierarchy.split("/")
+        if (
+            not parts
+            or any(not part or part in {".", ".."} for part in parts)
+            or hierarchy.startswith("/")
+        ):
+            raise ValueError("streaming frontier hierarchy is invalid")
+        component = normalize_label(parts[0])
+        if not component or "/" in component or "\\" in component:
+            raise ValueError("streaming frontier hierarchy is invalid")
+    return f"{entry.source_id}:{component}"
 
 
 def iter_local_structure_events(

@@ -11,6 +11,10 @@ import pytest
 
 import portfolio_maker.infrastructure.semantic_crawler as semantic_crawler_module
 from portfolio_maker.application.approval import SourceApproval
+from portfolio_maker.application.semantic_frontier_v3 import (
+    FRONTIER_SELECTOR_VERSION,
+    build_frontier_plan,
+)
 from portfolio_maker.domain.semantic_frontier import BaselineCoverage
 from portfolio_maker.domain.semantic_models import AnalysisStatus, SemanticNodeKind
 from portfolio_maker.infrastructure.semantic_crawler import (
@@ -291,6 +295,43 @@ def test_high_fanout_worker_streams_without_directory_tuple(tmp_path: Path) -> N
     assert observer.max_buffered_events <= 256
     assert observer.directory_tuple_materializations == 0
     assert observer.spool_count_query_count == 0
+
+
+def test_frontier_feature_state_is_bounded_for_high_fanout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Breaks if frontier signals retain a directory child population in Python."""
+    root = tmp_path / "high-fanout"
+    root.mkdir()
+    for index in range(1_024):
+        (root / f"note-{index:04}.md").write_text("evidence", encoding="utf-8")
+    sink = StreamingStructureSink(
+        tmp_path / "authority.pm-pack",
+        tmp_path / "authority.catalog.sqlite",
+    )
+    observed_cells = 0
+    original = StreamingStructureSink._record_frontier_feature
+
+    def observe_feature(self, frame):
+        nonlocal observed_cells
+        observed_cells = max(
+            observed_cells,
+            sum(
+                len(item.material_signals) + len(item.coverage_states)
+                for item in self._frontier_feature_frames
+            ),
+        )
+        return original(self, frame)
+
+    monkeypatch.setattr(StreamingStructureSink, "_record_frontier_feature", observe_feature)
+    list(iter_local_structure_events(root, approval_for(root), sink=sink))
+    build_frontier_plan(
+        sink.planning_session(FRONTIER_SELECTOR_VERSION), "0" * 32, "1" * 64
+    )
+    sink.seal()
+
+    assert observed_cells <= 6
 
 
 def test_streaming_reuses_one_global_worker_and_sqlite_sibling_backlog(
@@ -1243,10 +1284,10 @@ def test_streaming_sink_exposes_only_a_completed_preseal_planning_session(
         sink.planning_session("adaptive-frontier-v1")
 
     list(iter_local_structure_events(root, approval_for(root), sink=sink))
-    session = sink.planning_session("adaptive-frontier-v1")
+    session = sink.planning_session(FRONTIER_SELECTOR_VERSION)
     with pytest.raises(ValueError, match="planning session is active"):
-        sink.planning_session("adaptive-frontier-v1")
-    session.finish()
+        sink.planning_session(FRONTIER_SELECTOR_VERSION)
+    build_frontier_plan(session, "0" * 32, "1" * 64)
 
     artifacts = sink.seal()
 

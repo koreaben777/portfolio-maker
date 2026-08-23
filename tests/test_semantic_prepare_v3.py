@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import errno
 import hashlib
+import json
 import os
 from pathlib import Path
 
@@ -10,8 +11,14 @@ import pytest
 import portfolio_maker.infrastructure.semantic_analyzers as semantic_analyzers_module
 import portfolio_maker.infrastructure.semantic_crawler as semantic_crawler_module
 import portfolio_maker.infrastructure.semantic_source_reader as source_reader
-from portfolio_maker.application.approval import SourceApproval
+from portfolio_maker.application.approval import SourceApproval, write_sample_approval
+from portfolio_maker.application.models import PrepareSemanticIndexRequest
+from portfolio_maker.application.semantic_index import prepare_semantic_index
 from portfolio_maker.domain.semantic_frontier import PackRecordRef
+from portfolio_maker.application.semantic_frontier_v3 import (
+    FRONTIER_SELECTOR_VERSION,
+    build_frontier_plan,
+)
 from portfolio_maker.infrastructure.semantic_catalog import SemanticCatalogReader
 from portfolio_maker.infrastructure.semantic_crawler import (
     StructuralEventKind,
@@ -27,6 +34,8 @@ from portfolio_maker.infrastructure.semantic_source_reader import (
     read_verified_sample,
     read_verified_representative,
 )
+from portfolio_maker.infrastructure.sqlite_repository import SQLiteRepository
+from portfolio_maker.workspace import WorkspacePaths
 
 
 def _approval_for(root: Path, *, excluded: tuple[Path, ...] = ()) -> SourceApproval:
@@ -46,7 +55,16 @@ def _approval_for(root: Path, *, excluded: tuple[Path, ...] = ()) -> SourceAppro
 def _completed_sink(root: Path, pack_path: Path, catalog_path: Path) -> StreamingStructureSink:
     sink = StreamingStructureSink(pack_path, catalog_path)
     list(iter_local_structure_events(root, _approval_for(root), sink=sink))
+    _plan_sink(sink)
     return sink
+
+
+def _plan_sink(sink: StreamingStructureSink) -> None:
+    build_frontier_plan(
+        sink.planning_session(FRONTIER_SELECTOR_VERSION),
+        "0" * 32,
+        "1" * 64,
+    )
 
 
 def _force_cross_device_publish(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -189,6 +207,7 @@ def test_streaming_sink_persists_exact_node_edge_and_baseline_authorities(
     sink = StreamingStructureSink(pack_path, catalog_path)
 
     events = list(iter_local_structure_events(root, _approval_for(root), sink=sink))
+    _plan_sink(sink)
     artifacts = sink.seal()
 
     node_events = [event for event in events if event.kind is StructuralEventKind.NODE_SEEN]
@@ -241,6 +260,169 @@ def test_streaming_sink_persists_exact_node_edge_and_baseline_authorities(
     assert len({(ref.offset, ref.length, ref.sha256) for ref in references}) == len(references)
 
 
+def test_streaming_sink_records_distinct_descendant_frontier_features(
+    tmp_path: Path,
+) -> None:
+    """Breaks if pre-seal planning has no durable feature authority."""
+    root = tmp_path / "source"
+    (root / "project" / "src").mkdir(parents=True)
+    (root / "project" / "README.md").write_text("purpose", encoding="utf-8")
+    (root / "project" / "pyproject.toml").write_text(
+        "[project]\nname = 'synthetic'\n", encoding="utf-8"
+    )
+    (root / "project" / "src" / "app.py").write_text("print('ok')", encoding="utf-8")
+
+    first_sink = _completed_sink(
+        root, tmp_path / "first.pm-pack", tmp_path / "first.catalog.sqlite"
+    )
+    first = first_sink.seal()
+    second_sink = _completed_sink(
+        root, tmp_path / "second.pm-pack", tmp_path / "second.catalog.sqlite"
+    )
+    second = second_sink.seal()
+
+    def feature_rows(path: Path, seal) -> list[tuple[object, ...]]:
+        with SemanticCatalogReader(path, seal) as catalog:
+            return [
+                tuple(row)
+                for row in catalog.connection.execute(
+                    """SELECT node.relative_hierarchy, feature.project_like,
+                              feature.independent_child, feature.top_level_lane,
+                              feature.feature_digest
+                       FROM frontier_features AS feature
+                       JOIN nodes AS node ON node.node_id = feature.node_id
+                       ORDER BY node.node_id"""
+                ).fetchall()
+            ]
+
+    first_rows = feature_rows(tmp_path / "first.catalog.sqlite", first.catalog_seal)
+    second_rows = feature_rows(tmp_path / "second.catalog.sqlite", second.catalog_seal)
+
+    assert first_rows == second_rows
+    assert len(first_rows) == 6
+    project = next(row for row in first_rows if row[0] == "project")
+    assert project[1:3] == (1, 1)
+    contextual = next(row for row in first_rows if row[0] == "project/src")
+    assert contextual[2] == 0
+    assert all(isinstance(row[4], str) and len(row[4]) == 64 for row in first_rows)
+
+
+@pytest.mark.parametrize(
+    ("filename", "content"),
+    (
+        ("README.md", "purpose"),
+        ("pyproject.toml", "[project]\nname = 'synthetic'\n"),
+        ("app.py", "print('ok')"),
+    ),
+)
+def test_single_signal_does_not_create_a_project_like_frontier_feature(
+    tmp_path: Path, filename: str, content: str,
+) -> None:
+    root = tmp_path / "source"
+    root.mkdir()
+    (root / filename).write_text(content, encoding="utf-8")
+    artifacts = _completed_sink(
+        root, tmp_path / "authority.pm-pack", tmp_path / "authority.catalog.sqlite"
+    ).seal()
+
+    with SemanticCatalogReader(tmp_path / "authority.catalog.sqlite", artifacts.catalog_seal) as catalog:
+        rows = catalog.connection.execute(
+            "SELECT project_like FROM frontier_features ORDER BY node_id"
+        ).fetchall()
+
+    assert rows
+    assert all(row[0] == 0 for row in rows)
+
+
+def test_frontier_features_preserve_uncertainty_and_source_fair_lanes(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "source"
+    (root / "alpha").mkdir(parents=True)
+    (root / "alpha" / "README.md").write_text("purpose", encoding="utf-8")
+    (root / "beta").mkdir()
+    target = tmp_path / "outside.txt"
+    target.write_text("outside", encoding="utf-8")
+    (root / "beta" / "alias.txt").symlink_to(target)
+    artifacts = _completed_sink(
+        root, tmp_path / "authority.pm-pack", tmp_path / "authority.catalog.sqlite"
+    ).seal()
+
+    with SemanticCatalogReader(tmp_path / "authority.catalog.sqlite", artifacts.catalog_seal) as catalog:
+        rows = {
+            row[0]: tuple(row[1:])
+            for row in catalog.connection.execute(
+                """SELECT node.relative_hierarchy, feature.top_level_lane,
+                          feature.uncertainty, feature.project_like
+                   FROM frontier_features AS feature
+                   JOIN nodes AS node ON node.node_id = feature.node_id"""
+            ).fetchall()
+        }
+
+    assert rows["."][0].endswith(":.")
+    assert rows["alpha"][0].endswith(":alpha")
+    assert rows["beta"][0].endswith(":beta")
+    assert rows["beta/alias.txt"][1] == 1
+    assert rows["beta"][1] == 1
+    assert rows["beta"][2] == 0
+
+
+def test_frontier_feature_write_fault_aborts_both_authorities(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "source"
+    root.mkdir()
+    (root / "README.md").write_text("purpose", encoding="utf-8")
+    pack_path = tmp_path / "authority.pm-pack"
+    catalog_path = tmp_path / "authority.catalog.sqlite"
+    sink = StreamingStructureSink(pack_path, catalog_path)
+
+    def fail_feature_write(*_args, **_kwargs) -> None:
+        raise OSError("synthetic feature write failure")
+
+    monkeypatch.setattr(
+        semantic_crawler_module.SemanticCatalogWriter,
+        "add_frontier_feature",
+        fail_feature_write,
+    )
+
+    with pytest.raises(OSError, match="synthetic feature write failure"):
+        list(iter_local_structure_events(root, _approval_for(root), sink=sink))
+
+    assert sink.state is StreamingStructureSinkState.ABORTED
+    assert not pack_path.exists()
+    assert not catalog_path.exists()
+
+
+def test_default_v3_prepare_creates_a_ready_unit_for_distinct_project_signals(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    root = workspace / "approved-source"
+    (root / "project" / "src").mkdir(parents=True)
+    (root / "project" / "README.md").write_text("purpose", encoding="utf-8")
+    (root / "project" / "pyproject.toml").write_text(
+        "[project]\nname = 'synthetic'\n", encoding="utf-8"
+    )
+    (root / "project" / "src" / "app.py").write_text("print('ok')", encoding="utf-8")
+    paths = WorkspacePaths.from_root(workspace)
+    write_sample_approval(paths)
+    approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    approval["approved_source_uris"] = [root.resolve().as_uri()]
+    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+
+    prepared = prepare_semantic_index(
+        PrepareSemanticIndexRequest(workspace=workspace, root=root)
+    )
+    repository = SQLiteRepository(paths.db_path)
+
+    with repository._read_connection() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM semantic_v3_units WHERE run_id = ? AND state = 'ready'",
+            (prepared.run_id,),
+        ).fetchone()[0] >= 1
+
+
 def test_streaming_baseline_payload_persists_only_the_masked_excerpt(
     tmp_path: Path,
 ) -> None:
@@ -257,6 +439,7 @@ def test_streaming_baseline_payload_persists_only_the_masked_excerpt(
     sink = StreamingStructureSink(pack_path, catalog_path)
 
     events = list(iter_local_structure_events(root, _approval_for(root), sink=sink))
+    _plan_sink(sink)
     artifacts = sink.seal()
     baseline_event = next(
         event
