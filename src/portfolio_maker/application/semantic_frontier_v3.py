@@ -74,6 +74,24 @@ class FrontierTransition:
     converged: bool = False
 
 
+@dataclass(frozen=True)
+class FrontierOpenedUnit:
+    """A deterministic unit opened by a bounded validated child request."""
+
+    unit: SemanticPlannedUnit
+    next_child_cursor: str | None
+
+
+@dataclass(frozen=True)
+class FrontierTransitionAuthority:
+    """Pure sealed transition data for the Task 10 receipt transaction."""
+
+    transition: FrontierTransition
+    opened_units: tuple[FrontierOpenedUnit, ...]
+    pending_runtime_deferred: tuple[SemanticDeferredAuditRow, ...]
+    requires_expansion_queue_check: bool
+
+
 class FrontierSelectionError(ValueError):
     pass
 
@@ -400,6 +418,116 @@ def transition_frontier(
         action,
         enqueued_child_node_ids=requested,
         next_child_cursor=next_cursor,
+    )
+
+
+def transition_frontier_with_authority(
+    validated_output: object,
+    *,
+    run_id: str,
+    current_unit: SemanticPlannedUnit,
+    reader: SemanticCatalogReader,
+    selector_version: str,
+    budget_exhausted: bool,
+    remaining_deferred_node_ids: tuple[str, ...] = (),
+    resume_cursor: str | None = None,
+) -> FrontierTransitionAuthority:
+    """Derive bounded receipt inputs without reconstructing sealed selector rows."""
+
+    from portfolio_maker.application.semantic_quality_v3 import (
+        ValidatedV3SemanticOutput,
+    )
+
+    _require_text(run_id, "transition run id")
+    _require_text(selector_version, "transition selector version")
+    if not isinstance(current_unit, SemanticPlannedUnit):
+        raise FrontierSelectionError("frontier transition unit is invalid")
+    if (
+        not isinstance(current_unit.phase, FrontierPhase)
+        or not isinstance(current_unit.unit_id, str)
+        or not current_unit.unit_id
+        or not isinstance(current_unit.target_node_ids, tuple)
+        or not 1 <= len(current_unit.target_node_ids) <= MAX_DEPENDENCIES
+        or len(set(current_unit.target_node_ids)) != len(current_unit.target_node_ids)
+        or any(
+            not isinstance(node_id, str) or not node_id
+            for node_id in current_unit.target_node_ids
+        )
+        or not isinstance(current_unit.dependency_unit_ids, tuple)
+        or len(current_unit.dependency_unit_ids) > MAX_DEPENDENCIES
+        or any(
+            not isinstance(unit_id, str) or not unit_id
+            for unit_id in current_unit.dependency_unit_ids
+        )
+        or len(set(current_unit.dependency_unit_ids))
+        != len(current_unit.dependency_unit_ids)
+        or type(current_unit.estimated_input_bytes) is not int
+        or current_unit.estimated_input_bytes < 0
+        or type(current_unit.priority) is not int
+        or not isinstance(current_unit.fairness_lane, str)
+        or not current_unit.fairness_lane
+    ):
+        raise FrontierSelectionError("frontier transition unit is invalid")
+    if not isinstance(reader, SemanticCatalogReader):
+        raise FrontierSelectionError("frontier transition catalog is invalid")
+    if (
+        not isinstance(validated_output, ValidatedV3SemanticOutput)
+        or validated_output.run_id != run_id
+        or validated_output.unit_id != current_unit.unit_id
+        or validated_output.target_node_ids != current_unit.target_node_ids
+    ):
+        raise FrontierSelectionError("frontier transition output authority is invalid")
+    transition = transition_frontier(
+        validated_output,
+        budget_exhausted=budget_exhausted,
+        remaining_deferred_node_ids=remaining_deferred_node_ids,
+        resume_cursor=resume_cursor,
+    )
+    opened: list[FrontierOpenedUnit] = []
+    if transition.action is FrontierAction.EXPAND_CHILDREN:
+        if len(current_unit.dependency_unit_ids) + 1 > MAX_DEPENDENCIES:
+            raise FrontierSelectionError("frontier transition dependency limit is invalid")
+        dependencies = (*current_unit.dependency_unit_ids, current_unit.unit_id)
+        for position, child_node_id in enumerate(transition.enqueued_child_node_ids):
+            child = reader.node(child_node_id)
+            if (
+                child is None
+                or child.parent_node_id not in current_unit.target_node_ids
+            ):
+                raise FrontierSelectionError("frontier transition child authority is invalid")
+            opened.append(
+                FrontierOpenedUnit(
+                    SemanticPlannedUnit(
+                        _stable_id(
+                            "opened-unit",
+                            run_id,
+                            current_unit.unit_id,
+                            current_unit.phase.value,
+                            child_node_id,
+                            canonical_json_text(dependencies),
+                            transition.next_child_cursor or "null",
+                        ),
+                        current_unit.phase,
+                        (child_node_id,),
+                        dependencies,
+                        current_unit.estimated_input_bytes,
+                        current_unit.priority + position + 1,
+                        current_unit.fairness_lane,
+                    ),
+                    transition.next_child_cursor,
+                )
+            )
+    pending = reader.runtime_deferred_projection(
+        selector_version, transition.deferred_node_ids
+    )
+    return FrontierTransitionAuthority(
+        transition=transition,
+        opened_units=tuple(opened),
+        pending_runtime_deferred=pending,
+        requires_expansion_queue_check=(
+            current_unit.phase is FrontierPhase.EXPANSION
+            and not transition.paused_budget
+        ),
     )
 
 

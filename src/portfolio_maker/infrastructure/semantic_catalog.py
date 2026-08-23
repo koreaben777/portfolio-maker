@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sqlite3
 from dataclasses import dataclass
 from functools import wraps
@@ -24,6 +25,16 @@ from portfolio_maker.infrastructure.managed_files import (
 
 _ROOT_DOMAIN = b"portfolio-maker-semantic-catalog-v1\0"
 _ADAPTIVE_FRONTIER_SELECTOR_VERSION = "adaptive-frontier-v1"
+_UNSAFE_RUNTIME_SOURCE_ID = re.compile(
+    r"(?i)(?:file|https?)://|(?:^|[^A-Za-z0-9_.-])/(?:[^\s/]+(?:/[^\s/]+)*)|[A-Za-z]:[\\/]|\\\\[^\s\\]+\\[^\s\\]+"
+)
+_ADAPTIVE_DEFERRED_REASONS = frozenset(
+    {
+        "single_signal_or_no_frontier_authority",
+        "ancestor_closure_limit",
+        "frontier_budget_or_unit_limit",
+    }
+)
 _AUTHORITATIVE_TABLES = (
     ("nodes", ("node_id",)),
     ("children", ("parent_node_id", "child_node_id")),
@@ -203,6 +214,15 @@ class DeferredSummary:
     count: int
     root: str
     cursor_root: str
+
+
+@dataclass
+class RuntimeDeferredProjectionObserver:
+    """Bounded-query evidence for one Task 10 transition projection."""
+
+    query_count: int = 0
+    max_query_rows: int = 0
+    max_python_rows: int = 0
 
 
 @dataclass
@@ -1364,6 +1384,177 @@ class SemanticCatalogReader:
                 yield row
             cursor = self.frontier_deferred_cursor(page[-1])
 
+    def runtime_deferred_projection(
+        self,
+        selector_version: str,
+        node_ids: tuple[str, ...],
+        *,
+        observer: RuntimeDeferredProjectionObserver | None = None,
+    ) -> tuple[SemanticDeferredAuditRow, ...]:
+        """Return exact sealed deferred authority in the caller's bounded order."""
+
+        _require_text(selector_version, "runtime deferred selector version")
+        if (
+            not isinstance(node_ids, tuple)
+            or len(node_ids) > 64
+            or any(not isinstance(node_id, str) or not node_id for node_id in node_ids)
+            or len(set(node_ids)) != len(node_ids)
+        ):
+            raise CatalogError("runtime deferred authority is invalid")
+        if observer is not None and not isinstance(
+            observer, RuntimeDeferredProjectionObserver
+        ):
+            raise CatalogError("runtime deferred observer is invalid")
+        if selector_version != _ADAPTIVE_FRONTIER_SELECTOR_VERSION:
+            raise CatalogError("runtime deferred authority is invalid")
+        if not node_ids:
+            row = self.connection.execute(
+                """
+                SELECT selector_digest
+                FROM frontier_selector_authorities
+                WHERE selector_version = ?
+                """,
+                (selector_version,),
+            ).fetchone()
+            if observer is not None:
+                observer.query_count += 1
+                observer.max_query_rows = max(observer.max_query_rows, 1)
+                observer.max_python_rows = max(observer.max_python_rows, 1)
+            try:
+                if row is None:
+                    raise ValueError("selector authority is missing")
+                _validate_digest(row["selector_digest"], "selector authority digest")
+            except (CatalogError, TypeError, ValueError) as error:
+                raise CatalogError("runtime deferred authority is invalid") from error
+            return ()
+        requested = ", ".join("(?, ?)" for _ in node_ids)
+        parameters: list[object] = []
+        for position, node_id in enumerate(node_ids):
+            parameters.extend((position, node_id))
+        parameters.append(selector_version)
+        rows = self.connection.execute(
+            f"""
+            WITH requested(position, node_id) AS (VALUES {requested})
+            SELECT requested.position AS requested_position,
+                   requested.node_id AS requested_node_id,
+                   result.selected AS result_selected,
+                   result.node_id AS result_node_id,
+                   result.reason AS result_reason,
+                   result.node_digest AS result_node_digest,
+                   result.cursor_json AS result_cursor_json,
+                   result.cursor_order AS result_cursor_order,
+                   result.source_id AS result_source_id,
+                   result.coverage_stratum AS result_coverage_stratum,
+                   result.relevance_rank AS result_relevance_rank,
+                   result.selector_version AS result_selector_version,
+                   result.selector_feature_digest AS result_selector_feature_digest,
+                   deferred.node_id AS deferred_node_id,
+                   deferred.reason AS deferred_reason,
+                   deferred.node_digest AS deferred_node_digest,
+                   deferred.cursor_json AS deferred_cursor_json,
+                   deferred.cursor_order AS deferred_cursor_order,
+                   deferred.source_id AS deferred_source_id,
+                   deferred.coverage_stratum AS deferred_coverage_stratum,
+                   deferred.relevance_rank AS deferred_relevance_rank,
+                   deferred.selector_version AS deferred_selector_version,
+                   deferred.selector_feature_digest AS deferred_selector_feature_digest,
+                   node.source_id AS node_source_id,
+                   node.parent_node_id AS node_parent_node_id,
+                   node.relative_hierarchy AS node_relative_hierarchy,
+                   baseline.coverage AS baseline_coverage,
+                   baseline.roles_json AS baseline_roles_json,
+                   baseline.inspected_bytes AS baseline_inspected_bytes,
+                   baseline.full_content_sha256 AS baseline_full_content_sha256,
+                   feature.feature_digest AS feature_digest,
+                   ordering.fair_round AS ordering_fair_round,
+                   ordering.top_level_lane AS ordering_top_level_lane,
+                   ordering.project_like AS ordering_project_like,
+                   ordering.ambiguous AS ordering_ambiguous,
+                   ordering.independent_child AS ordering_independent_child,
+                   ordering.evidence_linked AS ordering_evidence_linked,
+                   ordering.uncertainty AS ordering_uncertainty,
+                   authority.selector_digest AS selector_digest
+            FROM requested
+            LEFT JOIN frontier_selector_results AS result
+              ON result.node_id = requested.node_id
+             AND result.selector_version = ?
+            LEFT JOIN frontier_deferred AS deferred
+              ON deferred.node_id = result.node_id
+             AND deferred.selector_version = result.selector_version
+            LEFT JOIN nodes AS node ON node.node_id = result.node_id
+            LEFT JOIN local_baselines AS baseline ON baseline.node_id = result.node_id
+            LEFT JOIN frontier_features AS feature ON feature.node_id = result.node_id
+            LEFT JOIN frontier_order AS ordering ON ordering.node_id = result.node_id
+            LEFT JOIN frontier_selector_authorities AS authority
+              ON authority.selector_version = result.selector_version
+            ORDER BY requested.position
+            """,
+            tuple(parameters),
+        ).fetchall()
+        if observer is not None:
+            observer.query_count += 1
+            observer.max_query_rows = max(observer.max_query_rows, len(rows))
+            observer.max_python_rows = max(observer.max_python_rows, len(rows))
+        if len(rows) != len(node_ids):
+            raise CatalogError("runtime deferred authority is invalid")
+        projected: list[SemanticDeferredAuditRow] = []
+        deferred_fields = (
+            ("node_id", "result_node_id", "deferred_node_id"),
+            ("reason", "result_reason", "deferred_reason"),
+            ("node_digest", "result_node_digest", "deferred_node_digest"),
+            ("cursor_json", "result_cursor_json", "deferred_cursor_json"),
+            ("cursor_order", "result_cursor_order", "deferred_cursor_order"),
+            ("source_id", "result_source_id", "deferred_source_id"),
+            (
+                "coverage_stratum",
+                "result_coverage_stratum",
+                "deferred_coverage_stratum",
+            ),
+            ("relevance_rank", "result_relevance_rank", "deferred_relevance_rank"),
+            ("selector_version", "result_selector_version", "deferred_selector_version"),
+            (
+                "selector_feature_digest",
+                "result_selector_feature_digest",
+                "deferred_selector_feature_digest",
+            ),
+        )
+        for position, row in enumerate(rows):
+            if (
+                row["requested_position"] != position
+                or row["requested_node_id"] != node_ids[position]
+                or row["result_selected"] != 0
+                or row["selector_digest"] is None
+                or row["node_source_id"] != row["result_source_id"]
+                or row["baseline_coverage"] != row["result_coverage_stratum"]
+                or row["feature_digest"] != row["result_selector_feature_digest"]
+                or any(row[left] != row[right] for _field, left, right in deferred_fields)
+            ):
+                raise CatalogError("runtime deferred authority is invalid")
+            try:
+                result = FrontierSelectorResult(
+                    False,
+                    *tuple(row[field] for _name, field, _deferred in deferred_fields),
+                )
+                _validate_selector_row(result)
+                _validate_runtime_deferred_projection_row(row, result)
+            except (TypeError, ValueError) as error:
+                raise CatalogError("runtime deferred authority is invalid") from error
+            projected.append(
+                SemanticDeferredAuditRow(
+                    result.node_id,
+                    result.reason,
+                    result.node_digest,
+                    result.cursor_json,
+                    result.cursor_order,
+                    result.source_id,
+                    result.coverage_stratum,
+                    result.relevance_rank,
+                    result.selector_version,
+                    result.selector_feature_digest,
+                )
+            )
+        return tuple(projected)
+
     def frontier_deferred_page(
         self,
         selector_version: str,
@@ -1493,6 +1684,71 @@ def _validate_adaptive_selector_bindings(connection: sqlite3.Connection) -> None
         )
         if row[3] != relevance_rank:
             raise CatalogError("adaptive selector relevance binding is invalid")
+
+
+def _validate_runtime_deferred_projection_row(
+    row: sqlite3.Row, result: FrontierSelectorResult
+) -> None:
+    """Validate one bounded reader row without rescanning the sealed catalog."""
+
+    try:
+        _validate_digest(row["selector_digest"], "selector authority digest")
+        if _UNSAFE_RUNTIME_SOURCE_ID.search(result.source_id):
+            raise ValueError("unsafe source identifier")
+        if result.reason not in _ADAPTIVE_DEFERRED_REASONS:
+            raise ValueError("unexpected selector reason")
+        roles = _text_tuple(row["baseline_roles_json"], "baseline roles")
+        inspected_bytes = int(row["baseline_inspected_bytes"])
+        if inspected_bytes < 0:
+            raise ValueError("negative inspected bytes")
+        bool_fields = (
+            "ordering_project_like",
+            "ordering_ambiguous",
+            "ordering_independent_child",
+            "ordering_evidence_linked",
+            "ordering_uncertainty",
+        )
+        if any(row[field] not in (0, 1) for field in bool_fields):
+            raise ValueError("invalid ordering flag")
+        if result.selector_version != _ADAPTIVE_FRONTIER_SELECTOR_VERSION:
+            raise ValueError("unexpected selector version")
+        expected_cursor = {
+            "depth_band": _catalog_depth_band(str(row["node_relative_hierarchy"])),
+            "fair_round": row["ordering_fair_round"],
+            "lane": row["ordering_top_level_lane"],
+            "node_id": result.node_id,
+            "order": result.cursor_order,
+            "role_band": _catalog_role_band(roles),
+            "selector_feature_digest": result.selector_feature_digest,
+            "size_band": _catalog_size_band(inspected_bytes),
+        }
+        if _canonical_json_from_text(result.cursor_json) != expected_cursor:
+            raise ValueError("cursor binding mismatch")
+        expected_digest = hashlib.sha256(
+            canonical_json_text(
+                {
+                    "coverage": result.coverage_stratum,
+                    "feature_digest": result.selector_feature_digest,
+                    "full_content_sha256": row["baseline_full_content_sha256"],
+                    "node_id": result.node_id,
+                    "parent_node_id": row["node_parent_node_id"],
+                    "source_id": result.source_id,
+                }
+            ).encode("utf-8")
+        ).hexdigest()
+        if result.node_digest != expected_digest:
+            raise ValueError("node digest mismatch")
+        expected_rank = (
+            (int(not bool(row["ordering_project_like"])) << 4)
+            | (int(not bool(row["ordering_ambiguous"])) << 3)
+            | (int(not bool(row["ordering_independent_child"])) << 2)
+            | (int(not bool(row["ordering_evidence_linked"])) << 1)
+            | int(not bool(row["ordering_uncertainty"]))
+        )
+        if result.relevance_rank != expected_rank:
+            raise ValueError("relevance binding mismatch")
+    except (CatalogError, TypeError, ValueError) as error:
+        raise CatalogError("runtime deferred authority is invalid") from error
 
 
 _CATALOG_ROLE_ORDER = (

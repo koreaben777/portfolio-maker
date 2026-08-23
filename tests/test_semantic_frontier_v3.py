@@ -17,17 +17,23 @@ from portfolio_maker.application.semantic_frontier_v3 import (
     build_frontier_plan,
     freeze_audit_sample,
     representative_nodes,
+    transition_frontier,
+    transition_frontier_with_authority,
 )
+from portfolio_maker.application.semantic_quality_v3 import ValidatedV3SemanticOutput
 from portfolio_maker.domain.semantic_frontier import (
     BaselineCoverage,
+    FrontierAction,
     MAX_UNIT_BYTES,
     FrontierPhase,
+    SemanticPlannedUnit,
     SemanticDeferredAuditRow,
     SemanticRuntimeDeferredRow,
 )
 from portfolio_maker.infrastructure.semantic_catalog import (
     BaselineRecord,
     CatalogError,
+    CatalogSeal,
     DeferredSummary,
     FrontierFeatureRecord,
     FrontierPlanningRow,
@@ -35,9 +41,12 @@ from portfolio_maker.infrastructure.semantic_catalog import (
     NodeRecord,
     PlanningNodeProjection,
     PlanningQueryObserver,
+    RuntimeDeferredProjectionObserver,
     SemanticCatalogPlanningSession,
     SemanticCatalogReader,
     SemanticCatalogWriter,
+    _file_sha256,
+    _logical_root,
     canonical_json_text,
 )
 
@@ -107,6 +116,554 @@ def _build_three_lane_plan(path: Path):
         )
         seal = writer.seal()
     return plan, seal
+
+
+def _build_deferred_catalog(path: Path, count: int = 3):
+    with SemanticCatalogWriter(path) as writer:
+        for index in range(count):
+            node_id = f"deferred-{index:03}"
+            _add_feature(
+                writer,
+                node_id,
+                source_id=f"source-{index % 2}",
+                lane=f"lane-{index % 2}",
+                project_like=False,
+            )
+        plan = build_frontier_plan(
+            writer.planning_session(FRONTIER_SELECTOR_VERSION),
+            revision_id="revision-deferred",
+            policy_hash="a" * 64,
+        )
+        seal = writer.seal()
+    return plan, seal
+
+
+def _rehashed_catalog_seal(path: Path) -> CatalogSeal:
+    with sqlite3.connect(path) as connection:
+        return CatalogSeal(
+            byte_length=path.stat().st_size,
+            file_sha256=_file_sha256(path),
+            logical_root=_logical_root(connection),
+            node_count=int(connection.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]),
+        )
+
+
+def _validated_output(
+    action: FrontierAction,
+    targets: tuple[str, ...],
+    requested_children: tuple[str, ...] = (),
+    cursor: str | None = None,
+    *,
+    run_id: str = "run-1",
+    unit_id: str = "unit-1",
+) -> ValidatedV3SemanticOutput:
+    return ValidatedV3SemanticOutput(
+        "revision-1",
+        run_id,
+        unit_id,
+        "a" * 64,
+        action,
+        targets,
+        ("signal-1",),
+        ("b" * 64,),
+        "grounded synthetic semantic rationale",
+        (),
+        0.75,
+        requested_children,
+        cursor,
+    )
+
+
+def test_runtime_deferred_projection_is_exact_bounded_and_in_caller_order(
+    tmp_path: Path,
+) -> None:
+    """Catches lifecycle reconstruction of selector/source/coverage authority."""
+    path = tmp_path / "deferred.sqlite"
+    _, seal = _build_deferred_catalog(path, count=64)
+    requested = tuple(f"deferred-{index:03}" for index in range(63, -1, -1))
+
+    with SemanticCatalogReader(path, seal) as reader:
+        expected_by_id = {
+            row.node_id: row
+            for row in reader.frontier_deferred_page(
+                FRONTIER_SELECTOR_VERSION, None, 64
+            )
+        }
+        observer = RuntimeDeferredProjectionObserver()
+        projected = reader.runtime_deferred_projection(
+            FRONTIER_SELECTOR_VERSION,
+            requested,
+            observer=observer,
+        )
+
+    assert projected == tuple(expected_by_id[node_id] for node_id in requested)
+    assert observer.query_count == 1
+    assert observer.max_python_rows == 64
+    assert observer.max_query_rows == 64
+    assert all("/" not in row.source_id for row in projected)
+
+
+def test_runtime_deferred_projection_rejects_missing_duplicate_and_selected_nodes(
+    tmp_path: Path,
+) -> None:
+    """Catches partial or selected rows entering runtime-deferred authority."""
+    path = tmp_path / "projection-rejections.sqlite"
+    with SemanticCatalogWriter(path) as writer:
+        _add_feature(
+            writer,
+            "selected",
+            source_id="source-a",
+            lane="lane-a",
+            project_like=True,
+        )
+        _add_feature(
+            writer,
+            "deferred",
+            source_id="source-b",
+            lane="lane-b",
+            project_like=False,
+        )
+        build_frontier_plan(
+            writer.planning_session(FRONTIER_SELECTOR_VERSION),
+            revision_id="revision-projection",
+            policy_hash="a" * 64,
+        )
+        seal = writer.seal()
+
+    with SemanticCatalogReader(path, seal) as reader:
+        for requested in (
+            ("missing",),
+            ("deferred", "deferred"),
+            ("selected",),
+        ):
+            with pytest.raises(CatalogError, match="runtime deferred authority"):
+                reader.runtime_deferred_projection(
+                    FRONTIER_SELECTOR_VERSION, requested
+                )
+        with pytest.raises(CatalogError, match="runtime deferred authority"):
+            reader.runtime_deferred_projection("wrong-selector", ("deferred",))
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "cursor",
+        "node_digest",
+        "feature_digest",
+        "source_locator",
+        "source_unc_locator",
+        "reason",
+    ),
+)
+def test_runtime_deferred_projection_rejects_rehashed_malformed_or_drifted_rows(
+    tmp_path: Path, mutation: str
+) -> None:
+    """Catches a coherent replacement catalog whose selector authority disagrees."""
+    path = tmp_path / f"projection-{mutation}.sqlite"
+    _build_deferred_catalog(path, count=1)
+    with sqlite3.connect(path) as connection:
+        if mutation == "cursor":
+            connection.execute(
+                "UPDATE frontier_selector_results SET cursor_json = '{}'"
+            )
+            connection.execute("UPDATE frontier_deferred SET cursor_json = '{}'")
+        elif mutation == "node_digest":
+            connection.execute(
+                "UPDATE frontier_selector_results SET node_digest = ?",
+                (_digest("replaced-node"),),
+            )
+            connection.execute(
+                "UPDATE frontier_deferred SET node_digest = ?",
+                (_digest("replaced-node"),),
+            )
+        elif mutation == "feature_digest":
+            connection.execute(
+                "UPDATE frontier_features SET feature_digest = ?",
+                (_digest("replaced-feature"),),
+            )
+        elif mutation in {"source_locator", "source_unc_locator"}:
+            unsafe = (
+                "file:///private/synthetic"
+                if mutation == "source_locator"
+                else "\\\\server\\private"
+            )
+            row = connection.execute(
+                """
+                SELECT node.node_id, node.parent_node_id, baseline.coverage,
+                       baseline.full_content_sha256, feature.feature_digest
+                FROM nodes AS node
+                JOIN local_baselines AS baseline ON baseline.node_id = node.node_id
+                JOIN frontier_features AS feature ON feature.node_id = node.node_id
+                """
+            ).fetchone()
+            assert row is not None
+            replaced_digest = hashlib.sha256(
+                canonical_json_text(
+                    {
+                        "coverage": row[2],
+                        "feature_digest": row[4],
+                        "full_content_sha256": row[3],
+                        "node_id": row[0],
+                        "parent_node_id": row[1],
+                        "source_id": unsafe,
+                    }
+                ).encode("utf-8")
+            ).hexdigest()
+            connection.execute("UPDATE nodes SET source_id = ?", (unsafe,))
+            connection.execute(
+                "UPDATE frontier_selector_results SET source_id = ?, node_digest = ?",
+                (unsafe, replaced_digest),
+            )
+            connection.execute(
+                "UPDATE frontier_deferred SET source_id = ?, node_digest = ?",
+                (unsafe, replaced_digest),
+            )
+        else:
+            connection.execute(
+                "UPDATE frontier_selector_results SET reason = 'unexpected'"
+            )
+            connection.execute("UPDATE frontier_deferred SET reason = 'unexpected'")
+        connection.commit()
+    seal = _rehashed_catalog_seal(path)
+
+    with SemanticCatalogReader(path, seal) as reader:
+        with pytest.raises(CatalogError, match="runtime deferred authority"):
+            reader.runtime_deferred_projection(
+                FRONTIER_SELECTOR_VERSION, ("deferred-000",)
+            )
+
+
+def test_typed_transition_projects_opened_units_and_pending_deferred_rows(
+    tmp_path: Path,
+) -> None:
+    """Catches caller-provided child/deferred metadata bypassing sealed authority."""
+    path = tmp_path / "typed-transition.sqlite"
+    with SemanticCatalogWriter(path) as writer:
+        _add_feature(
+            writer,
+            "parent",
+            source_id="source-a",
+            lane="lane-a",
+            project_like=True,
+        )
+        _add_feature(
+            writer,
+            "child",
+            parent_node_id="parent",
+            source_id="source-a",
+            lane="lane-a",
+            project_like=False,
+        )
+        plan = build_frontier_plan(
+            writer.planning_session(FRONTIER_SELECTOR_VERSION),
+            revision_id="revision-transition",
+            policy_hash="a" * 64,
+        )
+        seal = writer.seal()
+
+    parent_unit = next(
+        unit for unit in plan.units if unit.target_node_ids == ("parent",)
+    )
+    expansion_unit = SemanticPlannedUnit(
+        parent_unit.unit_id,
+        FrontierPhase.EXPANSION,
+        parent_unit.target_node_ids,
+        parent_unit.dependency_unit_ids,
+        parent_unit.estimated_input_bytes,
+        parent_unit.priority,
+        parent_unit.fairness_lane,
+    )
+    with SemanticCatalogReader(path, seal) as reader:
+        expanded = transition_frontier_with_authority(
+            _validated_output(
+                FrontierAction.EXPAND_CHILDREN,
+                ("parent",),
+                ("child",),
+                run_id=plan.run_id,
+                unit_id=expansion_unit.unit_id,
+            ),
+            run_id=plan.run_id,
+            current_unit=expansion_unit,
+            reader=reader,
+            selector_version=FRONTIER_SELECTOR_VERSION,
+            budget_exhausted=False,
+        )
+        repeated_expanded = transition_frontier_with_authority(
+            _validated_output(
+                FrontierAction.EXPAND_CHILDREN,
+                ("parent",),
+                ("child",),
+                run_id=plan.run_id,
+                unit_id=expansion_unit.unit_id,
+            ),
+            run_id=plan.run_id,
+            current_unit=expansion_unit,
+            reader=reader,
+            selector_version=FRONTIER_SELECTOR_VERSION,
+            budget_exhausted=False,
+        )
+        deferred = transition_frontier_with_authority(
+            _validated_output(
+                FrontierAction.DEFER_ON_DEMAND,
+                ("child",),
+                run_id=plan.run_id,
+                unit_id="runtime-unit",
+            ),
+            run_id=plan.run_id,
+            current_unit=SemanticPlannedUnit(
+                "runtime-unit",
+                FrontierPhase.EXPANSION,
+                ("child",),
+                (),
+                expansion_unit.estimated_input_bytes,
+                expansion_unit.priority,
+                expansion_unit.fairness_lane,
+            ),
+            reader=reader,
+            selector_version=FRONTIER_SELECTOR_VERSION,
+            budget_exhausted=False,
+        )
+        budget = transition_frontier_with_authority(
+            _validated_output(
+                FrontierAction.ACCEPT_BOUNDARY,
+                ("parent",),
+                run_id=plan.run_id,
+                unit_id=expansion_unit.unit_id,
+            ),
+            run_id=plan.run_id,
+            current_unit=expansion_unit,
+            reader=reader,
+            selector_version=FRONTIER_SELECTOR_VERSION,
+            budget_exhausted=True,
+            remaining_deferred_node_ids=("child",),
+            resume_cursor='{"after":"child"}',
+        )
+
+    assert len(expanded.opened_units) == 1
+    assert expanded.opened_units[0].unit.target_node_ids == ("child",)
+    assert expanded.opened_units[0].unit.dependency_unit_ids == (parent_unit.unit_id,)
+    assert expanded.requires_expansion_queue_check is True
+    assert repeated_expanded == expanded
+    assert [row.node_id for row in deferred.pending_runtime_deferred] == ["child"]
+    assert [row.node_id for row in budget.pending_runtime_deferred] == ["child"]
+    assert budget.transition.paused_budget is True
+
+
+def test_typed_transition_opens_at_most_64_deterministic_child_units(
+    tmp_path: Path,
+) -> None:
+    """Catches an expansion helper that bypasses the bounded quality contract."""
+    path = tmp_path / "bounded-opened-units.sqlite"
+    child_ids = tuple(f"child-{index:03}" for index in range(64))
+    with SemanticCatalogWriter(path) as writer:
+        _add_feature(
+            writer,
+            "parent",
+            source_id="source-a",
+            lane="lane-a",
+            project_like=True,
+        )
+        for child_id in child_ids:
+            _add_feature(
+                writer,
+                child_id,
+                parent_node_id="parent",
+                source_id="source-a",
+                lane="lane-a",
+                project_like=False,
+            )
+        plan = build_frontier_plan(
+            writer.planning_session(FRONTIER_SELECTOR_VERSION),
+            revision_id="revision-bounded-open",
+            policy_hash="a" * 64,
+        )
+        seal = writer.seal()
+    parent_unit = next(
+        unit for unit in plan.units if unit.target_node_ids == ("parent",)
+    )
+    with SemanticCatalogReader(path, seal) as reader:
+        first = transition_frontier_with_authority(
+            _validated_output(
+                FrontierAction.EXPAND_CHILDREN,
+                ("parent",),
+                child_ids,
+                run_id=plan.run_id,
+                unit_id=parent_unit.unit_id,
+            ),
+            run_id=plan.run_id,
+            current_unit=parent_unit,
+            reader=reader,
+            selector_version=FRONTIER_SELECTOR_VERSION,
+            budget_exhausted=False,
+        )
+        second = transition_frontier_with_authority(
+            _validated_output(
+                FrontierAction.EXPAND_CHILDREN,
+                ("parent",),
+                child_ids,
+                run_id=plan.run_id,
+                unit_id=parent_unit.unit_id,
+            ),
+            run_id=plan.run_id,
+            current_unit=parent_unit,
+            reader=reader,
+            selector_version=FRONTIER_SELECTOR_VERSION,
+            budget_exhausted=False,
+        )
+
+    assert len(first.opened_units) == 64
+    assert first == second
+    assert [item.unit.target_node_ids[0] for item in first.opened_units] == list(child_ids)
+
+
+def test_existing_pure_transition_contract_is_unchanged() -> None:
+    """Catches a Task 10 prerequisite changing accepted Task 6 transition behavior."""
+    accepted = transition_frontier(
+        _validated_output(FrontierAction.ACCEPT_BOUNDARY, ("target",)),
+        budget_exhausted=False,
+    )
+    deferred = transition_frontier(
+        _validated_output(FrontierAction.DEFER_ON_DEMAND, ("target",)),
+        budget_exhausted=True,
+        remaining_deferred_node_ids=("remaining",),
+        resume_cursor='{"after":"remaining"}',
+    )
+
+    assert accepted.accepted_node_ids == ("target",)
+    assert accepted.deferred_node_ids == ()
+    assert deferred.deferred_node_ids == ("target", "remaining")
+    assert deferred.paused_budget is True
+
+
+def test_typed_transition_rejects_output_from_another_run_or_unit(
+    tmp_path: Path,
+) -> None:
+    """Catches a validated result being replayed against another run authority."""
+    path = tmp_path / "transition-output-binding.sqlite"
+    with SemanticCatalogWriter(path) as writer:
+        _add_feature(
+            writer,
+            "target",
+            source_id="source-a",
+            lane="lane-a",
+            project_like=True,
+        )
+        plan = build_frontier_plan(
+            writer.planning_session(FRONTIER_SELECTOR_VERSION),
+            revision_id="revision-output-binding",
+            policy_hash="a" * 64,
+        )
+        seal = writer.seal()
+    unit = next(unit for unit in plan.units if unit.target_node_ids == ("target",))
+
+    with SemanticCatalogReader(path, seal) as reader:
+        for output in (
+            _validated_output(
+                FrontierAction.ACCEPT_BOUNDARY,
+                ("target",),
+                run_id="other-run",
+                unit_id=unit.unit_id,
+            ),
+            _validated_output(
+                FrontierAction.ACCEPT_BOUNDARY,
+                ("target",),
+                run_id=plan.run_id,
+                unit_id="other-unit",
+            ),
+            _validated_output(
+                FrontierAction.ACCEPT_BOUNDARY,
+                ("other-target",),
+                run_id=plan.run_id,
+                unit_id=unit.unit_id,
+            ),
+        ):
+            with pytest.raises(FrontierSelectionError, match="output authority"):
+                transition_frontier_with_authority(
+                    output,
+                    run_id=plan.run_id,
+                    current_unit=unit,
+                    reader=reader,
+                    selector_version=FRONTIER_SELECTOR_VERSION,
+                    budget_exhausted=False,
+                )
+        with pytest.raises(CatalogError, match="runtime deferred authority"):
+            transition_frontier_with_authority(
+                _validated_output(
+                    FrontierAction.ACCEPT_BOUNDARY,
+                    ("target",),
+                    run_id=plan.run_id,
+                    unit_id=unit.unit_id,
+                ),
+                run_id=plan.run_id,
+                current_unit=unit,
+                reader=reader,
+                selector_version="wrong-selector",
+                budget_exhausted=False,
+            )
+
+
+def test_typed_transition_keeps_64_dependencies_for_terminal_actions(
+    tmp_path: Path,
+) -> None:
+    """Catches an inclusive dependency limit rejecting a valid terminal unit."""
+    path = tmp_path / "transition-dependency-limit.sqlite"
+    with SemanticCatalogWriter(path) as writer:
+        _add_feature(
+            writer,
+            "target",
+            source_id="source-a",
+            lane="lane-a",
+            project_like=True,
+        )
+        plan = build_frontier_plan(
+            writer.planning_session(FRONTIER_SELECTOR_VERSION),
+            revision_id="revision-dependency-limit",
+            policy_hash="a" * 64,
+        )
+        seal = writer.seal()
+    current = SemanticPlannedUnit(
+        "terminal-unit",
+        FrontierPhase.EXPANSION,
+        ("target",),
+        tuple(f"dependency-{index:03}" for index in range(64)),
+        1024,
+        1,
+        "lane-a",
+    )
+    terminal = _validated_output(
+        FrontierAction.ACCEPT_BOUNDARY,
+        ("target",),
+        run_id=plan.run_id,
+        unit_id=current.unit_id,
+    )
+    expansion = _validated_output(
+        FrontierAction.EXPAND_CHILDREN,
+        ("target",),
+        ("target",),
+        run_id=plan.run_id,
+        unit_id=current.unit_id,
+    )
+
+    with SemanticCatalogReader(path, seal) as reader:
+        authority = transition_frontier_with_authority(
+            terminal,
+            run_id=plan.run_id,
+            current_unit=current,
+            reader=reader,
+            selector_version=FRONTIER_SELECTOR_VERSION,
+            budget_exhausted=False,
+        )
+        with pytest.raises(FrontierSelectionError, match="dependency"):
+            transition_frontier_with_authority(
+                expansion,
+                run_id=plan.run_id,
+                current_unit=current,
+                reader=reader,
+                selector_version=FRONTIER_SELECTOR_VERSION,
+                budget_exhausted=False,
+            )
+
+    assert authority.transition.accepted_node_ids == ("target",)
 
 
 def test_frontier_plan_is_deterministic_and_breadth_before_depth_fair(
