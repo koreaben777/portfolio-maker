@@ -177,24 +177,25 @@ def next_semantic_work_v3(
         if not isinstance(run_id, str) or _RUN_ID.fullmatch(run_id) is None:
             raise SemanticLifecycleV3Error("semantic execution request is invalid")
         authority = repository.load_semantic_v3_execution_authority(run_id)
+        input_path = paths.semantic_v3_exchange_input_path(
+            authority.revision_id, authority.run_id
+        )
+        output_path = paths.semantic_v3_exchange_output_path(
+            authority.revision_id, authority.run_id
+        )
+        exchange = SemanticExchange(input_path, output_path)
         reservation = repository.reserve_next_semantic_v3_unit(
             run_id,
             uuid4().hex,
             expected_authority_root=authority.proposal.authority_root,
         )
         if reservation is None:
+            if input_path.exists() or output_path.exists():
+                exchange.discard_slots()
             raise SemanticLifecycleV3Error("semantic execution is paused_budget")
         # The singleton DB claim precedes all managed/source reads. A losing
         # concurrent run therefore never opens authority, source, or exchange files.
         _validate_execution_authority(paths, authority)
-        exchange = SemanticExchange(
-            paths.semantic_v3_exchange_input_path(
-                reservation.revision_id, reservation.run_id
-            ),
-            paths.semantic_v3_exchange_output_path(
-                reservation.revision_id, reservation.run_id
-            ),
-        )
         if reservation.issued:
             binding = exchange.replay_input(
                 reservation.run_id,
@@ -226,9 +227,33 @@ def next_semantic_work_v3(
             payload
         ):
             raise SemanticLifecycleV3Error("semantic execution authority is stale")
-        binding = exchange.publish_input(
-            reservation.run_id, reservation.lease_nonce, payload
+        # Check expiry immediately before the first managed write. This check
+        # intentionally does not charge time, so an oversized unpublished
+        # canonical payload leaves no budget mutation behind.
+        may_publish = repository.revalidate_semantic_v3_materialization_for_publication(
+            reservation.run_id,
+            reservation.lease_nonce,
+            expected_authority_root=authority.proposal.authority_root,
         )
+        if not may_publish:
+            if input_path.exists() or output_path.exists():
+                exchange.discard_slots()
+            raise SemanticLifecycleV3Error("semantic execution is paused_budget")
+        try:
+            binding = exchange.publish_input(
+                reservation.run_id, reservation.lease_nonce, payload
+            )
+        except SemanticExchangeError as error:
+            if "byte budget" not in str(error):
+                raise
+            repository.abandon_semantic_v3_materialization_for_budget(
+                reservation.run_id,
+                reservation.lease_nonce,
+                expected_authority_root=authority.proposal.authority_root,
+            )
+            if input_path.exists() or output_path.exists():
+                exchange.discard_slots()
+            raise SemanticLifecycleV3Error("semantic execution is paused_budget") from error
         issued = repository.issue_semantic_v3_input(
             reservation.run_id,
             reservation.lease_nonce,

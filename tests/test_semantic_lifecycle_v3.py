@@ -301,6 +301,519 @@ def test_active_lease_replays_the_same_bounded_v3_input(workspace: Path) -> None
     )
 
 
+def test_issued_lease_deadline_pauses_and_removes_exchange_slots(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [100.0]
+    monkeypatch.setattr(
+        SQLiteRepository,
+        "_semantic_v3_monotonic_seconds",
+        staticmethod(lambda: clock[0]),
+        raising=False,
+    )
+    repository, prepared = _prepared_frontier_run(workspace)
+    approve_semantic_execution(
+        ApproveSemanticExecutionRequest(
+            workspace, prepared.revision_id, prepared.proposal_sha256
+        )
+    )
+
+    first = next_semantic_work_v3(NextSemanticWorkV3Request(workspace, prepared.run_id))
+    paths = WorkspacePaths.from_root(workspace)
+    assert first.input_path.exists()
+    assert paths.semantic_v3_exchange_output_path(
+        prepared.revision_id, prepared.run_id
+    ).exists()
+
+    clock[0] += 300.0
+    with pytest.raises(SemanticLifecycleV3Error, match="paused_budget"):
+        next_semantic_work_v3(NextSemanticWorkV3Request(workspace, prepared.run_id))
+
+    assert repository.run_state(prepared.run_id) is SemanticRunState.PAUSED_BUDGET
+    assert repository.execution_lock() is None
+    assert not first.input_path.exists()
+    assert not paths.semantic_v3_exchange_output_path(
+        prepared.revision_id, prepared.run_id
+    ).exists()
+    with repository._read_connection() as connection:
+        assert connection.execute(
+            "SELECT state FROM semantic_v3_leases WHERE run_id = ?", (prepared.run_id,)
+        ).fetchone()[0] == "expired"
+        assert connection.execute(
+            "SELECT state FROM semantic_v3_units WHERE run_id = ?", (prepared.run_id,)
+        ).fetchone()[0] == "ready"
+
+
+def test_durable_expired_issued_lease_cannot_replay(workspace: Path) -> None:
+    repository, prepared = _prepared_frontier_run(workspace)
+    approve_semantic_execution(
+        ApproveSemanticExecutionRequest(
+            workspace, prepared.revision_id, prepared.proposal_sha256
+        )
+    )
+    first = next_semantic_work_v3(NextSemanticWorkV3Request(workspace, prepared.run_id))
+    with repository._connection() as connection:
+        connection.execute(
+            """UPDATE semantic_v3_leases SET lease_deadline_active_seconds = 0
+               WHERE run_id = ? AND lease_nonce = ?""",
+            (prepared.run_id, first.lease_nonce),
+        )
+
+    with pytest.raises(SemanticLifecycleV3Error, match="paused_budget"):
+        next_semantic_work_v3(NextSemanticWorkV3Request(workspace, prepared.run_id))
+
+    assert repository.run_state(prepared.run_id) is SemanticRunState.PAUSED_BUDGET
+    assert repository.execution_lock() is None
+
+
+def test_initialize_migrates_an_existing_v3_lease_table_for_monotonic_time(
+    workspace: Path,
+) -> None:
+    paths = WorkspacePaths.from_root(workspace)
+    paths.db_path.parent.mkdir(parents=True)
+    with sqlite3.connect(paths.db_path) as connection:
+        connection.execute(
+            """CREATE TABLE semantic_v3_leases (
+                   run_id TEXT NOT NULL,
+                   unit_id TEXT NOT NULL,
+                   lease_nonce TEXT NOT NULL UNIQUE,
+                   state TEXT NOT NULL,
+                   input_sha256 TEXT,
+                   input_bytes INTEGER,
+                   lease_started_active_seconds REAL NOT NULL,
+                   lease_deadline_active_seconds REAL NOT NULL,
+                   PRIMARY KEY(run_id, unit_id)
+               )"""
+        )
+
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    with repository._read_connection() as connection:
+        columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(semantic_v3_leases)")
+        }
+        assert {
+            "lease_last_monotonic_seconds",
+            "lease_charged_active_seconds",
+        }.issubset(columns)
+        assert connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'semantic_v3_phase_active_time'"
+        ).fetchone() is not None
+
+
+def test_materializing_lease_expiry_cannot_issue_input(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [200.0]
+    monkeypatch.setattr(
+        SQLiteRepository,
+        "_semantic_v3_monotonic_seconds",
+        staticmethod(lambda: clock[0]),
+        raising=False,
+    )
+    repository, prepared = _prepared_frontier_run(workspace)
+    approve_semantic_execution(
+        ApproveSemanticExecutionRequest(
+            workspace, prepared.revision_id, prepared.proposal_sha256
+        )
+    )
+    original_publish = SemanticExchange.publish_input
+
+    def publish_after_lease_expiry(self, *args, **kwargs):
+        binding = original_publish(self, *args, **kwargs)
+        clock[0] += 300.0
+        return binding
+
+    monkeypatch.setattr(SemanticExchange, "publish_input", publish_after_lease_expiry)
+    with pytest.raises(SemanticLifecycleV3Error, match="paused_budget"):
+        next_semantic_work_v3(NextSemanticWorkV3Request(workspace, prepared.run_id))
+
+    paths = WorkspacePaths.from_root(workspace)
+    assert repository.run_state(prepared.run_id) is SemanticRunState.PAUSED_BUDGET
+    assert repository.execution_lock() is None
+    assert not paths.semantic_v3_exchange_input_path(
+        prepared.revision_id, prepared.run_id
+    ).exists()
+    with repository._read_connection() as connection:
+        assert connection.execute(
+            "SELECT state FROM semantic_v3_leases WHERE run_id = ?", (prepared.run_id,)
+        ).fetchone()[0] == "expired"
+        assert connection.execute(
+            "SELECT state FROM semantic_v3_units WHERE run_id = ?", (prepared.run_id,)
+        ).fetchone()[0] == "ready"
+
+
+def test_active_time_is_durable_across_replay_and_rejects_regressing_clock(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [1_000.0]
+    monkeypatch.setattr(
+        SQLiteRepository,
+        "_semantic_v3_monotonic_seconds",
+        staticmethod(lambda: clock[0]),
+        raising=False,
+    )
+    repository, prepared = _prepared_frontier_run(workspace)
+    approve_semantic_execution(
+        ApproveSemanticExecutionRequest(
+            workspace, prepared.revision_id, prepared.proposal_sha256
+        )
+    )
+    first = next_semantic_work_v3(NextSemanticWorkV3Request(workspace, prepared.run_id))
+
+    clock[0] += 10.0
+    replay = next_semantic_work_v3(NextSemanticWorkV3Request(workspace, prepared.run_id))
+    assert replay.lease_nonce == first.lease_nonce
+    with repository._read_connection() as connection:
+        assert connection.execute(
+            "SELECT used_active_seconds FROM semantic_v3_runs WHERE run_id = ?",
+            (prepared.run_id,),
+        ).fetchone()[0] == 10.0
+
+    reopened = SQLiteRepository(WorkspacePaths.from_root(workspace).db_path)
+    reopened.initialize()
+    clock[0] += 10.0
+    next_semantic_work_v3(NextSemanticWorkV3Request(workspace, prepared.run_id))
+    with reopened._read_connection() as connection:
+        assert connection.execute(
+            "SELECT used_active_seconds FROM semantic_v3_runs WHERE run_id = ?",
+            (prepared.run_id,),
+        ).fetchone()[0] == 20.0
+
+    clock[0] -= 1.0
+    with pytest.raises(SemanticLifecycleV3Error, match="paused_budget"):
+        next_semantic_work_v3(NextSemanticWorkV3Request(workspace, prepared.run_id))
+    assert reopened.run_state(prepared.run_id) is SemanticRunState.PAUSED_BUDGET
+    assert reopened.execution_lock() is None
+
+
+@pytest.mark.parametrize("clock_value", (float("nan"), "invalid"))
+def test_invalid_active_clock_fails_closed_and_releases_the_lease(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch, clock_value: object,
+) -> None:
+    clock = [2_000.0]
+    monkeypatch.setattr(
+        SQLiteRepository,
+        "_semantic_v3_monotonic_seconds",
+        staticmethod(lambda: clock[0]),
+        raising=False,
+    )
+    repository, prepared = _prepared_frontier_run(workspace)
+    approve_semantic_execution(
+        ApproveSemanticExecutionRequest(
+            workspace, prepared.revision_id, prepared.proposal_sha256
+        )
+    )
+    next_semantic_work_v3(NextSemanticWorkV3Request(workspace, prepared.run_id))
+    clock[0] = clock_value
+
+    with pytest.raises(SemanticLifecycleV3Error, match="paused_budget"):
+        next_semantic_work_v3(NextSemanticWorkV3Request(workspace, prepared.run_id))
+
+    assert repository.run_state(prepared.run_id) is SemanticRunState.PAUSED_BUDGET
+    assert repository.execution_lock() is None
+
+
+@pytest.mark.parametrize(
+    ("invalid_value", "invalid_label"),
+    (("NaN", "nan"), (float("inf"), "positive-infinity"), (float("-inf"), "negative-infinity")),
+)
+@pytest.mark.parametrize(
+    ("table", "column"),
+    (
+        ("semantic_v3_runs", "used_active_seconds"),
+        ("semantic_v3_phase_active_time", "active_seconds"),
+        ("semantic_v3_leases", "lease_started_active_seconds"),
+        ("semantic_v3_leases", "lease_deadline_active_seconds"),
+        ("semantic_v3_leases", "lease_last_monotonic_seconds"),
+        ("semantic_v3_leases", "lease_charged_active_seconds"),
+    ),
+)
+def test_corrupt_durable_active_time_pauses_and_releases_without_rollback(
+    workspace: Path,
+    table: str,
+    column: str,
+    invalid_value: object,
+    invalid_label: str,
+) -> None:
+    repository, first = _prepared_frontier_run(workspace)
+    root = workspace / "approved-source"
+    second = prepare_semantic_index(PrepareSemanticIndexRequest(workspace, root))
+    for prepared in (first, second):
+        approve_semantic_execution(
+            ApproveSemanticExecutionRequest(
+                workspace, prepared.revision_id, prepared.proposal_sha256
+            )
+        )
+    next_semantic_work_v3(NextSemanticWorkV3Request(workspace, first.run_id))
+    with repository._connection() as connection:
+        if table == "semantic_v3_phase_active_time":
+            phase = connection.execute(
+                "SELECT phase FROM semantic_v3_units WHERE run_id = ?",
+                (first.run_id,),
+            ).fetchone()[0]
+            connection.execute(
+                """INSERT INTO semantic_v3_phase_active_time(run_id, phase, active_seconds)
+                   VALUES (?, ?, ?) ON CONFLICT(run_id, phase) DO UPDATE SET
+                   active_seconds = excluded.active_seconds""",
+                (first.run_id, phase, invalid_value),
+            )
+        else:
+            connection.execute(
+                f"UPDATE {table} SET {column} = ? WHERE run_id = ?",
+                (invalid_value, first.run_id),
+            )
+
+    with pytest.raises(SemanticLifecycleV3Error, match="paused_budget"):
+        next_semantic_work_v3(NextSemanticWorkV3Request(workspace, first.run_id))
+
+    assert repository.run_state(first.run_id) is SemanticRunState.PAUSED_BUDGET
+    assert repository.execution_lock() is None
+    with repository._read_connection() as connection:
+        assert connection.execute(
+            "SELECT state FROM semantic_v3_leases WHERE run_id = ?", (first.run_id,)
+        ).fetchone()[0] == "expired"
+        assert connection.execute(
+            "SELECT state FROM semantic_v3_units WHERE run_id = ?", (first.run_id,)
+        ).fetchone()[0] == "ready"
+        assert tuple(connection.execute(
+            "SELECT used_units, used_input_bytes FROM semantic_v3_runs WHERE run_id = ?",
+            (first.run_id,),
+        ).fetchone()) == (0, 0)
+    replacement = next_semantic_work_v3(NextSemanticWorkV3Request(workspace, second.run_id))
+    assert replacement.run_id == second.run_id
+
+
+def test_expiry_after_source_revalidation_stops_before_exchange_publication(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [5_000.0]
+    monkeypatch.setattr(
+        SQLiteRepository,
+        "_semantic_v3_monotonic_seconds",
+        staticmethod(lambda: clock[0]),
+        raising=False,
+    )
+    _repository, prepared = _prepared_frontier_run(workspace)
+    approve_semantic_execution(
+        ApproveSemanticExecutionRequest(
+            workspace, prepared.revision_id, prepared.proposal_sha256
+        )
+    )
+    original_materialize = lifecycle_v3_module._materialize_bounded_v3_input
+    original_publish = SemanticExchange.publish_input
+    materializations = 0
+    published = False
+
+    def advance_after_final_revalidation(*args, **kwargs):
+        nonlocal materializations
+        payload = original_materialize(*args, **kwargs)
+        materializations += 1
+        if materializations == 2:
+            clock[0] += 300.0
+        return payload
+
+    def record_publication(self, *args, **kwargs):
+        nonlocal published
+        published = True
+        return original_publish(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        lifecycle_v3_module, "_materialize_bounded_v3_input", advance_after_final_revalidation
+    )
+    monkeypatch.setattr(SemanticExchange, "publish_input", record_publication)
+    with pytest.raises(SemanticLifecycleV3Error, match="paused_budget"):
+        next_semantic_work_v3(NextSemanticWorkV3Request(workspace, prepared.run_id))
+
+    assert materializations == 2
+    assert not published
+
+
+def test_exchange_unit_byte_limit_pauses_and_releases_materializing_claim(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository, first = _prepared_frontier_run(workspace)
+    root = workspace / "approved-source"
+    second = prepare_semantic_index(PrepareSemanticIndexRequest(workspace, root))
+    for prepared in (first, second):
+        approve_semantic_execution(
+            ApproveSemanticExecutionRequest(
+                workspace, prepared.revision_id, prepared.proposal_sha256
+            )
+        )
+    original_materialize = lifecycle_v3_module._materialize_bounded_v3_input
+
+    def oversized_payload(*args, **kwargs):
+        payload = original_materialize(*args, **kwargs)
+        return {**payload, "safe_padding": "x" * MAX_SEMANTIC_EXCHANGE_INPUT_BYTES}
+
+    monkeypatch.setattr(
+        lifecycle_v3_module, "_materialize_bounded_v3_input", oversized_payload
+    )
+    with pytest.raises(SemanticLifecycleV3Error, match="paused_budget"):
+        next_semantic_work_v3(NextSemanticWorkV3Request(workspace, first.run_id))
+    monkeypatch.setattr(
+        lifecycle_v3_module, "_materialize_bounded_v3_input", original_materialize
+    )
+
+    paths = WorkspacePaths.from_root(workspace)
+    assert repository.run_state(first.run_id) is SemanticRunState.PAUSED_BUDGET
+    assert repository.execution_lock() is None
+    assert not paths.semantic_v3_exchange_input_path(first.revision_id, first.run_id).exists()
+    assert not paths.semantic_v3_exchange_output_path(first.revision_id, first.run_id).exists()
+    with repository._read_connection() as connection:
+        assert connection.execute(
+            "SELECT state FROM semantic_v3_leases WHERE run_id = ?", (first.run_id,)
+        ).fetchone()[0] == "expired"
+        assert connection.execute(
+            "SELECT state FROM semantic_v3_units WHERE run_id = ?", (first.run_id,)
+        ).fetchone()[0] == "ready"
+        assert tuple(connection.execute(
+            "SELECT used_units, used_input_bytes FROM semantic_v3_runs WHERE run_id = ?",
+            (first.run_id,),
+        ).fetchone()) == (0, 0)
+        assert connection.execute(
+            "SELECT used_active_seconds FROM semantic_v3_runs WHERE run_id = ?",
+            (first.run_id,),
+        ).fetchone()[0] == 0.0
+        assert connection.execute(
+            """SELECT COALESCE((SELECT active_seconds
+               FROM semantic_v3_phase_active_time WHERE run_id = ? LIMIT 1), 0)""",
+            (first.run_id,),
+        ).fetchone()[0] == 0.0
+        assert connection.execute(
+            "SELECT lease_charged_active_seconds FROM semantic_v3_leases WHERE run_id = ?",
+            (first.run_id,),
+        ).fetchone()[0] == 0.0
+        assert connection.execute(
+            "SELECT used_active_seconds FROM semantic_v3_aggregates WHERE run_id = ?",
+            (first.run_id,),
+        ).fetchone()[0] == 0.0
+    replacement = next_semantic_work_v3(NextSemanticWorkV3Request(workspace, second.run_id))
+    assert replacement.run_id == second.run_id
+
+
+def test_total_active_budget_exhaustion_pauses_before_the_lease_can_replay(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [3_000.0]
+    monkeypatch.setattr(
+        SQLiteRepository,
+        "_semantic_v3_monotonic_seconds",
+        staticmethod(lambda: clock[0]),
+        raising=False,
+    )
+    repository, prepared = _prepared_frontier_run(workspace)
+    approve_semantic_execution(
+        ApproveSemanticExecutionRequest(
+            workspace, prepared.revision_id, prepared.proposal_sha256
+        )
+    )
+    next_semantic_work_v3(NextSemanticWorkV3Request(workspace, prepared.run_id))
+    with repository._connection() as connection:
+        connection.execute(
+            """UPDATE semantic_v3_runs SET used_active_seconds = 7190
+               WHERE run_id = ?""",
+            (prepared.run_id,),
+        )
+        connection.execute(
+            """UPDATE semantic_v3_leases SET lease_started_active_seconds = 7190,
+                       lease_deadline_active_seconds = 10000
+               WHERE run_id = ?""",
+            (prepared.run_id,),
+        )
+
+    clock[0] += 10.0
+    with pytest.raises(SemanticLifecycleV3Error, match="paused_budget"):
+        next_semantic_work_v3(NextSemanticWorkV3Request(workspace, prepared.run_id))
+    assert repository.run_state(prepared.run_id) is SemanticRunState.PAUSED_BUDGET
+    assert repository.execution_lock() is None
+
+
+def test_phase_active_budget_does_not_borrow_from_the_total_budget(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [4_000.0]
+    monkeypatch.setattr(
+        SQLiteRepository,
+        "_semantic_v3_monotonic_seconds",
+        staticmethod(lambda: clock[0]),
+        raising=False,
+    )
+    repository, prepared = _prepared_frontier_run(workspace)
+    approve_semantic_execution(
+        ApproveSemanticExecutionRequest(
+            workspace, prepared.revision_id, prepared.proposal_sha256
+        )
+    )
+    next_semantic_work_v3(NextSemanticWorkV3Request(workspace, prepared.run_id))
+    with repository._connection() as connection:
+        connection.execute(
+            """UPDATE semantic_v3_leases SET lease_deadline_active_seconds = 10000
+               WHERE run_id = ?""",
+            (prepared.run_id,),
+        )
+
+    clock[0] += 900.0
+    with pytest.raises(SemanticLifecycleV3Error, match="paused_budget"):
+        next_semantic_work_v3(NextSemanticWorkV3Request(workspace, prepared.run_id))
+    assert repository.run_state(prepared.run_id) is SemanticRunState.PAUSED_BUDGET
+    assert repository.execution_lock() is None
+
+
+def test_real_input_budget_exhaustion_releases_claim_for_another_prepared_run(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository, first = _prepared_frontier_run(workspace)
+    root = workspace / "approved-source"
+    second = prepare_semantic_index(PrepareSemanticIndexRequest(workspace, root))
+    for prepared in (first, second):
+        approve_semantic_execution(
+            ApproveSemanticExecutionRequest(
+                workspace, prepared.revision_id, prepared.proposal_sha256
+            )
+        )
+    original_reserve = SQLiteRepository.reserve_next_semantic_v3_unit
+
+    def reserve_then_exhaust_total(self, run_id, *args, **kwargs):
+        reservation = original_reserve(self, run_id, *args, **kwargs)
+        if run_id == first.run_id and reservation is not None and not reservation.issued:
+            with self._connection() as connection:
+                connection.execute(
+                    "UPDATE semantic_v3_runs SET used_input_bytes = ? WHERE run_id = ?",
+                    (128 * 1024**2, run_id),
+                )
+        return reservation
+
+    monkeypatch.setattr(
+        SQLiteRepository, "reserve_next_semantic_v3_unit", reserve_then_exhaust_total
+    )
+    with pytest.raises(SemanticLifecycleV3Error, match="paused_budget"):
+        next_semantic_work_v3(NextSemanticWorkV3Request(workspace, first.run_id))
+
+    paths = WorkspacePaths.from_root(workspace)
+    assert repository.run_state(first.run_id) is SemanticRunState.PAUSED_BUDGET
+    assert repository.execution_lock() is None
+    assert not paths.semantic_v3_exchange_input_path(first.revision_id, first.run_id).exists()
+    with repository._read_connection() as connection:
+        assert connection.execute(
+            "SELECT state FROM semantic_v3_leases WHERE run_id = ?", (first.run_id,)
+        ).fetchone()[0] == "expired"
+        assert connection.execute(
+            "SELECT state FROM semantic_v3_units WHERE run_id = ?", (first.run_id,)
+        ).fetchone()[0] == "ready"
+        usage = connection.execute(
+            "SELECT used_units, used_input_bytes FROM semantic_v3_runs WHERE run_id = ?",
+            (first.run_id,),
+        ).fetchone()
+        assert tuple(usage) == (0, 128 * 1024**2)
+
+    replacement = next_semantic_work_v3(NextSemanticWorkV3Request(workspace, second.run_id))
+    assert replacement.run_id == second.run_id
+
+
 def test_concurrent_next_claims_one_workspace_lease_and_leaves_loser_prepared(
     workspace: Path,
 ) -> None:
