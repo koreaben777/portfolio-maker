@@ -33,6 +33,7 @@ from portfolio_maker.application.semantic_work import (
     SemanticWorkError,
     finalize_semantic_index,
     next_semantic_work,
+    next_semantic_work_v3,
     semantic_index_status,
     validate_semantic_work,
 )
@@ -76,6 +77,7 @@ from portfolio_maker.application.models import (
     ApproveSemanticExecutionRequest,
     ApplyVisionAnalysisRequest,
     NextSemanticWorkRequest,
+    NextSemanticWorkV3Request,
     PrepareSemanticIndexRequest,
     PrepareSemanticIndexResult,
     PrepareVisionAnalysisRequest,
@@ -193,6 +195,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     next_semantic = subparsers.add_parser("next-semantic-work")
     next_semantic.add_argument("--workspace", type=Path, default=Path("."))
+    next_semantic.add_argument("--run-id")
 
     validate_semantic = subparsers.add_parser("validate-semantic-work")
     validate_semantic.add_argument("--workspace", type=Path, default=Path("."))
@@ -575,6 +578,35 @@ def _main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     if args.command == "next-semantic-work":
+        repository = SQLiteRepository(WorkspacePaths.from_root(args.workspace).db_path)
+        if repository.has_semantic_v3_runs():
+            result = next_semantic_work_v3(
+                NextSemanticWorkV3Request(
+                    workspace=args.workspace,
+                    run_id=args.run_id,
+                )
+            )
+            revision_id = _safe_semantic_revision(result.revision_id)
+            run_id = _safe_semantic_run(result.run_id)
+            unit_id = _safe_semantic_v3_unit(result.unit_id)
+            lease_nonce = _safe_semantic_run(result.lease_nonce)
+            input_sha256 = _safe_semantic_digest(result.input_sha256)
+            if type(result.input_byte_count) is not int or result.input_byte_count < 0:
+                raise SemanticWorkError("semantic work output is unsafe")
+            relative_path = _safe_semantic_v3_exchange_path(
+                args.workspace,
+                result.input_path,
+                revision_id,
+                run_id,
+            )
+            print(f"Semantic revision: {revision_id}")
+            print(f"Semantic run: {run_id}")
+            print(f"Semantic work unit: {unit_id}")
+            print(f"Lease nonce: {lease_nonce}")
+            print(f"Managed input: {relative_path}")
+            print(f"Input SHA-256: {input_sha256}")
+            print(f"Input bytes: {result.input_byte_count}")
+            return 0
         result = next_semantic_work(
             NextSemanticWorkRequest(workspace=args.workspace)
         )
@@ -860,6 +892,16 @@ def _safe_semantic_unit(value: object) -> str:
     return value
 
 
+def _safe_semantic_v3_unit(value: object) -> str:
+    if (
+        type(value) is not str
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise SemanticWorkError("semantic work output is unsafe")
+    return value
+
+
 def _safe_semantic_digest(value: object) -> str:
     if (
         type(value) is not str
@@ -895,6 +937,19 @@ def _safe_semantic_managed_path(
     if path.resolve(strict=False) != expected.resolve(strict=False):
         raise SemanticWorkError("semantic work output is unsafe")
     return str(expected.relative_to(WorkspacePaths.from_root(workspace).workspace))
+
+
+def _safe_semantic_v3_exchange_path(
+    workspace: Path,
+    path: Path,
+    revision_id: str,
+    run_id: str,
+) -> str:
+    paths = WorkspacePaths.from_root(workspace)
+    expected = paths.semantic_v3_exchange_input_path(revision_id, run_id)
+    if path.resolve(strict=False) != expected.resolve(strict=False):
+        raise SemanticWorkError("semantic work output is unsafe")
+    return str(expected.relative_to(paths.workspace))
 
 
 def _history_apply_mode(args: argparse.Namespace) -> str:

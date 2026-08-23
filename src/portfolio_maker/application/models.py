@@ -273,6 +273,25 @@ class NextSemanticWorkResult:
 
 
 @dataclass(frozen=True)
+class NextSemanticWorkV3Request:
+    workspace: Path
+    run_id: str | None = None
+
+
+@dataclass(frozen=True)
+class NextSemanticWorkV3Result:
+    revision_id: str
+    run_id: str
+    unit_id: str
+    lease_nonce: str
+    input_path: Path = field(repr=False, compare=False)
+    input_sha256: str
+    input_byte_count: int
+    target_node_ids: tuple[str, ...]
+    protocol: str = SEMANTIC_PROTOCOL_V3
+
+
+@dataclass(frozen=True)
 class ValidateSemanticWorkRequest:
     workspace: Path
     unit_id: str

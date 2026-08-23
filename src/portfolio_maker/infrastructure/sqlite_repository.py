@@ -429,6 +429,28 @@ class _DatabaseIdentity:
     sidecars: tuple[tuple[str, int | None, int | None], ...]
 
 
+@dataclass(frozen=True)
+class SemanticV3ExecutionAuthority:
+    revision_id: str
+    run_id: str
+    proposal: SemanticExecutionProposal
+
+
+@dataclass(frozen=True)
+class SemanticV3LeaseReservation:
+    revision_id: str
+    run_id: str
+    unit_id: str
+    lease_nonce: str
+    phase: str
+    target_ref_json: str
+    target_ref_sha256: str
+    dependency_root: str
+    input_sha256: str | None
+    input_bytes: int | None
+    issued: bool
+
+
 class SQLiteRepository:
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
@@ -1676,7 +1698,7 @@ class SQLiteRepository:
                       proposal.revision_id AS proposal_revision_id,
                       proposal.approval_kind AS proposal_approval_kind,
                       proposal.project_id AS proposal_project_id,
-                      proposal.proposal_canonical_json, proposal.plan_canonical_json,
+                      proposal.proposal_canonical_json,
                       proposal.plan_sha256 AS proposal_plan_sha256,
                       proposal.proposal_sha256 AS proposal_proposal_sha256,
                       proposal.manifest_sha256 AS proposal_manifest_sha256,
@@ -2060,8 +2082,8 @@ class SQLiteRepository:
         self, row: sqlite3.Row
     ) -> tuple[SemanticProposalEnvelope, bytes, bytes]:
         body = row["proposal_canonical_json"]
-        plan = row["plan_canonical_json"]
-        if not isinstance(body, bytes) or not isinstance(plan, bytes):
+        plan = row["plan_canonical_json"] if "plan_canonical_json" in row.keys() else None
+        if not isinstance(body, bytes):
             raise RepositoryError("semantic proposal storage is invalid")
         try:
             payload = json.loads(body, object_pairs_hook=self._v3_no_duplicates)
@@ -2071,7 +2093,10 @@ class SQLiteRepository:
         if semantic_canonical_json_bytes(proposal) != body:
             raise RepositoryError("semantic proposal storage is invalid")
         envelope = SemanticProposalEnvelope(proposal, row["proposal_sha256"])
-        if sha256(plan).hexdigest() != proposal.plan_sha256:
+        if plan is not None and (
+            not isinstance(plan, bytes)
+            or sha256(plan).hexdigest() != proposal.plan_sha256
+        ):
             raise RepositoryError("semantic proposal storage is invalid")
         return envelope, body, plan
 
@@ -2361,6 +2386,251 @@ class SQLiteRepository:
         except ValueError as error:
             raise RepositoryError("semantic run state is invalid") from error
 
+    def load_semantic_v3_execution_authority(
+        self, run_id: str,
+    ) -> SemanticV3ExecutionAuthority:
+        with self._read_connection() as conn:
+            row, _, _total_budget, _phase_budgets = self._v3_authority(conn, run_id)
+            proposal = self._v3_validate_canonical_proposal_row(row)
+            digest = sha256()
+            length_row = conn.execute(
+                """SELECT length(plan_canonical_json) AS byte_length
+                   FROM semantic_v3_proposals WHERE run_id = ?""",
+                (run_id,),
+            ).fetchone()
+            if length_row is None or type(length_row["byte_length"]) is not int:
+                raise RepositoryError("semantic execution authority is invalid")
+            offset = 1
+            remaining = length_row["byte_length"]
+            while remaining:
+                chunk = conn.execute(
+                    """SELECT substr(plan_canonical_json, ?, 65536) AS chunk
+                       FROM semantic_v3_proposals WHERE run_id = ?""",
+                    (offset, run_id),
+                ).fetchone()
+                value = None if chunk is None else chunk["chunk"]
+                if not isinstance(value, bytes) or not value:
+                    raise RepositoryError("semantic execution authority is invalid")
+                digest.update(value)
+                offset += len(value)
+                remaining -= len(value)
+            if digest.hexdigest() != proposal.plan_sha256:
+                raise RepositoryError("semantic execution authority is invalid")
+        return SemanticV3ExecutionAuthority(
+            revision_id=proposal.revision_id,
+            run_id=proposal.run_id,
+            proposal=proposal,
+        )
+
+    def select_runnable_semantic_v3_run(self) -> str:
+        with self._read_connection() as conn:
+            rows = conn.execute(
+                """SELECT run_id FROM semantic_v3_runs
+                   WHERE state IN ('prepared', 'running')
+                   ORDER BY run_id LIMIT 2"""
+            ).fetchall()
+        if len(rows) != 1:
+            raise RepositoryError("semantic runnable run is ambiguous")
+        return str(rows[0]["run_id"])
+
+    def reserve_next_semantic_v3_unit(
+        self,
+        run_id: str,
+        lease_nonce: str,
+        *,
+        expected_authority_root: str,
+    ) -> SemanticV3LeaseReservation | None:
+        if not lease_nonce or not self._semantic_sha256(expected_authority_root):
+            raise RepositoryError("semantic execution authority is invalid")
+        try:
+            with self._connection() as conn:
+                row, _, total_budget, phase_budgets = self._v3_authority(conn, run_id)
+                proposal = self._v3_validate_canonical_proposal_row(row)
+                if proposal.authority_root != expected_authority_root:
+                    raise RepositoryError("semantic execution authority is stale")
+                lock = conn.execute(
+                    "SELECT * FROM semantic_v3_execution_lock WHERE singleton = 1"
+                ).fetchone()
+                if lock is not None:
+                    if lock["run_id"] != run_id:
+                        raise RepositoryError("semantic execution is busy")
+                    return self._semantic_v3_active_lease_reservation(
+                        conn, row, lock, expected_authority_root
+                    )
+                if row["state"] != SemanticRunState.PREPARED.value:
+                    raise RepositoryError("semantic run is not ready")
+                occupied = conn.execute(
+                    "SELECT run_id FROM semantic_v3_runs WHERE state = 'running'"
+                ).fetchone()
+                if occupied is not None:
+                    raise RepositoryError("semantic execution is busy")
+                unit = conn.execute(
+                    """SELECT * FROM semantic_v3_units
+                       WHERE run_id = ? AND state = 'ready'
+                       ORDER BY phase, priority, fairness_lane, unit_id LIMIT 1""",
+                    (run_id,),
+                ).fetchone()
+                if unit is None:
+                    raise RepositoryError("semantic run has no ready work")
+                phase_budget = phase_budgets.get(unit["phase"])
+                if phase_budget is None:
+                    raise RepositoryError("semantic budget authority is invalid")
+                phase_usage = conn.execute(
+                    """SELECT COUNT(*) AS units, COALESCE(SUM(receipt.input_bytes), 0) AS input_bytes,
+                              COALESCE(SUM(receipt.active_seconds), 0) AS active_seconds
+                       FROM semantic_v3_receipts AS receipt
+                       JOIN semantic_v3_units AS prior ON prior.run_id = receipt.run_id
+                         AND prior.unit_id = receipt.unit_id
+                       WHERE receipt.run_id = ? AND prior.phase = ?""",
+                    (run_id, unit["phase"]),
+                ).fetchone()
+                estimated_bytes = self._required_int(unit, "estimated_input_bytes")
+                if (
+                    estimated_bytes > total_budget.max_unit_input_bytes
+                    or self._required_int(row, "used_units") >= total_budget.max_units
+                    or self._required_int(row, "used_input_bytes") + estimated_bytes
+                    > total_budget.max_input_bytes
+                    or float(row["used_active_seconds"]) >= total_budget.max_wall_seconds
+                    or self._required_int(phase_usage, "units") >= phase_budget.max_units
+                    or self._required_int(phase_usage, "input_bytes") + estimated_bytes
+                    > phase_budget.max_input_bytes
+                    or float(phase_usage["active_seconds"]) >= phase_budget.max_wall_seconds
+                ):
+                    conn.execute(
+                        "UPDATE semantic_v3_runs SET state = 'paused_budget' WHERE run_id = ?",
+                        (run_id,),
+                    )
+                    self._semantic_v3_refresh_aggregate(conn, run_id)
+                    return None
+                started_active_seconds = float(row["used_active_seconds"])
+                deadline = started_active_seconds + min(
+                    300.0,
+                    float(total_budget.max_unit_wall_seconds),
+                    float(phase_budget.max_unit_wall_seconds),
+                )
+                if deadline <= started_active_seconds:
+                    raise RepositoryError("semantic budget authority is invalid")
+                transitioned = conn.execute(
+                    """UPDATE semantic_v3_runs SET state = 'running'
+                       WHERE run_id = ? AND state = 'prepared'""",
+                    (run_id,),
+                )
+                if transitioned.rowcount != 1:
+                    raise RepositoryError("semantic run is not ready")
+                updated = conn.execute(
+                    """UPDATE semantic_v3_units SET state = 'leased'
+                       WHERE run_id = ? AND unit_id = ? AND state = 'ready'""",
+                    (run_id, unit["unit_id"]),
+                )
+                if updated.rowcount != 1:
+                    raise RepositoryError("semantic unit is not ready")
+                conn.execute(
+                    """INSERT INTO semantic_v3_leases(
+                           run_id, unit_id, lease_nonce, state, lease_started_active_seconds,
+                           lease_deadline_active_seconds
+                       ) VALUES (?, ?, ?, 'materializing', ?, ?)""",
+                    (run_id, unit["unit_id"], lease_nonce, started_active_seconds, deadline),
+                )
+                conn.execute(
+                    """INSERT INTO semantic_v3_execution_lock(
+                           singleton, run_id, unit_id, lease_nonce, lease_state
+                       ) VALUES (1, ?, ?, ?, 'materializing')""",
+                    (run_id, unit["unit_id"], lease_nonce),
+                )
+                self._semantic_v3_refresh_aggregate(conn, run_id)
+                return SemanticV3LeaseReservation(
+                    revision_id=row["revision_id"],
+                    run_id=run_id,
+                    unit_id=unit["unit_id"],
+                    lease_nonce=lease_nonce,
+                    phase=unit["phase"],
+                    target_ref_json=unit["target_ref_json"],
+                    target_ref_sha256=unit["target_ref_sha256"],
+                    dependency_root=unit["dependency_root"],
+                    input_sha256=None,
+                    input_bytes=None,
+                    issued=False,
+                )
+        except sqlite3.IntegrityError as error:
+            raise RepositoryError("semantic execution is busy") from error
+
+    def _semantic_v3_active_lease_reservation(
+        self,
+        conn: sqlite3.Connection,
+        run: sqlite3.Row,
+        lock: sqlite3.Row,
+        expected_authority_root: str,
+    ) -> SemanticV3LeaseReservation:
+        _row, _, _budget, _phases = self._v3_authority(conn, run["run_id"])
+        proposal = self._v3_validate_canonical_proposal_row(_row)
+        if proposal.authority_root != expected_authority_root:
+            raise RepositoryError("semantic execution authority is stale")
+        lease = conn.execute(
+            """SELECT lease.*, unit.phase, unit.target_ref_json, unit.target_ref_sha256,
+                      unit.dependency_root
+               FROM semantic_v3_leases AS lease
+               JOIN semantic_v3_units AS unit ON unit.run_id = lease.run_id
+                 AND unit.unit_id = lease.unit_id
+               WHERE lease.run_id = ? AND lease.lease_nonce = ?""",
+            (run["run_id"], lock["lease_nonce"]),
+        ).fetchone()
+        if (
+            lease is None
+            or lock["unit_id"] != lease["unit_id"]
+            or lock["lease_state"] != lease["state"]
+            or lease["state"] not in {
+                SemanticLeaseState.MATERIALIZING.value,
+                SemanticLeaseState.ISSUED.value,
+            }
+            or run["state"] != SemanticRunState.RUNNING.value
+        ):
+            raise RepositoryError("semantic execution lease is invalid")
+        if lease["state"] == SemanticLeaseState.ISSUED.value and (
+            not isinstance(lease["input_sha256"], str)
+            or type(lease["input_bytes"]) is not int
+        ):
+            raise RepositoryError("semantic execution lease is invalid")
+        return SemanticV3LeaseReservation(
+            revision_id=run["revision_id"],
+            run_id=run["run_id"],
+            unit_id=lease["unit_id"],
+            lease_nonce=lease["lease_nonce"],
+            phase=lease["phase"],
+            target_ref_json=lease["target_ref_json"],
+            target_ref_sha256=lease["target_ref_sha256"],
+            dependency_root=lease["dependency_root"],
+            input_sha256=lease["input_sha256"],
+            input_bytes=lease["input_bytes"],
+            issued=lease["state"] == SemanticLeaseState.ISSUED.value,
+        )
+
+    def semantic_v3_unit_dependencies(
+        self, run_id: str, unit_id: str, expected_root: str,
+    ) -> tuple[tuple[str, str], ...]:
+        with self._read_connection() as conn:
+            rows = conn.execute(
+                """SELECT dependency_unit_id, dependency_digest
+                   FROM semantic_v3_dependencies
+                   WHERE run_id = ? AND unit_id = ?
+                   ORDER BY dependency_unit_id LIMIT 65""",
+                (run_id, unit_id),
+            ).fetchall()
+        if len(rows) > 64:
+            raise RepositoryError("semantic unit dependency bound is exceeded")
+        dependencies = tuple(
+            (str(row["dependency_unit_id"]), str(row["dependency_digest"]))
+            for row in rows
+        )
+        if any(not self._semantic_sha256(digest) for _, digest in dependencies):
+            raise RepositoryError("semantic unit dependency is invalid")
+        observed_root = self._v3_root(
+            b"portfolio-maker-semantic-v3-dependency\0",
+            iter(dependency_id for dependency_id, _digest in dependencies),
+        )
+        if observed_root != expected_root:
+            raise RepositoryError("semantic unit dependency is invalid")
+        return dependencies
+
     def claim_semantic_v3_running_slot(self, run_id: str) -> None:
         with self._connection() as conn:
             self._v3_authority(conn, run_id)
@@ -2403,7 +2673,15 @@ class SQLiteRepository:
             )
             self._semantic_v3_refresh_aggregate(conn, run_id)
 
-    def issue_semantic_v3_input(self, run_id: str, lease_nonce: str, input_sha256: str, byte_count: int) -> None:
+    def issue_semantic_v3_input(
+        self,
+        run_id: str,
+        lease_nonce: str,
+        input_sha256: str,
+        byte_count: int,
+        *,
+        expected_authority_root: str | None = None,
+    ) -> bool:
         self._v3_digest(input_sha256, "input digest")
         if type(byte_count) is not int or byte_count < 0:
             raise RepositoryError("semantic input exceeds its budget")
@@ -2413,6 +2691,12 @@ class SQLiteRepository:
             if lock is None or lease is None or lock["run_id"] != run_id or lock["lease_nonce"] != lease_nonce or lock["lease_state"] != SemanticLeaseState.MATERIALIZING.value or lease["state"] != SemanticLeaseState.MATERIALIZING.value:
                 raise RepositoryError("semantic execution lease is invalid")
             authority, _, total_budget, phase_budgets = self._v3_authority(conn, run_id)
+            proposal = self._v3_validate_canonical_proposal_row(authority)
+            if (
+                expected_authority_root is not None
+                and proposal.authority_root != expected_authority_root
+            ):
+                raise RepositoryError("semantic execution authority is stale")
             unit = conn.execute(
                 "SELECT phase FROM semantic_v3_units WHERE run_id = ? AND unit_id = ?",
                 (run_id, lease["unit_id"]),
@@ -2436,9 +2720,12 @@ class SQLiteRepository:
                 or phase_used["input_bytes"] + byte_count > phase_budget.max_input_bytes
             ):
                 self._v3_pause_budget(conn, run_id)
-                return
+                self._semantic_v3_refresh_aggregate(conn, run_id)
+                return False
             conn.execute("UPDATE semantic_v3_leases SET state = 'issued', input_sha256 = ?, input_bytes = ? WHERE run_id = ? AND lease_nonce = ?", (input_sha256, byte_count, run_id, lease_nonce))
             conn.execute("UPDATE semantic_v3_execution_lock SET lease_state = 'issued' WHERE singleton = 1")
+            self._semantic_v3_refresh_aggregate(conn, run_id)
+            return True
 
     def execution_lock(self) -> tuple[str, str, str, str] | None:
         with self._read_connection() as conn:
@@ -2486,7 +2773,10 @@ class SQLiteRepository:
                WHERE receipt.run_id = ?""", (run_id,)
         ).fetchone()
         # Leases are deleted at receipt commit, so input usage is retained in the run row.
-        run = conn.execute("SELECT used_input_bytes FROM semantic_v3_runs WHERE run_id = ?", (run_id,)).fetchone()
+        run = conn.execute(
+            "SELECT used_input_bytes, state FROM semantic_v3_runs WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
         if receipt is None or run is None:
             raise RepositoryError("semantic aggregate is invalid")
         phase_rows = conn.execute(
@@ -2499,7 +2789,7 @@ class SQLiteRepository:
             "local_baseline_complete": False,
             "planned_receipts_complete": counts[SemanticUnitState.READY] == 0 and counts[SemanticUnitState.LEASED] == 0,
             "frontier_converged": False,
-            "paused_budget": False,
+            "paused_budget": run["state"] == SemanticRunState.PAUSED_BUDGET.value,
             "project_discovery_ready": False,
             "deepening_complete": False,
         }

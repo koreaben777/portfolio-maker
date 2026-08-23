@@ -16,6 +16,8 @@ from portfolio_maker.application.models import (
     FinalizeSemanticIndexResult,
     NextSemanticWorkRequest,
     NextSemanticWorkResult,
+    NextSemanticWorkV3Request,
+    NextSemanticWorkV3Result,
     SemanticIndexStatusRequest,
     SemanticIndexStatusResult,
     SemanticIndexStatusV3Result,
@@ -621,6 +623,17 @@ def next_semantic_work(
         input_path=input_path,
         remaining_count=remaining_count,
     )
+
+
+def next_semantic_work_v3(
+    request: NextSemanticWorkV3Request,
+) -> NextSemanticWorkV3Result:
+    """Preserve the legacy v2 surface while routing v3 to its lease boundary."""
+    from portfolio_maker.application.semantic_lifecycle_v3 import (
+        next_semantic_work_v3 as _next_semantic_work_v3,
+    )
+
+    return _next_semantic_work_v3(request)
 
 
 def validate_semantic_work(

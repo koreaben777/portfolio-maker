@@ -15,6 +15,7 @@ from portfolio_maker.application.approval import write_sample_approval
 from portfolio_maker.application.artifact_approval import write_sample_artifact_policy
 from portfolio_maker.application.history import HistoryError
 from portfolio_maker.application.models import (
+    ApproveSemanticExecutionRequest,
     ApplyVisionAnalysisRequest,
     NextSemanticWorkRequest,
     PrepareSemanticIndexRequest,
@@ -27,6 +28,7 @@ from portfolio_maker.application.semantic_work import (
     validate_semantic_work,
 )
 from portfolio_maker.application.semantic_index import prepare_semantic_index
+from portfolio_maker.application.semantic_lifecycle_v3 import approve_semantic_execution
 from portfolio_maker.application.vision_analysis import (
     VisionAnalysisError,
     apply_vision_analysis,
@@ -173,6 +175,28 @@ def prepare_v2_semantic_fixture(workspace: Path, root: Path) -> None:
             protocol="codex-semantic-v2",
         )
     )
+
+
+def prepare_approved_v3_semantic_fixture(workspace: Path):
+    root = workspace / "approved-v3-root"
+    (root / "project" / "src").mkdir(parents=True)
+    (root / "project" / "README.md").write_text("Approved project", encoding="utf-8")
+    (root / "project" / "pyproject.toml").write_text(
+        "[project]\nname = 'approved-v3'\n", encoding="utf-8"
+    )
+    (root / "project" / "src" / "app.py").write_text(
+        "def main() -> None:\n    print('safe')\n", encoding="utf-8"
+    )
+    approve_semantic_root(workspace, root)
+    prepared = prepare_semantic_index(
+        PrepareSemanticIndexRequest(workspace=workspace, root=root)
+    )
+    approve_semantic_execution(
+        ApproveSemanticExecutionRequest(
+            workspace, prepared.revision_id, prepared.proposal_sha256
+        )
+    )
+    return root, prepared
 
 
 def seed_v2_candidate(workspace, *, confidence="medium") -> tuple[WorkspacePaths, str]:
@@ -654,6 +678,56 @@ def test_cli_semantic_work_lifecycle_outputs_only_safe_identifiers_and_counts(
     ):
         assert forbidden not in combined
     assert "Traceback" not in combined
+
+
+def test_cli_next_semantic_work_dispatches_v3_with_safe_run_and_exchange_output(
+    workspace, capsys,
+):
+    root, prepared = prepare_approved_v3_semantic_fixture(workspace)
+
+    assert main(
+        [
+            "next-semantic-work",
+            "--workspace",
+            str(workspace),
+            "--run-id",
+            prepared.run_id,
+        ]
+    ) == 0
+
+    captured = capsys.readouterr()
+    assert f"Semantic run: {prepared.run_id}" in captured.out
+    assert "Lease nonce: " in captured.out
+    assert "Input SHA-256: " in captured.out
+    assert "Managed input: .portfolio-maker/raw/semantic-index/" in captured.out
+    assert captured.err == ""
+    assert str(workspace) not in captured.out
+    assert str(root) not in captured.out
+    assert "Approved project" not in captured.out
+
+
+def test_cli_v3_next_rejects_ambiguous_or_unsafe_run_identifier(workspace, capsys) -> None:
+    _root, first = prepare_approved_v3_semantic_fixture(workspace)
+    root = workspace / "approved-v3-root"
+    second = prepare_semantic_index(PrepareSemanticIndexRequest(workspace=workspace, root=root))
+    approve_semantic_execution(
+        ApproveSemanticExecutionRequest(
+            workspace, second.revision_id, second.proposal_sha256
+        )
+    )
+
+    assert main(["next-semantic-work", "--workspace", str(workspace)]) == 1
+    ambiguous = capsys.readouterr()
+    assert ambiguous.out == ""
+    assert ambiguous.err == "semantic work command failed safely\n"
+    assert first.run_id not in ambiguous.err
+
+    assert main(
+        ["next-semantic-work", "--workspace", str(workspace), "--run-id", "file:///unsafe"]
+    ) == 1
+    unsafe = capsys.readouterr()
+    assert unsafe.out == ""
+    assert unsafe.err == "semantic work command failed safely\n"
 
 
 def test_cli_parser_matches_resumable_semantic_skill_commands() -> None:

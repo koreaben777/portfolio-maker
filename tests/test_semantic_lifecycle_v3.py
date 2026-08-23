@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from hashlib import sha256
 import json
 from pathlib import Path
+import sqlite3
 
 import pytest
 
@@ -32,15 +34,23 @@ from portfolio_maker.domain.semantic_frontier import (
 from portfolio_maker.application.approval import write_sample_approval
 from portfolio_maker.application.models import (
     ApproveSemanticExecutionRequest,
+    NextSemanticWorkV3Request,
     PrepareSemanticIndexRequest,
     SemanticIndexStatusRequest,
 )
 from portfolio_maker.application.semantic_index import prepare_semantic_index
+import portfolio_maker.application.semantic_lifecycle_v3 as lifecycle_v3_module
 from portfolio_maker.application.semantic_lifecycle_v3 import (
     SemanticLifecycleV3Error,
     approve_semantic_execution,
+    next_semantic_work_v3,
 )
 from portfolio_maker.application.semantic_work import semantic_index_status
+from portfolio_maker.infrastructure.semantic_exchange import (
+    MAX_SEMANTIC_EXCHANGE_INPUT_BYTES,
+    SemanticExchange,
+    SemanticExchangeError,
+)
 from portfolio_maker.infrastructure.sqlite_repository import RepositoryError, SQLiteRepository
 from portfolio_maker.workspace import WorkspacePaths
 
@@ -53,6 +63,20 @@ def _prepared_frontier_run(workspace: Path) -> tuple[SQLiteRepository, object]:
     root = workspace / "approved-source"
     root.mkdir()
     (root / "README.md").write_text("# Approved semantic fixture\n", encoding="utf-8")
+    project = root / "project"
+    (project / "src").mkdir(parents=True)
+    (project / "README.md").write_text(
+        "# Approved semantic project\nIndependent project evidence.\n",
+        encoding="utf-8",
+    )
+    (project / "pyproject.toml").write_text(
+        "[project]\nname = 'semantic-fixture'\n",
+        encoding="utf-8",
+    )
+    (project / "src" / "app.py").write_text(
+        "def main() -> None:\n    print('approved')\n",
+        encoding="utf-8",
+    )
     paths = WorkspacePaths.from_root(workspace)
     write_sample_approval(paths)
     approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
@@ -252,6 +276,358 @@ def test_two_exact_approved_v3_runs_remain_prepared_without_running_slot(
         assert connection.execute(
             "SELECT COUNT(*) FROM semantic_v3_runs WHERE state = 'running'"
         ).fetchone()[0] == 0
+
+
+def test_active_lease_replays_the_same_bounded_v3_input(workspace: Path) -> None:
+    repository, prepared = _prepared_frontier_run(workspace)
+    approve_semantic_execution(
+        ApproveSemanticExecutionRequest(
+            workspace, prepared.revision_id, prepared.proposal_sha256
+        )
+    )
+
+    first = next_semantic_work_v3(NextSemanticWorkV3Request(workspace, prepared.run_id))
+    second = next_semantic_work_v3(NextSemanticWorkV3Request(workspace, prepared.run_id))
+
+    assert first.lease_nonce == second.lease_nonce
+    assert first.input_sha256 == second.input_sha256
+    assert first.input_byte_count == second.input_byte_count
+    assert first.input_path.read_bytes() == second.input_path.read_bytes()
+    assert repository.execution_lock() == (
+        prepared.run_id,
+        first.unit_id,
+        first.lease_nonce,
+        "issued",
+    )
+
+
+def test_concurrent_next_claims_one_workspace_lease_and_leaves_loser_prepared(
+    workspace: Path,
+) -> None:
+    repository, first = _prepared_frontier_run(workspace)
+    root = workspace / "approved-source"
+    second = prepare_semantic_index(PrepareSemanticIndexRequest(workspace, root))
+    for prepared in (first, second):
+        approve_semantic_execution(
+            ApproveSemanticExecutionRequest(
+                workspace, prepared.revision_id, prepared.proposal_sha256
+            )
+        )
+
+    def issue(run_id: str) -> object:
+        try:
+            return next_semantic_work_v3(NextSemanticWorkV3Request(workspace, run_id))
+        except SemanticLifecycleV3Error as error:
+            return error
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = list(executor.map(issue, (first.run_id, second.run_id)))
+
+    successes = [outcome for outcome in outcomes if not isinstance(outcome, Exception)]
+    failures = [outcome for outcome in outcomes if isinstance(outcome, Exception)]
+    assert len(successes) == 1
+    assert len(failures) == 1
+    assert str(failures[0]) == "semantic execution is run_busy"
+    winner = successes[0]
+    assert getattr(winner, "run_id") in {first.run_id, second.run_id}
+    loser = second.run_id if winner.run_id == first.run_id else first.run_id
+    assert repository.run_state(loser) is SemanticRunState.PREPARED
+    assert repository.execution_lock() is not None
+
+
+def test_next_rejects_current_source_drift_without_publishing_exchange_input(
+    workspace: Path,
+) -> None:
+    repository, prepared = _prepared_frontier_run(workspace)
+    approve_semantic_execution(
+        ApproveSemanticExecutionRequest(
+            workspace, prepared.revision_id, prepared.proposal_sha256
+        )
+    )
+    catalog_path = WorkspacePaths.from_root(workspace).semantic_v3_catalog_path(
+        prepared.revision_id
+    )
+    with sqlite3.connect(catalog_path) as catalog:
+        file_node = catalog.execute(
+            """SELECT node_id FROM nodes
+               WHERE node_kind = 'file' AND relative_hierarchy = 'project/src/app.py'"""
+        ).fetchone()[0]
+    with repository._connection() as connection:
+        target = semantic_canonical_json_bytes([file_node]).decode("utf-8")
+        connection.execute(
+            """UPDATE semantic_v3_units
+               SET target_ref_json = ?, target_ref_sha256 = ?
+               WHERE run_id = ?""",
+            (target, sha256(target.encode("utf-8")).hexdigest(), prepared.run_id),
+        )
+    (workspace / "approved-source" / "project" / "src" / "app.py").write_text(
+        "def main() -> None:\n    print('changed')\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SemanticLifecycleV3Error, match="stale"):
+        next_semantic_work_v3(NextSemanticWorkV3Request(workspace, prepared.run_id))
+
+    paths = WorkspacePaths.from_root(workspace)
+    assert not paths.semantic_v3_exchange_input_path(
+        prepared.revision_id, prepared.run_id
+    ).exists()
+    assert repository.execution_lock() is not None
+
+
+def test_run_scoped_exchange_rejects_replay_drift_and_keeps_one_fixed_slot(
+    workspace: Path,
+) -> None:
+    exchange_dir = workspace / ".portfolio-maker" / "private" / "exchange"
+    exchange = SemanticExchange(
+        exchange_dir / "input.pm-pack", exchange_dir / "output.pm-pack"
+    )
+    binding = exchange.publish_input("a" * 64, "b" * 32, {"value": "safe"})
+
+    assert exchange.input_path.name == "input.pm-pack"
+    assert (exchange_dir / "output.pm-pack").is_file()
+    assert exchange.replay_input(
+        "a" * 64, "b" * 32, binding.sha256, binding.byte_count
+    ).sha256 == binding.sha256
+    exchange.input_path.write_text("{}", encoding="utf-8")
+    with pytest.raises(SemanticExchangeError, match="binding"):
+        exchange.replay_input("a" * 64, "b" * 32, binding.sha256, binding.byte_count)
+
+
+def test_next_rejects_invalid_target_ref_and_pauses_on_phase_budget(
+    workspace: Path,
+) -> None:
+    repository, prepared = _prepared_frontier_run(workspace)
+    approve_semantic_execution(
+        ApproveSemanticExecutionRequest(
+            workspace, prepared.revision_id, prepared.proposal_sha256
+        )
+    )
+    with repository._connection() as connection:
+        target = semantic_canonical_json_bytes(["unit-not-a-catalog-node"]).decode("utf-8")
+        connection.execute(
+            """UPDATE semantic_v3_units
+               SET target_ref_json = ?, target_ref_sha256 = ?
+               WHERE run_id = ?""",
+            (target, sha256(target.encode("utf-8")).hexdigest(), prepared.run_id),
+        )
+
+    with pytest.raises(SemanticLifecycleV3Error, match="target authority"):
+        next_semantic_work_v3(NextSemanticWorkV3Request(workspace, prepared.run_id))
+
+    assert repository.execution_lock() is not None
+
+
+def test_next_pauses_before_lease_when_unit_exceeds_phase_budget(workspace: Path) -> None:
+    repository, prepared = _prepared_frontier_run(workspace)
+    approve_semantic_execution(
+        ApproveSemanticExecutionRequest(
+            workspace, prepared.revision_id, prepared.proposal_sha256
+        )
+    )
+    with repository._connection() as connection:
+        connection.execute(
+            """UPDATE semantic_v3_units SET estimated_input_bytes = 999999999
+               WHERE run_id = ?""",
+            (prepared.run_id,),
+        )
+
+    with pytest.raises(SemanticLifecycleV3Error, match="paused_budget"):
+        next_semantic_work_v3(NextSemanticWorkV3Request(workspace, prepared.run_id))
+
+    assert repository.run_state(prepared.run_id) is SemanticRunState.PAUSED_BUDGET
+    assert repository.execution_lock() is None
+
+
+def test_materializing_lease_recovers_after_issue_failure_without_double_charge(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository, prepared = _prepared_frontier_run(workspace)
+    approve_semantic_execution(
+        ApproveSemanticExecutionRequest(
+            workspace, prepared.revision_id, prepared.proposal_sha256
+        )
+    )
+    original = SQLiteRepository.issue_semantic_v3_input
+    failed_once = False
+
+    def fail_after_publish(self, *args, **kwargs):
+        nonlocal failed_once
+        if not failed_once:
+            failed_once = True
+            raise RepositoryError("synthetic issue failure")
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(SQLiteRepository, "issue_semantic_v3_input", fail_after_publish)
+    with pytest.raises(SemanticLifecycleV3Error, match="unavailable"):
+        next_semantic_work_v3(NextSemanticWorkV3Request(workspace, prepared.run_id))
+
+    with repository._read_connection() as connection:
+        before = connection.execute(
+            "SELECT lease_nonce FROM semantic_v3_leases WHERE run_id = ?", (prepared.run_id,)
+        ).fetchone()[0]
+        assert connection.execute(
+            "SELECT used_input_bytes FROM semantic_v3_runs WHERE run_id = ?", (prepared.run_id,)
+        ).fetchone()[0] == 0
+
+    recovered = next_semantic_work_v3(NextSemanticWorkV3Request(workspace, prepared.run_id))
+
+    assert recovered.lease_nonce == before
+    assert recovered.input_path.read_bytes()
+    with repository._read_connection() as connection:
+        assert connection.execute(
+            "SELECT used_input_bytes FROM semantic_v3_runs WHERE run_id = ?", (prepared.run_id,)
+        ).fetchone()[0] == 0
+
+
+def test_exchange_enforces_exact_byte_cap_and_rejects_symlink_replay(workspace: Path) -> None:
+    exchange_dir = workspace / ".portfolio-maker" / "private" / "exchange-cap"
+    exchange = SemanticExchange(
+        exchange_dir / "input.pm-pack", exchange_dir / "output.pm-pack"
+    )
+    empty = semantic_canonical_json_bytes({"text": ""})
+    payload = {"text": "x" * (MAX_SEMANTIC_EXCHANGE_INPUT_BYTES - len(empty))}
+    binding = exchange.publish_input("a" * 64, "b" * 32, payload)
+    assert binding.byte_count == MAX_SEMANTIC_EXCHANGE_INPUT_BYTES
+
+    with pytest.raises(SemanticExchangeError, match="byte budget"):
+        exchange.publish_input(
+            "a" * 64,
+            "b" * 32,
+            {"text": payload["text"] + "x"},
+        )
+
+    exchange.input_path.unlink()
+    exchange.input_path.symlink_to(exchange_dir / "output.pm-pack")
+    with pytest.raises(SemanticExchangeError, match="unavailable"):
+        exchange.replay_input("a" * 64, "b" * 32, binding.sha256, binding.byte_count)
+
+
+def test_next_rejects_same_inode_tail_rewrite_before_exchange_publication(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository, prepared = _prepared_frontier_run(workspace)
+    approve_semantic_execution(
+        ApproveSemanticExecutionRequest(
+            workspace, prepared.revision_id, prepared.proposal_sha256
+        )
+    )
+    catalog_path = WorkspacePaths.from_root(workspace).semantic_v3_catalog_path(
+        prepared.revision_id
+    )
+    with sqlite3.connect(catalog_path) as catalog:
+        file_node = catalog.execute(
+            """SELECT node_id FROM nodes
+               WHERE node_kind = 'file' AND relative_hierarchy = 'project/src/app.py'"""
+        ).fetchone()[0]
+    with repository._connection() as connection:
+        target = semantic_canonical_json_bytes([file_node]).decode("utf-8")
+        connection.execute(
+            """UPDATE semantic_v3_units
+               SET target_ref_json = ?, target_ref_sha256 = ?
+               WHERE run_id = ?""",
+            (target, sha256(target.encode("utf-8")).hexdigest(), prepared.run_id),
+        )
+    source = workspace / "approved-source" / "project" / "src" / "app.py"
+    original = lifecycle_v3_module.read_verified_representative
+
+    def rewrite_after_read(path, ranges, limit):
+        result = original(path, ranges, limit)
+        source.write_text("def changed() -> None:\n    pass\n", encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(
+        lifecycle_v3_module, "read_verified_representative", rewrite_after_read
+    )
+    with pytest.raises(SemanticLifecycleV3Error, match="stale"):
+        next_semantic_work_v3(NextSemanticWorkV3Request(workspace, prepared.run_id))
+
+    assert not WorkspacePaths.from_root(workspace).semantic_v3_exchange_input_path(
+        prepared.revision_id, prepared.run_id
+    ).exists()
+
+
+def test_next_rejects_policy_drift_before_exchange_publication(workspace: Path) -> None:
+    repository, prepared = _prepared_frontier_run(workspace)
+    approve_semantic_execution(
+        ApproveSemanticExecutionRequest(
+            workspace, prepared.revision_id, prepared.proposal_sha256
+        )
+    )
+    paths = WorkspacePaths.from_root(workspace)
+    approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    approval["excluded_file_patterns"] = ["*.blocked"]
+    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+
+    with pytest.raises(SemanticLifecycleV3Error, match="stale"):
+        next_semantic_work_v3(NextSemanticWorkV3Request(workspace, prepared.run_id))
+
+    assert repository.execution_lock() is not None
+    assert not paths.semantic_v3_exchange_input_path(
+        prepared.revision_id, prepared.run_id
+    ).exists()
+
+
+def test_next_rejects_overbound_targets_before_exchange(
+    workspace: Path,
+) -> None:
+    repository, prepared = _prepared_frontier_run(workspace)
+    approve_semantic_execution(
+        ApproveSemanticExecutionRequest(
+            workspace, prepared.revision_id, prepared.proposal_sha256
+        )
+    )
+    paths = WorkspacePaths.from_root(workspace)
+    with sqlite3.connect(paths.semantic_v3_catalog_path(prepared.revision_id)) as catalog:
+        node_id = catalog.execute(
+            "SELECT node_id FROM nodes WHERE node_kind = 'file' ORDER BY node_id LIMIT 1"
+        ).fetchone()[0]
+    overbound_targets = semantic_canonical_json_bytes([node_id] * 65).decode("utf-8")
+    with repository._connection() as connection:
+        connection.execute(
+            """UPDATE semantic_v3_units
+               SET target_ref_json = ?, target_ref_sha256 = ?
+               WHERE run_id = ?""",
+            (
+                overbound_targets,
+                sha256(overbound_targets.encode("utf-8")).hexdigest(),
+                prepared.run_id,
+            ),
+        )
+
+    with pytest.raises(SemanticLifecycleV3Error, match="target authority"):
+        next_semantic_work_v3(NextSemanticWorkV3Request(workspace, prepared.run_id))
+    assert not paths.semantic_v3_exchange_input_path(
+        prepared.revision_id, prepared.run_id
+    ).exists()
+
+
+def test_execution_authority_streams_plan_hash_without_plan_blob_projection(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository, prepared = _prepared_frontier_run(workspace)
+    approve_semantic_execution(
+        ApproveSemanticExecutionRequest(
+            workspace, prepared.revision_id, prepared.proposal_sha256
+        )
+    )
+    statements: list[str] = []
+    original = SQLiteRepository._read_connection
+
+    @contextmanager
+    def traced_read_connection(repository_instance: SQLiteRepository):
+        with original(repository_instance) as connection:
+            connection.set_trace_callback(statements.append)
+            yield connection
+
+    monkeypatch.setattr(SQLiteRepository, "_read_connection", traced_read_connection)
+    authority = repository.load_semantic_v3_execution_authority(prepared.run_id)
+
+    assert not hasattr(authority, "plan_bytes")
+    selects = "\n".join(statement.casefold() for statement in statements)
+    assert "length(plan_canonical_json)" in selects
+    assert "substr(plan_canonical_json" in selects
+    assert "proposal.plan_canonical_json" not in selects
 
 
 def test_v3_status_uses_only_constant_aggregate_queries(
