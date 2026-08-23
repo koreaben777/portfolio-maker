@@ -36,6 +36,10 @@ from portfolio_maker.application.semantic_work import (
     semantic_index_status,
     validate_semantic_work,
 )
+from portfolio_maker.application.semantic_lifecycle_v3 import (
+    SemanticLifecycleV3Error,
+    approve_semantic_execution,
+)
 from portfolio_maker.application.vision_analysis import (
     VisionAnalysisError,
     apply_vision_analysis,
@@ -69,6 +73,7 @@ from portfolio_maker.application.models import (
     ComposeProjectsV2Request,
     PrepareProjectReviewRequest,
     ApplySemanticIndexRequest,
+    ApproveSemanticExecutionRequest,
     ApplyVisionAnalysisRequest,
     NextSemanticWorkRequest,
     PrepareSemanticIndexRequest,
@@ -196,6 +201,11 @@ def build_parser() -> argparse.ArgumentParser:
     finalize_semantic = subparsers.add_parser("finalize-semantic-index")
     finalize_semantic.add_argument("--workspace", type=Path, default=Path("."))
 
+    approve_semantic = subparsers.add_parser("approve-semantic-execution")
+    approve_semantic.add_argument("--workspace", type=Path, default=Path("."))
+    approve_semantic.add_argument("--revision-id", required=True)
+    approve_semantic.add_argument("--proposal-digest", required=True)
+
     prepare_vision = subparsers.add_parser("prepare-vision-analysis")
     prepare_vision.add_argument("--workspace", type=Path, default=Path("."))
     prepare_vision.add_argument("--source-id", type=int, required=True)
@@ -237,6 +247,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(_safe_vision_error_message(error), file=sys.stderr)
         return 1
     except SemanticWorkError:
+        print("semantic work command failed safely", file=sys.stderr)
+        return 1
+    except SemanticLifecycleV3Error:
         print("semantic work command failed safely", file=sys.stderr)
         return 1
     except (
@@ -507,6 +520,25 @@ def _main(argv: Sequence[str] | None = None) -> int:
         print("Semantic index applied.")
         return 0
 
+    if args.command == "approve-semantic-execution":
+        result = approve_semantic_execution(
+            ApproveSemanticExecutionRequest(
+                workspace=args.workspace,
+                revision_id=args.revision_id,
+                proposal_sha256=args.proposal_digest,
+            )
+        )
+        revision_id = _safe_semantic_revision(result.revision_id)
+        run_id = _safe_semantic_run(result.run_id)
+        proposal_digest = _safe_semantic_digest(result.proposal_sha256)
+        if result.run_state.value != "prepared":
+            raise SemanticWorkError("semantic work output is unsafe")
+        print(f"Semantic revision: {revision_id}")
+        print(f"Semantic run: {run_id}")
+        print(f"Proposal SHA-256: {proposal_digest}")
+        print("State: prepared")
+        return 0
+
     if args.command == "semantic-index-status":
         result = semantic_index_status(
             SemanticIndexStatusRequest(workspace=args.workspace)
@@ -525,6 +557,15 @@ def _main(argv: Sequence[str] | None = None) -> int:
             )
         else:
             print(f"Semantic revision: {revision_id}")
+            if result.protocol == "codex-semantic-v3":
+                run_id = _safe_semantic_run(result.run_id)
+                print(f"Semantic run: {run_id}")
+                print(f"State: {result.run_state.value}")
+                print(f"Ready: {result.ready_count}")
+                print(f"Receipted: {result.receipted_count}")
+                print(f"Deferred: {result.deferred_count}")
+                print(f"Integrity: {result.integrity_level}")
+                return 0
             print(f"Nodes: {result.node_count}")
             print(f"Work units: {result.work_unit_count}")
             print(f"Ready: {result.ready_count}")
@@ -814,6 +855,26 @@ def _safe_semantic_unit(value: object) -> str:
         or not value.startswith("unit-")
         or len(value) < 11
         or not value[5:].isdigit()
+    ):
+        raise SemanticWorkError("semantic work output is unsafe")
+    return value
+
+
+def _safe_semantic_digest(value: object) -> str:
+    if (
+        type(value) is not str
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise SemanticWorkError("semantic work output is unsafe")
+    return value
+
+
+def _safe_semantic_run(value: object) -> str:
+    if (
+        type(value) is not str
+        or len(value) not in {32, 64}
+        or any(character not in "0123456789abcdef" for character in value)
     ):
         raise SemanticWorkError("semantic work output is unsafe")
     return value

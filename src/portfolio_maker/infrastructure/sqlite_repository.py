@@ -2263,7 +2263,9 @@ class SQLiteRepository:
         if budget_exhausted:
             raise RepositoryError("semantic budget is exhausted")
 
-    def approve_semantic_v3_run(self, run_id: str, proposal_sha256: str) -> None:
+    def approve_semantic_v3_run(
+        self, run_id: str, proposal_sha256: str,
+    ) -> SemanticRunState:
         with self._connection() as conn:
             row = conn.execute(
                 "SELECT * FROM semantic_v3_proposals WHERE run_id = ?", (run_id,)
@@ -2281,10 +2283,26 @@ class SQLiteRepository:
             self._v3_validate_revision_authority(
                 conn, proposal, "semantic approval authority is invalid",
             )
-            if proposal.run_id != run_id or row["state"] != "proposed":
+            if proposal.run_id != run_id:
                 raise RepositoryError("semantic approval authority is invalid")
-            if run["state"] != SemanticRunState.PREPARED.value:
-                raise RepositoryError("semantic run is not prepared")
+            existing = conn.execute(
+                "SELECT proposal_sha256 FROM semantic_v3_approvals WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["proposal_sha256"] == proposal_sha256
+                    and row["state"] == "approved"
+                    and run["state"] == SemanticRunState.PREPARED.value
+                ):
+                    return SemanticRunState.PREPARED
+                raise RepositoryError("semantic approval authority is invalid")
+            if row["state"] != "proposed" or run["state"] not in {
+                SemanticRunState.AWAITING_APPROVAL.value,
+                # Retained only for pre-Task-8 repository lifecycle fixtures.
+                SemanticRunState.PREPARED.value,
+            }:
+                raise RepositoryError("semantic run is not awaiting approval")
             budget, phases, budget_binding = self._v3_budget_binding(proposal)
             conn.execute(
                 """INSERT INTO semantic_v3_approvals(
@@ -2311,6 +2329,15 @@ class SQLiteRepository:
             )
             if result.rowcount != 1:
                 raise RepositoryError("semantic approval authority is invalid")
+            if run["state"] == SemanticRunState.AWAITING_APPROVAL.value:
+                transitioned = conn.execute(
+                    """UPDATE semantic_v3_runs SET state = 'prepared'
+                       WHERE run_id = ? AND state = 'awaiting_approval'""",
+                    (run_id,),
+                )
+                if transitioned.rowcount != 1:
+                    raise RepositoryError("semantic approval authority is invalid")
+            return SemanticRunState.PREPARED
 
     def run_state(self, run_id: str) -> SemanticRunState:
         with self._read_connection() as conn:
@@ -2710,6 +2737,101 @@ class SQLiteRepository:
             return SemanticStatusSnapshot(row["revision_id"], row["run_id"], SemanticRunState(row["state"]), completion)
         except (TypeError, ValueError, json.JSONDecodeError) as error:
             raise RepositoryError("semantic status is invalid") from error
+
+    def has_semantic_v3_runs(self) -> bool:
+        with self._read_connection() as conn:
+            try:
+                return conn.execute(
+                    "SELECT 1 FROM semantic_v3_runs LIMIT 1"
+                ).fetchone() is not None
+            except sqlite3.OperationalError:
+                return False
+
+    def semantic_v3_aggregate_status(self, run_id: str | None) -> dict[str, object]:
+        """Read one bounded v3 run projection without catalog or lifecycle scans."""
+        with self._read_connection() as conn:
+            selector = (
+                "WHERE run.run_id = ?"
+                if run_id is not None
+                else "ORDER BY run.rowid DESC LIMIT 1"
+            )
+            parameters: tuple[object, ...] = (run_id,) if run_id is not None else ()
+            row = conn.execute(
+                f"""
+                SELECT run.revision_id, run.run_id, run.state,
+                       aggregate.ready_count, aggregate.leased_count,
+                       aggregate.validated_count, aggregate.deferred_count,
+                       aggregate.error_count, aggregate.used_units,
+                       aggregate.used_input_bytes, aggregate.used_active_seconds,
+                       aggregate.phase_usage_json, aggregate.completion_json,
+                       aggregate.last_verified_at,
+                       proposal.total_budget_json,
+                       COALESCE(
+                           (SELECT checkpoint.checkpoint_root
+                              FROM semantic_v3_checkpoints AS checkpoint
+                             WHERE checkpoint.run_id = run.run_id
+                             ORDER BY checkpoint.sequence DESC LIMIT 1),
+                           binding.current_checkpoint_root
+                       ) AS last_checkpoint_root
+                FROM semantic_v3_runs AS run
+                JOIN semantic_v3_aggregates AS aggregate
+                  ON aggregate.run_id = run.run_id
+                JOIN semantic_v3_proposals AS proposal
+                  ON proposal.run_id = run.run_id
+                JOIN semantic_v3_revision_bindings AS binding
+                  ON binding.revision_id = run.revision_id
+                {selector}
+                """,
+                parameters,
+            ).fetchone()
+        if row is None:
+            raise RepositoryError("semantic run was not found")
+        try:
+            phase_usage = json.loads(row["phase_usage_json"], object_pairs_hook=self._v3_no_duplicates)
+            completion = json.loads(row["completion_json"], object_pairs_hook=self._v3_no_duplicates)
+            total_budget = json.loads(row["total_budget_json"], object_pairs_hook=self._v3_no_duplicates)
+            if (
+                type(phase_usage) is not dict
+                or type(completion) is not dict
+                or type(total_budget) is not dict
+                or semantic_canonical_json_bytes(phase_usage).decode("utf-8") != row["phase_usage_json"]
+                or semantic_canonical_json_bytes(completion).decode("utf-8") != row["completion_json"]
+                or semantic_canonical_json_bytes(total_budget).decode("utf-8") != row["total_budget_json"]
+                or not isinstance(row["last_checkpoint_root"], str)
+            ):
+                raise ValueError("aggregate projection is invalid")
+            SemanticRunState(row["state"])
+            SemanticCompletion(**completion)
+            SemanticBudget(**total_budget)
+            numeric_fields = (
+                "ready_count", "leased_count", "validated_count", "deferred_count",
+                "error_count", "used_units", "used_input_bytes",
+            )
+            if any(type(row[field]) is not int or row[field] < 0 for field in numeric_fields):
+                raise ValueError("aggregate projection is invalid")
+            if not isinstance(row["used_active_seconds"], (int, float)) or row["used_active_seconds"] < 0:
+                raise ValueError("aggregate projection is invalid")
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            raise RepositoryError("semantic aggregate is invalid") from error
+        return {
+            "revision_id": row["revision_id"],
+            "run_id": row["run_id"],
+            "run_state": row["state"],
+            "completion": completion,
+            "phase_usage": phase_usage,
+            "ready_count": row["ready_count"],
+            "leased_count": row["leased_count"],
+            "validated_count": row["validated_count"],
+            "receipted_count": row["validated_count"] + row["deferred_count"],
+            "deferred_count": row["deferred_count"],
+            "error_count": row["error_count"],
+            "used_units": row["used_units"],
+            "used_input_bytes": row["used_input_bytes"],
+            "used_active_seconds": row["used_active_seconds"],
+            "last_checkpoint_root": row["last_checkpoint_root"],
+            "last_verified_at": row["last_verified_at"],
+            "total_budget": total_budget,
+        }
 
     def _semantic_v3_insert_checkpoint(
         self, conn: sqlite3.Connection, checkpoint: SemanticCheckpoint

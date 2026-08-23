@@ -18,6 +18,8 @@ from portfolio_maker.application.models import (
     NextSemanticWorkResult,
     SemanticIndexStatusRequest,
     SemanticIndexStatusResult,
+    SemanticIndexStatusV3Result,
+    SemanticIndexStatusV3Request,
     ValidateSemanticWorkRequest,
     ValidateSemanticWorkResult,
 )
@@ -534,9 +536,17 @@ def structural_chunk_name(index: int) -> str:
 
 def semantic_index_status(
     request: SemanticIndexStatusRequest,
-) -> SemanticIndexStatusResult:
+) -> SemanticIndexStatusResult | SemanticIndexStatusV3Result:
     paths = WorkspacePaths.from_root(request.workspace)
     repository = SQLiteRepository(paths.db_path)
+    if repository.has_semantic_v3_runs():
+        from portfolio_maker.application.semantic_lifecycle_v3 import (
+            semantic_index_status_v3,
+        )
+
+        return semantic_index_status_v3(
+            SemanticIndexStatusV3Request(workspace=request.workspace)
+        )
     try:
         with repository._repository_critical_section():
             state = _load_verified_state(paths, repository)

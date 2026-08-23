@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from hashlib import sha256
 import json
 from pathlib import Path
@@ -28,12 +29,217 @@ from portfolio_maker.domain.semantic_frontier import (
     semantic_canonical_json_bytes,
     semantic_proposal_sha256,
 )
+from portfolio_maker.application.approval import write_sample_approval
+from portfolio_maker.application.models import (
+    ApproveSemanticExecutionRequest,
+    PrepareSemanticIndexRequest,
+    SemanticIndexStatusRequest,
+)
+from portfolio_maker.application.semantic_index import prepare_semantic_index
+from portfolio_maker.application.semantic_lifecycle_v3 import (
+    SemanticLifecycleV3Error,
+    approve_semantic_execution,
+)
+from portfolio_maker.application.semantic_work import semantic_index_status
 from portfolio_maker.infrastructure.sqlite_repository import RepositoryError, SQLiteRepository
 from portfolio_maker.workspace import WorkspacePaths
 
 
 def _digest(label: str) -> str:
     return sha256(label.encode("utf-8")).hexdigest()
+
+
+def _prepared_frontier_run(workspace: Path) -> tuple[SQLiteRepository, object]:
+    root = workspace / "approved-source"
+    root.mkdir()
+    (root / "README.md").write_text("# Approved semantic fixture\n", encoding="utf-8")
+    paths = WorkspacePaths.from_root(workspace)
+    write_sample_approval(paths)
+    approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    approval["approved_source_uris"] = [root.resolve().as_uri()]
+    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+    prepared = prepare_semantic_index(PrepareSemanticIndexRequest(workspace, root))
+    repository = SQLiteRepository(paths.db_path)
+    repository.initialize()
+    return repository, prepared
+
+
+def test_approval_transitions_awaiting_run_without_claiming_execution(
+    workspace: Path,
+) -> None:
+    repository, prepared = _prepared_frontier_run(workspace)
+    assert repository.run_state(prepared.run_id) is SemanticRunState.AWAITING_APPROVAL
+
+    result = approve_semantic_execution(
+        ApproveSemanticExecutionRequest(
+            workspace,
+            prepared.revision_id,
+            prepared.proposal_sha256,
+        )
+    )
+
+    assert result.run_state is SemanticRunState.PREPARED
+    assert repository.run_state(prepared.run_id) is SemanticRunState.PREPARED
+    assert repository.execution_lock() is None
+    with repository._read_connection() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM semantic_v3_runs WHERE state = 'running'"
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM semantic_v3_leases WHERE run_id = ?", (prepared.run_id,)
+        ).fetchone()[0] == 0
+
+
+def test_approval_rejects_tampered_durable_plan_without_state_mutation(
+    workspace: Path,
+) -> None:
+    repository, prepared = _prepared_frontier_run(workspace)
+    with repository._connection() as connection:
+        connection.execute(
+            "UPDATE semantic_v3_proposals SET plan_canonical_json = ? WHERE run_id = ?",
+            (b'{"tampered":true}', prepared.run_id),
+        )
+
+    with pytest.raises(SemanticLifecycleV3Error, match="approval authority"):
+        approve_semantic_execution(
+            ApproveSemanticExecutionRequest(
+                workspace,
+                prepared.revision_id,
+                prepared.proposal_sha256,
+            )
+        )
+
+    assert repository.run_state(prepared.run_id) is SemanticRunState.AWAITING_APPROVAL
+    with repository._read_connection() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM semantic_v3_approvals WHERE run_id = ?", (prepared.run_id,)
+        ).fetchone()[0] == 0
+
+
+def test_v3_status_dispatches_to_aggregate_authority_without_project_readiness(
+    workspace: Path,
+) -> None:
+    _repository, prepared = _prepared_frontier_run(workspace)
+
+    status = semantic_index_status(SemanticIndexStatusRequest(workspace))
+
+    assert status.protocol == "codex-semantic-v3"
+    assert status.run_id == prepared.run_id
+    assert status.run_state is SemanticRunState.AWAITING_APPROVAL
+    assert status.integrity_level == "aggregate_bound"
+    assert status.completion.structural_complete is False
+    assert status.completion.project_discovery_ready is False
+    assert status.resumable is True
+
+
+def test_approval_rejects_current_source_policy_drift_without_state_mutation(
+    workspace: Path,
+) -> None:
+    repository, prepared = _prepared_frontier_run(workspace)
+    paths = WorkspacePaths.from_root(workspace)
+    approval = json.loads(paths.approval_path.read_text(encoding="utf-8"))
+    approval["excluded_file_patterns"] = ["*.synthetic"]
+    paths.approval_path.write_text(json.dumps(approval), encoding="utf-8")
+
+    with pytest.raises(SemanticLifecycleV3Error, match="stale"):
+        approve_semantic_execution(
+            ApproveSemanticExecutionRequest(
+                workspace, prepared.revision_id, prepared.proposal_sha256
+            )
+        )
+
+    assert repository.run_state(prepared.run_id) is SemanticRunState.AWAITING_APPROVAL
+    with repository._read_connection() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM semantic_v3_approvals WHERE run_id = ?", (prepared.run_id,)
+        ).fetchone()[0] == 0
+
+
+@pytest.mark.parametrize(
+    ("column", "value"),
+    (
+        ("catalog_root", _digest("tampered-catalog")),
+        ("selector_version", "tampered-selector"),
+        ("private_context_scope", "tampered-scope"),
+        ("total_budget_json", "{}"),
+        ("phase_bindings_json", "[]"),
+    ),
+)
+def test_approval_rejects_durable_projection_drift_without_state_mutation(
+    workspace: Path, column: str, value: str,
+) -> None:
+    repository, prepared = _prepared_frontier_run(workspace)
+    with repository._connection() as connection:
+        connection.execute(
+            f"UPDATE semantic_v3_proposals SET {column} = ? WHERE run_id = ?",
+            (value, prepared.run_id),
+        )
+
+    with pytest.raises(SemanticLifecycleV3Error, match="approval authority"):
+        approve_semantic_execution(
+            ApproveSemanticExecutionRequest(
+                workspace, prepared.revision_id, prepared.proposal_sha256
+            )
+        )
+
+    assert repository.run_state(prepared.run_id) is SemanticRunState.AWAITING_APPROVAL
+    with repository._read_connection() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM semantic_v3_approvals WHERE run_id = ?", (prepared.run_id,)
+        ).fetchone()[0] == 0
+
+
+def test_two_exact_approved_v3_runs_remain_prepared_without_running_slot(
+    workspace: Path,
+) -> None:
+    repository, first = _prepared_frontier_run(workspace)
+    root = workspace / "approved-source"
+    second = prepare_semantic_index(PrepareSemanticIndexRequest(workspace, root))
+
+    first_result = approve_semantic_execution(
+        ApproveSemanticExecutionRequest(workspace, first.revision_id, first.proposal_sha256)
+    )
+    second_result = approve_semantic_execution(
+        ApproveSemanticExecutionRequest(workspace, second.revision_id, second.proposal_sha256)
+    )
+
+    assert first_result.run_state is second_result.run_state is SemanticRunState.PREPARED
+    assert repository.execution_lock() is None
+    with repository._read_connection() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM semantic_v3_runs WHERE state = 'running'"
+        ).fetchone()[0] == 0
+
+
+def test_v3_status_uses_only_constant_aggregate_queries(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _repository, _prepared = _prepared_frontier_run(workspace)
+    statements: list[str] = []
+    original = SQLiteRepository._read_connection
+
+    @contextmanager
+    def traced_read_connection(repository: SQLiteRepository):
+        with original(repository) as connection:
+            connection.set_trace_callback(statements.append)
+            yield connection
+
+    monkeypatch.setattr(SQLiteRepository, "_read_connection", traced_read_connection)
+
+    status = semantic_index_status(SemanticIndexStatusRequest(workspace))
+
+    selects = [statement.lower() for statement in statements if statement.lstrip().lower().startswith("select")]
+    assert len(selects) <= 2
+    assert all(
+        forbidden not in "\n".join(selects)
+        for forbidden in (
+            "semantic_v3_units",
+            "semantic_v3_dependencies",
+            "semantic_v3_deferred",
+            "semantic_v3_receipts",
+        )
+    )
+    assert status.integrity_level == "aggregate_bound"
 
 
 def _proposal(

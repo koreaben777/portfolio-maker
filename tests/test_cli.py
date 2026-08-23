@@ -6,6 +6,7 @@ import hashlib
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -369,6 +370,94 @@ def test_cli_prepare_semantic_index_reports_chunks_without_locator_values(
     assert "Managed input bytes:" in report_text
     assert str(workspace) not in report_text
     assert str(root) not in report_text
+
+
+def test_cli_approves_v3_semantic_execution_and_reports_aggregate_status_safely(
+    workspace, tmp_path, capsys
+) -> None:
+    root = tmp_path / "approved-root"
+    root.mkdir()
+    (root / "README.md").write_text("# Safe semantic fixture", encoding="utf-8")
+    approve_semantic_root(workspace, root)
+    prepared = prepare_semantic_index(
+        PrepareSemanticIndexRequest(workspace, root)
+    )
+    capsys.readouterr()
+
+    assert main(
+        [
+            "approve-semantic-execution",
+            "--workspace", str(workspace),
+            "--revision-id", prepared.revision_id,
+            "--proposal-digest", prepared.proposal_sha256,
+        ]
+    ) == 0
+    approved = capsys.readouterr()
+    assert prepared.revision_id in approved.out
+    assert prepared.proposal_sha256 in approved.out
+    assert "prepared" in approved.out
+    assert str(root) not in approved.out
+    assert root.as_uri() not in approved.out
+
+    assert main(
+        ["semantic-index-status", "--workspace", str(workspace), "--format", "json"]
+    ) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["protocol"] == "codex-semantic-v3"
+    assert payload["integrity_level"] == "aggregate_bound"
+    assert payload["completion"]["project_discovery_ready"] is False
+
+
+def test_cli_rejects_unsafe_v3_approval_identifier_without_locator_output(
+    workspace, capsys
+) -> None:
+    exit_code = main(
+        [
+            "approve-semantic-execution",
+            "--workspace", str(workspace),
+            "--revision-id", "file:///synthetic/private",
+            "--proposal-digest", "0" * 64,
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "file:" not in captured.err
+    assert "semantic work command failed safely" in captured.err
+
+
+def test_cli_approval_reopens_durable_v3_authority_in_a_fresh_process(
+    workspace, tmp_path
+) -> None:
+    root = tmp_path / "approved-root"
+    root.mkdir()
+    (root / "README.md").write_text("# Safe semantic fixture", encoding="utf-8")
+    approve_semantic_root(workspace, root)
+    prepared = prepare_semantic_index(
+        PrepareSemanticIndexRequest(workspace, root)
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-B",
+            "-m",
+            "portfolio_maker",
+            "approve-semantic-execution",
+            "--workspace", str(workspace),
+            "--revision-id", prepared.revision_id,
+            "--proposal-digest", prepared.proposal_sha256,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0
+    assert prepared.revision_id in completed.stdout
+    assert prepared.proposal_sha256 in completed.stdout
+    assert str(root) not in completed.stdout
+    assert root.as_uri() not in completed.stdout
 
 
 @pytest.mark.parametrize(

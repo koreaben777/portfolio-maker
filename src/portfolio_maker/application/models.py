@@ -8,7 +8,10 @@ from portfolio_maker.domain.history_models import CleanupExecutionState
 from portfolio_maker.domain.semantic_frontier import (
     SEMANTIC_PROTOCOL_V2,
     SEMANTIC_PROTOCOL_V3,
+    SemanticBudget,
+    SemanticCompletion,
     SemanticPhaseBinding,
+    SemanticRunState,
 )
 
 
@@ -202,6 +205,12 @@ class SemanticIndexStatusRequest:
 
 
 @dataclass(frozen=True)
+class SemanticIndexStatusV3Request:
+    workspace: Path
+    run_id: str | None = None
+
+
+@dataclass(frozen=True)
 class SemanticIndexStatusResult:
     revision_id: str
     node_count: int
@@ -211,6 +220,42 @@ class SemanticIndexStatusResult:
     invalid_count: int
     complete: bool
     protocol: str = SEMANTIC_PROTOCOL_V2
+
+
+@dataclass(frozen=True)
+class SemanticIndexStatusV3Result:
+    revision_id: str
+    run_id: str
+    run_state: SemanticRunState
+    completion: SemanticCompletion
+    phase_usage: tuple[tuple[str, int], ...]
+    ready_count: int
+    leased_count: int
+    validated_count: int
+    receipted_count: int
+    deferred_count: int
+    error_count: int
+    last_checkpoint_root: str
+    last_verified_at: str | None
+    remaining_budget: SemanticBudget
+    resumable: bool
+    integrity_level: str = "aggregate_bound"
+    protocol: str = SEMANTIC_PROTOCOL_V3
+
+
+@dataclass(frozen=True)
+class ApproveSemanticExecutionRequest:
+    workspace: Path
+    revision_id: str
+    proposal_sha256: str
+
+
+@dataclass(frozen=True)
+class ApproveSemanticExecutionResult:
+    revision_id: str
+    run_id: str
+    proposal_sha256: str
+    run_state: SemanticRunState
 
 
 @dataclass(frozen=True)
