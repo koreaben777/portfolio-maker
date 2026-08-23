@@ -2285,25 +2285,38 @@ class SQLiteRepository:
             )
             if proposal.run_id != run_id:
                 raise RepositoryError("semantic approval authority is invalid")
+            budget, phases, budget_binding = self._v3_budget_binding(proposal)
             existing = conn.execute(
-                "SELECT proposal_sha256 FROM semantic_v3_approvals WHERE run_id = ?",
-                (run_id,),
+                "SELECT * FROM semantic_v3_approvals WHERE run_id = ?", (run_id,)
             ).fetchone()
             if existing is not None:
                 if (
-                    existing["proposal_sha256"] == proposal_sha256
+                    tuple(existing[field] for field in (
+                        "approval_kind", "proposal_sha256", "manifest_sha256",
+                        "source_policy_sha256", "source_approval_sha256", "catalog_root",
+                        "selector_version", "private_context_scope", "parent_checkpoint_root",
+                        "project_boundary_sha256", "parent_proposal_sha256",
+                        "evidence_policy_sha256", "total_budget_json", "phase_bindings_json",
+                        "budget_binding_sha256", "project_id", "user_confirmed",
+                    )) == (
+                        proposal.approval_kind, proposal_sha256, proposal.manifest_sha256,
+                        proposal.policy_sha256, proposal.source_approval_sha256,
+                        proposal.catalog_root, proposal.selector_version,
+                        proposal.private_context_scope, proposal.parent_checkpoint_root,
+                        proposal.project_boundary_sha256, proposal.parent_proposal_sha256,
+                        proposal.evidence_policy_sha256, budget, phases, budget_binding,
+                        proposal.project_id, 1,
+                    )
                     and row["state"] == "approved"
                     and run["state"] == SemanticRunState.PREPARED.value
                 ):
                     return SemanticRunState.PREPARED
                 raise RepositoryError("semantic approval authority is invalid")
-            if row["state"] != "proposed" or run["state"] not in {
-                SemanticRunState.AWAITING_APPROVAL.value,
-                # Retained only for pre-Task-8 repository lifecycle fixtures.
-                SemanticRunState.PREPARED.value,
-            }:
+            if (
+                row["state"] != "proposed"
+                or run["state"] != SemanticRunState.AWAITING_APPROVAL.value
+            ):
                 raise RepositoryError("semantic run is not awaiting approval")
-            budget, phases, budget_binding = self._v3_budget_binding(proposal)
             conn.execute(
                 """INSERT INTO semantic_v3_approvals(
                     run_id, approval_kind, proposal_sha256, manifest_sha256, source_policy_sha256,
@@ -2329,14 +2342,13 @@ class SQLiteRepository:
             )
             if result.rowcount != 1:
                 raise RepositoryError("semantic approval authority is invalid")
-            if run["state"] == SemanticRunState.AWAITING_APPROVAL.value:
-                transitioned = conn.execute(
-                    """UPDATE semantic_v3_runs SET state = 'prepared'
-                       WHERE run_id = ? AND state = 'awaiting_approval'""",
-                    (run_id,),
-                )
-                if transitioned.rowcount != 1:
-                    raise RepositoryError("semantic approval authority is invalid")
+            transitioned = conn.execute(
+                """UPDATE semantic_v3_runs SET state = 'prepared'
+                   WHERE run_id = ? AND state = 'awaiting_approval'""",
+                (run_id,),
+            )
+            if transitioned.rowcount != 1:
+                raise RepositoryError("semantic approval authority is invalid")
             return SemanticRunState.PREPARED
 
     def run_state(self, run_id: str) -> SemanticRunState:

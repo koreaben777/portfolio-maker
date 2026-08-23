@@ -90,6 +90,49 @@ def test_approval_transitions_awaiting_run_without_claiming_execution(
         ).fetchone()[0] == 0
 
 
+def test_repository_approval_rejects_prepared_run_without_receipt(
+    workspace: Path,
+) -> None:
+    repository, prepared = _prepared_frontier_run(workspace)
+    with repository._connection() as connection:
+        connection.execute(
+            "UPDATE semantic_v3_runs SET state = 'prepared' WHERE run_id = ?",
+            (prepared.run_id,),
+        )
+
+    with repository._read_connection() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM semantic_v3_approvals WHERE run_id = ?", (prepared.run_id,)
+        ).fetchone()[0] == 0
+    before = _lifecycle_snapshot(repository, prepared.run_id, prepared.revision_id)
+
+    with pytest.raises(RepositoryError, match="awaiting approval"):
+        repository.approve_semantic_v3_run(prepared.run_id, prepared.proposal_sha256)
+
+    assert _lifecycle_snapshot(repository, prepared.run_id, prepared.revision_id) == before
+
+
+def test_repository_approval_replays_only_exact_existing_receipt(
+    workspace: Path,
+) -> None:
+    repository, prepared = _prepared_frontier_run(workspace)
+
+    assert repository.approve_semantic_v3_run(
+        prepared.run_id, prepared.proposal_sha256
+    ) is SemanticRunState.PREPARED
+    before = _lifecycle_snapshot(repository, prepared.run_id, prepared.revision_id)
+
+    assert repository.approve_semantic_v3_run(
+        prepared.run_id, prepared.proposal_sha256
+    ) is SemanticRunState.PREPARED
+
+    assert _lifecycle_snapshot(repository, prepared.run_id, prepared.revision_id) == before
+    with repository._read_connection() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM semantic_v3_approvals WHERE run_id = ?", (prepared.run_id,)
+        ).fetchone()[0] == 1
+
+
 def test_approval_rejects_tampered_durable_plan_without_state_mutation(
     workspace: Path,
 ) -> None:
@@ -376,7 +419,11 @@ def _unit(unit_id: str, *, project_deepening: bool = False) -> SemanticPlannedUn
     )
 
 
-def _lifecycle_snapshot(repository: SQLiteRepository, run_id: str) -> dict[str, object]:
+def _lifecycle_snapshot(
+    repository: SQLiteRepository,
+    run_id: str,
+    revision_id: str = "revision-1",
+) -> dict[str, object]:
     tables = (
         "semantic_v3_proposals",
         "semantic_v3_runs",
@@ -404,7 +451,8 @@ def _lifecycle_snapshot(repository: SQLiteRepository, run_id: str) -> dict[str, 
             for table in tables
         }
         snapshot["revision_checkpoint_root"] = connection.execute(
-            "SELECT current_checkpoint_root FROM semantic_v3_revision_bindings WHERE revision_id = 'revision-1'"
+            "SELECT current_checkpoint_root FROM semantic_v3_revision_bindings WHERE revision_id = ?",
+            (revision_id,),
         ).fetchone()[0]
     return snapshot
 
@@ -437,8 +485,21 @@ def _initialized_run(repository: SQLiteRepository, run_id: str) -> SemanticPropo
             ),
         ),
     )
-    repository.approve_semantic_v3_run(run_id, envelope.proposal_sha256)
+    _approve_legacy_fixture_run(repository, run_id, envelope.proposal_sha256)
     return envelope
+
+
+def _approve_legacy_fixture_run(
+    repository: SQLiteRepository,
+    run_id: str,
+    proposal_sha256: str,
+) -> SemanticRunState:
+    with repository._connection() as connection:
+        connection.execute(
+            "UPDATE semantic_v3_runs SET state = 'awaiting_approval' WHERE run_id = ?",
+            (run_id,),
+        )
+    return repository.approve_semantic_v3_run(run_id, proposal_sha256)
 
 
 def initialized_repository(workspace: Path) -> SQLiteRepository:
@@ -907,7 +968,7 @@ def test_queue_rejects_aligned_project_id_authority_drift_without_mutation(works
         "deepening-run",
         (SemanticPlannedUnit("unit-1", FrontierPhase.DEEPENING, ("node-1",), (), 1, 0, "source-1"),),
     )
-    repository.approve_semantic_v3_run("deepening-run", envelope.proposal_sha256)
+    _approve_legacy_fixture_run(repository, "deepening-run", envelope.proposal_sha256)
     with repository._connection() as connection:
         connection.execute(
             "UPDATE semantic_v3_runs SET project_id = 'project-drift' WHERE run_id = 'deepening-run'",
@@ -1268,7 +1329,7 @@ def test_current_checkpoint_drift_fails_closed_at_every_authority_boundary(
             repository.add_semantic_v3_units(
                 run_id, (_unit("unit-1", project_deepening=project_deepening),),
             )
-            repository.approve_semantic_v3_run(run_id, envelope.proposal_sha256)
+            _approve_legacy_fixture_run(repository, run_id, envelope.proposal_sha256)
         if boundary in {"acquire", "issue", "receipt"}:
             repository.claim_semantic_v3_running_slot(run_id)
         if boundary in {"issue", "receipt"}:
@@ -1399,7 +1460,7 @@ def test_checkpoint_cadence_advances_current_root_without_blocking_the_same_run(
     repository.add_semantic_v3_units(
         "run-a", tuple(_unit(f"unit-{sequence}") for sequence in range(1, 18)),
     )
-    repository.approve_semantic_v3_run("run-a", envelope.proposal_sha256)
+    _approve_legacy_fixture_run(repository, "run-a", envelope.proposal_sha256)
     repository.claim_semantic_v3_running_slot("run-a")
 
     for sequence in range(1, 18):
@@ -1433,7 +1494,7 @@ def test_irregular_checkpoint_sequences_remain_monotonic_across_automatic_cadenc
     repository.add_semantic_v3_units(
         "run-a", tuple(_unit(f"unit-{sequence}") for sequence in range(1, 33)),
     )
-    repository.approve_semantic_v3_run("run-a", envelope.proposal_sha256)
+    _approve_legacy_fixture_run(repository, "run-a", envelope.proposal_sha256)
     repository.claim_semantic_v3_running_slot("run-a")
 
     for sequence in range(1, 8):
@@ -1546,7 +1607,7 @@ def test_external_checkpoint_drift_after_cadence_preserves_issued_receipt_state(
     repository.add_semantic_v3_units(
         "run-a", tuple(_unit(f"unit-{sequence}") for sequence in range(1, 18)),
     )
-    repository.approve_semantic_v3_run("run-a", envelope.proposal_sha256)
+    _approve_legacy_fixture_run(repository, "run-a", envelope.proposal_sha256)
     repository.claim_semantic_v3_running_slot("run-a")
     for sequence in range(1, 17):
         unit_id = f"unit-{sequence}"
@@ -1584,7 +1645,7 @@ def test_exact_receipt_replay_revalidates_current_checkpoint_authority(
     repository.add_semantic_v3_units(
         run_id, (_unit("unit-1", project_deepening=project_deepening),),
     )
-    repository.approve_semantic_v3_run(run_id, envelope.proposal_sha256)
+    _approve_legacy_fixture_run(repository, run_id, envelope.proposal_sha256)
     repository.claim_semantic_v3_running_slot(run_id)
     repository.acquire_semantic_v3_execution(run_id, "unit-1", "nonce-1")
     repository.issue_semantic_v3_input(run_id, "nonce-1", _digest("input-1"), 1)
