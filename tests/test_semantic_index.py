@@ -57,26 +57,21 @@ def write_valid_outputs(prepared) -> None:
     input_dir = prepared.manifest_path.parent / "input"
     output_dir = prepared.manifest_path.parent / "output"
     output_dir.mkdir(exist_ok=True)
+    input_payloads = {}
+    input_nodes = {}
     for input_path in sorted(input_dir.glob("chunk-*.json")):
         input_text = input_path.read_text(encoding="utf-8")
         input_payload = json.loads(input_text)
+        input_payloads[input_path] = (input_text, input_payload)
+        input_nodes.update({node["node_id"]: node for node in input_payload["nodes"]})
+    generated_nodes = semantic_index_module._generate_output_nodes(input_nodes)
+    for input_path, (input_text, input_payload) in input_payloads.items():
         payload = {
             "version": 1,
             "revision_id": prepared.revision_id,
             "input_sha256": hashlib.sha256(input_text.encode("utf-8")).hexdigest(),
             "nodes": [
-                {
-                    "node_id": node["node_id"],
-                    "semantic_summary": (
-                        ""
-                        if node["analysis_status"] in {"unsupported", "unreadable"}
-                        else f"Summary for {node['display_name']}"
-                    ),
-                    "semantic_roles": node["roles"],
-                    "topics": ["semantic-index"],
-                    "analysis_status": node["analysis_status"],
-                    "child_node_ids": node["child_node_ids"],
-                }
+                generated_nodes[node["node_id"]]
                 for node in input_payload["nodes"]
             ],
         }
@@ -86,6 +81,29 @@ def write_valid_outputs(prepared) -> None:
             )
         ).hexdigest()
         (output_dir / input_path.name).write_text(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+            encoding="utf-8",
+        )
+
+
+def write_uniform_semantic_outputs(prepared) -> None:
+    write_valid_outputs(prepared)
+    output_dir = prepared.manifest_path.parent / "output"
+    for output_path in output_dir.glob("chunk-*.json"):
+        payload = json.loads(output_path.read_text(encoding="utf-8"))
+        for node in payload["nodes"]:
+            if node["analysis_status"] not in {"unsupported", "unreadable"}:
+                node["semantic_summary"] = "Indexed content."
+                node["topics"] = ["semantic-index"]
+        payload["output_sha256"] = hashlib.sha256(
+            json.dumps(
+                {key: value for key, value in payload.items() if key != "output_sha256"},
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        output_path.write_text(
             json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
             encoding="utf-8",
         )
@@ -264,6 +282,59 @@ def test_apply_semantic_index_activates_complete_bottom_up_output(
     with sqlite3.connect(WorkspacePaths.from_root(workspace).db_path) as connection:
         legacy_projects = connection.execute("SELECT name FROM projects").fetchall()
     assert legacy_projects == [("legacy-technical-project",)]
+
+
+def test_apply_semantic_index_rejects_uniform_semantic_output(
+    workspace: Path, tmp_path: Path
+) -> None:
+    prepared = prepare_fixture_revision(workspace, tmp_path)
+    write_uniform_semantic_outputs(prepared)
+
+    with pytest.raises(SemanticIndexError, match="semantic quality"):
+        apply_semantic_index(ApplySemanticIndexRequest(workspace=workspace))
+
+
+def test_generate_semantic_outputs_distinguishes_content_and_synthesizes_directories(
+    workspace: Path, tmp_path: Path
+) -> None:
+    prepared = prepare_fixture_revision(workspace, tmp_path)
+
+    generated_count = semantic_index_module.generate_semantic_outputs(workspace)
+
+    assert generated_count == 5
+    outputs = {}
+    for output_path in (prepared.manifest_path.parent / "output").glob("chunk-*.json"):
+        outputs.update(
+            {
+                node["node_id"]: node
+                for node in json.loads(output_path.read_text(encoding="utf-8"))["nodes"]
+            }
+        )
+    input_nodes = {}
+    for input_path in (prepared.manifest_path.parent / "input").glob("chunk-*.json"):
+        input_nodes.update(
+            {
+                node["node_id"]: node
+                for node in json.loads(input_path.read_text(encoding="utf-8"))["nodes"]
+            }
+        )
+
+    file_outputs = [
+        outputs[node_id]
+        for node_id, node in input_nodes.items()
+        if node["kind"] == "file"
+    ]
+    assert len({node["semantic_summary"] for node in file_outputs}) == 2
+    assert len({tuple(node["topics"]) for node in file_outputs}) == 2
+
+    root_id = next(node_id for node_id, node in input_nodes.items() if node["relative_hierarchy"] == ".")
+    root = outputs[root_id]
+    child_topics = {
+        topic
+        for child_id in input_nodes[root_id]["child_node_ids"]
+        for topic in outputs[child_id]["topics"]
+    }
+    assert child_topics.intersection(root["topics"])
 
 
 def test_apply_semantic_index_invalid_output_keeps_previous_active_revision(
@@ -560,6 +631,66 @@ def test_prepare_semantic_index_scans_only_the_requested_root(
     assert "not-in-scope.md" not in serialized
 
 
+def test_prepare_semantic_index_skips_unsupported_symlink_analysis(
+    workspace: Path, tmp_path: Path
+) -> None:
+    root = tmp_path / "approved-root"
+    root.mkdir()
+    (root / "README.md").write_text("evidence", encoding="utf-8")
+    (root / "broken-link").symlink_to(tmp_path / "missing-target")
+    approve_root(workspace, root)
+
+    result = prepare_semantic_index(
+        PrepareSemanticIndexRequest(workspace=workspace, root=root)
+    )
+
+    broken_node = next(
+        node
+        for node in SQLiteRepository(WorkspacePaths.from_root(workspace).db_path).list_semantic_nodes(
+            result.revision_id
+        )
+        if node["relative_hierarchy"] == "broken-link"
+    )
+    assert broken_node["analysis_status"] == "unsupported"
+
+
+def test_prepare_semantic_index_skips_evidence_for_file_missing_during_prepare(
+    workspace: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "approved-root"
+    root.mkdir()
+    (root / "README.md").write_text("evidence", encoding="utf-8")
+    approve_root(workspace, root)
+
+    original_canonical_file_uri = semantic_index_module._canonical_file_uri
+
+    def missing_readme(path: Path) -> str:
+        if path.name == "README.md":
+            raise FileNotFoundError(path)
+        return original_canonical_file_uri(path)
+
+    monkeypatch.setattr(
+        semantic_index_module, "_canonical_file_uri", missing_readme
+    )
+
+    result = prepare_semantic_index(
+        PrepareSemanticIndexRequest(workspace=workspace, root=root)
+    )
+
+    readme_node = next(
+        node
+        for node in SQLiteRepository(WorkspacePaths.from_root(workspace).db_path).list_semantic_nodes(
+            result.revision_id
+        )
+        if node["relative_hierarchy"] == "README.md"
+    )
+    assert readme_node["evidence_ids"] == []
+
+
+def test_semantic_index_accepts_five_digit_chunk_names() -> None:
+    assert semantic_index_module._CHUNK_FILENAME.fullmatch("chunk-10000.json")
+
+
 def test_prepare_semantic_index_replaces_only_prior_managed_chunks(
     workspace: Path, tmp_path: Path
 ) -> None:
@@ -732,3 +863,71 @@ def test_prepare_semantic_index_restores_previous_input_when_publication_fails(
         ).fetchall()
     assert (created_revision_ids[0], "failed") in statuses
     assert all(status != "staging" for _, status in statuses)
+def test_validate_staged_structure_does_not_rescan_all_input_nodes_per_node():
+    from portfolio_maker.application import semantic_index
+
+    class CountingDict(dict):
+        item_calls = 0
+
+        def items(self):
+            self.item_calls += 1
+            if self.item_calls > 2:
+                raise AssertionError("input nodes were rescanned per node")
+            return super().items()
+
+    input_nodes = CountingDict(
+        {
+            "root": {
+                "kind": "directory",
+                "parent_node_id": None,
+                "display_name": "root",
+                "relative_hierarchy": "",
+                "content_fingerprint": "root-fingerprint",
+                "roles": [],
+                "analysis_status": "ready",
+                "child_node_ids": ["child"],
+            },
+            "child": {
+                "kind": "file",
+                "parent_node_id": "root",
+                "display_name": "child.txt",
+                "relative_hierarchy": "child.txt",
+                "content_fingerprint": "child-fingerprint",
+                "roles": [],
+                "analysis_status": "ready",
+                "child_node_ids": [],
+            },
+        }
+    )
+    staged_nodes = [
+        {
+            "node_id": "root",
+            "source_id": "source",
+            "node_kind": "directory",
+            "parent_node_id": None,
+            "display_name": "root",
+            "relative_hierarchy": "",
+            "content_fingerprint": "root-fingerprint",
+            "semantic_roles": [],
+            "analysis_status": "ready",
+            "analyzer_version": "v1",
+        },
+        {
+            "node_id": "child",
+            "source_id": "source",
+            "node_kind": "file",
+            "parent_node_id": "root",
+            "display_name": "child.txt",
+            "relative_hierarchy": "child.txt",
+            "content_fingerprint": "child-fingerprint",
+            "semantic_roles": [],
+            "analysis_status": "ready",
+            "analyzer_version": "v1",
+        },
+    ]
+
+    semantic_index._validate_staged_structure(
+        input_nodes,
+        staged_nodes,
+        {"source_id": "source", "analyzer_version": "v1"},
+    )

@@ -3,8 +3,10 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from urllib.parse import unquote, urlparse
 from uuid import uuid4
 
@@ -67,13 +69,27 @@ _LOCATOR_VALUE = re.compile(
 _CREDENTIAL_VALUE = re.compile(
     r"(?im)(\b[\w-]*credential[\w-]*\s*[:=]\s*)(?:\"[^\"\n]*\"|'[^'\n]*'|[^\s,}\]\n]+)"
 )
+_SEMANTIC_TERM = re.compile(r"[^\W\d_][\w+#-]{2,}", re.UNICODE)
+_SEMANTIC_STOPWORDS = frozenset(
+    {
+        "and",
+        "are",
+        "for",
+        "from",
+        "into",
+        "that",
+        "the",
+        "this",
+        "with",
+    }
+)
 _LOCATOR_TOKEN = re.compile(
     r"(?i)(?:file://|https?://|(?<![A-Za-z0-9_.-])(?:/|~[/\\\\]|[A-Za-z]:[/\\\\]|\\\\\\\\))[^\s'\"`<>)}\]]+"
 )
 _RELATIVE_FILE_LOCATOR = re.compile(
     r"(?i)(?<![\w.-])(?:\.{1,2}[/\\\\][^\s'\"`<>)}\]]+|(?:[\w-]+[/\\\\])+[\w-]+\.[a-z][a-z0-9_-]*)"
 )
-_CHUNK_FILENAME = re.compile(r"chunk-\d{4}\.json")
+_CHUNK_FILENAME = re.compile(r"chunk-\d{4,}\.json")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 
 
@@ -195,6 +211,403 @@ def apply_semantic_index(
     )
 
 
+def generate_semantic_outputs(workspace: Path) -> int:
+    """Generate content-derived semantic output from managed input chunks only."""
+    paths = WorkspacePaths.from_root(workspace)
+    manifest = _load_streaming_input_manifest(paths)
+    with TemporaryDirectory(prefix="portfolio-maker-semantic-") as temp_dir:
+        connection = sqlite3.connect(Path(temp_dir) / "state.sqlite3")
+        try:
+            _initialize_semantic_output_state(connection)
+            chunk_paths = _verified_input_chunk_paths(paths, manifest)
+            for input_path, input_text in chunk_paths:
+                _stage_semantic_output_input(connection, input_text, manifest)
+            processed_count = _process_semantic_output_state(connection)
+            output_dir = paths.semantic_index_dir / "output"
+            ensure_managed_directory(output_dir)
+            for input_path, input_text in _verified_input_chunk_paths(paths, manifest):
+                input_payload = json.loads(input_text)
+                raw_nodes = input_payload["nodes"]
+                assert isinstance(raw_nodes, list)
+                output_nodes = [
+                    _read_generated_output_node(connection, node["node_id"])
+                    for node in raw_nodes
+                ]
+                payload: dict[str, object] = {
+                    "version": 1,
+                    "revision_id": manifest["revision_id"],
+                    "input_sha256": hashlib.sha256(input_text.encode("utf-8")).hexdigest(),
+                    "nodes": output_nodes,
+                }
+                payload["output_sha256"] = hashlib.sha256(
+                    _canonical_json(payload).encode("utf-8")
+                ).hexdigest()
+                write_managed_text(output_dir / input_path.name, _canonical_json(payload))
+        finally:
+            connection.close()
+    return processed_count
+
+
+def _load_streaming_input_manifest(paths: WorkspacePaths) -> dict[str, object]:
+    try:
+        manifest_text = read_managed_bytes(paths.semantic_index_manifest_path).decode("utf-8")
+    except (FileNotFoundError, UnicodeDecodeError) as error:
+        raise SemanticIndexError("semantic index input is missing") from error
+    return _parse_input_manifest(manifest_text)
+
+
+def _verified_input_chunk_paths(
+    paths: WorkspacePaths, manifest: dict[str, object]
+) -> tuple[tuple[Path, str], ...]:
+    chunk_sha256s = manifest["chunk_sha256s"]
+    assert isinstance(chunk_sha256s, list)
+    expected_paths = tuple(
+        paths.semantic_index_input_dir / f"chunk-{index:04}.json"
+        for index in range(1, len(chunk_sha256s) + 1)
+    )
+    try:
+        actual_paths = tuple(paths.semantic_index_input_dir.glob("chunk-*.json"))
+    except OSError as error:
+        raise SemanticIndexError("semantic index input has unverified managed chunks") from error
+    if set(actual_paths) != set(expected_paths) or any(
+        _CHUNK_FILENAME.fullmatch(path.name) is None for path in actual_paths
+    ):
+        raise SemanticIndexError("semantic index input has unverified managed chunks")
+    verified: list[tuple[Path, str]] = []
+    for path, digest in zip(expected_paths, chunk_sha256s, strict=True):
+        try:
+            text = read_managed_bytes(path).decode("utf-8")
+        except (FileNotFoundError, UnicodeDecodeError, OSError) as error:
+            raise SemanticIndexError(
+                "semantic index input has unverified managed chunks"
+            ) from error
+        if hashlib.sha256(text.encode("utf-8")).hexdigest() != digest:
+            raise SemanticIndexError("semantic index input has unverified managed chunks")
+        verified.append((path, text))
+    return tuple(verified)
+
+
+def _initialize_semantic_output_state(connection: sqlite3.Connection) -> None:
+    connection.executescript(
+        """
+        CREATE TABLE nodes (
+            node_id TEXT PRIMARY KEY,
+            parent_node_id TEXT,
+            kind TEXT NOT NULL,
+            relative_hierarchy TEXT NOT NULL,
+            masked_excerpt TEXT NOT NULL,
+            input_roles_json TEXT NOT NULL,
+            analysis_status TEXT NOT NULL,
+            child_node_ids_json TEXT NOT NULL,
+            pending_children INTEGER NOT NULL,
+            processed INTEGER NOT NULL DEFAULT 0,
+            semantic_summary TEXT,
+            semantic_roles_json TEXT,
+            topics_json TEXT
+        );
+        CREATE INDEX nodes_parent_idx ON nodes(parent_node_id);
+        CREATE TABLE ready_nodes (
+            node_id TEXT PRIMARY KEY
+        );
+        """
+    )
+
+
+def _stage_semantic_output_input(
+    connection: sqlite3.Connection,
+    input_text: str,
+    manifest: dict[str, object],
+) -> None:
+    try:
+        payload = json.loads(input_text)
+    except json.JSONDecodeError as error:
+        raise SemanticIndexError("semantic index input is invalid") from error
+    if not isinstance(payload, dict) or set(payload) != {"version", "revision_id", "nodes"}:
+        raise SemanticIndexError("semantic index input is invalid")
+    if payload.get("version") != 1 or payload.get("revision_id") != manifest["revision_id"]:
+        raise SemanticIndexError("semantic index input is invalid")
+    raw_nodes = payload.get("nodes")
+    if not isinstance(raw_nodes, list) or not raw_nodes:
+        raise SemanticIndexError("semantic index input is invalid")
+    rows = []
+    for node in raw_nodes:
+        _validate_input_node(node)
+        assert isinstance(node, dict)
+        child_node_ids = node["child_node_ids"]
+        assert isinstance(child_node_ids, list)
+        rows.append(
+            (
+                node["node_id"],
+                node["parent_node_id"],
+                node["kind"],
+                node["relative_hierarchy"],
+                node["masked_excerpt"],
+                json.dumps(node["roles"], ensure_ascii=False),
+                node["analysis_status"],
+                json.dumps(child_node_ids, ensure_ascii=False),
+                len(child_node_ids),
+            )
+        )
+    try:
+        connection.executemany(
+            """
+            INSERT INTO nodes
+                (node_id, parent_node_id, kind, relative_hierarchy, masked_excerpt,
+                 input_roles_json, analysis_status, child_node_ids_json, pending_children)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+        connection.commit()
+    except sqlite3.IntegrityError as error:
+        raise SemanticIndexError("semantic index input has duplicate node IDs") from error
+
+
+def _process_semantic_output_state(connection: sqlite3.Connection) -> int:
+    connection.execute(
+        "INSERT INTO ready_nodes SELECT node_id FROM nodes WHERE pending_children = 0"
+    )
+    connection.commit()
+    processed_count = 0
+    while True:
+        ready = connection.execute(
+            "SELECT node_id FROM ready_nodes ORDER BY node_id LIMIT 256"
+        ).fetchall()
+        if not ready:
+            break
+        for (node_id,) in ready:
+            connection.execute("DELETE FROM ready_nodes WHERE node_id = ?", (node_id,))
+            row = connection.execute(
+                """
+                SELECT node_id, parent_node_id, kind, relative_hierarchy, masked_excerpt,
+                       input_roles_json, analysis_status, child_node_ids_json, processed
+                FROM nodes WHERE node_id = ?
+                """,
+                (node_id,),
+            ).fetchone()
+            if row is None or row[8] != 0:
+                raise SemanticIndexError("semantic output node was processed more than once")
+            input_node = {
+                "node_id": row[0],
+                "parent_node_id": row[1],
+                "kind": row[2],
+                "relative_hierarchy": row[3],
+                "masked_excerpt": row[4],
+                "roles": json.loads(row[5]),
+                "analysis_status": row[6],
+                "child_node_ids": json.loads(row[7]),
+            }
+            summary, roles, topics = _generate_node_semantics(connection, input_node)
+            connection.execute(
+                """
+                UPDATE nodes
+                SET processed = 1, semantic_summary = ?, semantic_roles_json = ?, topics_json = ?
+                WHERE node_id = ? AND processed = 0
+                """,
+                (
+                    summary,
+                    json.dumps(roles, ensure_ascii=False),
+                    json.dumps(topics, ensure_ascii=False),
+                    node_id,
+                ),
+            )
+            processed_count += 1
+            parent_node_id = row[1]
+            if parent_node_id is not None:
+                updated = connection.execute(
+                    """
+                    UPDATE nodes
+                    SET pending_children = pending_children - 1
+                    WHERE node_id = ? AND pending_children > 0
+                    """,
+                    (parent_node_id,),
+                )
+                if updated.rowcount != 1:
+                    raise SemanticIndexError("semantic output parent graph is invalid")
+                pending = connection.execute(
+                    "SELECT pending_children FROM nodes WHERE node_id = ?",
+                    (parent_node_id,),
+                ).fetchone()
+                if pending is None:
+                    raise SemanticIndexError("semantic output parent graph is invalid")
+                if pending[0] == 0:
+                    connection.execute(
+                        "INSERT OR IGNORE INTO ready_nodes (node_id) VALUES (?)",
+                        (parent_node_id,),
+                    )
+        connection.commit()
+    total = connection.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
+    if processed_count != total:
+        raise SemanticIndexError("semantic output graph could not be processed bottom-up")
+    return processed_count
+
+
+def _generate_node_semantics(
+    connection: sqlite3.Connection,
+    input_node: dict[str, object],
+) -> tuple[str, list[str], list[str]]:
+    status = str(input_node["analysis_status"])
+    input_roles = [str(role) for role in input_node["roles"]]
+    if status in {AnalysisStatus.UNSUPPORTED.value, AnalysisStatus.UNREADABLE.value}:
+        return "", input_roles, []
+    if input_node["kind"] == SemanticNodeKind.FILE.value:
+        return _generate_content_semantics(input_node)
+    child_rows = connection.execute(
+        """
+        SELECT semantic_roles_json, topics_json
+        FROM nodes
+        WHERE parent_node_id = ? AND processed = 1
+        """,
+        (input_node["node_id"],),
+    ).fetchall()
+    topics = sorted(
+        {
+            str(topic)
+            for row in child_rows
+            for topic in json.loads(row[1] or "[]")
+        }
+    )
+    roles = sorted(
+        set(input_roles)
+        | {
+            str(role)
+            for row in child_rows
+            for role in json.loads(row[0] or "[]")
+        }
+    )
+    summary = (
+        f"Combines child signals for {', '.join(topics)}."
+        if topics
+        else "No analyzable child signal was found."
+    )
+    return summary, roles, topics
+
+
+def _generate_content_semantics(
+    input_node: dict[str, object],
+) -> tuple[str, list[str], list[str]]:
+    terms = sorted(_semantic_terms(str(input_node["masked_excerpt"])))
+    summary = (
+        f"Discusses {', '.join(terms)}."
+        if terms
+        else "Managed content has no extractable topic."
+    )
+    roles = sorted(
+        {str(role) for role in input_node["roles"]}
+        | {_ROLE_BY_TERM[term] for term in terms if term in _ROLE_BY_TERM}
+    )
+    return summary, roles, terms
+
+
+def _read_generated_output_node(
+    connection: sqlite3.Connection, node_id: str
+) -> dict[str, object]:
+    row = connection.execute(
+        """
+        SELECT node_id, semantic_summary, semantic_roles_json, topics_json,
+               analysis_status, child_node_ids_json, processed
+        FROM nodes WHERE node_id = ?
+        """,
+        (node_id,),
+    ).fetchone()
+    if row is None or row[6] != 1:
+        raise SemanticIndexError("semantic output node is missing")
+    return {
+        "node_id": row[0],
+        "semantic_summary": row[1] or "",
+        "semantic_roles": json.loads(row[2] or "[]"),
+        "topics": json.loads(row[3] or "[]"),
+        "analysis_status": row[4],
+        "child_node_ids": json.loads(row[5]),
+    }
+
+
+_ROLE_BY_TERM = {
+    "analysis": "analysis",
+    "api": "api",
+    "backend": "backend",
+    "database": "database",
+    "deploy": "deployment",
+    "deployment": "deployment",
+    "frontend": "frontend",
+    "guide": "documentation",
+    "model": "modeling",
+    "portfolio": "portfolio",
+    "python": "python",
+    "rag": "retrieval",
+    "setup": "setup",
+    "test": "testing",
+    "testing": "testing",
+    "typescript": "typescript",
+}
+
+
+def _generate_output_nodes(
+    input_nodes: dict[str, dict[str, object]],
+) -> dict[str, dict[str, object]]:
+    generated: dict[str, dict[str, object]] = {}
+    ordered_nodes = sorted(
+        input_nodes.items(),
+        key=lambda item: (
+            -_hierarchy_depth(str(item[1]["relative_hierarchy"])),
+            str(item[1]["relative_hierarchy"]),
+            item[0],
+        ),
+    )
+    for node_id, input_node in ordered_nodes:
+        status = str(input_node["analysis_status"])
+        if status in {AnalysisStatus.UNSUPPORTED.value, AnalysisStatus.UNREADABLE.value}:
+            summary = ""
+            roles = list(input_node["roles"])
+            topics: list[str] = []
+        elif input_node["kind"] == SemanticNodeKind.FILE.value:
+            terms = sorted(_semantic_terms(str(input_node["masked_excerpt"])))
+            summary = (
+                f"Discusses {', '.join(terms)}."
+                if terms
+                else "Managed content has no extractable topic."
+            )
+            topics = terms
+            roles = sorted(
+                set(str(role) for role in input_node["roles"])
+                | {_ROLE_BY_TERM[term] for term in terms if term in _ROLE_BY_TERM}
+            )
+        else:
+            child_nodes = [generated[child_id] for child_id in input_node["child_node_ids"]]
+            topics = sorted(
+                {
+                    str(topic)
+                    for child in child_nodes
+                    for topic in child["topics"]
+                }
+            )
+            roles = sorted(
+                {
+                    str(role)
+                    for child in child_nodes
+                    for role in child["semantic_roles"]
+                }
+                | {str(role) for role in input_node["roles"]}
+            )
+            summary = (
+                f"Combines child signals for {', '.join(topics)}."
+                if topics
+                else "No analyzable child signal was found."
+            )
+
+        generated[node_id] = {
+            "node_id": node_id,
+            "semantic_summary": _safe_output_text(summary, "semantic summary") if summary else "",
+            "semantic_roles": [
+                _safe_output_text(role, "semantic_roles") for role in roles
+            ],
+            "topics": [_safe_output_text(topic, "topics") for topic in topics],
+            "analysis_status": status,
+            "child_node_ids": list(input_node["child_node_ids"]),
+        }
+    return generated
+
+
 def _parse_input_manifest(manifest_text: str | None) -> dict[str, object]:
     if manifest_text is None:
         raise SemanticIndexError("semantic index input is missing")
@@ -305,6 +718,13 @@ def _validate_staged_structure(
     staged_by_id = {str(node["node_id"]): node for node in staged_nodes}
     if len(staged_by_id) != len(staged_nodes) or set(staged_by_id) != set(input_nodes):
         raise SemanticIndexError("semantic index input does not match the staged revision")
+    children_by_parent: dict[str, list[str]] = {}
+    for child_id, child in input_nodes.items():
+        parent_node_id = child["parent_node_id"]
+        if isinstance(parent_node_id, str):
+            children_by_parent.setdefault(parent_node_id, []).append(child_id)
+    for child_ids in children_by_parent.values():
+        child_ids.sort()
     for node_id, input_node in input_nodes.items():
         staged = staged_by_id[node_id]
         if (
@@ -319,11 +739,7 @@ def _validate_staged_structure(
             or staged["analyzer_version"] != manifest["analyzer_version"]
         ):
             raise SemanticIndexError("semantic index input does not match the staged revision")
-        expected_children = sorted(
-            child_id
-            for child_id, child in input_nodes.items()
-            if child["parent_node_id"] == node_id
-        )
+        expected_children = children_by_parent.get(node_id, [])
         if input_node["child_node_ids"] != expected_children:
             raise SemanticIndexError("semantic index input has invalid child references")
 
@@ -387,6 +803,7 @@ def _parse_output_chunks(
             output_nodes[node_id] = output_node
     if set(output_nodes) != set(input_nodes):
         raise SemanticIndexError("semantic index output has invalid node coverage")
+    _validate_semantic_quality(output_nodes, input_nodes)
     return output_nodes
 
 
@@ -456,6 +873,92 @@ def _validate_output_semantics(
         assert isinstance(values, list)
         for value in values:
             _safe_output_text(value, field)
+
+
+def _validate_semantic_quality(
+    output_nodes: dict[str, dict[str, object]],
+    input_nodes: dict[str, dict[str, object]],
+) -> None:
+    content_node_ids = [
+        node_id
+        for node_id, node in input_nodes.items()
+        if (
+            node["kind"] == SemanticNodeKind.FILE.value
+            and node["analysis_status"]
+            not in {AnalysisStatus.UNSUPPORTED.value, AnalysisStatus.UNREADABLE.value}
+            and isinstance(node["masked_excerpt"], str)
+            and _semantic_terms(node["masked_excerpt"])
+        )
+    ]
+    if len(content_node_ids) > 1:
+        summaries = {
+            output_nodes[node_id]["semantic_summary"] for node_id in content_node_ids
+        }
+        topics = {
+            tuple(output_nodes[node_id]["topics"]) for node_id in content_node_ids
+        }
+        if len(summaries) == 1 and len(topics) == 1:
+            raise SemanticIndexError(
+                "semantic quality is indistinguishable across content-bearing nodes"
+            )
+
+    for node_id in content_node_ids:
+        input_terms = _semantic_terms(str(input_nodes[node_id]["masked_excerpt"]))
+        output = output_nodes[node_id]
+        output_terms = _semantic_terms(
+            " ".join(
+                [
+                    str(output["semantic_summary"]),
+                    *[str(topic) for topic in output["topics"]],
+                ]
+            )
+        )
+        if not input_terms.intersection(output_terms):
+            raise SemanticIndexError(
+                "semantic quality does not reflect managed content"
+            )
+
+    for node_id, input_node in input_nodes.items():
+        if input_node["kind"] != SemanticNodeKind.DIRECTORY.value:
+            continue
+        child_terms = set()
+        for child_id in input_node["child_node_ids"]:
+            child = output_nodes.get(child_id)
+            if child is None:
+                continue
+            child_terms.update(
+                _semantic_terms(
+                    " ".join(
+                        [
+                            str(child["semantic_summary"]),
+                            *[str(topic) for topic in child["topics"]],
+                        ]
+                    )
+                )
+            )
+        if not child_terms:
+            continue
+        directory = output_nodes[node_id]
+        directory_terms = _semantic_terms(
+            " ".join(
+                [
+                    str(directory["semantic_summary"]),
+                    *[str(topic) for topic in directory["topics"]],
+                ]
+            )
+        )
+        if not child_terms.intersection(directory_terms):
+            raise SemanticIndexError(
+                "semantic quality does not propagate child meaning to directory"
+            )
+
+
+def _semantic_terms(value: str) -> set[str]:
+    return {
+        term.casefold()
+        for term in _SEMANTIC_TERM.findall(value)
+        if term.casefold() not in _SEMANTIC_STOPWORDS
+    }
 
 
 def _replacement_nodes(
@@ -560,7 +1063,10 @@ def _prepare_nodes(
 
     prepared: list[_PreparedNode] = []
     for entry in structural_entries:
-        if entry.kind is SemanticNodeKind.FILE:
+        if (
+            entry.kind is SemanticNodeKind.FILE
+            and entry.status is not AnalysisStatus.UNSUPPORTED
+        ):
             analysis = analyze_file_input(entry)
             content_fingerprint = analysis.content_fingerprint
             semantic_roles = analysis.semantic_roles
@@ -571,6 +1077,17 @@ def _prepare_nodes(
             semantic_roles = ()
             masked_excerpt = ""
             status = entry.status
+        evidence_ids: tuple[int, ...] = ()
+        if (
+            entry.kind is SemanticNodeKind.FILE
+            and entry.status is not AnalysisStatus.UNSUPPORTED
+        ):
+            try:
+                evidence_ids = approved_evidence_by_source_uri.get(
+                    _canonical_file_uri(entry.absolute_path), ()
+                )
+            except (OSError, RuntimeError):
+                evidence_ids = ()
         node = SemanticNode(
             node_id=entry.node_id,
             source_id=entry.source_id,
@@ -582,11 +1099,7 @@ def _prepare_nodes(
             semantic_summary="",
             semantic_roles=semantic_roles,
             topics=(),
-            evidence_ids=(
-                approved_evidence_by_source_uri.get(_canonical_file_uri(entry.absolute_path), ())
-                if entry.kind is SemanticNodeKind.FILE
-                else ()
-            ),
+            evidence_ids=evidence_ids,
             analysis_status=status,
             analyzer_version=ANALYZER_VERSION,
             updated_at="",

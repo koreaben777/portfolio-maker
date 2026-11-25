@@ -2811,6 +2811,14 @@ def test_sqlite_repository_creates_private_unlinked_database_and_upgrades_permis
     assert paths.db_path.stat().st_nlink == 1
 
 
+def test_sqlite_repository_reuses_existing_database(workspace):
+    paths = WorkspacePaths.from_root(workspace)
+    repository = SQLiteRepository(paths.db_path)
+
+    repository.initialize()
+    SQLiteRepository(paths.db_path).initialize()
+
+
 @pytest.mark.parametrize("alias_kind", ("symlink", "hardlink", "directory", "fifo"))
 def test_sqlite_repository_rejects_unsafe_main_database_entry(
     workspace,
