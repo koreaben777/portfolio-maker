@@ -250,9 +250,13 @@ class PMPackReader:
     def __init__(self, path: Path) -> None:
         self._path = Path(path)
 
-    def read(self, reference: PackRecordRef) -> object:
+    def read(self, reference: PackRecordRef, *, max_record_bytes: int | None = None) -> object:
+        if max_record_bytes is not None and (type(max_record_bytes) is not int or max_record_bytes < 0):
+            raise SemanticPackError("semantic pack record limit is invalid")
         if (
-            reference.offset < len(PACK_MAGIC)
+            type(reference.offset) is not int
+            or type(reference.length) is not int
+            or reference.offset < len(PACK_MAGIC)
             or reference.length < 0
             or len(reference.sha256) != _DIGEST_BYTES * 2
         ):
@@ -265,7 +269,8 @@ class PMPackReader:
             raise SemanticPackError("semantic pack record reference is invalid")
         descriptor = _open_existing_file(self._path, os.O_RDONLY)
         try:
-            size = os.fstat(descriptor).st_size
+            before = os.fstat(descriptor)
+            size = before.st_size
             if os.pread(descriptor, len(PACK_MAGIC), 0) != PACK_MAGIC:
                 raise SemanticPackError("semantic pack magic is invalid")
             frame_length = _read_exact_at(descriptor, _LENGTH.size, reference.offset)
@@ -274,6 +279,8 @@ class PMPackReader:
             payload_length = _LENGTH.unpack(frame_length)[0]
             if payload_length != reference.length:
                 raise SemanticPackError("semantic pack record reference is invalid")
+            if max_record_bytes is not None and payload_length > max_record_bytes:
+                raise SemanticPackError("semantic pack record exceeds byte limit")
             payload_offset = reference.offset + _LENGTH.size
             record_end = payload_offset + payload_length + _DIGEST_BYTES
             if record_end > size:
@@ -284,7 +291,9 @@ class PMPackReader:
                 raise SemanticPackError("semantic pack record is truncated")
             if digest != expected_digest or hashlib.sha256(payload).digest() != digest:
                 raise SemanticPackError("semantic pack record digest is invalid")
-            return _decode_canonical_payload(payload)
+            decoded = _decode_canonical_payload(payload)
+            _require_unchanged(self._path, descriptor, before)
+            return decoded
         finally:
             os.close(descriptor)
 
@@ -292,26 +301,27 @@ class PMPackReader:
 def verify_pack(path: Path, seal: PackSeal) -> PackSeal:
     if not isinstance(seal, PackSeal):
         raise SemanticPackError("semantic pack seal is invalid")
-    actual_length = _file_size(path)
-    if actual_length < seal.byte_length:
-        verify_pack_prefix(path, seal.byte_length)
-        raise SemanticPackError("semantic pack seal is invalid")
-    if actual_length != seal.byte_length:
-        raise SemanticPackError("semantic pack seal is invalid")
-    observed = verify_pack_prefix(path, actual_length)
+    observed = _verify_pack_prefix(path, seal.byte_length, exact_length=True)
     if observed != seal:
         raise SemanticPackError("semantic pack seal is invalid")
     return observed
 
 
 def verify_pack_prefix(path: Path, length: int) -> PackSeal:
+    return _verify_pack_prefix(path, length, exact_length=False)
+
+
+def _verify_pack_prefix(path: Path, length: int, *, exact_length: bool) -> PackSeal:
     if not isinstance(length, int) or length < len(PACK_MAGIC):
         raise SemanticPackError("semantic pack prefix length is invalid")
     descriptor = _open_existing_file(Path(path), os.O_RDONLY)
     try:
-        actual_size = os.fstat(descriptor).st_size
+        before = os.fstat(descriptor)
+        actual_size = before.st_size
         if actual_size < length:
             raise SemanticPackError("semantic pack prefix is truncated")
+        if exact_length and actual_size != length:
+            raise SemanticPackError("semantic pack seal is invalid")
         if _read_exact_at(descriptor, len(PACK_MAGIC), 0) != PACK_MAGIC:
             raise SemanticPackError("semantic pack magic is invalid")
         offset = len(PACK_MAGIC)
@@ -340,6 +350,7 @@ def verify_pack_prefix(path: Path, length: int) -> PackSeal:
             offset = record_end
         if offset != length:
             raise SemanticPackError("semantic pack prefix is invalid")
+        _require_unchanged(Path(path), descriptor, before)
         return PackSeal(
             byte_length=length,
             record_count=record_count,
@@ -428,6 +439,18 @@ def _open_existing_file(path: Path, flags: int) -> int:
             raise
     finally:
         os.close(directory_descriptor)
+
+
+def _require_unchanged(path: Path, descriptor: int, before: os.stat_result) -> None:
+    def identity(status):
+        return (status.st_dev, status.st_ino, status.st_size, status.st_mtime_ns, status.st_ctime_ns)
+
+    check_descriptor = _open_existing_file(path, os.O_RDONLY)
+    try:
+        if identity(before) != identity(os.fstat(descriptor)) or identity(before) != identity(os.fstat(check_descriptor)):
+            raise SemanticPackError("semantic pack changed during read")
+    finally:
+        os.close(check_descriptor)
 
 
 def _target_status(directory_descriptor: int, filename: str) -> os.stat_result | None:

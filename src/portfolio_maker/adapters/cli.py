@@ -40,6 +40,9 @@ from portfolio_maker.application.semantic_work import (
 from portfolio_maker.application.semantic_lifecycle_v3 import (
     SemanticLifecycleV3Error,
     approve_semantic_execution,
+    pause_semantic_work,
+    resume_semantic_work,
+    validate_semantic_work_v3,
 )
 from portfolio_maker.application.vision_analysis import (
     VisionAnalysisError,
@@ -78,12 +81,15 @@ from portfolio_maker.application.models import (
     ApplyVisionAnalysisRequest,
     NextSemanticWorkRequest,
     NextSemanticWorkV3Request,
+    PauseSemanticWorkRequest,
     PrepareSemanticIndexRequest,
     PrepareSemanticIndexResult,
     PrepareVisionAnalysisRequest,
     SemanticIndexStatusRequest,
     SetVisionAnalysisStateRequest,
+    ResumeSemanticWorkRequest,
     ValidateSemanticWorkRequest,
+    ValidateSemanticWorkV3Request,
 )
 from portfolio_maker.infrastructure.github_connector import GitHubDiscoveryError
 from portfolio_maker.infrastructure.local_discovery import DiscoveryRootError
@@ -200,6 +206,16 @@ def build_parser() -> argparse.ArgumentParser:
     validate_semantic = subparsers.add_parser("validate-semantic-work")
     validate_semantic.add_argument("--workspace", type=Path, default=Path("."))
     validate_semantic.add_argument("--unit-id", required=True)
+    validate_semantic.add_argument("--run-id")
+    validate_semantic.add_argument("--lease-nonce")
+
+    pause_semantic = subparsers.add_parser("pause-semantic-work")
+    pause_semantic.add_argument("--workspace", type=Path, default=Path("."))
+    pause_semantic.add_argument("--run-id", required=True)
+
+    resume_semantic = subparsers.add_parser("resume-semantic-work")
+    resume_semantic.add_argument("--workspace", type=Path, default=Path("."))
+    resume_semantic.add_argument("--run-id", required=True)
 
     finalize_semantic = subparsers.add_parser("finalize-semantic-index")
     finalize_semantic.add_argument("--workspace", type=Path, default=Path("."))
@@ -579,7 +595,7 @@ def _main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "next-semantic-work":
         repository = SQLiteRepository(WorkspacePaths.from_root(args.workspace).db_path)
-        if repository.has_semantic_v3_runs():
+        if args.run_id is not None or repository.has_semantic_v3_runs():
             result = next_semantic_work_v3(
                 NextSemanticWorkV3Request(
                     workspace=args.workspace,
@@ -632,6 +648,31 @@ def _main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     if args.command == "validate-semantic-work":
+        repository = SQLiteRepository(WorkspacePaths.from_root(args.workspace).db_path)
+        if args.run_id is not None or repository.has_semantic_v3_runs():
+            if args.lease_nonce is None:
+                raise SemanticWorkError("semantic v3 lease is required")
+            run_id = (
+                args.run_id
+                if args.run_id is not None
+                else repository.select_issued_semantic_v3_run(
+                    args.unit_id, args.lease_nonce
+                )
+            )
+            result = validate_semantic_work_v3(
+                ValidateSemanticWorkV3Request(
+                    workspace=args.workspace,
+                    run_id=run_id,
+                    unit_id=args.unit_id,
+                    lease_nonce=args.lease_nonce,
+                )
+            )
+            print(f"Semantic revision: {_safe_semantic_revision(result.revision_id)}")
+            print(f"Semantic run: {_safe_semantic_run(result.run_id)}")
+            print(f"Semantic work unit: {_safe_semantic_v3_unit(result.unit_id)}")
+            print(f"Receipt sequence: {result.receipt_sequence}")
+            print(f"Result SHA-256: {_safe_semantic_digest(result.result_sha256)}")
+            return 0
         result = validate_semantic_work(
             ValidateSemanticWorkRequest(
                 workspace=args.workspace,
@@ -657,6 +698,24 @@ def _main(argv: Sequence[str] | None = None) -> int:
         print(f"Semantic work unit: {unit_id}")
         print(f"Receipt: {relative_path}")
         print(f"Output SHA-256: {result.output_sha256}")
+        return 0
+
+    if args.command == "pause-semantic-work":
+        result = pause_semantic_work(
+            PauseSemanticWorkRequest(args.workspace, args.run_id)
+        )
+        print(f"Semantic revision: {_safe_semantic_revision(result.revision_id)}")
+        print(f"Semantic run: {_safe_semantic_run(result.run_id)}")
+        print(f"State: {result.run_state.value}")
+        return 0
+
+    if args.command == "resume-semantic-work":
+        result = resume_semantic_work(
+            ResumeSemanticWorkRequest(args.workspace, args.run_id)
+        )
+        print(f"Semantic revision: {_safe_semantic_revision(result.revision_id)}")
+        print(f"Semantic run: {_safe_semantic_run(result.run_id)}")
+        print(f"State: {result.run_state.value}")
         return 0
 
     if args.command == "finalize-semantic-index":

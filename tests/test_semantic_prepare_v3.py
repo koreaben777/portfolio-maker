@@ -1172,3 +1172,80 @@ def test_successful_sink_seal_closes_writer_descriptors_and_is_idempotent(
     sink.abort()
     sink.close()
     assert sink.state is StreamingStructureSinkState.SEALED
+
+
+def test_new_prepare_binds_authenticated_index(workspace):
+    from test_semantic_lifecycle_v3 import _prepared_frontier_run
+    repository, prepared = _prepared_frontier_run(workspace)
+    manifest = json.loads(prepared.manifest_path.read_text())
+    extension = manifest['authenticated_index']
+    assert extension['generation_id'] == prepared.revision_id
+    assert extension['projection'] == 'semantic-auth-projection-v1'
+    assert extension['filename'] == 'authenticated.pm-pack'
+    envelope, _, _ = repository.get_semantic_v3_proposal_for_run(prepared.run_id)
+    assert envelope.proposal.manifest_sha256 == manifest['manifest_sha256']
+    assert (prepared.manifest_path.parent / extension['filename']).is_file()
+
+
+@pytest.mark.parametrize('field,value', [('format','unknown'), ('filename','../escape'), ('generation_id','1'*32), ('tree_seal',{})])
+def test_invalid_authenticated_extension_fails_closed(workspace, field, value):
+    from test_semantic_lifecycle_v3 import _prepared_frontier_run
+    from portfolio_maker.application.semantic_prepare_v3 import _parse_canonical_v3_manifest, _sha256, _canonical_text
+    _, prepared = _prepared_frontier_run(workspace)
+    manifest = json.loads(prepared.manifest_path.read_text())
+    manifest['authenticated_index'][field] = value
+    manifest['manifest_sha256'] = _sha256({k:v for k,v in manifest.items() if k != 'manifest_sha256'})
+    with pytest.raises(ValueError):
+        _parse_canonical_v3_manifest(_canonical_text(manifest).encode())
+
+
+@pytest.mark.parametrize("stage", ["index-build", "manifest-write", "publication", "post-publication-full", "db-bind"])
+def test_authenticated_prepare_failure_preserves_existing_bindings(workspace, monkeypatch, stage):
+    import sqlite3
+    import portfolio_maker.application.semantic_prepare_v3 as module
+    from test_semantic_lifecycle_v3 import _prepared_frontier_run
+    from portfolio_maker.application.semantic_index import SemanticIndexError
+    _, prepared = _prepared_frontier_run(workspace)
+    paths = WorkspacePaths.from_root(workspace)
+    def database_snapshot():
+        with sqlite3.connect(paths.db_path) as connection:
+            return tuple(connection.iterdump())
+    before = database_snapshot()
+    approval = paths.approval_path.read_bytes()
+    old_revision = paths.semantic_revision_raw_dir(prepared.revision_id)
+    old_files = {p.relative_to(old_revision): p.read_bytes() for p in old_revision.rglob("*") if p.is_file()}
+    fired = False
+    def fail(*args, **kwargs):
+        nonlocal fired
+        fired = True
+        raise OSError("synthetic authenticated prepare failure")
+    if stage == "index-build":
+        monkeypatch.setattr(module, "build_authenticated_catalog", fail)
+    elif stage == "manifest-write":
+        original = module.write_managed_text
+        def write(path, *args, **kwargs):
+            if path.name == "manifest.v3.json":
+                fail()
+            return original(path, *args, **kwargs)
+        monkeypatch.setattr(module, "write_managed_text", write)
+    elif stage == "publication":
+        monkeypatch.setattr(module, "_publish_revision_directory", fail)
+    elif stage == "post-publication-full":
+        original = module.verify_authenticated_catalog_full
+        calls = 0
+        def verify(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                fail()
+            return original(*args, **kwargs)
+        monkeypatch.setattr(module, "verify_authenticated_catalog_full", verify)
+    else:
+        monkeypatch.setattr(module.SQLiteRepository, "bind_semantic_v3_revision_genesis_proposal_and_units", fail)
+    with pytest.raises(SemanticIndexError):
+        prepare_semantic_index(PrepareSemanticIndexRequest(workspace, workspace / "approved-source"))
+    assert fired
+    assert database_snapshot() == before
+    assert paths.approval_path.read_bytes() == approval
+    assert {p.relative_to(old_revision): p.read_bytes() for p in old_revision.rglob("*") if p.is_file()} == old_files
+    assert not list(old_revision.parent.glob(".*.prepare"))

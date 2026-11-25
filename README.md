@@ -1,9 +1,22 @@
+<!-- restart-2026-10-11 -->
+> **2026-10-11 재개 안내:** 이 worktree는 미완성 v3 연구 후보다. 개인 포트폴리오의 실제 완성과 갱신을 우선하는 [정본 재개안](../../docs/PROJECT_RESTART.md)을 먼저 읽는다. 아래 0.2.2 설명은 기존 개발 경로의 기술 참고이며 release·실사용 완료를 의미하지 않는다. 링크는 로컬 checkout 전용이다.
+<!-- /restart-2026-10-11 -->
+
 # Portfolio Maker
+
+> 개발 설계 개정(2026-09-24): [목적 중심 복구 설계](docs/superpowers/specs/2026-09-24-portfolio-outcome-recovery-design.md)와 [후속 계획](docs/superpowers/plans/2026-09-24-portfolio-outcome-recovery.md)은 작은 범위의 포트폴리오 생성·갱신 검증을 앞당깁니다. 문서 개정이며 현재 기능·전체 홈 지원·release 완료를 추가로 주장하지 않습니다.
 
 > 현재 로컬 릴리스 후보: `0.2.2` (아직 tag·publish·deploy하지 않음)
 >
 > 계층형 의미 인덱스, Project Boundary Detection, 명시적 automatic 모드,
 > 가역적 제외·재포함, managed history, 선택형 Codex 비전, multi-skill plugin을 제공합니다.
+
+> [!WARNING]
+> 이 후보를 전체 홈 디렉터리의 production-ready 의미 분석기로 간주하지 마세요.
+> 기존 검증 범위는 repository subtree입니다. 대규모 분석용 v3의 중지 기한 교정은 검증됐지만,
+> Task 10 재전송 무결성 결함과 후속 검증·적용 구현이 남아 있습니다.
+> 기존 active revision과 보존 파일럿을 유지하세요.
+> [개발 현황](docs/DEVELOPMENT_STATUS.md)에서 기본 0.2.2 기능과 미완성 v3 범위를 구분합니다.
 
 승인한 내 작업 자료를 바탕으로, **근거를 확인할 수 있는 커리어 프로필**과 **검토용 포트폴리오 초안**, **public-safe 정적 HTML 포트폴리오**를 만드는 로컬 우선 도구입니다.
 

@@ -99,6 +99,39 @@ class SemanticExchange:
             input_path=self._input_path,
         )
 
+    def read_output(self) -> bytes:
+        return self._read_slot(self._output_path, "output")
+
+    def read_input(self) -> bytes:
+        return self._read_slot(self._input_path, "input")
+
+    @staticmethod
+    def _read_slot(path: Path, kind: str) -> bytes:
+        try:
+            snapshot = read_managed_relative_file(
+                path.parent, Path(path.name)
+            )
+        except OSError as error:
+            raise SemanticExchangeError(f"semantic exchange {kind} is unavailable") from error
+        if snapshot.size > MAX_SEMANTIC_EXCHANGE_INPUT_BYTES:
+            raise SemanticExchangeError(f"semantic exchange {kind} exceeds byte budget")
+        return snapshot.content
+
+    def clear_output_if_matches(self, expected_sha256: str) -> None:
+        if len(expected_sha256) != 64:
+            raise SemanticExchangeError("semantic exchange binding is invalid")
+        try:
+            snapshot = read_managed_relative_file(
+                self._output_path.parent, Path(self._output_path.name)
+            )
+            if snapshot.content_hash != expected_sha256:
+                raise SemanticExchangeError("semantic exchange output changed")
+            remove_managed_file(self._output_path)
+        except SemanticExchangeError:
+            raise
+        except OSError as error:
+            raise SemanticExchangeError("semantic exchange output is unavailable") from error
+
     def discard_slots(self) -> None:
         try:
             remove_managed_file(self._input_path, missing_ok=True)

@@ -267,3 +267,81 @@ def _single_record_seal(path: Path, payload: bytes) -> PackSeal:
         record_root=root,
         file_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
     )
+
+
+def test_bounded_pack_read_rejects_length_before_payload_read(tmp_path, monkeypatch):
+    path = tmp_path / "bounded.pm-pack"
+    with PMPackWriter(path) as writer:
+        ref = writer.append({"text": "x" * 1024})
+    observed = []
+    original = semantic_pack.os.pread
+    def observe(fd, amount, offset):
+        observed.append(amount)
+        return original(fd, amount, offset)
+    monkeypatch.setattr(semantic_pack.os, "pread", observe)
+    with pytest.raises(SemanticPackError):
+        PMPackReader(path).read(ref, max_record_bytes=16)
+    assert max(observed, default=0) <= 8
+
+
+@pytest.mark.parametrize("change", ["rename", "inplace"])
+def test_bounded_pack_read_rejects_change_during_read(tmp_path, monkeypatch, change):
+    path = tmp_path / "bounded.pm-pack"
+    with PMPackWriter(path) as writer:
+        ref = writer.append({"text": "original"})
+    original = semantic_pack.os.pread
+    changed = False
+    def race(fd, amount, offset):
+        nonlocal changed
+        result = original(fd, amount, offset)
+        if offset == ref.offset + 8 and not changed:
+            changed = True
+            if change == "rename":
+                other = tmp_path / "replacement"
+                other.write_bytes(path.read_bytes())
+                other.replace(path)
+            else:
+                with path.open("ab") as stream:
+                    stream.write(b"extra")
+        return result
+    monkeypatch.setattr(semantic_pack.os, "pread", race)
+    with pytest.raises(SemanticPackError):
+        PMPackReader(path).read(ref, max_record_bytes=65536)
+
+
+@pytest.mark.parametrize("mode", ["full", "prefix"])
+@pytest.mark.parametrize("change", ["rename", "inplace", "symlink"])
+def test_pack_verification_rejects_change_after_last_record_read(tmp_path, monkeypatch, mode, change):
+    """A valid hash of previously read bytes must not certify a changed file."""
+    path = tmp_path / "race.pm-pack"
+    with PMPackWriter(path) as writer:
+        ref = writer.append({"text": "original"})
+        seal = writer.seal()
+    replacement = tmp_path / "replacement.pm-pack"
+    replacement.write_bytes(path.read_bytes())
+    original = semantic_pack.os.pread
+    changed = False
+
+    def race(fd, amount, offset):
+        nonlocal changed
+        result = original(fd, amount, offset)
+        if offset == ref.offset + 8 + ref.length and not changed:
+            changed = True
+            if change == "rename":
+                replacement.replace(path)
+            elif change == "symlink":
+                path.unlink()
+                path.symlink_to(replacement)
+            else:
+                with path.open("r+b") as stream:
+                    stream.seek(ref.offset + 8)
+                    stream.write(b"!")
+        return result
+
+    monkeypatch.setattr(semantic_pack.os, "pread", race)
+    with pytest.raises((SemanticPackError, OSError)):
+        if mode == "full":
+            verify_pack(path, seal)
+        else:
+            semantic_pack.verify_pack_prefix(path, seal.byte_length)
+    assert changed

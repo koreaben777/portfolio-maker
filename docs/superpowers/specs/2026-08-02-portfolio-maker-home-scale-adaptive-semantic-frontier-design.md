@@ -1,4 +1,10 @@
+<!-- restart-2026-10-11 -->
+> **2026-10-11 문서 분류: 이전 설계·계획·인계 기록.** 재개 범위와 다음 작업은 [프로젝트 재개안](../../../../../docs/PROJECT_RESTART.md)을 따른다. 아래의 당시 승인·기술 계약·검증 기록은 보존하며, 미완료 체크박스를 지금의 실행 지시로 해석하지 않는다. 보안·근거·호환 계약을 완화하는 변경이 아니다.
+<!-- /restart-2026-10-11 -->
+
 # Portfolio Maker 전수 로컬 인덱스·적응형 Codex 의미 프런티어 설계
+
+> 2026-09-24 추가 계약: [목적 중심 개정](2026-09-24-portfolio-outcome-recovery-design.md)을 함께 적용한다. Task 10은 새 R1 사이클의 receipt 검증으로 닫고, Tasks 11/12에 자원 gate E, Task 12 뒤·Task 13 전에 포트폴리오 gate P를 적용한다. Tasks 13–16 및 기존 full-home/release gate H는 생략하지 않는다. 상세 protocol·budget·승인 계약과 과거 판정은 유지한다.
 
 날짜: 2026-08-02
 상태: 사용자 승인 설계, 구현 전 권위 계약
@@ -646,8 +652,14 @@ idempotent success이며, 다른 output은 conflict로 거부한다.
 
 ### 10.3 pause와 recovery
 
-- 사용자 pause 또는 interrupt 요청은 현재 atomic unit 이후 10초 안에 새 lease 발급을
-  멈추고 durable checkpoint를 게시한다.
+- 사용자 pause 요청의 10초 grace window는 요청이 durable하게 수락된 시점부터다.
+  deadline 이상 시점의 미확정 결과는 receipt가 될 수 없으며, 기존 확정 prefix에서
+  checkpoint와 lease 해제를 수행한다. 현재 atomic unit 완료를 무기한 기다리지 않는다.
+- deadline과 clock 유효성 authority를 영속화하고 receipt transaction이 lock을 얻은 뒤
+  현재 시각으로 다시 검사한다. 반복 pause나 pause caller 종료는 기한을 연장·소거하지 않는다.
+  기존 receipt replay와 단일 budget 정산은 보존한다. DB contention에 따른 응답 지연과
+  receipt 허용 기한은 별개다. 상세 수용 기준은
+  [2026-09-08 Task 10 교정 계획](../plans/2026-09-08-semantic-v3-task10-pause-closeout.md)에 따른다.
 - process crash 전 commit되지 않은 output은 receipt가 아니며 다시 실행한다.
 - exchange write는 temporary + fsync + atomic replace를 사용한다.
 - checkpoint는 receipt sequence, result-pack root/length, queue root, aggregate root,

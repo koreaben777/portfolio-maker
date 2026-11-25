@@ -199,6 +199,32 @@ def prepare_approved_v3_semantic_fixture(workspace: Path):
     return root, prepared
 
 
+def write_cli_v3_output(input_path: Path, output_path: Path) -> None:
+    work_input = json.loads(input_path.read_text(encoding="utf-8"))
+    payload = {
+        "schema_version": "semantic-frontier-output-v3",
+        "revision_id": work_input["revision_id"],
+        "run_id": work_input["run_id"],
+        "unit_id": work_input["unit_id"],
+        "input_sha256": work_input["input_sha256"],
+        "action": "accept_boundary",
+        "target_node_ids": work_input["target_node_ids"],
+        "grounding_signal_ids": [work_input["approved_local_signal_ids"][0]],
+        "representative_digests": [
+            item["full_content_sha256"] for item in work_input["representatives"]
+        ],
+        "rationale": "검증된 목적과 실행 진입점 신호를 함께 근거로 경계를 판단한다.",
+        "counter_signal_ids": [],
+        "confidence": 0.8,
+        "requested_child_node_ids": [],
+        "next_child_cursor": None,
+    }
+    write_managed_text(
+        output_path,
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+    )
+
+
 def seed_v2_candidate(workspace, *, confidence="medium") -> tuple[WorkspacePaths, str]:
     paths = WorkspacePaths.from_root(workspace)
     evidence_path = workspace / "approved-evidence.md"
@@ -704,6 +730,90 @@ def test_cli_next_semantic_work_dispatches_v3_with_safe_run_and_exchange_output(
     assert str(workspace) not in captured.out
     assert str(root) not in captured.out
     assert "Approved project" not in captured.out
+
+
+def test_cli_v3_validate_pause_and_resume_route_without_v2_fallback(
+    workspace, capsys,
+) -> None:
+    root, prepared = prepare_approved_v3_semantic_fixture(workspace)
+    assert main(
+        [
+            "next-semantic-work", "--workspace", str(workspace),
+            "--run-id", prepared.run_id,
+        ]
+    ) == 0
+    next_output = capsys.readouterr().out
+    nonce = next_output.split("Lease nonce: ", 1)[1].splitlines()[0]
+    unit = next_output.split("Semantic work unit: ", 1)[1].splitlines()[0]
+    paths = WorkspacePaths.from_root(workspace)
+    write_cli_v3_output(
+        paths.semantic_v3_exchange_input_path(prepared.revision_id, prepared.run_id),
+        paths.semantic_v3_exchange_output_path(prepared.revision_id, prepared.run_id),
+    )
+
+    assert main(
+        [
+            "validate-semantic-work", "--workspace", str(workspace),
+            "--run-id", prepared.run_id, "--unit-id", unit,
+            "--lease-nonce", nonce,
+        ]
+    ) == 0
+    validated = capsys.readouterr()
+    assert f"Semantic run: {prepared.run_id}" in validated.out
+    assert "Receipt sequence: 1" in validated.out
+    assert str(workspace) not in validated.out
+    assert str(root) not in validated.out
+
+    assert main(
+        ["pause-semantic-work", "--workspace", str(workspace), "--run-id", prepared.run_id]
+    ) == 0
+    assert "State: paused_user" in capsys.readouterr().out
+    assert main(
+        ["resume-semantic-work", "--workspace", str(workspace), "--run-id", prepared.run_id]
+    ) == 0
+    assert "State: prepared" in capsys.readouterr().out
+
+
+def test_cli_v3_validate_selects_the_unique_issued_run_without_run_id(
+    workspace, capsys,
+) -> None:
+    _root, prepared = prepare_approved_v3_semantic_fixture(workspace)
+    assert main(
+        ["next-semantic-work", "--workspace", str(workspace), "--run-id", prepared.run_id]
+    ) == 0
+    next_output = capsys.readouterr().out
+    nonce = next_output.split("Lease nonce: ", 1)[1].splitlines()[0]
+    unit = next_output.split("Semantic work unit: ", 1)[1].splitlines()[0]
+    paths = WorkspacePaths.from_root(workspace)
+    write_cli_v3_output(
+        paths.semantic_v3_exchange_input_path(prepared.revision_id, prepared.run_id),
+        paths.semantic_v3_exchange_output_path(prepared.revision_id, prepared.run_id),
+    )
+
+    assert main(
+        [
+            "validate-semantic-work", "--workspace", str(workspace),
+            "--unit-id", unit, "--lease-nonce", nonce,
+        ]
+    ) == 0
+    assert f"Semantic run: {prepared.run_id}" in capsys.readouterr().out
+
+
+def test_cli_v3_authority_rejects_missing_lease_without_v2_fallback(
+    workspace, capsys,
+) -> None:
+    _root, _prepared = prepare_approved_v3_semantic_fixture(workspace)
+
+    assert main(
+        [
+            "validate-semantic-work", "--workspace", str(workspace),
+            "--unit-id", "unit-000001",
+        ]
+    ) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "semantic work command failed safely\n"
 
 
 def test_cli_v3_next_rejects_ambiguous_or_unsafe_run_identifier(workspace, capsys) -> None:

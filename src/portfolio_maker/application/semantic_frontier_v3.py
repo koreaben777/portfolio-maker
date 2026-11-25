@@ -22,6 +22,8 @@ from portfolio_maker.domain.semantic_frontier import (
     SemanticPlannedUnit,
     SemanticRuntimeDeferredRow,
 )
+from portfolio_maker.infrastructure.semantic_authenticated_catalog import AuthenticatedCatalogReader
+
 from portfolio_maker.infrastructure.semantic_catalog import (
     FrontierPlanningRow,
     FrontierSelectorResult,
@@ -305,7 +307,7 @@ def _build_frontier_plan(
 
 
 def representative_nodes(
-    reader: SemanticCatalogReader,
+    reader: SemanticCatalogReader | AuthenticatedCatalogReader,
     parent_node_id: str,
     *,
     observer: RepresentativeSelectionObserver | None = None,
@@ -426,7 +428,7 @@ def transition_frontier_with_authority(
     *,
     run_id: str,
     current_unit: SemanticPlannedUnit,
-    reader: SemanticCatalogReader,
+    reader: SemanticCatalogReader | AuthenticatedCatalogReader,
     selector_version: str,
     budget_exhausted: bool,
     remaining_deferred_node_ids: tuple[str, ...] = (),
@@ -468,7 +470,7 @@ def transition_frontier_with_authority(
         or not current_unit.fairness_lane
     ):
         raise FrontierSelectionError("frontier transition unit is invalid")
-    if not isinstance(reader, SemanticCatalogReader):
+    if not isinstance(reader, (SemanticCatalogReader, AuthenticatedCatalogReader)):
         raise FrontierSelectionError("frontier transition catalog is invalid")
     if (
         not isinstance(validated_output, ValidatedV3SemanticOutput)

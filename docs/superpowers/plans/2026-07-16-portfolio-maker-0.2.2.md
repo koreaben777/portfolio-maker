@@ -1,4 +1,15 @@
+<!-- restart-2026-10-11 -->
+> **2026-10-11 문서 분류: 이전 설계·계획·인계 기록.** 재개 범위와 다음 작업은 [프로젝트 재개안](../../../../../docs/PROJECT_RESTART.md)을 따른다. 아래의 당시 승인·기술 계약·검증 기록은 보존하며, 미완료 체크박스를 지금의 실행 지시로 해석하지 않는다. 보안·근거·호환 계약을 완화하는 변경이 아니다.
+<!-- /restart-2026-10-11 -->
+
 # Portfolio Maker 0.2.2 Managed History and Codex Vision Implementation Plan
+
+> 2026-09-24 운영 연결: [목적 중심 후속 계획](2026-09-24-portfolio-outcome-recovery.md)을 먼저 확인한다. 이 문서의 기능 계약과 과거 검증·종료 판정은 보존한다. 후속 계획은 receipt 교정, 조기 자원 검증, 작은 포트폴리오 수직 검증을 추가하며 구현·Git·release 승인이 아니다.
+
+> 2026-09-08 상태 구분: 이 계획은 #5/#14 기본 기능 범위다. 현재 진행 중인 전체 홈
+> 분석 복구는 별도 v3 계획이며, 그 Task 10과 이 문서의 Task 10은 서로 다르다.
+> [현재 개발 현황](../../DEVELOPMENT_STATUS.md)과
+> [v3 Task 10 교정 계획](2026-09-08-semantic-v3-task10-pause-closeout.md)을 먼저 확인한다.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (- [ ]) syntax for tracking.
 

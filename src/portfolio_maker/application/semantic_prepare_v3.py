@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import asdict
 import hashlib
 import json
 import math
@@ -57,6 +58,13 @@ from portfolio_maker.infrastructure.semantic_crawler import (
 )
 from portfolio_maker.infrastructure.semantic_catalog import CatalogSeal, SemanticCatalogReader
 from portfolio_maker.infrastructure.semantic_pack import PackSeal, verify_pack
+from portfolio_maker.domain.semantic_frontier import PackRecordRef
+from portfolio_maker.infrastructure.semantic_auth_index import (
+    AUTH_FORMAT, PROJECTION_VERSION, AuthTreeSeal, AuthIndexReader, _fields, _integer, _digest,
+)
+from portfolio_maker.infrastructure.semantic_authenticated_catalog import (
+    AUTH_FILENAME, build_authenticated_catalog, verify_authenticated_catalog_full,
+)
 from portfolio_maker.infrastructure.sqlite_repository import RepositoryError, SQLiteRepository
 from portfolio_maker.workspace import WorkspacePaths
 
@@ -148,6 +156,8 @@ def prepare_semantic_index_v3(
             policy_sha256,
         )
         artifacts = sink.seal()
+        auth_seal = build_authenticated_catalog(temporary, artifacts.catalog_seal, artifacts.pack_seal, revision_id)
+        verify_authenticated_catalog_full(temporary, artifacts.catalog_seal, artifacts.pack_seal, auth_seal)
         resource_observation = _assert_prepare_resources(temporary, started_at)
         _assert_current_approval(paths, root, approval, policy_sha256, source_approval_sha256)
         plan_bytes = semantic_canonical_json_bytes(plan)
@@ -164,6 +174,11 @@ def prepare_semantic_index_v3(
         safe_source_label = normalize_label(root.name)
         private_context_scope = "approved_local_source"
         manifest_without_hash = {
+            "authenticated_index": {
+                "format": AUTH_FORMAT, "projection": PROJECTION_VERSION,
+                "filename": AUTH_FILENAME, "generation_id": revision_id,
+                "tree_seal": asdict(auth_seal),
+            },
             "baseline_coverage_counts": sorted(coverage_counts.items()),
             "catalog": {
                 "byte_length": artifacts.catalog_seal.byte_length,
@@ -381,6 +396,8 @@ def _reopen_sealed_authority(
             record_count=int(pack["record_count"]),
             record_root=str(pack["record_root"]),
         )
+        if "authenticated_index" in manifest:
+            verify_authenticated_catalog_full(revision_directory, seal, pack_seal, _authenticated_seal(manifest))
         verify_pack(revision_directory / "packs" / "structural.pm-pack", pack_seal)
         with SemanticCatalogReader(revision_directory / "catalog.sqlite", seal) as reader:
             deferred = reader.deferred_summary(
@@ -448,7 +465,7 @@ def _parse_canonical_v3_manifest(raw: bytes) -> dict[str, object]:
         raise SemanticPrepareV3Error("semantic v3 sealed authority is invalid") from error
     if not isinstance(manifest, dict) or semantic_canonical_json_bytes(manifest) != raw:
         raise SemanticPrepareV3Error("semantic v3 sealed authority is invalid")
-    if set(manifest) != _MANIFEST_KEYS:
+    if set(manifest) not in (_MANIFEST_KEYS, _MANIFEST_KEYS | {"authenticated_index"}):
         raise SemanticPrepareV3Error("semantic v3 sealed authority is invalid")
     stored_hash = manifest["manifest_sha256"]
     unsigned = {key: value for key, value in manifest.items() if key != "manifest_sha256"}
@@ -456,7 +473,35 @@ def _parse_canonical_v3_manifest(raw: bytes) -> dict[str, object]:
         raise SemanticPrepareV3Error("semantic v3 sealed authority is invalid")
     if not _has_valid_v3_manifest_types(manifest):
         raise SemanticPrepareV3Error("semantic v3 sealed authority is invalid")
+    if "authenticated_index" in manifest:
+        _authenticated_seal(manifest)
     return manifest
+
+
+def _authenticated_seal(manifest: dict[str, object]) -> AuthTreeSeal:
+    try:
+        extension = manifest["authenticated_index"]
+        _fields(extension, "format projection filename generation_id tree_seal")
+        if (extension["format"] != AUTH_FORMAT or extension["projection"] != PROJECTION_VERSION
+                or extension["filename"] != AUTH_FILENAME or extension["generation_id"] != manifest["revision_id"]):
+            raise ValueError("invalid authenticated index extension")
+        tree = extension["tree_seal"]
+        _fields(tree, "generation_id root root_digest height count pack_seal")
+        _fields(tree["root"], "offset length sha256")
+        _fields(tree["pack_seal"], "byte_length file_sha256 record_count record_root")
+        if tree["generation_id"] != extension["generation_id"]:
+            raise ValueError("authenticated generation mismatch")
+        pack = PackSeal(**tree["pack_seal"])
+        if not _integer(pack.record_count):
+            raise ValueError("empty authenticated pack")
+        _digest(pack.file_sha256)
+        _digest(pack.record_root)
+        seal = AuthTreeSeal(tree["generation_id"], PackRecordRef(**tree["root"]), tree["root_digest"], tree["height"], tree["count"], pack)
+        # Constructor checks only trusted metadata; it does not open this path.
+        AuthIndexReader(Path(AUTH_FILENAME), seal).close()
+        return seal
+    except (KeyError, TypeError, ValueError) as error:
+        raise SemanticPrepareV3Error("semantic v3 authenticated extension is invalid") from error
 
 
 def _has_valid_v3_manifest_types(manifest: dict[str, object]) -> bool:

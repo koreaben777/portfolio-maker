@@ -1,4 +1,15 @@
+<!-- restart-2026-10-11 -->
+> **2026-10-11 문서 분류: 이전 설계·계획·인계 기록.** 재개 범위와 다음 작업은 [프로젝트 재개안](../../../../../docs/PROJECT_RESTART.md)을 따른다. 아래의 당시 승인·기술 계약·검증 기록은 보존하며, 미완료 체크박스를 지금의 실행 지시로 해석하지 않는다. 보안·근거·호환 계약을 완화하는 변경이 아니다.
+<!-- /restart-2026-10-11 -->
+
 # Portfolio Maker Home-Scale Adaptive Semantic Frontier Implementation Plan
+
+> 2026-09-24 추가 계약: [목적 중심 개정](../specs/2026-09-24-portfolio-outcome-recovery-design.md)을 함께 적용한다. Task 10은 새 R1 사이클의 receipt 검증으로 닫고, Tasks 11/12에 자원 gate E, Task 12 뒤·Task 13 전에 포트폴리오 gate P를 적용한다. Tasks 13–16 및 기존 full-home/release gate H는 생략하지 않는다. 상세 protocol·budget·승인 계약과 과거 판정은 유지한다.
+
+> 현재 상태(2026-09-08): Tasks 1–9와 Task 10 선행 보완은 승인 기록이 있다.
+> Task 10 pause 교정은 통과했지만 누적 리뷰는 receipt replay 무결성 결함으로 NEEDS_WORK다.
+> Tasks 11–16과 새 실파일럿은 완료되지 않았다.
+> [개발 현황](../../DEVELOPMENT_STATUS.md)을 참조한다. 이번 한정 사이클은 Git 쓰기를 허용하지 않는다.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -2040,6 +2051,10 @@ git commit -m "feat: issue bounded semantic work"
 ---
 
 ### Task 10: Validated Result Pack, Atomic Receipt, Pause, and Resume
+
+> 현재 재개 계약: [2026-09-08 pause authority 교정 계획](2026-09-08-semantic-v3-task10-pause-closeout.md).
+> 이 문서의 전체 Task 10 수용 조건을 보존하면서 late receipt·durable deadline·restart 검증을 추가한다.
+> 아래 commit 단계는 이번 사이클에서는 보류하며, 독립 리뷰된 미커밋 후보까지 완료한다.
 
 **Files:**
 - Modify: `src/portfolio_maker/application/semantic_lifecycle_v3.py`

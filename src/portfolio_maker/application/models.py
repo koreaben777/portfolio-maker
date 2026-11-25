@@ -298,6 +298,44 @@ class ValidateSemanticWorkRequest:
 
 
 @dataclass(frozen=True)
+class ValidateSemanticWorkV3Request:
+    workspace: Path
+    run_id: str
+    unit_id: str
+    lease_nonce: str
+
+
+@dataclass(frozen=True)
+class ValidateSemanticWorkV3Result:
+    revision_id: str
+    run_id: str
+    unit_id: str
+    receipt_sequence: int
+    result_sha256: str
+    protocol: str = SEMANTIC_PROTOCOL_V3
+
+
+@dataclass(frozen=True)
+class PauseSemanticWorkRequest:
+    workspace: Path
+    run_id: str
+
+
+@dataclass(frozen=True)
+class ResumeSemanticWorkRequest:
+    workspace: Path
+    run_id: str
+
+
+@dataclass(frozen=True)
+class SemanticWorkLifecycleResult:
+    revision_id: str
+    run_id: str
+    run_state: SemanticRunState
+    protocol: str = SEMANTIC_PROTOCOL_V3
+
+
+@dataclass(frozen=True)
 class ValidateSemanticWorkResult:
     unit_id: str
     receipt_path: Path
